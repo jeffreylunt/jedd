@@ -5,6 +5,10 @@ to your Sonarr/Radarr. Family and friends just text it ("can you get Dune Part T
 season 1", "is it ready yet?") and it searches, adds, and follows up when the download is done — all
 driven by a local LLM running on [Ollama](https://ollama.com), so requests never leave your network.
 
+<p align="center">
+  <img src="docs/screenshots/jedd-demo.jpg" alt="Jedd in action: an iMessage conversation adding a movie" width="380">
+</p>
+
 It connects to three services you run yourself:
 
 - **[BlueBubbles](https://bluebubbles.app)** — bridges iMessage (requires a Mac running Messages.app).
