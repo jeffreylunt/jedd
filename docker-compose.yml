@@ -1,0 +1,48 @@
+# Jedd — iMessage media-request bot.
+#
+# This container talks to THREE external services that you run yourself (it does NOT bundle them):
+#   - a BlueBubbles server (on a Mac running Messages.app, signed into an iMessage account)
+#   - an Ollama server with a tool-calling model (e.g. qwen2.5:7b)
+#   - your existing Sonarr + Radarr
+#
+# Configure everything in a `.env` file next to this compose file (see .env.example).
+#
+# REACHING THE EXTERNAL SERVICES:
+#   - On macOS / Windows Docker Desktop, point the *_URL vars at `host.docker.internal`
+#     (e.g. OLLAMA_URL=http://host.docker.internal:11434) to reach services on the host.
+#   - On Linux, use the host's LAN IP, or uncomment `network_mode: host` below and use localhost.
+#
+# INBOUND WEBHOOK (important): the BlueBubbles server must be able to POST inbound messages back to
+# this container. The container listens on BLUEBUBBLES_WEBHOOK_PORT, bound to BLUEBUBBLES_WEBHOOK_HOST
+# (set it to 0.0.0.0 in .env so the port is reachable). Set BLUEBUBBLES_WEBHOOK_URL in .env to an
+# address the BlueBubbles host can reach this container at (e.g. http://<docker-host-LAN-IP>:18790/webhook).
+#
+# macOS/iMessage caveat: iMessage requires a Mac. BlueBubbles + Messages.app must run on a Mac the
+# container can reach. Ollama and Sonarr/Radarr can run anywhere reachable.
+
+services:
+  jedd:
+    image: ghcr.io/jeffreylunt/jedd:latest
+    # To build from source instead of pulling the published image, comment out `image:` above
+    # and uncomment:
+    # build: .
+    container_name: jedd
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # host:container — the inbound BlueBubbles webhook receiver.
+      - "${BLUEBUBBLES_WEBHOOK_PORT:-18790}:${BLUEBUBBLES_WEBHOOK_PORT:-18790}"
+    volumes:
+      # Persist state.json (active jobs, processed-message ids, conversation history).
+      - jedd-data:/app/data
+    # On Linux you can instead share the host network (then use localhost URLs and drop `ports`):
+    # network_mode: host
+
+    # DROP-IN to an existing *arr stack: add this service to the same compose file as your
+    # sonarr/radarr (or set `networks:` to join their network), then reference them by service
+    # name in .env — SONARR_URL=http://sonarr:8989/api/v3, RADARR_URL=http://radarr:7878/api/v3,
+    # OLLAMA_URL=http://ollama:11434. No host.docker.internal needed when on the same network.
+
+volumes:
+  jedd-data:

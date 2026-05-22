@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+data/
+
+# Internal worker-memory dir — must never enter the public repo.
+knowledge/
