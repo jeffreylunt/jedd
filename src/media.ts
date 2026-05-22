@@ -47,14 +47,15 @@ function blockNumber(sender: string, state: AppState, reason: string): void {
 export function handleMessage(msg: IncomingMessage, state: AppState): void {
   const { sender, text } = msg;
 
-  // Spam check (never block the owner).
-  if (!isOwner(sender) && isSpam(sender, text, state)) return;
-
-  // If an allow-list is configured, silently ignore senders not on it (owner always allowed).
+  // DEFAULT DENY — drop any sender not explicitly allowed (owner or allowlist, unless
+  // ALLOW_ALL_SENDERS). Don't process, don't reply. Log with the number redacted.
   if (!isAllowed(sender)) {
-    console.log(`[media] Ignoring message from non-allowed sender ${sender}`);
+    console.log(`[media] Blocked sender (not on allowlist): ...${sender.slice(-4)}`);
     return;
   }
+
+  // Spam check (never block the owner).
+  if (!isOwner(sender) && isSpam(sender, text, state)) return;
 
   console.log(`[media] Processing message from ${sender}: "${text.substring(0, 80)}"`);
 

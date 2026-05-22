@@ -118,9 +118,23 @@ All configuration is via environment variables (a `.env` file). Every option is 
 | `BLUEBUBBLES_WEBHOOK_HOST` | | `127.0.0.1` | Bind host (use `0.0.0.0` in a container) |
 | `BLUEBUBBLES_WEBHOOK_URL` | | derived | URL BlueBubbles POSTs inbound messages to |
 | `OWNER_PHONE` | | — | Owner's number (full access, never spam-blocked) |
-| `ALLOWED_SENDERS` | | (empty = open) | Comma-separated allowed numbers; empty = anyone |
+| `ALLOWED_SENDERS` | | (empty) | Comma-separated additional allowed numbers (see Access control) |
+| `ALLOW_ALL_SENDERS` | | `false` | `true` opens the bot to anyone (see Access control) |
 | `DISPLAY_NAME` | | `Jedd` | The bot's persona name |
 | `PREFERRED_LANGUAGE` | | `English` | Documented release-language preference (see below) |
+
+### Access control (default deny)
+
+By default Jedd is **locked down**: only the `OWNER_PHONE` and any numbers in `ALLOWED_SENDERS` can
+interact with it. Every other number is silently ignored — no processing, no reply. Out of the box
+(empty `ALLOWED_SENDERS`, `ALLOW_ALL_SENDERS` unset) **only the owner can use the bot** until you add
+numbers to the config.
+
+- To let specific people in, add their numbers to `ALLOWED_SENDERS` (comma-separated, E.164 or US
+  10-digit), e.g. `ALLOWED_SENDERS=+15557654321,+15559876543`.
+- To open the bot to **anyone** who messages it, set `ALLOW_ALL_SENDERS=true`. (Spam is still
+  rate-limited and pattern-blocked.)
+- The owner is always allowed and is never spam-blocked.
 
 ### Sonarr/Radarr setup notes
 

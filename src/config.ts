@@ -71,12 +71,14 @@ export const config = {
   },
   // Display name / persona used in prompts and replies.
   displayName: process.env.DISPLAY_NAME || 'Jedd',
-  // Access control. OWNER_PHONE = full access (any request). ALLOWED_SENDERS = comma-separated
-  // additional phone numbers that may make media requests. If ALLOWED_SENDERS is empty, ANYONE who
-  // messages can make media requests (spam is still rate/pattern-blocked). The owner is always
-  // allowed and never spam-blocked.
+  // Access control — DEFAULT DENY. A sender is allowed ONLY if they are the OWNER_PHONE or in the
+  // ALLOWED_SENDERS allowlist. Everyone else is silently ignored. With an empty allowlist and
+  // ALLOW_ALL_SENDERS unset, NOBODY can use the bot until numbers are added to the config — this is
+  // the secure default. Set ALLOW_ALL_SENDERS=true to open the bot to anyone who messages (spam is
+  // still rate/pattern-blocked). The owner is always allowed and never spam-blocked.
   ownerPhone: normalizePhone(process.env.OWNER_PHONE || ''),
   allowedSenders: parsePhoneList(process.env.ALLOWED_SENDERS || ''),
+  allowAllSenders: /^(true|1|yes)$/i.test(process.env.ALLOW_ALL_SENDERS || ''),
   dataDir: join(PROJECT_ROOT, 'data'),
 } as const;
 
@@ -85,11 +87,12 @@ export function isOwner(phone: string): boolean {
   return !!config.ownerPhone && phone === config.ownerPhone;
 }
 
-/** True if the sender is allowed to make media requests. Owner always allowed; if no allow-list is
- *  configured, everyone is allowed (open mode). */
+/** True if the sender may interact with the bot. DEFAULT DENY: only the owner and numbers in the
+ *  ALLOWED_SENDERS allowlist are permitted. ALLOW_ALL_SENDERS=true opens it to everyone. An empty
+ *  allowlist with the flag off means nobody is allowed until numbers are added — the secure default. */
 export function isAllowed(phone: string): boolean {
   if (isOwner(phone)) return true;
-  if (config.allowedSenders.length === 0) return true; // open mode
+  if (config.allowAllSenders) return true; // explicitly opened to everyone
   return config.allowedSenders.includes(phone);
 }
 
