@@ -105,13 +105,13 @@ All configuration is via environment variables (a `.env` file). Every option is 
 | `SONARR_URL` | | `http://localhost:8989/api/v3` | Sonarr API v3 base URL |
 | `SONARR_API_KEY` | yes | — | Sonarr API key |
 | `SONARR_ROOT_FOLDER` | yes | — | Root folder path as seen by Sonarr |
-| `SONARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added shows |
+| `SONARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added shows (1 = "Any" — set a real HD profile) |
 | `RADARR_URL` | | `http://localhost:7878/api/v3` | Radarr API v3 base URL |
 | `RADARR_API_KEY` | yes | — | Radarr API key |
 | `RADARR_ROOT_FOLDER` | yes | — | Root folder path as seen by Radarr |
-| `RADARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added movies |
+| `RADARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added movies (1 = "Any" — set a real HD profile) |
 | `OLLAMA_URL` | | `http://localhost:11434` | Ollama daemon URL |
-| `OLLAMA_MODEL` | | `qwen2.5:7b` | Tool-calling model (alias: `LOCAL_MODEL`) |
+| `OLLAMA_MODEL` | | `qwen2.5:7b` | Tool-calling model |
 | `BLUEBUBBLES_URL` | | `http://localhost:1234` | BlueBubbles server URL |
 | `BLUEBUBBLES_PASSWORD` | yes | — | BlueBubbles server password |
 | `BLUEBUBBLES_WEBHOOK_PORT` | | `18790` | Port the inbound webhook listens on |
@@ -140,7 +140,8 @@ numbers to the config.
 
 - **Quality profile id** and **root folder** are specific to *your* instance. Find the profile id
   in the URL when editing a profile (Settings > Profiles), and the root folder under
-  Settings > Media Management.
+  Settings > Media Management. **Set the quality profile** — the default `1` is usually the "Any"
+  profile, which will grab low-quality cam/screener releases; point it at a real HD profile.
 - **Language preference:** `PREFERRED_LANGUAGE` is documentation only — it does not enforce anything
   by itself. To actually prefer a language, add Custom Formats in your Sonarr/Radarr quality profiles
   (a positive "Language: <lang>" CF and a negative "Not <lang>" CF). Jedd reads the value but the

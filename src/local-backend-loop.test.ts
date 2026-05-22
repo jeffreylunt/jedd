@@ -12,7 +12,7 @@ process.env.RADARR_API_KEY ??= 'test';
 process.env.SONARR_ROOT_FOLDER ??= '/tv';
 process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
-process.env.LOCAL_MODEL ??= 'test-model';
+process.env.OLLAMA_MODEL ??= 'test-model';
 
 const { runLocalSession } = await import('./local-backend.js');
 

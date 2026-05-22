@@ -25,9 +25,9 @@ export const config = {
     // (or http://host.docker.internal:8989/... from a container on macOS).
     baseUrl: (process.env.SONARR_URL || 'http://localhost:8989/api/v3').replace(/\/$/, ''),
     apiKey: requireEnv('SONARR_API_KEY'),
-    // Quality profile id + root folder are SPECIFIC TO YOUR Sonarr instance — look them up in
-    // Sonarr (Settings > Profiles, and the path under Settings > Media Management). Defaults are
-    // placeholders; set SONARR_QUALITY_PROFILE_ID and SONARR_ROOT_FOLDER for your install.
+    // Quality profile id is SPECIFIC TO YOUR Sonarr instance (Settings > Profiles — the id is in the
+    // URL). The default 1 is usually the "Any" profile, which will grab cam/screener junk — SET
+    // SONARR_QUALITY_PROFILE_ID to a real HD profile for good results. Root folder must also be set.
     qualityProfileId: parseInt(process.env.SONARR_QUALITY_PROFILE_ID || '1'),
     rootFolder: requireEnv('SONARR_ROOT_FOLDER'),
   },
@@ -62,12 +62,11 @@ export const config = {
         || `http://${config.bluebubbles.webhookHost}:${config.bluebubbles.webhookPort}/webhook`;
     },
   },
-  // The Ollama LLM. `model` should be a tool-calling-capable model (default qwen2.5:7b). Change it
-  // without a code edit via OLLAMA_MODEL (LOCAL_MODEL is a back-compat alias). `url` is your Ollama
-  // daemon (http://host.docker.internal:11434 from a container on macOS).
+  // The Ollama LLM. `model` should be a tool-calling-capable model (default qwen2.5:7b). `url` is
+  // your Ollama daemon (http://host.docker.internal:11434 from a container on macOS).
   ollama: {
     url: (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, ''),
-    model: process.env.OLLAMA_MODEL || process.env.LOCAL_MODEL || 'qwen2.5:7b',
+    model: process.env.OLLAMA_MODEL || 'qwen2.5:7b',
   },
   // Display name / persona used in prompts and replies.
   displayName: process.env.DISPLAY_NAME || 'Jedd',
@@ -94,6 +93,12 @@ export function isAllowed(phone: string): boolean {
   if (isOwner(phone)) return true;
   if (config.allowAllSenders) return true; // explicitly opened to everyone
   return config.allowedSenders.includes(phone);
+}
+
+// Warn loudly if the bot is configured to ignore EVERYONE (no owner, no allowlist, not open) —
+// otherwise it starts fine but silently drops every message, which looks like a broken bot.
+if (!config.ownerPhone && config.allowedSenders.length === 0 && !config.allowAllSenders) {
+  console.warn('[config] WARNING: no OWNER_PHONE, empty ALLOWED_SENDERS, and ALLOW_ALL_SENDERS is not set — the bot will ignore ALL incoming messages. Set OWNER_PHONE (and/or ALLOWED_SENDERS), or ALLOW_ALL_SENDERS=true.');
 }
 
 export interface ConversationMessage {
