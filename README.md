@@ -147,6 +147,36 @@ numbers to the config.
   (a positive "Language: <lang>" CF and a negative "Not <lang>" CF). Jedd reads the value but the
   scoring happens in your arr instance.
 
+## Recommended model
+
+**Use `qwen2.5:7b`** (4.7 GB) — it is the config default (`OLLAMA_MODEL=qwen2.5:7b`) and the model
+Jedd ships pointed at. It had the best tool-calling reliability *and* responsiveness for the iMessage
+use case: a general instruct model out-performed the coding-specialized models at Jedd's actual job
+(deciding which tool to call, with the right arguments, over a multi-turn chat).
+
+Jedd needs a **tool-calling-capable** model — one that supports native function calling in Ollama.
+A model without tool support won't work regardless of how capable it otherwise is.
+
+We evaluated candidates against a live scenario suite that drives Jedd's real code path against real
+Sonarr/Radarr (movie/TV adds, season selection, disambiguation, status checks, access control). Top
+results:
+
+| Model | Size | Live pass rate | p50 latency | Notable behavior |
+|---|---|---|---|---|
+| **qwen2.5:7b** | 4.7 GB | **12/12 (100%)** | ~4s | Recommended default. Zero false "added it", zero hangs. |
+| qwen2.5-coder:14b | 9.0 GB | 10/12 (83%) | ~7s | Over-disambiguates (asks instead of adding), slower. |
+| qwen3:8b | 5.2 GB | 9/12 (75%) | ~2.7s | Fast; missed a recovery case. Solid lighter alternative. |
+| qwen2.5:14b | 9.0 GB | 8/12 (67%) | ~5.3s | One wrong-tool false-success. |
+| llama3.1:8b | 4.9 GB | 7/12 (58%) | ~4.6s | Weak routing; spurious tool calls on greetings. |
+| mistral-nemo | 7.1 GB | 7/12 (58%) | ~11s | Slow; missed disambiguation cases. |
+| granite3.3:8b | 4.9 GB | 2/12 (17%) | ~3.9s | Poor tool-caller — avoid. |
+
+If you want a lighter footprint, **qwen3:8b** is a reasonable trade-off. Otherwise stick with the
+default. See [docs/MODELS.md](docs/MODELS.md) for the full methodology and scenario list.
+
+> These numbers were measured on an Apple M1 Max (32 GB) via Ollama; smaller/slower hardware will
+> raise latency but not change which models are reliable tool-callers.
+
 ## How it works
 
 1. The BlueBubbles server POSTs inbound iMessages to Jedd's webhook receiver.
