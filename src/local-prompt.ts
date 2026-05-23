@@ -7,6 +7,8 @@
 export function systemPromptV2(owner: boolean, displayName = 'Jedd'): string {
   return `You are ${displayName}, a friendly media request assistant for a family. People text you asking for movies and TV shows. ALWAYS help with media requests — that is your whole job.
 
+YOUR DOMAIN IS MOVIES AND TV ONLY. You can ONLY find and download movies and TV shows. You do NOT deal with video games, mobile games, apps, music, or anything else — those tools do not exist for you. When someone names a title, it is ALWAYS a movie or TV show: NEVER ask "is this the mobile game?" or offer game/app options. If a title is ambiguous between a movie and a show, search_movie first (or ask "movie or show?"), but never frame it as a game or anything non-media. Example: "Apex" → treat as a movie/TV title (search_movie), not the video game.
+
 #1 RULE — ACT, DON'T PROMISE. Anything you can do right now (check a status, search, add) you MUST do in this same turn by calling the tool — then reply with ONLY the result. NEVER send a message that narrates intent or asks the user to wait: no "I'll search for that", "I'm checking the status now", "let me look that up", "searching now", "on it", "hang on", "give me a sec", "I'll let you know", or "can you wait a moment?". You do NOT follow up later — there is no later. A reply like that with no tool call is a FAILURE and the user never gets an answer. If you intend to check/search/add, call the tool NOW; only AFTER the tool returns do you write a single reply with the actual result.
 
 HOW TO ACT — call the provided tools, do not describe steps or write curl:
@@ -194,6 +196,63 @@ export function isStallReply(text: string): boolean {
   // A confirmed add ("Added X — grabbing all seasons now") contains "grabbing ... now" but is a
   // real result, handled by concreteAnswer above.
   return !concreteAnswer;
+}
+
+// The known tool names, duplicated here (local-prompt has ZERO runtime deps and can't import the
+// tool schema from local-backend without a cycle). Keep in sync with the `tools` array there.
+const KNOWN_TOOL_NAMES = ['search_movie', 'search_tv', 'add_movie', 'add_tv', 'check_status'];
+// Match a function-call invocation emitted as PLAIN TEXT, e.g. `search_movie({"query": "Apex"})` or
+// `add_tv({"tvdb_id": 12345, "title": "X"})`. qwen2.5:7b sometimes prints the tool call as literal
+// content instead of making a real function/tool call — if that text is delivered, the user gets
+// gibberish (live Apex bug, 2026-05-22). The arg blob is captured for JSON parsing by the caller.
+const INLINE_TOOLCALL_RE = new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(\\s*(\\{[\\s\\S]*\\})\\s*\\)`);
+
+// Parse a raw `toolName({...json...})` invocation out of free text. Returns the tool name and the
+// parsed argument object when the text contains a recognizable tool-call syntax with a valid JSON
+// arg blob; otherwise null. Tolerates surrounding prose ("Sure! search_movie({\"query\":\"Apex\"})").
+// The JSON blob is brace-matched from the first `{` after the paren so trailing prose doesn't break
+// JSON.parse. This is the parser arm of the raw-tool-call fix — the loop PARSES + EXECUTES the call
+// instead of ever delivering the literal string to the user.
+export function parseInlineToolCall(text: string): { name: string; arguments: Record<string, unknown> } | null {
+  if (!text) return null;
+  const nameMatch = text.match(new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(`));
+  if (!nameMatch) return null;
+  const name = nameMatch[1];
+  // Brace-match the JSON arg blob starting at the first `{` after the opening paren.
+  const parenIdx = text.indexOf('(', nameMatch.index! + name.length - 1);
+  if (parenIdx === -1) return null;
+  const braceStart = text.indexOf('{', parenIdx);
+  if (braceStart === -1) {
+    // `toolName()` with no args, or `toolName(...)` with non-JSON args — treat as an empty-arg call
+    // only when the parens are clearly empty; otherwise we can't parse it, return null.
+    const after = text.slice(parenIdx + 1).trimStart();
+    if (after.startsWith(')')) return { name, arguments: {} };
+    return null;
+  }
+  let depth = 0;
+  let end = -1;
+  for (let i = braceStart; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end === -1) return null;
+  try {
+    const args = JSON.parse(text.slice(braceStart, end + 1));
+    if (args && typeof args === 'object' && !Array.isArray(args)) return { name, arguments: args as Record<string, unknown> };
+  } catch { /* unparseable arg blob */ }
+  return null;
+}
+
+// True when the text LOOKS like a raw tool-call invocation for a known tool (`toolName({...})` or
+// `toolName(...)`), regardless of whether the JSON args parse. Used as a FINAL delivery guard: a
+// reply matching this must NEVER be sent to the user verbatim — at best it's an unexecuted tool
+// call, at worst gibberish (the live Apex bug, 2026-05-22). When parseInlineToolCall can extract a
+// clean call we execute it; when it can't, we suppress + re-force rather than deliver the string.
+export function looksLikeRawToolCall(text: string): boolean {
+  if (!text) return false;
+  if (INLINE_TOOLCALL_RE.test(text)) return true;
+  // `toolName(` with any (or no) args — catches a malformed blob parseInlineToolCall can't parse.
+  return new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(`).test(text);
 }
 
 // Deterministically resolve a SEASON-SELECTION phrase from the user against a show's REAL season

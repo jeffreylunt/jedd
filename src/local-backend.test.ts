@@ -8,7 +8,7 @@ process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
 
 const { promisesActionWithoutTool, claimsAddWithoutExecuting, splitQueryYear, titlesRoughlyMatch } = await import('./local-backend.js');
-const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary } = await import('./local-prompt.js');
+const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall } = await import('./local-prompt.js');
 
 // --- splitQueryYear: derive year from param OR a year stuffed into the query (Eternity regression) ---
 
@@ -364,6 +364,56 @@ test('isStatusQuery fires on "How is severance doing" (the leaked phrasing)', ()
   assert.equal(isStatusQuery('How is severance doing'), true);
   assert.equal(isStatusQuery("how's severance doing?"), true);
   assert.equal(isStatusQuery('how is the matrix looking'), true);
+});
+
+// --- Raw tool-call string: NEVER deliver `toolName({...})` text to the user (live Apex bug, 2026-05-22) ---
+
+test('parseInlineToolCall parses the exact leaked Apex string', () => {
+  assert.deepEqual(parseInlineToolCall('search_movie({"query": "Apex"})'), { name: 'search_movie', arguments: { query: 'Apex' } });
+});
+
+test('parseInlineToolCall parses a call wrapped in prose', () => {
+  assert.deepEqual(parseInlineToolCall('Sure! search_movie({"query":"Apex"}) is what I will do.'), { name: 'search_movie', arguments: { query: 'Apex' } });
+});
+
+test('parseInlineToolCall parses add_tv with multiple args', () => {
+  assert.deepEqual(parseInlineToolCall('add_tv({"tvdb_id": 12345, "title": "Severance", "seasons": [1]})'), { name: 'add_tv', arguments: { tvdb_id: 12345, title: 'Severance', seasons: [1] } });
+});
+
+test('parseInlineToolCall returns null for normal prose', () => {
+  assert.equal(parseInlineToolCall('Added Apex (2019) — grabbing it now.'), null);
+  assert.equal(parseInlineToolCall("Couldn't find that one, sorry."), null);
+  assert.equal(parseInlineToolCall(''), null);
+});
+
+test('parseInlineToolCall returns null for an unknown function name', () => {
+  assert.equal(parseInlineToolCall('do_something({"x": 1})'), null);
+});
+
+test('parseInlineToolCall returns null when the arg blob is broken JSON', () => {
+  assert.equal(parseInlineToolCall('search_movie({"query": "Apex"'), null);
+});
+
+test('looksLikeRawToolCall flags any raw tool-call shape, even malformed args', () => {
+  assert.equal(looksLikeRawToolCall('search_movie({"query": "Apex"})'), true);
+  assert.equal(looksLikeRawToolCall('search_movie({"query": "Apex"'), true);
+  assert.equal(looksLikeRawToolCall('add_movie(tmdb_id=872585)'), true);
+  assert.equal(looksLikeRawToolCall('check_status()'), true);
+});
+
+test('looksLikeRawToolCall does NOT flag a normal plain-language reply', () => {
+  assert.equal(looksLikeRawToolCall('Added Apex (2019) — grabbing it now.'), false);
+  assert.equal(looksLikeRawToolCall('Which one did you mean?'), false);
+  assert.equal(looksLikeRawToolCall("I'll search for that show now."), false);
+});
+
+// --- Domain reinforcement: movies/TV only, never games (the "Found several games" Apex bug) ---
+
+test('systemPromptV2 forbids games/apps framing and treats titles as movies/TV', () => {
+  const p = systemPromptV2(true);
+  assert.match(p, /MOVIES AND TV ONLY/);
+  assert.match(p, /video games|mobile game/i);
+  assert.match(p, /Apex/);
 });
 
 // --- isStallReply: the universal "doing it now / wait a moment" backstop (Jeff, 2026-05-22) ---

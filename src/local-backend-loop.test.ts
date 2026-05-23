@@ -709,3 +709,72 @@ test('post-search stall: model searches, finds it, then stalls before adding -> 
     stub.restore();
   }
 });
+
+// --- Raw tool-call string in content: PARSE + EXECUTE, never deliver (the live Apex bug, 2026-05-22) ---
+
+test('raw tool-call string `search_movie({...})` is recovered + executed, never delivered to the user', async () => {
+  // The EXACT live failure: after the promise-net forced a tool call, qwen2.5:7b emitted the call as
+  // LITERAL TEXT — `search_movie({"query": "Apex"})` — and the bot delivered that raw string. With the
+  // fix, recoverToolCalls parses the inline syntax and runs the real search, then the add completes.
+  const turns: Turn[] = [
+    { content: 'search_movie({"query": "Apex"})' },                       // tool call emitted as TEXT
+    tc('add_movie', { tmdb_id: 12244, title: 'Apex' }),                   // model adds from results
+    { content: 'Added Apex (2019) — grabbing it now.' },
+  ];
+  const stub = installFetchStub(turns, {
+    library: [],
+    lookupByTerm: { Apex: [{ tmdbId: 12244, title: 'Apex', year: 2019, id: 0 }] },
+    lookupByTmdb: { 12244: [{ tmdbId: 12244, title: 'Apex', year: 2019 }] },
+    onAdd: (b) => ({ id: 501, title: b.title, tmdbId: b.tmdbId, year: 2019 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', "It's a movie", []);
+    assert.ok(r.job, 'the inline tool call must be executed, leading to a real add');
+    assert.equal(r.job!.arrId, 501);
+    assert.doesNotMatch(r.response, /search_movie\(/, 'must NEVER deliver the raw tool-call string');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'the recovered search must have actually run');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a single inline search_movie call resolves to a one-result direct add (no raw string leak)', async () => {
+  // Even when the model ONLY ever emits the inline string (no follow-up turn), it must be executed
+  // and never delivered. Here the recovered search returns one result; the model then adds it.
+  const turns: Turn[] = [
+    { content: 'Sure, let me look. search_movie({"query":"Apex"})' },     // inline call w/ prose
+    tc('add_movie', { tmdb_id: 12244, title: 'Apex' }),
+    { content: 'Got it — Apex (2019) is downloading.' },
+  ];
+  const stub = installFetchStub(turns, {
+    library: [],
+    lookupByTerm: { Apex: [{ tmdbId: 12244, title: 'Apex', year: 2019, id: 0 }] },
+    lookupByTmdb: { 12244: [{ tmdbId: 12244, title: 'Apex', year: 2019 }] },
+    onAdd: (b) => ({ id: 502, title: b.title, tmdbId: b.tmdbId, year: 2019 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can we get Apex?', []);
+    assert.ok(r.job, 'the inline call wrapped in prose must still execute');
+    assert.doesNotMatch(r.response, /search_movie\(/, 'must never deliver the raw tool-call string');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a MALFORMED raw tool-call string is suppressed → honest error, never delivered', async () => {
+  // The arg JSON is broken so recoverToolCalls can't execute it. The final guard must SUPPRESS it
+  // (re-force a real tool call), and if the model keeps emitting garbage, bail to an honest error —
+  // it must NEVER deliver the literal `search_movie(...)` text.
+  const turns: Turn[] = [
+    { content: 'search_movie({"query": "Apex"' },   // broken JSON — unrecoverable
+  ];
+  const stub = installFetchStub(turns, { library: [] });
+  try {
+    const r = await runLocalSession('+15551234567', "It's a movie", []);
+    assert.doesNotMatch(r.response, /search_movie\(/, 'must NEVER deliver the raw tool-call string');
+    assert.match(r.response, /snag|try again|try .* in a sec/i, 'should be an honest error after re-forcing fails');
+  } finally {
+    stub.restore();
+  }
+});

@@ -17,10 +17,10 @@ import {
   searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue,
   searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall } from './local-prompt.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
-export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary };
+export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall };
 
 // Active local model + Ollama URL come from config.ollama (env: LOCAL_MODEL / OLLAMA_URL,
 // default qwen2.5-coder:14b — the benchmark winner). Swap the model without a code change.
@@ -154,6 +154,13 @@ function recoverToolCalls(content: string): RecoveredCall[] {
       if (out.length) return out;
     } catch { /* not JSON, try next candidate */ }
   }
+  // LAST RESORT: a tool call emitted in FUNCTION-CALL syntax as plain text, e.g.
+  // `search_movie({"query": "Apex"})` — qwen2.5:7b does this and the JSON-only candidates above
+  // miss it (the whole string isn't JSON; the brace-matched `{"query":"Apex"}` has no `name`). Parse
+  // it so we EXECUTE the call instead of ever delivering the literal string (the live Apex bug,
+  // 2026-05-22).
+  const inline = parseInlineToolCall(content);
+  if (inline) out.push({ function: { name: inline.name, arguments: inline.arguments } });
   return out;
 }
 
@@ -515,6 +522,11 @@ export async function runLocalSession(
   // status query phrased so isStatusQuery missed it — "How is severance doing", 2026-05-22). Capped
   // so a model that refuses to ever call a tool bails to an honest error, never a delivered stall.
   let stallBackstopNudges = 0;
+  // How many times we've suppressed + re-forced a reply that was a RAW tool-call string the
+  // recoverToolCalls parser couldn't cleanly execute (malformed `search_movie({...})` text). Capped
+  // so a model that keeps emitting garbage bails to an honest error — NEVER delivers the raw string
+  // to the user (the live Apex bug, 2026-05-22).
+  let rawToolCallNudges = 0;
   // The most recent search results + the query they came from, so net #8 can run a deterministic
   // dominance check (top result clearly matches the request → add directly instead of asking).
   let lastSearchResults: Array<{ title?: string; year?: number; in_library?: boolean; tmdb_id?: number; tvdb_id?: number; seasons?: number[] }> = [];
@@ -900,6 +912,28 @@ export async function runLocalSession(
         content: looksStatus
           ? `Stop. Do NOT reply with text and do NOT ask me to wait. Call check_status${titlePart} RIGHT NOW, then report the real status in one message.`
           : `Stop. Do NOT reply with text and do NOT ask me to wait. Call the right tool RIGHT NOW — search_tv for a show/series/cartoon or search_movie for a film, then add it — and report the result in one message. Make the tool call now, not a promise.`,
+      });
+      continue;
+    }
+
+    // FINAL GUARD — raw tool-call string. The model emitted a tool call as LITERAL TEXT
+    // (`search_movie({"query": "Apex"})`) that recoverToolCalls couldn't cleanly parse+execute
+    // (malformed/partial JSON args, or it slipped through earlier). Delivering it is gibberish to
+    // the user (the live Apex bug, 2026-05-22). NEVER send it: suppress and re-force a proper tool
+    // call, capped → honest error. This runs LAST — a recoverable inline call was already turned
+    // into a real tool call at the top of the loop, so anything reaching here is unrecoverable.
+    if (looksLikeRawToolCall(content)) {
+      const RAW_TOOLCALL_CAP = 3;
+      rawToolCallNudges++;
+      if (rawToolCallNudges > RAW_TOOLCALL_CAP) {
+        console.log(`[local] raw tool-call string emitted ${rawToolCallNudges}x, unrecoverable — honest error (NOT delivering "${content.slice(0, 60)}")`);
+        return { response: `I hit a snag with that just now — give it another try in a sec.` };
+      }
+      console.log(`[local] raw tool-call string detected ("${content.slice(0, 60)}"), suppressing + re-forcing (nudge ${rawToolCallNudges}/${RAW_TOOLCALL_CAP})`);
+      messages.push({ role: 'assistant', content });
+      messages.push({
+        role: 'user',
+        content: 'Do NOT write the tool call as text — actually invoke it. Make a real tool call now (search_movie / search_tv / add_movie / add_tv / check_status as appropriate), and after it returns reply with ONLY the plain-language result. Never put a function call like search_movie({...}) in your message text.',
       });
       continue;
     }
