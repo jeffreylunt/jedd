@@ -8,7 +8,7 @@ process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
 
 const { promisesActionWithoutTool, claimsAddWithoutExecuting, splitQueryYear, titlesRoughlyMatch } = await import('./local-backend.js');
-const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall } = await import('./local-prompt.js');
+const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer } = await import('./local-prompt.js');
 
 // --- splitQueryYear: derive year from param OR a year stuffed into the query (Eternity regression) ---
 
@@ -130,6 +130,71 @@ test('claimsResultsWithoutSearching does NOT fire on a plain seasons question', 
 
 test('claimsResultsWithoutSearching does NOT fire on the non-Jeff refusal', () => {
   assert.equal(claimsResultsWithoutSearching('Hey! I can help you find movies, TV shows, and ebooks.'), false);
+});
+
+// --- messageHasPlausibleTitle: gate net #3 so gibberish / no-title requests never force a search
+// that makes the small model hallucinate a title (live 2026-05-22: "asdkjfh" → searched+added
+// "Barbie"). Real titles (incl. one-word and accented) must still pass. ---
+
+test('messageHasPlausibleTitle: false for single-token gibberish', () => {
+  assert.equal(messageHasPlausibleTitle('asdkjfh'), false);
+  assert.equal(messageHasPlausibleTitle('qwrtplkjhg'), false);
+});
+
+test('messageHasPlausibleTitle: false for pure non-media requests', () => {
+  assert.equal(messageHasPlausibleTitle('play music'), false);
+  assert.equal(messageHasPlausibleTitle('can you add a book for me'), false);
+  assert.equal(messageHasPlausibleTitle('download Spotify'), false);
+  // "get the new Taylor Swift album" has a proper-noun ("Taylor Swift") title token, so it is left
+  // to search (may match a concert film) rather than suppressed — the model will honestly report
+  // "couldn't find an album" without inventing a title.
+});
+
+test('messageHasPlausibleTitle: true for real titles (incl. one-word and accented)', () => {
+  assert.equal(messageHasPlausibleTitle('get Inception'), true);
+  assert.equal(messageHasPlausibleTitle('add Barbie'), true);
+  assert.equal(messageHasPlausibleTitle('Memento'), true);
+  assert.equal(messageHasPlausibleTitle('add Amélie'), true);
+  assert.equal(messageHasPlausibleTitle('get Eternity 2025'), true);
+  assert.equal(messageHasPlausibleTitle('add The Last of Us'), true);
+  assert.equal(messageHasPlausibleTitle('can yuo add intersteller plz'), true);
+});
+
+// --- stripTrailingOffer: remove a dangling "I'll check the other years if you're interested" style
+// follow-up offer that qwen2.5:7b tacks on after a complete answer (live Apex reply, 2026-05-22).
+// Never touch the actual answer. ---
+
+test('stripTrailingOffer removes the Apex "I\'ll check the other years" offer', () => {
+  assert.equal(
+    stripTrailingOffer("The 2026 version of Apex is already in your library. I'll check the other years if you're interested."),
+    'The 2026 version of Apex is already in your library.',
+  );
+});
+
+test('stripTrailingOffer removes "Let me know and I\'ll look."', () => {
+  assert.equal(
+    stripTrailingOffer('Added Tenet (2020) — grabbing it now. Let me know and I\'ll look for anything else.'),
+    'Added Tenet (2020) — grabbing it now.',
+  );
+});
+
+test('stripTrailingOffer leaves a clean answer untouched', () => {
+  assert.equal(stripTrailingOffer('Added Tenet (2020) — grabbing it now.'), 'Added Tenet (2020) — grabbing it now.');
+  assert.equal(stripTrailingOffer("Couldn't find that one, sorry."), "Couldn't find that one, sorry.");
+});
+
+test('stripTrailingOffer does NOT strip a clarifying question or a needed prompt to the user', () => {
+  // A genuine "what would you like" clarifying reply must survive (it is the whole answer).
+  assert.equal(
+    stripTrailingOffer("Couldn't find that one, sorry. Please provide the title of the movie or TV show you're looking for."),
+    "Couldn't find that one, sorry. Please provide the title of the movie or TV show you're looking for.",
+  );
+});
+
+test('stripTrailingOffer never empties a reply that is ONLY an offer', () => {
+  // Degenerate: if the whole reply is an offer, keep it rather than return empty.
+  const onlyOffer = "I'll look into that for you.";
+  assert.equal(stripTrailingOffer(onlyOffer), onlyOffer);
 });
 
 test('claimsResultsWithoutSearching does NOT fire on a simple confirmation', () => {

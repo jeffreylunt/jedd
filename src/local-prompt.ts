@@ -9,7 +9,7 @@ export function systemPromptV2(owner: boolean, displayName = 'Jedd'): string {
 
 YOUR DOMAIN IS MOVIES AND TV ONLY. You can ONLY find and download movies and TV shows. You do NOT deal with video games, mobile games, apps, music, or anything else — those tools do not exist for you. When someone names a title, it is ALWAYS a movie or TV show: NEVER ask "is this the mobile game?" or offer game/app options. If a title is ambiguous between a movie and a show, search_movie first (or ask "movie or show?"), but never frame it as a game or anything non-media. Example: "Apex" → treat as a movie/TV title (search_movie), not the video game.
 
-#1 RULE — ACT, DON'T PROMISE. Anything you can do right now (check a status, search, add) you MUST do in this same turn by calling the tool — then reply with ONLY the result. NEVER send a message that narrates intent or asks the user to wait: no "I'll search for that", "I'm checking the status now", "let me look that up", "searching now", "on it", "hang on", "give me a sec", "I'll let you know", or "can you wait a moment?". You do NOT follow up later — there is no later. A reply like that with no tool call is a FAILURE and the user never gets an answer. If you intend to check/search/add, call the tool NOW; only AFTER the tool returns do you write a single reply with the actual result.
+#1 RULE — ACT, DON'T PROMISE. Anything you can do right now (check a status, search, add) you MUST do in this same turn by calling the tool — then reply with ONLY the result. NEVER send a message that narrates intent or asks the user to wait: no "I'll search for that", "I'm checking the status now", "let me look that up", "searching now", "on it", "hang on", "give me a sec", "I'll let you know", or "can you wait a moment?". You do NOT follow up later — there is no later. A reply like that with no tool call is a FAILURE and the user never gets an answer. If you intend to check/search/add, call the tool NOW; only AFTER the tool returns do you write a single reply with the actual result. Also do NOT offer to do more later ("I'll check the other years if you're interested", "let me know and I'll look", "I can look into that for you") — just give the result and stop; if the user wants something else they will ask.
 
 HOW TO ACT — call the provided tools, do not describe steps or write curl:
 - Movie request -> call search_movie, then add_movie with the tmdb_id from the result. If the search returns exactly ONE movie, add it directly — do NOT ask "should I add it?". Only say something is added AFTER add_movie actually returns ok.
@@ -105,6 +105,58 @@ export function refusesWithoutSearching(text: string): boolean {
     || /\bno luck\b/.test(t)
     || /\b(does ?n'?t|did ?n'?t|not)\s+(seem to be|appear to be)?\s*(available|found|in (the )?library)\b/.test(t)
     || /\b(can'?t|could ?n'?t|unable to)\s+(get|locate|track down)\b/.test(t);
+}
+
+// Does the user's message plausibly contain a real media TITLE worth searching for? Used to gate
+// net #3 (refusal/parrot → force a search). Net #3 was built for the POISONED-HISTORY case where
+// the user names a real title ("get Eternity 2025") and the model parrots a prior "couldn't find"
+// without searching — forcing a search there is correct. But forcing a search on a message with NO
+// title — gibberish ("asdkjfh"), a pure non-media request ("play music", "add a book") — makes the
+// small model HALLUCINATE a plausible title to satisfy the forcing turn (live 2026-05-22: "asdkjfh"
+// → searched + added "Barbie"). So when the message has no plausible title, we let the honest
+// clarifying reply ("couldn't find that — what are you looking for?") stand instead of forcing.
+//
+// Conservative — defaults to TRUE (search) so a real title is never suppressed; returns FALSE only
+// for clearly title-less messages: (a) a single gibberish token (a long word with no vowels or an
+// improbable consonant run, and not a request phrase), or (b) the whole message is just a non-media
+// request verb with no quoted/capitalized title and no other content words.
+const NON_MEDIA_NOUNS = /\b(music|song|songs|album|albums|playlist|book|books|ebook|ebooks|podcast|game|games|app|apps|software|spotify|netflix|weather|news)\b/i;
+const REQUEST_VERBS = /\b(get|add|download|find|grab|play|want|watch|search|look|pull up)\b/i;
+export function messageHasPlausibleTitle(userMessage: string): boolean {
+  const raw = (userMessage || '').trim();
+  if (!raw) return false;
+  const t = raw.toLowerCase();
+  // Strip leading request framing ("can you", "could you", "please", "for me", trailing "plz").
+  const stripped = t
+    .replace(/\b(can|could|would|will)\s+(you|we|u)\b/g, ' ')
+    .replace(/\bplease\b|\bplz\b|\bpls\b|\bfor me\b|\bthanks?\b/g, ' ')
+    .replace(/[?.!,]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Tokens that are NOT request verbs / fillers — the candidate "title" words.
+  const FILLER = new Set(['a', 'an', 'the', 'me', 'us', 'you', 'i', 'to', 'of', 'and', 'or', 'some', 'new', 'latest', 'movie', 'film', 'show', 'series', 'tv', 'season']);
+  const tokens = stripped.split(' ').filter(Boolean);
+  const contentTokens = tokens.filter(w => !REQUEST_VERBS.test(w) && !FILLER.has(w));
+  // A pure non-media request with no real title ("play music", "add a book"): every content token
+  // is a non-media noun (or there are none), so there's no media title to search. A proper-noun
+  // title ("Taylor Swift album", "Spotify"-the-name) still has capitalized/non-noun content, so it
+  // is left to search (it may legitimately match a concert film) — we only suppress the truly
+  // contentless cases. NOTE: "download Spotify" is a single non-media noun token → suppressed.
+  if (contentTokens.length === 0) return false;
+  const allNonMedia = contentTokens.every(w => NON_MEDIA_NOUNS.test(w));
+  if (allNonMedia) return false;
+  // Single-token gibberish: one content token, length >= 6, with no vowel OR a run of 4+ consonants
+  // and not a real-looking word. ("asdkjfh" → no vowels in a long token = gibberish.) A real one-word
+  // title (Barbie, Memento, Inception, Amélie) has normal vowel structure and passes.
+  if (contentTokens.length === 1) {
+    const w = contentTokens[0].replace(/[^a-zà-ÿ]/g, '');
+    if (w.length >= 6) {
+      const vowels = (w.match(/[aeiouyà-ÿ]/g) || []).length;
+      const longConsonantRun = /[bcdfghjklmnpqrstvwxz]{4,}/.test(w);
+      if (vowels === 0 || (longConsonantRun && vowels / w.length < 0.2)) return false;
+    }
+  }
+  return true;
 }
 
 // Detect a "I found multiple results / which one did you mean?" disambiguation question emitted
@@ -253,6 +305,30 @@ export function looksLikeRawToolCall(text: string): boolean {
   if (INLINE_TOOLCALL_RE.test(text)) return true;
   // `toolName(` with any (or no) args — catches a malformed blob parseInlineToolCall can't parse.
   return new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(`).test(text);
+}
+
+// Strip a trailing "offer to do more later" sentence from an otherwise-complete reply. qwen2.5:7b
+// often answers correctly then tacks on a follow-up offer it will never fulfill — "I'll check the
+// other years if you're interested.", "Let me know and I'll look.", "I can look into that for you."
+// (live 2026-05-22, the Apex reply). Jeff's hard rule: Jedd does not promise future work. The reply
+// already carries the real answer, so this is NOT a stall to re-force — we just remove the dangling
+// offer at delivery. Only strips a SENTENCE that is purely such an offer; never touches the answer.
+const TRAILING_OFFER_RE = /(?:^|[.!?]\s+)((?:i'?(?:ll|d)|i can|i could|let me|just let me|feel free to|if you'?(?:d| would) like,? i'?(?:ll|d))\b[^.!?]*\b(?:check|look|search|find|see|let you know|get back|look into|update you|reach out|dig)\b[^.!?]*[.!?]?)\s*$/i;
+export function stripTrailingOffer(text: string): string {
+  if (!text) return text;
+  let out = text.trim();
+  // Strip up to two trailing offer sentences (some replies stack "...is in your library. I'll
+  // check the other years. Let me know!"), but never strip the whole reply to empty.
+  for (let i = 0; i < 2; i++) {
+    const m = out.match(TRAILING_OFFER_RE);
+    if (!m) break;
+    const candidate = out.slice(0, out.length - m[1].length).trim().replace(/[\s,;:-]+$/, '').trim();
+    if (!candidate) break; // would empty the reply — keep it as-is
+    out = candidate;
+    // Re-close punctuation if we trimmed mid-sentence.
+    if (!/[.!?]$/.test(out)) out += '.';
+  }
+  return out;
 }
 
 // Deterministically resolve a SEASON-SELECTION phrase from the user against a show's REAL season

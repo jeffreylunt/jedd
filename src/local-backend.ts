@@ -17,10 +17,10 @@ import {
   searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue,
   searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer } from './local-prompt.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
-export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall };
+export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer };
 
 // Active local model + Ollama URL come from config.ollama (env: LOCAL_MODEL / OLLAMA_URL,
 // default qwen2.5-coder:14b — the benchmark winner). Swap the model without a code change.
@@ -494,6 +494,16 @@ export async function runLocalSession(
   const userAskedStatus = isStatusQuery(userMessage);
   const statusTitle = userAskedStatus ? extractStatusTitle(userMessage) : '';
 
+  // Does the conversation actually reference a real media title to search for? Net #3 (force a
+  // search on a refusal/parrot with no search) is correct for the poisoned-history case (a real
+  // title named, model parrots "couldn't find" without searching). But forcing a search on a
+  // title-LESS message — gibberish ("asdkjfh"), a pure non-media request ("play music") — makes the
+  // small model HALLUCINATE a title to satisfy the forcing turn (live 2026-05-22: "asdkjfh" →
+  // searched + added "Barbie"). So net #3 only fires when the current message OR a recent history
+  // user turn plausibly names a title. A title-less message keeps its honest clarifying reply.
+  const userHasPlausibleTitle = messageHasPlausibleTitle(userMessage)
+    || (conversationHistory || []).some(m => m.role === 'user' && messageHasPlausibleTitle(m.text));
+
   // The user's CURRENT message as a season phrase ("all", "the latest season", "seasons 1-3",
   // "first and last"). qwen2.5:7b reliably mangles this when it builds the add_tv call itself (it
   // sent seasons:[1] for an "all seasons" request, live 2026-05-22). So whenever the user gave a
@@ -740,7 +750,7 @@ export async function runLocalSession(
     // Nets #1/#2 only catch forward promises and false add claims; both shapes slip through. Force
     // ONE real search. Gated on !searchToolUsed so a GENUINE post-search refusal/question is never
     // second-guessed.
-    if (!searchToolUsed && !nudgedForRefusal && (refusesWithoutSearching(content) || claimsResultsWithoutSearching(content))) {
+    if (!searchToolUsed && !nudgedForRefusal && userHasPlausibleTitle && (refusesWithoutSearching(content) || claimsResultsWithoutSearching(content))) {
       nudgedForRefusal = true;
       console.log(`[local] claim-without-searching detected ("${content.slice(0, 60)}"), forcing a search`);
       messages.push({ role: 'assistant', content });
@@ -938,8 +948,10 @@ export async function runLocalSession(
       continue;
     }
 
-    // Append the JOB tag so the scheduler tracks follow-up.
-    let response = content;
+    // Strip any dangling "I'll check the other years if you're interested" style follow-up offer the
+    // model tacks on after a complete answer (Jeff's no-future-promises rule; live Apex reply,
+    // 2026-05-22). The answer is already complete — this only removes the trailing empty offer.
+    let response = stripTrailingOffer(content);
     if (lastJob) response += `\n<!--JOB:${lastJob.type}:${lastJob.arrId}:${lastJob.title}-->`;
     return { response, job: lastJob };
   }
