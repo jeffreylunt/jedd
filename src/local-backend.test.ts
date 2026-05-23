@@ -321,6 +321,15 @@ test('prompt forbids re-asking a year/option the user already gave', () => {
   assert.match(p, /already named a year or picked an option/i);
 });
 
+test('prompt makes SEARCH the source of truth over the model\'s training knowledge (post-cutoff media)', () => {
+  const p = systemPromptV2(true);
+  assert.match(p, /source of truth/i);
+  // Must tell the model NOT to decide from memory whether a title exists / which year.
+  assert.match(p, /do NOT (decide|assume)|never decide from your own training knowledge/i);
+  // Must say a never-heard-of title is likely a NEW release to search for, not "doesn't exist".
+  assert.match(p, /never heard of is.*real, NEW release|do not say "I don't know that"/i);
+});
+
 test('prompt covers in_library for both movie and TV', () => {
   const p = systemPromptV2(true);
   assert.match(p, /Movie or TV search result has in_library/);
