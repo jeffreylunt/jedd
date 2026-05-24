@@ -105,13 +105,6 @@ export async function getSonarrQueue(seriesId: number): Promise<QueueItem[]> {
   return result.records || [];
 }
 
-export async function getEpisodeStatus(seriesId: number, seasonNumber: number): Promise<EpisodeStatus[]> {
-  const episodes = await sonarrGet<EpisodeStatus[]>(
-    `/episode?seriesId=${seriesId}&seasonNumber=${seasonNumber}`
-  );
-  return episodes;
-}
-
 export async function getAllEpisodeStatus(seriesId: number): Promise<EpisodeStatus[]> {
   return sonarrGet<EpisodeStatus[]>(`/episode?seriesId=${seriesId}`);
 }

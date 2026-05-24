@@ -24,6 +24,7 @@ NEVER say "I added it" / "it's been added" unless add_movie or add_tv actually r
 MOVIE vs TV — pick the right search tool:
 - DEFAULT to search_movie. Only use search_tv when there is a clear TV signal: the user says "show"/"series"/"season"/"episodes", it is a known cartoon / kids' animated series or sitcom, or it is plainly episodic (e.g. "Mickey and the Roadster Racers", "Bluey", "The Office", "Breaking Bad"). A bare film-like title (e.g. "Barbie", "Memento", "Dune") is a MOVIE — call search_movie.
 - If unsure and search_movie comes back with a poor/odd match, try search_tv before giving up.
+- CROSS-CHECK BEFORE GIVING UP: if the user did NOT say whether it's a movie or a show, and your first search returns NO results, you MUST call the OTHER search tool (search_tv if you tried search_movie, or search_movie if you tried search_tv) BEFORE telling them you couldn't find it. Only say "couldn't find that one" after BOTH a movie search AND a TV search come back empty. Many titles you don't recognize are TV shows — never assume not-found from a single movie search.
 
 CRITICAL — NEVER claim an action you did not actually perform this turn:
 - Do NOT say "I added it", "I'll search and add it", "it's been added", or "searching for it now" UNLESS you are calling a search/add tool in this SAME turn. Words are not actions — only a tool call adds anything.
@@ -267,22 +268,9 @@ const INLINE_TOOLCALL_RE = new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(
 // The JSON blob is brace-matched from the first `{` after the paren so trailing prose doesn't break
 // JSON.parse. This is the parser arm of the raw-tool-call fix — the loop PARSES + EXECUTES the call
 // instead of ever delivering the literal string to the user.
-export function parseInlineToolCall(text: string): { name: string; arguments: Record<string, unknown> } | null {
-  if (!text) return null;
-  const nameMatch = text.match(new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(`));
-  if (!nameMatch) return null;
-  const name = nameMatch[1];
-  // Brace-match the JSON arg blob starting at the first `{` after the opening paren.
-  const parenIdx = text.indexOf('(', nameMatch.index! + name.length - 1);
-  if (parenIdx === -1) return null;
-  const braceStart = text.indexOf('{', parenIdx);
-  if (braceStart === -1) {
-    // `toolName()` with no args, or `toolName(...)` with non-JSON args — treat as an empty-arg call
-    // only when the parens are clearly empty; otherwise we can't parse it, return null.
-    const after = text.slice(parenIdx + 1).trimStart();
-    if (after.startsWith(')')) return { name, arguments: {} };
-    return null;
-  }
+// Brace-match a `{...}` JSON arg blob starting at braceStart and JSON.parse it. Returns the call or
+// null if the braces don't balance / the blob isn't a JSON object.
+function braceMatchArgs(text: string, braceStart: number, name: string): { name: string; arguments: Record<string, unknown> } | null {
   let depth = 0;
   let end = -1;
   for (let i = braceStart; i < text.length; i++) {
@@ -297,6 +285,32 @@ export function parseInlineToolCall(text: string): { name: string; arguments: Re
   return null;
 }
 
+export function parseInlineToolCall(text: string): { name: string; arguments: Record<string, unknown> } | null {
+  if (!text) return null;
+  // Match a known tool name followed by an opener — either `(` (function-call form,
+  // `search_movie({...})`) or `{` (space-brace, NO-PAREN form qwen2.5:7b leaks live, e.g.
+  // `search_movie {"query":"Hook"}` / `check_status {}` — the Hook bug, 2026-05-24).
+  const nameMatch = text.match(new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*([({])`));
+  if (!nameMatch) return null;
+  const name = nameMatch[1];
+  const opener = nameMatch[2];
+  const openerIdx = nameMatch.index! + nameMatch[0].length - 1; // index of the `(` or `{`
+  if (opener === '{') {
+    // No-paren form: the brace IS the arg blob.
+    return braceMatchArgs(text, openerIdx, name);
+  }
+  // Paren form: brace-match the JSON arg blob starting at the first `{` after the opening paren.
+  const braceStart = text.indexOf('{', openerIdx);
+  if (braceStart === -1) {
+    // `toolName()` with no args, or `toolName(...)` with non-JSON args — treat as an empty-arg call
+    // only when the parens are clearly empty; otherwise we can't parse it, return null.
+    const after = text.slice(openerIdx + 1).trimStart();
+    if (after.startsWith(')')) return { name, arguments: {} };
+    return null;
+  }
+  return braceMatchArgs(text, braceStart, name);
+}
+
 // True when the text LOOKS like a raw tool-call invocation for a known tool (`toolName({...})` or
 // `toolName(...)`), regardless of whether the JSON args parse. Used as a FINAL delivery guard: a
 // reply matching this must NEVER be sent to the user verbatim — at best it's an unexecuted tool
@@ -305,8 +319,10 @@ export function parseInlineToolCall(text: string): { name: string; arguments: Re
 export function looksLikeRawToolCall(text: string): boolean {
   if (!text) return false;
   if (INLINE_TOOLCALL_RE.test(text)) return true;
-  // `toolName(` with any (or no) args — catches a malformed blob parseInlineToolCall can't parse.
-  return new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*\\(`).test(text);
+  // `toolName(` (paren form, possibly malformed args) OR `toolName {` (space-brace, NO-PAREN form,
+  // qwen's `search_movie {"query":"Hook"}` / `check_status {}` — the Hook bug, 2026-05-24). Catches a
+  // malformed blob parseInlineToolCall can't cleanly parse, so it's suppressed rather than delivered.
+  return new RegExp(`\\b(${KNOWN_TOOL_NAMES.join('|')})\\s*[({]`).test(text);
 }
 
 // Strip a trailing "offer to do more later" sentence from an otherwise-complete reply. qwen2.5:7b
@@ -370,6 +386,24 @@ export function parseSeasonSelection(userMessage: string, available: number[]): 
   // Only treat as a season phrase if the word "season" appears OR the whole msg is basically numbers.
   const nums = (t.match(/\b\d{1,2}\b/g) || []).map(Number);
   if (nums.length && (/\bseasons?\b/.test(t) || /^[\s\d,andjust&+-]+$/.test(t))) return clamp(nums);
+  return null;
+}
+
+// Did the user EXPLICITLY say whether they want a movie or a TV show? Used to gate the cross-type
+// search fallback (net #13): when the request is type-AMBIGUOUS (a bare title with no movie/TV
+// signal) and the first search comes back empty, Jedd must try the OTHER type before saying
+// "couldn't find it" (Jeff's ask, 2026-05-23: "keep sweet pray and obey" is a TV show, but a
+// movie-first search found nothing and Jedd gave up instead of trying TV). When the user DID
+// specify a type ("the movie X", "the show X", "season 2 of X"), we respect it and skip the
+// cross-search. Returns 'movie', 'tv', or null (ambiguous). Mirrors the prompt's MOVIE-vs-TV
+// signal list so the gate matches how the model is told to route.
+export function requestSpecifiesType(userMessage: string): 'movie' | 'tv' | null {
+  const t = userMessage.toLowerCase();
+  const tv = /\b(tv ?show|tv ?series|series|season|seasons|episode|episodes|sitcom|cartoon|anime|miniseries|mini-series|show)\b/.test(t);
+  const movie = /\b(movie|film|feature|flick)\b/.test(t);
+  // If somehow both signals appear, treat as ambiguous (don't guess) so the cross-search can run.
+  if (tv && !movie) return 'tv';
+  if (movie && !tv) return 'movie';
   return null;
 }
 

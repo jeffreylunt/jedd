@@ -30,7 +30,6 @@ export class BlueBubblesListener extends EventEmitter {
   private processedIds: Set<number>;
   private sinceRowid?: number;
   private port: number;
-  private webhookId?: number;
 
   constructor(initialProcessedIds: number[] = [], sinceRowid?: number, port?: number) {
     super();
@@ -182,7 +181,6 @@ export class BlueBubblesListener extends EventEmitter {
 
     const match = existing?.find((w) => w.url === url);
     if (match) {
-      this.webhookId = match.id;
       console.log(`[bb-webhook] Reusing existing webhook id=${match.id} url=${match.url}`);
       return;
     }
@@ -191,7 +189,6 @@ export class BlueBubblesListener extends EventEmitter {
       url,
       events: ['new-message'],
     });
-    this.webhookId = created?.id;
     console.log(`[bb-webhook] Registered webhook id=${created?.id} url=${url} events=[new-message]`);
   }
 
@@ -248,8 +245,4 @@ async function bbFetch<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?
     throw new Error(`BB ${method} ${path} failed (${res.status}): ${parsed.message || raw.slice(0, 200)}`);
   }
   return parsed.data;
-}
-
-export async function deleteWebhook(id: number): Promise<void> {
-  await bbFetch('DELETE', `/api/v1/webhook/${id}`);
 }

@@ -70,6 +70,7 @@ function installSonarrFetchStub(turns: Turn[], sonarr: {
   lookupByTerm?: Record<string, any[]>;       // term -> /series/lookup results
   lookupByTvdb?: Record<number, any[]>;       // tvdbId -> `tvdb:N` lookup results
   library?: any[];                            // GET /series (already-in-library check)
+  seriesById?: Record<number, any>;           // GET /series/{id} (episode-completeness stats)
   onAdd?: (body: any) => any;                 // POST /series -> added series
 }) {
   const realFetch = globalThis.fetch;
@@ -93,6 +94,11 @@ function installSonarrFetchStub(turns: Turn[], sonarr: {
         return { ok: true, json: async () => (sonarr.lookupByTvdb?.[id] || []) } as any;
       }
       return { ok: true, json: async () => (sonarr.lookupByTerm?.[term] || []) } as any;
+    }
+    // Sonarr single series (GET /series/{id}) — carries episode-completeness statistics
+    if (method === 'GET' && /\/series\/(\d+)/.test(u) && !u.includes('/lookup')) {
+      const id = Number(u.match(/\/series\/(\d+)/)![1]);
+      return { ok: true, json: async () => (sonarr.seriesById?.[id] || {}) } as any;
     }
     // Sonarr library list (GET /series, not /series/{id} or /series/lookup)
     if (/\/series(\?|$)/.test(u.split('?')[0] + (u.includes('?') ? '?' : '')) && method === 'GET' && !/\/series\/\d/.test(u)) {
@@ -157,6 +163,104 @@ test('already-in-library: add of an existing movie reports cleanly, no false add
     const r = await runLocalSession('+15551234567', 'Can you add Oppenheimer?', []);
     assert.equal(r.job, undefined, 'must NOT report a job for an already-in-library title');
     assert.match(r.response, /already in your library/i);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('in-library but no FILE: "get Hook" → net #11 triggers a MoviesSearch and reports downloading, not "already in your library"', async () => {
+  // Hook is in the library (id>0) but hasFile=false — it was added/requested earlier but never
+  // downloaded or imported (the live 2026-05-24 case). The model lists/asks instead of saying it's
+  // there; net #11 must detect the MISSING FILE, trigger a fresh search, and tell the user it's
+  // grabbing it now — NOT the misleading "already in your library" (Jeff can't watch a 0-byte movie).
+  // Turn 2 is the REAL live reply: the model only sees in_library:true and parrots "already in your
+  // library" — the net must OVERRIDE that because the file is actually missing.
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Hook' }),
+    { content: 'Hook (1991) is already in your library.' },
+  ];
+  const stub = installFetchStub(turns, {
+    lookupByTerm: { Hook: [{ id: 512, tmdbId: 879, title: 'Hook', year: 1991, hasFile: false }] },
+    library: [{ id: 512, tmdbId: 879, title: 'Hook', year: 1991, hasFile: false }],
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get hook?', []);
+    // Must correct the misleading "all set" framing — tell them it's NOT downloaded and is grabbing now.
+    assert.match(r.response, /hasn'?t downloaded yet/i, 'must tell the user the file is missing');
+    assert.match(r.response, /grabbing it now/i, 'must say it is fetching the file');
+    assert.ok(r.job, 'should register a follow-up job so the scheduler reports when it lands');
+    assert.equal(r.job!.arrId, 512);
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.startsWith('POST') && c.includes('/command')), 'a MoviesSearch command must be POSTed');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('in-library WITH file: "get Oppenheimer" → still reports already-in-library (no needless search)', async () => {
+  // Guard the happy path: a movie that's in the library AND has a file must keep the clean
+  // "already in your library" reply and must NOT trigger a redundant search or register a job.
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Oppenheimer' }),
+    { content: 'I found Oppenheimer (2023). Which one?' },
+  ];
+  const stub = installFetchStub(turns, {
+    lookupByTerm: { Oppenheimer: [{ id: 360, tmdbId: 872585, title: 'Oppenheimer', year: 2023, hasFile: true }] },
+    library: [{ id: 360, tmdbId: 872585, title: 'Oppenheimer', year: 2023, hasFile: true }],
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get Oppenheimer?', []);
+    assert.match(r.response, /already in your library/i);
+    assert.equal(r.job, undefined, 'no follow-up job for an already-downloaded movie');
+    const calls = stub.calls();
+    assert.ok(!calls.some(c => c.startsWith('POST') && c.includes('/command')), 'must NOT trigger a search when the file is present');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('in-library TV but INCOMPLETE: "get Andor" → net #11 triggers SeriesSearch + tv job + "some episodes haven\'t downloaded"', async () => {
+  // Andor is in the library (id 183) but missing an episode: episodeFileCount(23) < episodeCount(24).
+  // The /series/lookup stats are zeroed, so the net must fetch /series/{id} for real counts. The
+  // model parrots "already in your library" — the net must OVERRIDE it because episodes are missing.
+  const turns: Turn[] = [
+    tc('search_tv', { query: 'Andor' }),
+    { content: 'Andor (2022) is already in your library.' },
+  ];
+  const stub = installSonarrFetchStub(turns, {
+    lookupByTerm: { Andor: [{ id: 183, tvdbId: 393189, title: 'Andor', year: 2022, seasons: [{ seasonNumber: 1 }, { seasonNumber: 2 }] }] },
+    seriesById: { 183: { id: 183, title: 'Andor', year: 2022, statistics: { episodeCount: 24, episodeFileCount: 23 } } },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get Andor?', []);
+    assert.match(r.response, /some episodes haven'?t downloaded yet/i, 'must tell the user episodes are missing');
+    assert.match(r.response, /grabbing them now/i, 'must say it is fetching the episodes');
+    assert.ok(r.job, 'should register a follow-up job');
+    assert.equal(r.job!.arrId, 183);
+    assert.equal(r.job!.type, 'tv');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.startsWith('POST') && c.includes('/command')), 'a SeriesSearch command must be POSTed');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('in-library TV COMPLETE: "get Andor" → clean already-in-library reply, NO redundant search', async () => {
+  // Fully complete series: episodeFileCount(24) === episodeCount(24). Keep the clean reply, no search.
+  const turns: Turn[] = [
+    tc('search_tv', { query: 'Andor' }),
+    { content: 'I found Andor (2022). Which one did you mean?' },
+  ];
+  const stub = installSonarrFetchStub(turns, {
+    lookupByTerm: { Andor: [{ id: 183, tvdbId: 393189, title: 'Andor', year: 2022, seasons: [{ seasonNumber: 1 }, { seasonNumber: 2 }] }] },
+    seriesById: { 183: { id: 183, title: 'Andor', year: 2022, statistics: { episodeCount: 24, episodeFileCount: 24 } } },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get Andor?', []);
+    assert.match(r.response, /already in your library/i);
+    assert.equal(r.job, undefined, 'no follow-up job for a complete series');
+    const calls = stub.calls();
+    assert.ok(!calls.some(c => c.startsWith('POST') && c.includes('/command')), 'must NOT trigger a search for a complete series');
   } finally {
     stub.restore();
   }
@@ -774,6 +878,181 @@ test('a MALFORMED raw tool-call string is suppressed → honest error, never del
     const r = await runLocalSession('+15551234567', "It's a movie", []);
     assert.doesNotMatch(r.response, /search_movie\(/, 'must NEVER deliver the raw tool-call string');
     assert.match(r.response, /snag|try again|try .* in a sec/i, 'should be an honest error after re-forcing fails');
+  } finally {
+    stub.restore();
+  }
+});
+
+// --- Cross-type search fallback (net #13): movie↔TV. A combined stub serving BOTH Radarr movie
+// lookups AND Sonarr series lookups so a movie-first-empty turn can fall through to a TV search
+// (and vice-versa) within one session. Jeff's bug (2026-05-23): "keep sweet pray and obey" is a TV
+// show, a movie-first search found nothing, and Jedd said "couldn't find that one" without trying TV.
+function installCrossTypeFetchStub(turns: Turn[], cfg: {
+  radarrByTerm?: Record<string, any[]>;
+  radarrByTmdb?: Record<number, any[]>;
+  sonarrByTerm?: Record<string, any[]>;
+  sonarrByTvdb?: Record<number, any[]>;
+  onMovieAdd?: (body: any) => any;
+  onTvAdd?: (body: any) => any;
+}) {
+  const realFetch = globalThis.fetch;
+  let turnIdx = 0;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const u = String(url);
+    const method = init?.method || 'GET';
+    calls.push(`${method} ${u.split('?')[0]}`);
+    if (u.includes('/api/chat')) {
+      const turn = turns[Math.min(turnIdx, turns.length - 1)];
+      turnIdx++;
+      return { ok: true, json: async () => ({ message: turn }) } as any;
+    }
+    if (u.includes('/movie/lookup')) {
+      const m = decodeURIComponent(u).match(/term=([^&]+)/);
+      const term = m ? m[1] : '';
+      if (term.startsWith('tmdb:')) {
+        const id = Number(term.slice(5));
+        return { ok: true, json: async () => (cfg.radarrByTmdb?.[id] || []) } as any;
+      }
+      return { ok: true, json: async () => (cfg.radarrByTerm?.[term] || []) } as any;
+    }
+    if (u.includes('/series/lookup')) {
+      const m = decodeURIComponent(u).match(/term=([^&]+)/);
+      const term = m ? m[1] : '';
+      if (term.startsWith('tvdb:')) {
+        const id = Number(term.slice(5));
+        return { ok: true, json: async () => (cfg.sonarrByTvdb?.[id] || []) } as any;
+      }
+      return { ok: true, json: async () => (cfg.sonarrByTerm?.[term] || []) } as any;
+    }
+    if (/\/movie(\?|$)/.test(u) && method === 'POST') {
+      const body = JSON.parse(init.body);
+      return { ok: true, json: async () => (cfg.onMovieAdd ? cfg.onMovieAdd(body) : { id: 999, ...body }) } as any;
+    }
+    if (/\/series(\?|$)/.test(u) && method === 'POST') {
+      const body = JSON.parse(init.body);
+      return { ok: true, json: async () => (cfg.onTvAdd ? cfg.onTvAdd(body) : { id: 888, ...body }) } as any;
+    }
+    if (/\/movie$/.test(u.split('?')[0]) && method === 'GET' && !/\/movie\/\d/.test(u)) {
+      return { ok: true, json: async () => [] } as any;
+    }
+    if (/\/series$/.test(u.split('?')[0]) && method === 'GET' && !/\/series\/\d/.test(u)) {
+      return { ok: true, json: async () => [] } as any;
+    }
+    if (u.includes('/queue')) return { ok: true, json: async () => ({ records: [] }) } as any;
+    return { ok: true, json: async () => ({}) } as any;
+  }) as any;
+  return { restore: () => { globalThis.fetch = realFetch; }, calls: () => calls };
+}
+
+test('net #13 cross-type: bare TV-only title — movie search empty → forced search_tv finds it → adds', async () => {
+  // Jeff's exact bug: "keep sweet pray and obey" is a TV show. The model defaults to search_movie,
+  // gets nothing, and tries to say "couldn't find that one". Net #13 must force search_tv BEFORE the
+  // not-found reply; the TV search finds a short (2-season) dominant show → net #9 adds it directly.
+  const tvResults = [{
+    tvdbId: 400123, title: 'Keep Sweet: Pray and Obey', year: 2022,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }],
+  }];
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'keep sweet pray and obey' }),                 // movie-first, empty
+    { content: "Couldn't find that one, sorry." },                              // about to give up → net #13
+    tc('search_tv', { query: 'keep sweet pray and obey' }),                     // forced cross-search
+    { content: 'I found Keep Sweet: Pray and Obey. Which seasons?' },           // short dominant → net #9 adds
+  ];
+  let addBody: any;
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'keep sweet pray and obey': [] },                           // movie: nothing
+    sonarrByTerm: { 'keep sweet pray and obey': tvResults },                    // TV: found
+    sonarrByTvdb: { 400123: tvResults },
+    onTvAdd: (b) => { addBody = b; return { id: 911, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }; },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get keep sweet pray and obey', []);
+    assert.ok(r.job, 'should have found and added the TV show via the cross-type fallback');
+    assert.match(r.job!.title, /Keep Sweet/i);
+    assert.doesNotMatch(r.response, /couldn'?t find/i, 'must NOT say not-found after only a movie search');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'movie search ran first');
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'TV cross-search must have run');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net #13 cross-type: bare movie-only title — TV search empty → forced search_movie finds it → adds', async () => {
+  // Reverse direction: the model happens to try search_tv first on a bare title, gets nothing, and
+  // is about to give up. Net #13 forces search_movie, which finds the film → net #8 adds the dominant.
+  const movieResults = [{ tmdbId: 27205, title: 'Inception', year: 2010, id: 0 }];
+  const turns: Turn[] = [
+    tc('search_tv', { query: 'Inception' }),                                    // TV-first, empty
+    { content: "I couldn't find that show." },                                  // about to give up → net #13
+    tc('search_movie', { query: 'Inception' }),                                 // forced cross-search
+    { content: 'I found Inception (2010). Which one did you mean?' },            // needless ask → net #8 forces add
+    tc('add_movie', { tmdb_id: 27205, title: 'Inception' }),                    // forced add
+    { content: 'Done — Inception (2010) is downloading now.' },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    sonarrByTerm: { Inception: [] },                                            // TV: nothing
+    radarrByTerm: { Inception: movieResults },                                  // movie: found
+    radarrByTmdb: { 27205: [{ tmdbId: 27205, title: 'Inception', year: 2010 }] },
+    onMovieAdd: (b) => ({ id: 920, title: b.title, tmdbId: b.tmdbId, year: 2010 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get me Inception', []);
+    assert.ok(r.job, 'should have found and added the movie via the cross-type fallback');
+    assert.match(r.job!.title, /Inception/i);
+    assert.doesNotMatch(r.response, /couldn'?t find|could not find/i, 'must NOT say not-found after only a TV search');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'TV search ran first');
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'movie cross-search must have run');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net #13 cross-type: genuine nonsense — BOTH movie and TV empty → "couldn\'t find that one"', async () => {
+  // A real not-found: nothing matches as a movie OR a show. Net #13 forces the cross-search once,
+  // it also comes back empty, and the model's not-found reply is then allowed to stand (no loop).
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'asdfqwerzxcv nonsense title' }),
+    { content: "Couldn't find that one, sorry." },                              // net #13 forces cross-search
+    tc('search_tv', { query: 'asdfqwerzxcv nonsense title' }),                  // also empty
+    { content: "Couldn't find that one, sorry." },                              // now allowed to stand
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'asdfqwerzxcv nonsense title': [] },
+    sonarrByTerm: { 'asdfqwerzxcv nonsense title': [] },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'can you get asdfqwerzxcv nonsense title', []);
+    assert.equal(r.job, undefined, 'nothing should be added for a genuine nonsense title');
+    assert.match(r.response, /couldn'?t find/i, 'should report not-found after BOTH searches came back empty');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'movie search ran');
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'TV cross-search ran before giving up');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net #13 does NOT fire when the user explicitly said "movie" (respect the type)', async () => {
+  // "get me the movie Severance" — the user pinned MOVIE. A movie-empty result must NOT trigger a TV
+  // cross-search; the not-found reply stands and no /series/lookup happens.
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Severance' }),
+    { content: "Couldn't find that movie, sorry." },
+    { content: "Couldn't find that movie, sorry." },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { Severance: [] },
+    sonarrByTerm: { Severance: [{ tvdbId: 371980, title: 'Severance', year: 2022, seasons: [{ seasonNumber: 1 }] }] },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get me the movie Severance', []);
+    assert.equal(r.job, undefined, 'must not add — user asked for a movie and there is no movie');
+    assert.match(r.response, /couldn'?t find/i);
+    const calls = stub.calls();
+    assert.ok(!calls.some(c => c.includes('/series/lookup')), 'must NOT cross-search TV when user said movie');
   } finally {
     stub.restore();
   }

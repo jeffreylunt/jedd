@@ -21,6 +21,16 @@ export interface SonarrSeries {
   monitored: boolean;
   added: string;
   popularity?: number;
+  // Present on /series and /series/{id} (NOT reliably on /series/lookup — there it's zeroed). Used to
+  // tell a fully-downloaded series from one that's in the library but missing episodes (net #11 TV).
+  statistics?: {
+    seasonCount?: number;
+    episodeCount?: number;       // monitored episodes that have aired (the "should have a file" set)
+    episodeFileCount?: number;   // episodes that actually have a file on disk
+    totalEpisodeCount?: number;
+    percentOfEpisodes?: number;
+    sizeOnDisk?: number;
+  };
 }
 
 export interface RadarrMovie {

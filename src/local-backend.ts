@@ -14,13 +14,13 @@
 
 import { config, isOwner, type DownloadJob } from './config.js';
 import {
-  searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue,
-  searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue,
+  searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue, triggerMovieSearch,
+  searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue, getSonarrSeries, triggerSeriesSearch,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType } from './local-prompt.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
-export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer };
+export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType };
 
 // Active local model + Ollama URL come from config.ollama (env: LOCAL_MODEL / OLLAMA_URL,
 // default qwen2.5-coder:14b — the benchmark winner). Swap the model without a code change.
@@ -244,7 +244,7 @@ interface ToolOutcome {
   job?: { type: 'movie' | 'tv'; arrId: number; title: string };
   // Search results WITH popularity, for net #8's dominance check. Kept OUT of `result` (the
   // model-visible tool message) so the model never echoes raw popularity numbers to the user.
-  searchResults?: Array<{ title?: string; year?: number; in_library?: boolean; tmdb_id?: number; tvdb_id?: number; popularity?: number }>;
+  searchResults?: Array<{ title?: string; year?: number; in_library?: boolean; tmdb_id?: number; tvdb_id?: number; popularity?: number; hasFile?: boolean; arr_id?: number }>;
 }
 
 // Title-scoped status: resolve a named title against the LIVE library + queue and report its
@@ -314,11 +314,15 @@ async function runTool(name: string, args: Record<string, any>, senderPhone: str
       const top = results.slice(0, 8).map((m: RadarrMovie) => ({
         title: m.title, year: m.year, tmdb_id: m.tmdbId,
         in_library: m.id > 0 || m.hasFile === true,
+        // hasFile + arr_id ride along in searchResults (NOT shown to the model) so net #11 can tell a
+        // ready-to-watch library item from one that's in the library but never downloaded, and
+        // trigger a fresh search by Radarr id when the file is missing (the live Hook case 2026-05-24).
+        hasFile: m.hasFile === true, arr_id: m.id,
         popularity: m.popularity,
       }));
-      // Strip popularity from what the MODEL sees (it echoes raw numbers to the user otherwise);
-      // popularity rides along in searchResults for net #8's dominance check only.
-      const visible = (rs: typeof top) => rs.map(({ popularity, ...rest }) => rest);
+      // Strip the internal-only fields from what the MODEL sees (it echoes raw numbers/ids to the
+      // user otherwise); they ride along in searchResults for the deterministic nets only.
+      const visible = (rs: typeof top) => rs.map(({ popularity, hasFile, arr_id, ...rest }) => rest);
       if (year && top.length) {
         const matched = top.filter(m => m.year === year);
         // NEVER empty a non-empty result set: if the year matches nothing, fall back to all
@@ -342,10 +346,14 @@ async function runTool(name: string, args: Record<string, any>, senderPhone: str
           // numbers instead of guessing a count (it sent [1,8] for a 5-season show, live 2026-05-22).
           seasons: seasonNums,
           in_library: s.id > 0,
+          // arr_id rides along in searchResults (NOT shown to the model) so net #11 can fetch the
+          // series' real episode-completeness from /series/{id} and trigger a search if it's in the
+          // library but missing episodes (the TV analogue of the Hook movie case).
+          arr_id: s.id,
           popularity: s.popularity,
         };
       });
-      const visible = (rs: typeof top) => rs.map(({ popularity, ...rest }) => rest);
+      const visible = (rs: typeof top) => rs.map(({ popularity, arr_id, ...rest }) => rest);
       if (year && top.length) {
         const matched = top.filter(s => s.year === year);
         if (matched.length) return { result: { results: visible(matched) }, searchResults: matched };
@@ -512,9 +520,20 @@ export async function runLocalSession(
   // `_seasonPhrase`; resolved there against availableSeasons (so "all"/"latest" map to real numbers).
   const userSeasonPhraseRaw = userMessage;
 
+  // The request's explicit media type, if the user named one ("the movie X", "season 2 of X").
+  // null = type-ambiguous (a bare title) → eligible for the cross-type search fallback (net #13).
+  const requestedType = requestSpecifiesType(userMessage);
+
   let lastJob: LocalBackendResult['job'];
   let toolUsedThisSession = false;
   let searchToolUsed = false;
+  // Which search types ran this session, and whether each returned ZERO results — drives the
+  // cross-type fallback (net #13): a movie-first empty + the user never said "movie" → try TV.
+  let movieSearched = false;
+  let tvSearched = false;
+  let movieSearchEmpty = false;
+  let tvSearchEmpty = false;
+  let nudgedForCrossSearch = false;
   let statusToolUsed = false;
   let nudgedForStatusStall = false;
   let statusStalls = 0;
@@ -539,7 +558,7 @@ export async function runLocalSession(
   let rawToolCallNudges = 0;
   // The most recent search results + the query they came from, so net #8 can run a deterministic
   // dominance check (top result clearly matches the request → add directly instead of asking).
-  let lastSearchResults: Array<{ title?: string; year?: number; in_library?: boolean; tmdb_id?: number; tvdb_id?: number; seasons?: number[] }> = [];
+  let lastSearchResults: Array<{ title?: string; year?: number; in_library?: boolean; tmdb_id?: number; tvdb_id?: number; seasons?: number[]; hasFile?: boolean; arr_id?: number }> = [];
   let lastSearchQuery = '';
   let lastSearchWasTv = false;
   // True when an add tool returned ok:false because the id didn't resolve (hallucinated/bad id)
@@ -607,6 +626,9 @@ export async function runLocalSession(
           lastSearchResults = outcome.searchResults || [];
           lastSearchQuery = String(args.query || '').trim();
           lastSearchWasTv = name === 'search_tv';
+          const empty = (outcome.searchResults || []).length === 0;
+          if (name === 'search_movie') { movieSearched = true; movieSearchEmpty = empty; }
+          else { tvSearched = true; tvSearchEmpty = empty; }
         }
         // Track whether a season question is owed: a search_tv that found a single 3+ season
         // show with no seasons specified in the add args. Adding seasons clears it.
@@ -791,10 +813,63 @@ export async function runLocalSession(
     // already-have reply (so a good answer is never overwritten) and on no successful add.
     {
       const already = topResultAlreadyInLibrary(lastSearchQuery, lastSearchResults);
-      const saysAlready = /already (in|added|available|have|got)|in your library/i.test(content);
-      if (searchToolUsed && !addToolUsed && already && !saysAlready) {
-        console.log(`[local] already-in-library net: "${already.title}" matches "${lastSearchQuery}" and is in library`);
-        return { response: `${already.title}${already.year ? ` (${already.year})` : ''} is already in your library.` };
+      if (searchToolUsed && !addToolUsed && already) {
+        const label = `${already.title}${already.year ? ` (${already.year})` : ''}`;
+        // MOVIE that's in the library but has NO file: it was requested earlier but never downloaded
+        // or imported (the live Hook case, 2026-05-24). "Already in your library" is MISLEADING — the
+        // user can't watch a 0-byte movie. This OVERRIDES even a model reply that says "already in
+        // your library" (the small model only sees in_library:true and parrots that), because the
+        // file is genuinely missing. Trigger a fresh MoviesSearch by Radarr id, register a follow-up
+        // job (JOB tag → scheduler reports when it lands), and tell them it's grabbing now. Gated to
+        // movies (TV file-completeness is per-episode and murkier — left as a follow-up).
+        if (!lastSearchWasTv && already.hasFile === false && typeof already.arr_id === 'number' && already.arr_id > 0) {
+          console.log(`[local] already-in-library net: "${already.title}" is in library but hasFile=false — triggering MoviesSearch(${already.arr_id})`);
+          try {
+            await triggerMovieSearch(already.arr_id);
+            const job = { type: 'movie' as const, arrId: already.arr_id, title: already.title! };
+            return { response: `${label} is already in your library but hasn't downloaded yet — I'm grabbing it now.\n<!--JOB:movie:${already.arr_id}:${already.title}-->`, job };
+          } catch (err) {
+            console.error(`[local] MoviesSearch trigger failed for "${already.title}":`, err);
+            return { response: `${label} is in your library but hasn't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.` };
+          }
+        }
+        // TV analogue (2026-05-24): a SERIES in the library but missing episodes. The /series/lookup
+        // result has ZEROED statistics, so fetch /series/{id} for the real episode counts. Incomplete
+        // when monitored-aired episodes (episodeCount) exceed episodes with files (episodeFileCount).
+        // If incomplete, trigger a series-scoped SeriesSearch (grabs the missing monitored episodes),
+        // register a follow-up job, and override even a parroted "already in your library" — the user
+        // can't watch episodes that aren't there. A fully-complete series falls through to the clean
+        // reply. If we can't determine completeness (no stats / fetch failed), fall through (safe).
+        if (lastSearchWasTv && typeof already.arr_id === 'number' && already.arr_id > 0) {
+          let incomplete = false;
+          try {
+            const series = await getSonarrSeries(already.arr_id);
+            const st = series.statistics;
+            if (st && typeof st.episodeCount === 'number' && st.episodeCount > 0) {
+              incomplete = (st.episodeFileCount ?? 0) < st.episodeCount;
+            }
+          } catch (err) {
+            console.error(`[local] couldn't fetch series ${already.arr_id} for completeness:`, err);
+          }
+          if (incomplete) {
+            console.log(`[local] already-in-library net: series "${already.title}" is in library but missing episodes — triggering SeriesSearch(${already.arr_id})`);
+            try {
+              await triggerSeriesSearch(already.arr_id);
+              const job = { type: 'tv' as const, arrId: already.arr_id, title: already.title! };
+              return { response: `${label} is already in your library but some episodes haven't downloaded yet — I'm grabbing them now.\n<!--JOB:tv:${already.arr_id}:${already.title}-->`, job };
+            } catch (err) {
+              console.error(`[local] SeriesSearch trigger failed for "${already.title}":`, err);
+              return { response: `${label} is in your library but some episodes haven't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.` };
+            }
+          }
+        }
+        // It IS fully in the library (movie has a file / series is complete). Only emit the canned
+        // reply if the model didn't already say so — never overwrite a good already-have answer.
+        const saysAlready = /already (in|added|available|have|got)|in your library/i.test(content);
+        if (!saysAlready) {
+          console.log(`[local] already-in-library net: "${already.title}" matches "${lastSearchQuery}" and is in library`);
+          return { response: `${label} is already in your library.` };
+        }
       }
     }
 
@@ -868,6 +943,37 @@ export async function runLocalSession(
       messages.push({
         role: 'user',
         content: `I mean "${top?.title}"${top?.year ? ` (${top.year})` : ''} — the obvious one, don't ask which show. It has ${count} seasons. Ask me which seasons I want (or "all") in one short question. Do not add anything yet.`,
+      });
+      continue;
+    }
+
+    // SAFETY NET #13 — cross-type search fallback (movie↔TV): the user gave a type-AMBIGUOUS request
+    // (a bare title, no "movie"/"show"/"season" signal), the search that ran came back EMPTY, and the
+    // OTHER media type has NOT been searched yet this turn. Jeff's bug (2026-05-23): "keep sweet pray
+    // and obey" is a TV show; Jedd searched MOVIES, found nothing, and said "couldn't find that one"
+    // instead of trying TV. The rule: Jedd may only say not-found after BOTH a movie AND a TV search
+    // come up empty. So before accepting a not-found reply, force the cross-type search. Gated on:
+    //   - requestedType === null (the user did NOT pin movie/TV — respect explicit requests)
+    //   - exactly one type searched AND it was empty, the other not yet searched
+    //   - no successful add and no pending season question (those are real outcomes, not not-found)
+    // Fires once (nudgedForCrossSearch) so it can't ping-pong. If the cross search ALSO comes back
+    // empty, this net won't re-fire (the other type is now searched) and the model's not-found reply
+    // stands. We force the search rather than trusting a prompt rule because the 7b model is
+    // unreliable — the deterministic net is the guarantee.
+    const oneTypeSearchedEmpty =
+      (movieSearched && movieSearchEmpty && !tvSearched) ||
+      (tvSearched && tvSearchEmpty && !movieSearched);
+    if (requestedType === null && oneTypeSearchedEmpty && !addToolUsed && !pendingSeasonQuestion
+        && !nudgedForCrossSearch) {
+      nudgedForCrossSearch = true;
+      const otherIsTv = movieSearched && !tvSearched; // searched movie → now try TV
+      const crossFn = otherIsTv ? 'search_tv' : 'search_movie';
+      const crossTitle = lastSearchQuery || 'the title I asked for';
+      console.log(`[local] cross-type fallback: ${movieSearched ? 'movie' : 'tv'} search empty, forcing ${crossFn} for "${crossTitle}"`);
+      messages.push({ role: 'assistant', content });
+      messages.push({
+        role: 'user',
+        content: `Before you say you couldn't find it, check the other type — it might be a ${otherIsTv ? 'TV show' : 'movie'}. Call ${crossFn} RIGHT NOW with query "${crossTitle}". Only if THAT also returns nothing may you say you couldn't find it. Make the tool call now, not a reply.`,
       });
       continue;
     }

@@ -464,6 +464,16 @@ test('parseInlineToolCall returns null for an unknown function name', () => {
   assert.equal(parseInlineToolCall('do_something({"x": 1})'), null);
 });
 
+// The space-then-brace, NO-PAREN form qwen2.5:7b leaked live (Hook bug, 2026-05-24): the model
+// emitted `search_movie {"query": "Hook"}` and `check_status {}` as message TEXT. The old
+// paren-only regex missed these so they were delivered to the user verbatim. Now they recover +
+// execute (preferred) and are flagged by the delivery guard (backstop).
+test('parseInlineToolCall parses the no-paren space-brace form (live Hook bug)', () => {
+  assert.deepEqual(parseInlineToolCall('search_movie {"query": "Hook"}'), { name: 'search_movie', arguments: { query: 'Hook' } });
+  assert.deepEqual(parseInlineToolCall('check_status {}'), { name: 'check_status', arguments: {} });
+  assert.deepEqual(parseInlineToolCall('add_tv {"tvdb_id": 393189, "title": "Andor", "seasons": [1, 2]}'), { name: 'add_tv', arguments: { tvdb_id: 393189, title: 'Andor', seasons: [1, 2] } });
+});
+
 test('parseInlineToolCall returns null when the arg blob is broken JSON', () => {
   assert.equal(parseInlineToolCall('search_movie({"query": "Apex"'), null);
 });
@@ -473,6 +483,9 @@ test('looksLikeRawToolCall flags any raw tool-call shape, even malformed args', 
   assert.equal(looksLikeRawToolCall('search_movie({"query": "Apex"'), true);
   assert.equal(looksLikeRawToolCall('add_movie(tmdb_id=872585)'), true);
   assert.equal(looksLikeRawToolCall('check_status()'), true);
+  // no-paren space-brace form (live Hook bug, 2026-05-24)
+  assert.equal(looksLikeRawToolCall('search_movie {"query": "Hook"}'), true);
+  assert.equal(looksLikeRawToolCall('check_status {}'), true);
 });
 
 test('looksLikeRawToolCall does NOT flag a normal plain-language reply', () => {
