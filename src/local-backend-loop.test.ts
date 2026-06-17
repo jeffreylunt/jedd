@@ -481,6 +481,99 @@ test('add_tv ignores a hallucinated season number outside the show range (clamps
   }
 });
 
+// --- Star City false-success bug (2026-05-31): the model fabricated a whole search→found→add flow
+// from conversation history with ZERO tool calls, then told the user "I've added Star City Season 1"
+// when nothing was added (and reported "4 seasons" for a 1-season show). These pin the fix: a false
+// add-claim is NEVER delivered, a fabricated "found/N seasons" reply forces a real search, and a
+// dominant short-show match is actually added. ---
+const STAR_CITY = [{
+  tvdbId: 449146, title: 'Star City', year: 2026,
+  seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }],   // 1 real season (the live Sonarr truth)
+}];
+
+test('false add NEVER delivered: model claims "I\'ve added" with no tool call ever → honest failure, not a lie', async () => {
+  // The exact Star City turn-3 worst case: the model keeps narrating a successful add but never
+  // calls add_tv (or search_tv). Net #2 forces a search once; the model still won't act. The FINAL
+  // GUARD must suppress the false "I've added" and return an honest failure — never the lie.
+  const turns: Turn[] = [
+    { content: "I've added Star City Season 1. It should be available soon!" },
+    { content: "I've added Star City Season 1. It should be available soon!" },
+    { content: "I've added Star City Season 1. It should be available soon!" },
+  ];
+  const stub = installSonarrFetchStub(turns, {
+    library: [],
+    lookupByTerm: { 'Star City': STAR_CITY },
+    lookupByTvdb: { 449146: STAR_CITY },
+    onAdd: (b) => ({ id: 851, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get star city 2026', []);
+    assert.equal(r.job, undefined, 'nothing was actually added, so there must be NO job');
+    assert.doesNotMatch(r.response, /i'?ve added|added star city|it should be available/i,
+      'must NOT deliver a false success confirmation');
+    assert.match(r.response, /wasn'?t able to add|went wrong|nothing was actually added/i,
+      'must deliver an honest failure');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('false add → net #2 forces a real search → dominant short show is actually added (real recovery)', async () => {
+  // The model fabricates "I've added" (no tool). Net #2 forces a search; the search finds the real
+  // 1-season Star City; the model again narrates "I've added" — net #9 (short dominant show) now
+  // adds it for real. End state: a REAL add of the correct show, honest confirmation.
+  const turns: Turn[] = [
+    { content: "I've added Star City Season 1. It should be available soon!" },  // hop0 → net #2 forces search
+    tc('search_tv', { query: 'Star City' }),                                     // hop1 → real search
+    { content: "I've added Star City Season 1!" },                               // hop2 → net #9 real add
+  ];
+  let addBody: any;
+  const stub = installSonarrFetchStub(turns, {
+    library: [],
+    lookupByTerm: { 'Star City': STAR_CITY },
+    lookupByTvdb: { 449146: STAR_CITY },
+    onAdd: (b) => { addBody = b; return { id: 852, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }; },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get star city 2026', []);
+    assert.ok(r.job, 'the correct show should have been really added');
+    assert.equal(r.job!.arrId, 852);
+    assert.match(r.job!.title, /Star City/);
+    assert.match(r.response, /added star city/i, 'honest confirmation of the real add');
+    const monitored = (addBody.seasons || []).filter((s: any) => s.seasonNumber > 0 && s.monitored).map((s: any) => s.seasonNumber);
+    assert.deepEqual(monitored, [1], 'the one real season is monitored');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fabricated "Found X / 4 seasons" with no search → net #3b forces a real search → correct 1-season count', async () => {
+  // Turn-1/2 shape: the model says "Found Star City. It has 4 seasons. Which seasons would you like?"
+  // having NEVER searched. Net #3b forces a real search_tv; the real result is a 1-season show, so
+  // the bogus "4 seasons" never reaches the user and the show is added from real data.
+  const turns: Turn[] = [
+    { content: 'Found Star City. It has 4 seasons available. Which seasons would you like? I can add all.' },
+    tc('search_tv', { query: 'Star City' }),
+    { content: 'Found Star City (2026). Which seasons would you like?' },
+  ];
+  const stub = installSonarrFetchStub(turns, {
+    library: [],
+    lookupByTerm: { 'Star City': STAR_CITY },
+    lookupByTvdb: { 449146: STAR_CITY },
+    onAdd: (b) => ({ id: 853, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get star city 2026', []);
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'a real search must have happened');
+    assert.doesNotMatch(r.response, /4 seasons/i, 'the fabricated 4-season count must be gone');
+    assert.ok(r.job, 'the real 1-season show should be added from the search result');
+    assert.equal(r.job!.arrId, 853);
+  } finally {
+    stub.restore();
+  }
+});
+
 // --- Status path: title-scoped check_status + the "wait a moment" status-stall (2026-05-22) ---
 // A stub that serves Radarr movie lookups, Sonarr series lookups, and a per-id queue, so a
 // title-scoped check_status can resolve a real state. `radarrLib`/`sonarrLib` map a lookup term
@@ -1035,6 +1128,98 @@ test('net #13 cross-type: genuine nonsense — BOTH movie and TV empty → "coul
   }
 });
 
+test('net #14 carry-forward: cross-search FINDS a short show but model still says not-found → forces the add', async () => {
+  // The live "U.S. Against the World" bug (2026-06-16): movie search empty → net #13 forced search_tv
+  // → the search FOUND the docuseries → but the model STILL replied "couldn't find it as a movie or a
+  // TV show", discarding the result it had in hand. Jeff then had to nudge "it's a tv show". Net #14
+  // must NOT accept that not-found while a dominant match is in hand — it forces the add of the found
+  // (short, 1-season) show instead of dropping it.
+  const tvResults = [{
+    tvdbId: 412233, title: 'U.S. Against the World', year: 2023,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }],
+  }];
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'U.S. Against the World' }),                    // movie-first, empty
+    { content: "Couldn't find that one, sorry." },                              // about to give up → net #13
+    tc('search_tv', { query: 'U.S. Against the World' }),                       // forced cross-search → FINDS it
+    { content: "I couldn't find it as a movie or a TV show." },                 // BUG: discards the found result → net #14
+    tc('add_tv', { tvdb_id: 412233, title: 'U.S. Against the World' }),         // net #14 forces the add
+    { content: 'Done — U.S. Against the World is downloading now.' },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'U.S. Against the World': [] },                             // movie: nothing
+    sonarrByTerm: { 'U.S. Against the World': tvResults },                      // TV: found
+    sonarrByTvdb: { 412233: tvResults },
+    onTvAdd: (b) => ({ id: 933, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get U.S. Against the World', []);
+    assert.ok(r.job, 'should carry the cross-search result forward and add it, not drop it');
+    assert.match(r.job!.title, /U\.S\. Against the World/i);
+    assert.doesNotMatch(r.response, /couldn'?t find|could not find/i, 'must NOT deliver not-found when the show WAS found');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'TV cross-search ran');
+    assert.ok(calls.some(c => /\/series(\?|$)/.test(c.split(' ')[1] || c)), 'add_tv POST must have happened');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net #14 carry-forward: cross-search finds a LONG show but model says not-found → forces the seasons question', async () => {
+  // Same not-found-despite-a-match bug, but the found show has 3+ seasons. Adding all of it silently
+  // would be wrong — Jedd must surface the show and ASK which seasons (the model dropped it instead).
+  const tvResults = [{
+    tvdbId: 305288, title: 'Some Long Docuseries', year: 2019,
+    seasons: [{ seasonNumber: 1 }, { seasonNumber: 2 }, { seasonNumber: 3 }, { seasonNumber: 4 }],
+  }];
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Some Long Docuseries' }),                      // movie-first, empty
+    { content: "Couldn't find that one, sorry." },                              // → net #13
+    tc('search_tv', { query: 'Some Long Docuseries' }),                         // forced cross-search → FINDS it
+    { content: "I couldn't find it as a movie or a TV show." },                 // BUG → net #14
+    { content: 'I found Some Long Docuseries (2019). It has 4 seasons — which seasons would you like, or all?' },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'Some Long Docuseries': [] },
+    sonarrByTerm: { 'Some Long Docuseries': tvResults },
+    sonarrByTvdb: { 305288: tvResults },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get Some Long Docuseries', []);
+    assert.equal(r.job, undefined, 'a long show needs a season choice first — nothing added yet');
+    assert.doesNotMatch(r.response, /couldn'?t find|could not find/i, 'must NOT deliver not-found when the show WAS found');
+    assert.match(r.response, /season/i, 'should ask which seasons of the found show');
+    assert.match(r.response, /Some Long Docuseries/i, 'should name the found show, not a different one');
+    const calls = stub.calls();
+    assert.equal(calls.filter(c => /\/series(\?|$)/.test((c.split(' ')[1] || c)) && c.startsWith('POST')).length, 0, 'must NOT add a long show before the user picks seasons');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net #14 does NOT fire on a genuine miss: search returns only near-miss titles → not-found stands', async () => {
+  // Guard against over-firing: if the cross-search returns only UNRELATED near-miss titles (not a
+  // dominant match for the query), the model's not-found reply is honest and must be allowed to stand.
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Zxqv Wibble Nonsense' }),                      // movie-first, empty
+    { content: "Couldn't find that one, sorry." },                              // → net #13
+    tc('search_tv', { query: 'Zxqv Wibble Nonsense' }),                         // cross-search → only a near-miss
+    { content: "Couldn't find that one, sorry." },                              // honest not-found — must stand
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'Zxqv Wibble Nonsense': [] },
+    // A wholly-unrelated title, so topResultIsDominant() is false (no close match to the query).
+    sonarrByTerm: { 'Zxqv Wibble Nonsense': [{ tvdbId: 1, title: 'Completely Different Show', year: 2001, seasons: [{ seasonNumber: 1 }] }] },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you get Zxqv Wibble Nonsense', []);
+    assert.equal(r.job, undefined, 'nothing should be added for a non-dominant near-miss');
+    assert.match(r.response, /couldn'?t find/i, 'honest not-found must stand when there is no dominant match');
+  } finally {
+    stub.restore();
+  }
+});
+
 test('net #13 does NOT fire when the user explicitly said "movie" (respect the type)', async () => {
   // "get me the movie Severance" — the user pinned MOVIE. A movie-empty result must NOT trigger a TV
   // cross-search; the not-found reply stands and no /series/lookup happens.
@@ -1053,6 +1238,121 @@ test('net #13 does NOT fire when the user explicitly said "movie" (respect the t
     assert.match(r.response, /couldn'?t find/i);
     const calls = stub.calls();
     assert.ok(!calls.some(c => c.includes('/series/lookup')), 'must NOT cross-search TV when user said movie');
+  } finally {
+    stub.restore();
+  }
+});
+
+// --- Multi-movie / franchise requests (nets A + B + C, 2026-05-24) -------------------------------
+const dmCollection = (title: string, year: number, tmdbId: number, id = 0, hasFile = false) =>
+  ({ title, year, tmdbId, id, hasFile, collection: { title: 'Despicable Me Collection', tmdbId: 86066 } });
+
+test('net B — "get all the despicable me movies" → adds the whole collection by REAL id, one JOB per film', async () => {
+  let nextId = 700;
+  const stub = installFetchStub([], {
+    lookupByTerm: { 'despicable me': [
+      dmCollection('Despicable Me', 2010, 20352),
+      dmCollection('Despicable Me 4', 2024, 519182),
+      dmCollection('Despicable Me 2', 2013, 93456),
+      dmCollection('Despicable Me 3', 2017, 324852),
+      { title: 'Despicable Me Presents: Minion Madness', year: 2010, tmdbId: 286558, id: 0, hasFile: false }, // no collection → excluded
+    ] },
+    onAdd: (b) => ({ id: nextId++, title: b.title, tmdbId: b.tmdbId }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Can you just get all of the despicable me movies?', []);
+    for (const t of ['Despicable Me (2010)', 'Despicable Me 2 (2013)', 'Despicable Me 3 (2017)', 'Despicable Me 4 (2024)']) {
+      assert.match(r.response, new RegExp(t.replace(/[()]/g, '\\$&')), `should mention ${t}`);
+    }
+    assert.doesNotMatch(r.response, /Minion Madness/, 'non-collection extra must be excluded');
+    assert.equal([...r.response.matchAll(/<!--JOB:movie:\d+:/g)].length, 4, 'one JOB tag per film');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net A — "get 3 and 4 as well" → adds the 3rd & 4th franchise films (real ids, franchise from history)', async () => {
+  const hist = [
+    { role: 'user', text: 'Can you get despicable me?', timestamp: '' },
+    { role: 'assistant', text: "I've added Despicable Me (2010) to your library and it's now searching.", timestamp: '' },
+    { role: 'user', text: 'How about the second one', timestamp: '' },
+    { role: 'assistant', text: "I've added Despicable Me 2 (2013) to your library and it's now searching.", timestamp: '' },
+  ];
+  let nextId = 800;
+  const stub = installFetchStub([], {
+    lookupByTerm: { 'Despicable Me': [
+      dmCollection('Despicable Me', 2010, 20352, 514, true),   // already in library + file
+      dmCollection('Despicable Me 2', 2013, 93456, 515, true), // already in library + file
+      dmCollection('Despicable Me 3', 2017, 324852, 0, false), // not added
+      dmCollection('Despicable Me 4', 2024, 519182, 0, false), // not added
+    ] },
+    onAdd: (b) => ({ id: nextId++, title: b.title, tmdbId: b.tmdbId }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'Get 3 and 4 as well', [], hist);
+    assert.match(r.response, /Despicable Me 3 \(2017\)/);
+    assert.match(r.response, /Despicable Me 4 \(2024\)/);
+    assert.doesNotMatch(r.response, /Despicable Me \(2010\)/, 'DM1 was not requested');
+    assert.doesNotMatch(r.response, /Despicable Me 2 \(2013\)/, 'DM2 was not requested');
+    assert.equal([...r.response.matchAll(/<!--JOB:movie:\d+:/g)].length, 2, 'two films grabbed');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net A — never trusts a model id: uses the collection lookup id even though the model never spoke', async () => {
+  // The point of A/B: no model turn happens at all (handler runs pre-loop), so a hallucinated id like
+  // 356894 ("We Are the Littletons") can never sneak in — the JOB ids come only from onAdd/library.
+  let nextId = 900;
+  const stub = installFetchStub([], {
+    lookupByTerm: { 'Despicable Me': [
+      dmCollection('Despicable Me 3', 2017, 324852, 0, false),
+      dmCollection('Despicable Me 4', 2024, 519182, 0, false),
+    ] },
+    onAdd: (b) => ({ id: nextId++, title: b.title, tmdbId: b.tmdbId }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get 3 and 4', [], [
+      { role: 'assistant', text: 'Added Despicable Me 2 (2013).', timestamp: '' },
+    ]);
+    assert.doesNotMatch(r.response, /356894/);
+    assert.match(r.response, /Despicable Me 3/);
+    const calls = stub.calls();
+    assert.ok(!calls.some(c => c.includes('/api/chat')), 'the model was never called — fully deterministic');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('multi-add guard — a STATUS query with numbers ("are 3 and 4 here yet?") does NOT add anything', async () => {
+  // The handler must defer to the status path, never trigger adds on a status check.
+  const hist = [{ role: 'assistant', text: 'Added Despicable Me 2 (2013).', timestamp: '' }];
+  const stub = installFetchStub([{ content: 'Despicable Me 3 is still downloading.' }], {
+    lookupByTerm: { 'Despicable Me': [
+      dmCollection('Despicable Me 3', 2017, 324852, 0, false),
+      dmCollection('Despicable Me 4', 2024, 519182, 0, false),
+    ] },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'how are 3 and 4 doing?', [], hist);
+    const calls = stub.calls();
+    assert.ok(!calls.some(c => c.startsWith('POST') && c.includes('/movie')), 'must NOT add a movie on a status query');
+    assert.equal([...r.response.matchAll(/<!--JOB:/g)].length, 0, 'no jobs registered on a status query');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('net C — unresolvable multi-item request → graceful guidance, not a dead-end "try again"', async () => {
+  // "all the foobar movies": search returns nothing → no collection → handler bails to the model loop,
+  // which thrashes to hop exhaustion. C must reply with guidance, never the dead-end retry message.
+  const stub = installFetchStub([tc('search_movie', { query: 'foobar' })], {
+    lookupByTerm: { foobar: [] },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get all the foobar movies', []);
+    assert.match(r.response, /one at a time/i, 'should guide the user');
+    assert.doesNotMatch(r.response, /give it another try/i, 'must not dead-end');
   } finally {
     stub.restore();
   }

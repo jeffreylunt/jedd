@@ -1,6 +1,7 @@
 import { type AppState, type DownloadJob, saveState } from './config.js';
 import { runLocalSession } from './local-backend.js';
 import { sendMessage } from './send.js';
+import { jlog, newConversationId, truncate } from './logger.js';
 
 const QUIET_PERIOD_MS = 5000; // Wait 5s for stragglers before sending response
 
@@ -56,9 +57,9 @@ export function onMessage(phone: string, text: string, state: AppState): void {
 
 /** Run the Ollama backend once. The local backend is stateless — we replay recent
  *  conversation history so multi-turn (e.g. "which seasons?" -> "all") keeps context. */
-async function runBackend(phone: string, message: string, state: AppState): Promise<string> {
+async function runBackend(phone: string, message: string, state: AppState, conversationId: string): Promise<string> {
   const history = state.conversationHistory?.[phone]?.slice(-20);
-  const result = await runLocalSession(phone, message, state.activeJobs, history);
+  const result = await runLocalSession(phone, message, state.activeJobs, history, conversationId);
   return result.response;
 }
 
@@ -75,32 +76,38 @@ async function processSession(phone: string, state: AppState): Promise<void> {
       const messages = session.messageBuffer.splice(0);
       const combined = messages.join('\n\n');
 
+      // One conversationId per drained-buffer backend invocation — the correlation key that ties the
+      // inbound text → every model turn / tool call / net → the delivered reply in the logs.
+      const conversationId = newConversationId(phone);
       console.log(`[session] Calling backend for ${phone} (${messages.length} message(s))`);
+      jlog('inbound', { conversationId, phone, messageCount: messages.length, text: combined });
 
-      let response = await runBackend(phone, combined, state);
+      let response = await runBackend(phone, combined, state, conversationId);
       session.lastActivity = Date.now();
 
-      // Parse job tracking tag if present
-      const jobMatch = response.match(/<!--JOB:(movie|tv):(\d+):(.+?)-->/);
-      if (jobMatch) {
-        const [, type, arrId, title] = jobMatch;
-        response = response.replace(/\n?<!--JOB:.+?-->/, '').trim();
-
-        const job: DownloadJob = {
-          id: `${type}-${arrId}-${Date.now()}`,
-          type: type as 'movie' | 'tv',
-          title,
-          arrId: parseInt(arrId),
-          requestedBy: phone,
-          requestedAt: new Date().toISOString(),
-          qualityProfileId: type === 'movie' ? 6 : 3,
-          status: 'downloading',
-          nextCheckAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-          checkCount: 0,
-        };
-        state.activeJobs.push(job);
+      // Parse job tracking tag(s) if present. A multi-movie/franchise add emits MORE THAN ONE JOB
+      // tag (e.g. "get all the despicable me movies"), so register EVERY tag, not just the first.
+      const jobMatches = [...response.matchAll(/<!--JOB:(movie|tv):(\d+):(.+?)-->/g)];
+      if (jobMatches.length > 0) {
+        response = response.replace(/\n?<!--JOB:.+?-->/g, '').trim();
+        for (const [, type, arrId, title] of jobMatches) {
+          const job: DownloadJob = {
+            id: `${type}-${arrId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            type: type as 'movie' | 'tv',
+            title,
+            arrId: parseInt(arrId),
+            requestedBy: phone,
+            requestedAt: new Date().toISOString(),
+            qualityProfileId: type === 'movie' ? 6 : 3,
+            status: 'downloading',
+            nextCheckAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+            checkCount: 0,
+          };
+          state.activeJobs.push(job);
+          console.log(`[session] Registered job: ${type} "${title}" (arrId: ${arrId}) for ${phone}`);
+          jlog('job.registered', { conversationId, phone, jobId: job.id, type, arrId: parseInt(arrId), title });
+        }
         saveState(state);
-        console.log(`[session] Registered job: ${type} "${title}" (arrId: ${arrId}) for ${phone}`);
       }
 
       // Store conversation history
@@ -130,11 +137,13 @@ async function processSession(phone: string, state: AppState): Promise<void> {
       }
 
       console.log(`[session] Sending response to ${phone}: "${response.substring(0, 80)}"`);
+      jlog('delivery.sent', { conversationId, phone, text: truncate(response, 2000), length: response.length });
       await sendMessage(phone, response);
       break;
     }
   } catch (error) {
     console.error(`[session] Error for ${phone}:`, error);
+    jlog('error', { where: 'processSession', phone, error: error instanceof Error ? error.stack || error.message : String(error) });
     await sendMessage(phone, "Something went wrong on my end, sorry about that. Try again in a sec?");
   } finally {
     session.isRunning = false;

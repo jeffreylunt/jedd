@@ -5,3 +5,6 @@ data/
 
 # Internal worker-memory dir — must never enter the public repo.
 knowledge/
+
+# Local experiment/harness scripts — some embed live arr API keys (run-stress.sh). Never commit.
+experiments/

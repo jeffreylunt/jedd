@@ -3,9 +3,25 @@ import { BlueBubblesListener } from './bb-webhook.js';
 import { handleMessage } from './media.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
 import { cleanupSessions } from './session-manager.js';
+import { installConsoleMirror, jlog } from './logger.js';
 import type { IncomingMessage } from './types.js';
+import { readFileSync } from 'fs';
 
-console.log('[media-bot] Starting up...');
+// Released version — read from the package.json baked into the image (Dockerfile copies it to /app),
+// so the running container reports the EXACT version it was built/released at (running == released).
+function readVersion(): string {
+  try {
+    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')).version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+const VERSION = readVersion();
+
+// Install the durable console mirror FIRST so every subsequent log line (incl. startup) is
+// captured to the persistent file on the jedd-data volume — it outlives container recreation.
+installConsoleMirror();
+console.log(`[media-bot] Starting up... (jedd v${VERSION})`);
 
 // Load persisted state
 const state = loadState();
@@ -54,7 +70,8 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  console.log('[media-bot] Ready and listening for messages.');
+  console.log(`[media-bot] Ready and listening for messages. (jedd v${VERSION})`);
+  jlog('ready', { version: VERSION });
 }
 
 main().catch((err) => {

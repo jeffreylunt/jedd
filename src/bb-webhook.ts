@@ -1,6 +1,7 @@
 import http from 'http';
 import { EventEmitter } from 'events';
 import { config } from './config.js';
+import { jlog } from './logger.js';
 import type { IncomingMessage } from './types.js';
 
 const WEBHOOK_PATH = '/webhook';
@@ -172,6 +173,10 @@ export class BlueBubblesListener extends EventEmitter {
     };
 
     console.log(`[bb-webhook] ${source}: message ${rowid} (guid=${guid?.slice(0, 8)}) from ${normalized}: ${text.substring(0, 80)}`);
+    // Raw inbound with the FULL text + rowid + sender, before buffering/quiet-period batching.
+    // The downstream `inbound` event (session-manager) carries the conversationId; this is the
+    // earliest, most faithful record of exactly what the user sent and when.
+    jlog('imsg.received', { source, rowid, guid, sender: normalized, text, ts: timestamp });
     this.emit('message', message);
   }
 

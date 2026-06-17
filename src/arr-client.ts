@@ -1,51 +1,66 @@
 import { config } from './config.js';
+import { jlog, truncate } from './logger.js';
 import type { SonarrSeries, RadarrMovie, QueueItem, EpisodeStatus } from './types.js';
 
 // --- Generic HTTP helpers ---
+//
+// Every Sonarr/Radarr call is logged at the HTTP layer (service, method, path, status, ms, and a
+// short shape of the response — array length or the returned id) so a failed interaction can be
+// reconstructed from logs ALONE: you can see the exact lookup candidates returned, the add request
+// body, the HTTP status, and the returned arr id. The api key is appended to the url internally and
+// is NEVER logged (we log the key-free `path`; jlog also redacts apikey= as a backstop). On error,
+// the status + response body are logged before the throw so a 4xx/5xx/redirect is never silent.
 
-async function sonarrGet<T>(path: string): Promise<T> {
-  const url = `${config.sonarr.baseUrl}${path}`;
-  const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(`${url}${sep}apikey=${config.sonarr.apiKey}`);
-  if (!res.ok) throw new Error(`Sonarr GET ${path}: ${res.status} ${res.statusText}`);
-  return res.json() as Promise<T>;
-}
-
-async function sonarrPost<T>(path: string, body: unknown): Promise<T> {
-  const url = `${config.sonarr.baseUrl}${path}?apikey=${config.sonarr.apiKey}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Sonarr POST ${path}: ${res.status} ${text}`);
+// Compact, decision-relevant shape of an arr response for the log (full bodies can be huge).
+function shape(data: unknown): unknown {
+  if (Array.isArray(data)) {
+    return {
+      count: data.length,
+      sample: data.slice(0, 5).map((d: any) => ({
+        id: d?.id, title: d?.title, year: d?.year,
+        tmdbId: d?.tmdbId, tvdbId: d?.tvdbId, hasFile: d?.hasFile,
+      })),
+    };
   }
-  return res.json() as Promise<T>;
-}
-
-async function radarrGet<T>(path: string): Promise<T> {
-  const url = `${config.radarr.baseUrl}${path}`;
-  const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(`${url}${sep}apikey=${config.radarr.apiKey}`);
-  if (!res.ok) throw new Error(`Radarr GET ${path}: ${res.status} ${res.statusText}`);
-  return res.json() as Promise<T>;
-}
-
-async function radarrPost<T>(path: string, body: unknown): Promise<T> {
-  const url = `${config.radarr.baseUrl}${path}?apikey=${config.radarr.apiKey}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Radarr POST ${path}: ${res.status} ${text}`);
+  if (data && typeof data === 'object') {
+    const d = data as any;
+    return { id: d.id, title: d.title, year: d.year, tmdbId: d.tmdbId, tvdbId: d.tvdbId, hasFile: d.hasFile };
   }
-  return res.json() as Promise<T>;
+  return data;
 }
+
+async function arrFetch<T>(service: 'sonarr' | 'radarr', method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+  const cfg = service === 'sonarr' ? config.sonarr : config.radarr;
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${cfg.baseUrl}${path}${sep}apikey=${cfg.apiKey}`;
+  const started = Date.now();
+  let res: Response;
+  try {
+    res = await fetch(url, method === 'POST'
+      ? { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : { method });
+  } catch (err) {
+    jlog('arr.http', { service, method, path, ok: false, error: String(err), ms: Date.now() - started });
+    throw err;
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    jlog('arr.http', { service, method, path, status: res.status, ok: false, ms: Date.now() - started, error: truncate(text, 500) });
+    throw new Error(`${service} ${method} ${path}: ${res.status} ${res.statusText} ${text}`.trim());
+  }
+  const data = (await res.json()) as T;
+  jlog('arr.http', {
+    service, method, path, status: res.status, ok: true, ms: Date.now() - started,
+    ...(method === 'POST' ? { reqBody: body } : {}),
+    resp: shape(data),
+  });
+  return data;
+}
+
+const sonarrGet = <T>(path: string) => arrFetch<T>('sonarr', 'GET', path);
+const sonarrPost = <T>(path: string, body: unknown) => arrFetch<T>('sonarr', 'POST', path, body);
+const radarrGet = <T>(path: string) => arrFetch<T>('radarr', 'GET', path);
+const radarrPost = <T>(path: string, body: unknown) => arrFetch<T>('radarr', 'POST', path, body);
 
 // --- Sonarr (TV Shows) ---
 

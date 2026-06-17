@@ -34,8 +34,16 @@ services:
       # host:container — the inbound BlueBubbles webhook receiver.
       - "${BLUEBUBBLES_WEBHOOK_PORT:-18790}:${BLUEBUBBLES_WEBHOOK_PORT:-18790}"
     volumes:
-      # Persist state.json (active jobs, processed-message ids, conversation history).
+      # Persist state.json (active jobs, processed-message ids, conversation history) AND the durable
+      # structured logs under /app/data/logs (size-rotated by the app, ~250 MB hard cap by default).
       - jedd-data:/app/data
+    # Cap `docker logs` so the container's stdout JSON can't grow unbounded (separate from the app's
+    # own file rotation above). 50 MB per file, 5 files → ~250 MB max for docker logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # On Linux you can instead share the host network (then use localhost URLs and drop `ports`):
     # network_mode: host
 

@@ -46,6 +46,9 @@ export interface RadarrMovie {
   hasFile: boolean;
   added: string;
   popularity?: number;
+  // TMDB collection this film belongs to (e.g. "Despicable Me Collection"). Present on /movie/lookup
+  // results; used to resolve a whole-franchise / multi-sequel request to real members + real ids.
+  collection?: { title?: string; tmdbId?: number };
 }
 
 export interface QueueItem {

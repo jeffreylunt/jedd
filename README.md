@@ -121,7 +121,6 @@ All configuration is via environment variables (a `.env` file). Every option is 
 | `ALLOWED_SENDERS` | | (empty) | Comma-separated additional allowed numbers (see Access control) |
 | `ALLOW_ALL_SENDERS` | | `false` | `true` opens the bot to anyone (see Access control) |
 | `DISPLAY_NAME` | | `Jedd` | The bot's persona name |
-| `PREFERRED_LANGUAGE` | | `English` | Documented release-language preference (see below) |
 
 ### Access control (default deny)
 
@@ -142,10 +141,9 @@ numbers to the config.
   in the URL when editing a profile (Settings > Profiles), and the root folder under
   Settings > Media Management. **Set the quality profile** — the default `1` is usually the "Any"
   profile, which will grab low-quality cam/screener releases; point it at a real HD profile.
-- **Language preference:** `PREFERRED_LANGUAGE` is documentation only — it does not enforce anything
-  by itself. To actually prefer a language, add Custom Formats in your Sonarr/Radarr quality profiles
-  (a positive "Language: <lang>" CF and a negative "Not <lang>" CF). Jedd reads the value but the
-  scoring happens in your arr instance.
+- **Language preference:** set this in your Sonarr/Radarr quality profiles via Custom Formats — add a
+  positive "Language: <lang>" CF and a negative "Not <lang>" CF. All language scoring happens in your
+  arr instance; Jedd does not handle language itself.
 
 ## Recommended model
 

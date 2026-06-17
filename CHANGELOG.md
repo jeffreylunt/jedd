@@ -3,6 +3,19 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [1.4.3] — 2026-06-16
+
+Bugfix release for the cross-type (movie↔TV) search fallback.
+
+### Fixed
+- **A found title is no longer dropped after a cross-type search.** When you ask for something
+  without saying whether it's a movie or a show, Jedd searches one type first; if that comes up
+  empty it now searches the other type. Previously, even when that second search *found* the title,
+  the model sometimes still replied *"couldn't find it as a movie or TV show"* — so you had to nudge
+  *"it's a tv show"* before it worked. Jedd now carries the found match forward: it adds the show (or
+  asks which seasons for a long series) instead of discarding it. The anti-fabrication guard is
+  unchanged — Jedd still never claims it added something unless the add really succeeded.
+
 ## [1.2.0] — 2026-05-24
 
 Reliability release for the local-model (qwen2.5:7b) request flow — fixes a message-leak bug and

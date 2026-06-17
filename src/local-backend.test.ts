@@ -8,7 +8,7 @@ process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
 
 const { promisesActionWithoutTool, claimsAddWithoutExecuting, splitQueryYear, titlesRoughlyMatch } = await import('./local-backend.js');
-const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer } = await import('./local-prompt.js');
+const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle } = await import('./local-prompt.js');
 
 // --- splitQueryYear: derive year from param OR a year stuffed into the query (Eternity regression) ---
 
@@ -130,6 +130,31 @@ test('claimsResultsWithoutSearching does NOT fire on a plain seasons question', 
 
 test('claimsResultsWithoutSearching does NOT fire on the non-Jeff refusal', () => {
   assert.equal(claimsResultsWithoutSearching('Hey! I can help you find movies, TV shows, and ebooks.'), false);
+});
+
+// --- claimsFoundWithoutSearching: single-show "found it / N seasons / which seasons?" fabricated
+// from history with no search this session (the live Star City bug, 2026-05-31). ---
+
+test('claimsFoundWithoutSearching fires on the exact Star City turn-1 reply', () => {
+  assert.equal(claimsFoundWithoutSearching('Found Star City. Which seasons would you like to download? I can add all if you\'d like.'), true);
+});
+
+test('claimsFoundWithoutSearching fires on a fabricated season count', () => {
+  assert.equal(claimsFoundWithoutSearching('Star City has 4 seasons available. Which ones would you like to download?'), true);
+});
+
+test('claimsFoundWithoutSearching does NOT fire on a refusal (refusesWithoutSearching owns that)', () => {
+  assert.equal(claimsFoundWithoutSearching("Couldn't find that one, sorry."), false);
+  assert.equal(claimsFoundWithoutSearching("I haven't found anything matching that yet."), false);
+});
+
+test('claimsFoundWithoutSearching does NOT fire on already-in-library or the canned refusal', () => {
+  assert.equal(claimsFoundWithoutSearching('That one is already in your library.'), false);
+  assert.equal(claimsFoundWithoutSearching('I can help you find movies, TV shows, and ebooks.'), false);
+});
+
+test('claimsFoundWithoutSearching does NOT fire on a plain clarifying question with no found/season claim', () => {
+  assert.equal(claimsFoundWithoutSearching('What are you looking for — a movie or a show?'), false);
 });
 
 // --- messageHasPlausibleTitle: gate net #3 so gibberish / no-title requests never force a search
@@ -669,4 +694,67 @@ test('asksWhichOne fires on "Did you mean The Bear from 2022?"', () => {
 });
 test('asksWhichOne still ignores a "which seasons?" question (TV ask preserved)', () => {
   assert.equal(asksWhichOne('Which seasons would you like? It has 5.'), false);
+});
+
+// --- Multi-movie / franchise request detection (2026-05-24) ---
+test('parseFranchiseAllRequest extracts the franchise for whole-series requests', () => {
+  assert.equal(parseFranchiseAllRequest('Can you just get all of the despicable me movies?'), 'despicable me');
+  assert.equal(parseFranchiseAllRequest('get all the despicable me movies'), 'despicable me');
+  assert.equal(parseFranchiseAllRequest('download the whole star wars saga'), 'star wars');
+  assert.equal(parseFranchiseAllRequest('grab every john wick film'), 'john wick');
+});
+test('parseFranchiseAllRequest returns null for non-franchise / single requests', () => {
+  assert.equal(parseFranchiseAllRequest('can you get despicable me 3'), null);
+  assert.equal(parseFranchiseAllRequest('get all of the movies'), null); // no franchise named
+  assert.equal(parseFranchiseAllRequest('how is severance doing'), null);
+  assert.equal(parseFranchiseAllRequest(''), null);
+});
+test('parseSequelNumberList parses a list of >=2 bare numbers', () => {
+  assert.deepEqual(parseSequelNumberList('Get 3 and 4 as well'), [3, 4]);
+  assert.deepEqual(parseSequelNumberList('1, 2 and 3'), [1, 2, 3]);
+  assert.deepEqual(parseSequelNumberList('2 & 3 please'), [2, 3]);
+});
+test('parseSequelNumberList returns null for singletons / ordinals / counts / TV', () => {
+  assert.equal(parseSequelNumberList('get 3'), null);            // single number
+  assert.equal(parseSequelNumberList('get the 3rd one'), null);  // ordinal
+  assert.equal(parseSequelNumberList('get 3 movies'), null);     // count, not a list
+  assert.equal(parseSequelNumberList('seasons 1 and 2'), null);  // TV season territory
+  assert.equal(parseSequelNumberList('the first one'), null);
+});
+test('franchiseQueryFromHistory pulls the base name from the latest Title (Year)', () => {
+  const hist = [
+    { role: 'user', text: 'Can you get despicable me?' },
+    { role: 'assistant', text: "I've added Despicable Me (2010) to your library and it's now searching." },
+    { role: 'user', text: 'How about the second one' },
+    { role: 'assistant', text: "I've added Despicable Me 2 (2013) to your library and it's now searching." },
+  ];
+  assert.equal(franchiseQueryFromHistory(hist), 'Despicable Me');
+  assert.equal(franchiseQueryFromHistory([]), null);
+  assert.equal(franchiseQueryFromHistory(undefined), null);
+});
+test('franchiseQueryFromHistory strips a sentence-leading verb ("Added X (Year)")', () => {
+  // Net-#9 / net-#11 replies start "Added <title> (<year>)" — the capitalized "Added" must not leak.
+  assert.equal(franchiseQueryFromHistory([{ role: 'assistant', text: 'Added Despicable Me 2 (2013).' }]), 'Despicable Me');
+  assert.equal(franchiseQueryFromHistory([{ role: 'assistant', text: 'Grabbing The Matrix (1999) now.' }]), 'The Matrix');
+});
+test('franchiseQueryFromHistory keeps multi-word titles + title-leading verbs intact', () => {
+  // lowercase connectors must survive; title-plausible verbs (Get/I/Finding) must NOT be stripped.
+  assert.equal(franchiseQueryFromHistory([{ role: 'assistant', text: 'Added The Lord of the Rings (2001).' }]), 'The Lord of the Rings');
+  assert.equal(franchiseQueryFromHistory([{ role: 'assistant', text: 'Added Get Out (2017).' }]), 'Get Out');
+  assert.equal(franchiseQueryFromHistory([{ role: 'assistant', text: 'Added I Am Legend (2007).' }]), 'I Am Legend');
+});
+test('looksLikeMultiItemRequest does NOT fire on a TV episode list', () => {
+  assert.equal(looksLikeMultiItemRequest('get episodes 1 and 2 of naruto'), false);
+  assert.equal(looksLikeMultiItemRequest('seasons 2 and 3'), false);
+});
+test('looksLikeMultiItemRequest flags multi, not single', () => {
+  assert.equal(looksLikeMultiItemRequest('get 3 and 4 as well'), true);
+  assert.equal(looksLikeMultiItemRequest('get all the despicable me movies'), true);
+  assert.equal(looksLikeMultiItemRequest('can you get hook'), false);
+  assert.equal(looksLikeMultiItemRequest('get despicable me 3'), false);
+});
+test('sequelNumberOfTitle maps title to franchise index', () => {
+  assert.equal(sequelNumberOfTitle('Despicable Me'), 1);
+  assert.equal(sequelNumberOfTitle('Despicable Me 2'), 2);
+  assert.equal(sequelNumberOfTitle('Despicable Me 4'), 4);
 });

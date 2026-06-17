@@ -12,15 +12,18 @@
 // <!--JOB:--> tag so the scheduler picks up follow-up tracking. On error, session-manager
 // catches and replies with a friendly error — there is no secondary backend.
 
-import { config, isOwner, type DownloadJob } from './config.js';
+import { config, isOwner, isJfagoConfigured, normalizePhone, type DownloadJob } from './config.js';
+import { createInviteAndGetLink } from './jfago-client.js';
+import { sendMessage, imessageAvailability } from './send.js';
 import {
   searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue, triggerMovieSearch,
   searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue, getSonarrSeries, triggerSeriesSearch,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, extractInviteRecipient, buildInviteText, buildProvisionConfirmation, claimsProvisionWithoutExecuting } from './local-prompt.js';
+import { jlog, truncate } from './logger.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
-export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType };
+export { promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType };
 
 // Active local model + Ollama URL come from config.ollama (env: LOCAL_MODEL / OLLAMA_URL,
 // default qwen2.5-coder:14b — the benchmark winner). Swap the model without a code change.
@@ -109,6 +112,20 @@ const tools = [
         type: 'object',
         properties: { title: { type: 'string', description: 'Optional title to check; omit to list all active downloads.' } },
         required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'provision_jellyfin',
+      description: "Invite/create a NEW Jellyfin streaming account for someone. Call this when the user asks to invite, set up, create, add, or make a new Jellyfin (or 'media server' / 'streaming') account/user for a person. Put that person's EMAIL ADDRESS or PHONE NUMBER in `recipient` (an email is preferred when given). Do NOT call this for movie/TV download requests — only for setting up a person's account. If no email or phone was provided, ASK for one instead of calling this.",
+      parameters: {
+        type: 'object',
+        properties: {
+          recipient: { type: 'string', description: "The new user's email address (preferred) OR phone number to send the invite to, exactly as the user gave it." },
+        },
+        required: ['recipient'],
       },
     },
   },
@@ -301,7 +318,11 @@ async function statusForTitle(title: string): Promise<Record<string, unknown>> {
   return { title, state: 'not_added', in_library: false, message: `${title} isn't in your library yet — want me to add it?` };
 }
 
-async function runTool(name: string, args: Record<string, any>, senderPhone: string, activeJobs: DownloadJob[]): Promise<ToolOutcome> {
+// `convText` = the user's message(s) this session, used to GROUND a provision_jellyfin recipient so
+// the model can't invite a hallucinated/placeholder contact (qwen2.5:7b invents "friend@example.com"
+// when asked to "set up my friend" with no real address). Only a contact the user actually typed is
+// honored. Empty/unused for every other tool.
+async function runTool(name: string, args: Record<string, any>, senderPhone: string, activeJobs: DownloadJob[], convText = ''): Promise<ToolOutcome> {
   switch (name) {
     case 'search_movie': {
       // Robustness: small models often stuff the year INTO the query ("Eternity 2025") instead
@@ -466,6 +487,64 @@ async function runTool(name: string, args: Record<string, any>, senderPhone: str
       }
       return { result: { jobs } };
     }
+    case 'provision_jellyfin': {
+      // OWNER-ONLY — a deterministic CODE gate, never the model (the 7b will "pretend to be Jeff").
+      if (!isOwner(senderPhone)) {
+        jlog('provision.denied', { tool: 'provision_jellyfin', phone: senderPhone });
+        return { result: { ok: false, declined: true, message: 'Only the owner can set up new Jellyfin accounts. Politely tell the requester you can\'t do that.' } };
+      }
+      if (!isJfagoConfigured()) {
+        return { result: { ok: false, error: 'jfa-go provisioning is not configured', message: "Tell the user you can't set up Jellyfin accounts right now — it isn't configured." } };
+      }
+      const recipient = extractInviteRecipient(String(args.recipient || ''));
+      if (!recipient) {
+        return { result: { ok: false, need_recipient: true, message: 'No email or phone found. Ask the owner for the new user\'s email address or phone number.' } };
+      }
+      // GROUNDING: the recipient must actually appear in what the user typed — never provision to a
+      // contact the model invented. qwen2.5:7b fabricates "friend@example.com" when asked to "set up
+      // my friend" with no address; that must NOT create an invite.
+      const convDigits = convText.replace(/\D/g, '');
+      const grounded = recipient.kind === 'email'
+        ? convText.toLowerCase().includes(recipient.value.toLowerCase())
+        : convDigits.includes(recipient.value.replace(/\D/g, '').slice(-10));
+      if (!grounded) {
+        jlog('provision.ungrounded', { recipient: recipient.value });
+        return { result: { ok: false, need_recipient: true, message: "Don't invent a contact — the user didn't give an email or phone. Ask them for the new user's real email address or phone number. Do NOT claim anything was set up." } };
+      }
+      const hours = config.jfago.inviteValidityHours;
+      const label = `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      try {
+        if (recipient.kind === 'phone') {
+          const to = normalizePhone(recipient.value);
+          // iMessage capability check BEFORE burning the single-use invite. BlueBubbles is
+          // iMessage-only; a definitive `false` means we must NOT text it — ask for an email instead
+          // and DON'T create the invite. `null` = couldn't determine (e.g. BB Private API helper not
+          // connected) → proceed best-effort and hedge with the link.
+          const avail = await imessageAvailability(to);
+          if (avail === false) {
+            jlog('provision.not-imessage', { to });
+            return { result: { ok: false, not_imessage: true, recipient: to, message: `${to} isn't reachable on iMessage, so I can't text it. Ask the owner for an email address to send the invite to instead. Do NOT say an invite was sent.` } };
+          }
+          const { link } = await createInviteAndGetLink({ label });
+          const text = buildInviteText(link, hours, config.jellyfinPublicUrl);
+          try {
+            await sendMessage(to, text);
+          } catch (err) {
+            jlog('provision.deliver-failed', { to, error: String(err) });
+            return { result: { ok: false, delivery_failed: true, recipient: to, invite_url: link, message: `The invite was created but texting ${to} failed (maybe not an iMessage number). Give the owner this link to share directly: ${link}. Do NOT claim it was sent.` } };
+          }
+          jlog('provision.created', { channel: 'imessage', to, label, imessage_unverified: avail === null });
+          return { result: { ok: true, channel: 'imessage', recipient: to, invite_url: link, imessage_unverified: avail === null, message: `Invite created and texted to ${to} (expires in ${hours}h). Tell the owner it's done; if unsure it lands, share this link: ${link}` } };
+        }
+        // EMAIL: jfa-go's send-to emails the invite link via its configured SMTP.
+        const { link } = await createInviteAndGetLink({ label, email: recipient.value });
+        jlog('provision.created', { channel: 'email', recipient: recipient.value, label });
+        return { result: { ok: true, channel: 'email', recipient: recipient.value, invite_url: link, message: `Invite created and emailed to ${recipient.value} (expires in ${hours}h). Tell the owner it's done; if it doesn't arrive they can share this link: ${link}` } };
+      } catch (err) {
+        jlog('provision.error', { recipient: recipient.value, error: String(err) });
+        return { result: { ok: false, error: 'jfa-go create/read-back failed', message: 'Tell the owner there was a problem creating the invite and nothing was sent — they should try again.' } };
+      }
+    }
     default:
       return { result: { error: `unknown tool ${name}` } };
   }
@@ -479,12 +558,126 @@ export interface LocalBackendResult {
   job?: { type: 'movie' | 'tv'; arrId: number; title: string };
 }
 
+// ["A","B","C"] → "A, B and C"; ["A","B"] → "A and B"; ["A"] → "A".
+function listToProse(items: string[]): string {
+  if (items.length <= 1) return items[0] || '';
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+// Guidance reply when a multi-item request can't be fulfilled in one shot (net C fallback).
+const MULTI_ITEM_GUIDANCE = 'I can grab these best one at a time — send me a single title and I\'ll get it, or say "all the <name> movies" and I\'ll grab the whole series.';
+
+// --- Deterministic multi-movie / franchise add (nets A + B, 2026-05-24) ---
+// Jeff's live failure: "Get 3 and 4 as well" and "get all the despicable me movies". Multi-title
+// requests overwhelm the single-title-per-turn model loop (it thrashes, emits malformed tool calls,
+// hallucinates ids). This resolves the franchise's REAL TMDB collection + real ids via Radarr and
+// adds the selected members directly — never trusting a model-emitted id. Runs BEFORE the model loop;
+// returns null when it can't confidently resolve (no franchise / no collection / no member match) so
+// the caller falls through to the normal loop (no regression). Does NOT touch the hardened guards.
+async function handleMultiMovieRequest(
+  userMessage: string,
+  conversationHistory?: Array<{ role: string; text: string }>,
+): Promise<LocalBackendResult | null> {
+  // A status check ("are 3 and 4 here yet?") must NEVER trigger an add — go look, don't grab.
+  if (isStatusQuery(userMessage)) return null;
+  const numberList = parseSequelNumberList(userMessage);
+  const allReq = parseFranchiseAllRequest(userMessage);
+  if (!numberList && !allReq) return null;
+
+  // Resolve the franchise query: explicit ("all the despicable me movies") or from history ("3 and 4").
+  const franchiseQuery = allReq || franchiseQueryFromHistory(conversationHistory);
+  if (!franchiseQuery) return null;
+
+  let results: RadarrMovie[];
+  try {
+    results = await searchRadarr(splitQueryYear(franchiseQuery).term);
+  } catch (err) {
+    jlog('error', { where: 'multi-add.search', franchiseQuery, error: String(err) });
+    return null;
+  }
+  if (!results || results.length === 0) return null;
+
+  // Identify the collection from the closest title match (fall back to the first result that has one).
+  const anchor = results.find(r => titlesRoughlyMatch(franchiseQuery, r.title) && r.collection?.title)
+    || results.find(r => r.collection?.title);
+  const collectionTitle = anchor?.collection?.title;
+  if (!collectionTitle) return null; // no collection → can't enumerate a franchise reliably
+
+  // Collection members with REAL ids, de-duped, in release (sequel) order.
+  const seen = new Set<number>();
+  const members = results
+    .filter(r => r.collection?.title === collectionTitle && r.tmdbId && !seen.has(r.tmdbId) && (seen.add(r.tmdbId), true))
+    .sort((a, b) => (a.year || 0) - (b.year || 0));
+  if (members.length === 0) return null;
+
+  // Select: a number list → members at those franchise indices; 'all' → every member.
+  const selected = numberList
+    ? members.filter(m => numberList.includes(sequelNumberOfTitle(m.title)))
+    : members;
+  if (selected.length === 0) return null; // numbers didn't map to members → let the model try
+
+  // Add / re-trigger each selected member using its REAL tmdbId (never a model-emitted id).
+  const added: string[] = [];
+  const regrabbed: string[] = [];
+  const alreadyHave: string[] = [];
+  const jobTags: string[] = [];
+  let firstJob: LocalBackendResult['job'];
+  for (const m of selected) {
+    const label = `${m.title}${m.year ? ` (${m.year})` : ''}`;
+    try {
+      const inLibrary = (m.id && m.id > 0) || m.hasFile === true;
+      if (inLibrary) {
+        // Already in the library. No file → re-trigger a search; has file → already done.
+        if (m.hasFile === false && m.id > 0) {
+          await triggerMovieSearch(m.id);
+          regrabbed.push(label);
+          jobTags.push(`<!--JOB:movie:${m.id}:${m.title}-->`);
+          firstJob ||= { type: 'movie', arrId: m.id, title: m.title };
+        } else {
+          alreadyHave.push(label);
+        }
+      } else {
+        const addedMovie = await addRadarrMovie(m);
+        if (addedMovie?.id) {
+          added.push(label);
+          jobTags.push(`<!--JOB:movie:${addedMovie.id}:${m.title}-->`);
+          firstJob ||= { type: 'movie', arrId: addedMovie.id, title: m.title };
+        }
+      }
+    } catch (err) {
+      jlog('error', { where: 'multi-add.member', title: m.title, error: String(err) });
+    }
+  }
+
+  if (added.length === 0 && regrabbed.length === 0 && alreadyHave.length === 0) return null;
+
+  const grabbing = [...added, ...regrabbed];
+  const parts: string[] = [];
+  if (grabbing.length) parts.push(`grabbing ${listToProse(grabbing)} now`);
+  if (alreadyHave.length) parts.push(`${listToProse(alreadyHave)} ${alreadyHave.length === 1 ? 'is' : 'are'} already in your library`);
+  let response = parts.join('; ');
+  response = response.charAt(0).toUpperCase() + response.slice(1) + '.';
+  if (jobTags.length) response += '\n' + jobTags.join('\n');
+  jlog('multi-add', { mode: numberList ? `numbers ${JSON.stringify(numberList)}` : 'all', franchiseQuery, added, regrabbed, alreadyHave });
+  return { response, job: firstJob };
+}
+
 export async function runLocalSession(
   senderPhone: string,
   userMessage: string,
   activeJobs: DownloadJob[],
   conversationHistory?: Array<{ role: string; text: string; timestamp: string }>,
+  conversationId = 'c_nocid',
 ): Promise<LocalBackendResult> {
+  // Stable correlation id for this whole interaction. `turn` increments per model hop. Every
+  // structured event below carries {conversationId, turn} so a single conversation is greppable
+  // end-to-end (`grep <conversationId> jedd-*.log`). `net()` records which guardrail fired and why.
+  let turn = 0;
+  const cid = conversationId;
+  const net = (name: string, detail: Record<string, unknown> = {}) =>
+    jlog('net.fire', { conversationId: cid, turn, net: name, ...detail });
+
   const messages: OllamaMessage[] = [{ role: 'system', content: buildSystemPrompt(isOwner(senderPhone), config.displayName) }];
 
   // Replay recent history so the model has context (resume equivalent).
@@ -524,6 +717,25 @@ export async function runLocalSession(
   // null = type-ambiguous (a bare title) → eligible for the cross-type search fallback (net #13).
   const requestedType = requestSpecifiesType(userMessage);
 
+  jlog('session.start', {
+    conversationId: cid,
+    phone: senderPhone,
+    owner: isOwner(senderPhone),
+    message: userMessage,
+    historyLen: conversationHistory?.length || 0,
+    model: OLLAMA_MODEL,
+    gates: { userAskedStatus, statusTitle, userHasPlausibleTitle, requestedType },
+  });
+
+  // Nets A + B: a multi-movie / whole-franchise request ("get 3 and 4", "all the X movies"). Resolve
+  // the real TMDB collection + ids and add deterministically BEFORE the model loop (the small model
+  // thrashes on multi-title requests). null → not a resolvable multi-request → fall through.
+  const multiResult = await handleMultiMovieRequest(userMessage, conversationHistory);
+  if (multiResult) {
+    jlog('delivery.decision', { conversationId: cid, path: 'multi-movie-handler', deterministic: true, text: truncate(multiResult.response, 2000), job: multiResult.job });
+    return multiResult;
+  }
+
   let lastJob: LocalBackendResult['job'];
   let toolUsedThisSession = false;
   let searchToolUsed = false;
@@ -534,13 +746,27 @@ export async function runLocalSession(
   let movieSearchEmpty = false;
   let tvSearchEmpty = false;
   let nudgedForCrossSearch = false;
+  // Net #14: we've forced ONCE after the model emitted a not-found reply DESPITE the (usually
+  // cross-type-fallback) search returning a dominant match — so the found title is carried forward
+  // instead of dropped (the live "U.S. Against the World" bug, 2026-06-16).
+  let nudgedForFoundButRefused = false;
   let statusToolUsed = false;
   let nudgedForStatusStall = false;
   let statusStalls = 0;
   let addToolUsed = false;
+  // True once a provision_jellyfin call returned ok:true — gates the false-provision FINAL GUARD so
+  // the model can never claim an invite was sent unless one really was created + delivered.
+  let provisionSucceeded = false;
+  // The verified ok:true provision result (channel + REAL recipient + read-back-verified invite_url).
+  // Captured so the success reply is built deterministically from this — never the 7b's narration,
+  // which once reported a hallucinated "joey@example.com" even though a real invite was created.
+  let provisionResult: { channel?: string; recipient?: string; invite_url?: string; imessage_unverified?: boolean } | null = null;
   let nudgedForPromise = false;
   let nudgedForFakeAdd = false;
   let nudgedForRefusal = false;
+  // Net #3b: we've forced ONE real search after the model fabricated a "found it / N seasons /
+  // which seasons?" reply with no search this session (the live Star City bug, 2026-05-31).
+  let nudgedForFabricatedFound = false;
   let nudgedForBadIdAdd = false;
   let nudgedForStall = false;
   let nudgedForRecoveryAdd = false;
@@ -581,14 +807,28 @@ export async function runLocalSession(
   let pendingSeasonQuestion = false;
 
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
+    turn = hop + 1;
     const msg = await ollamaChat(messages);
     let toolCalls = msg.tool_calls || [];
+    const nativeToolCalls = toolCalls.length;
 
     // FALLBACK: recover tool calls emitted as JSON text in content (qwen2.5-coder).
+    let recoveredFromText = false;
     if (toolCalls.length === 0 && msg.content) {
       const recovered = recoverToolCalls(msg.content);
-      if (recovered.length) toolCalls = recovered;
+      if (recovered.length) { toolCalls = recovered; recoveredFromText = true; }
     }
+
+    // RAW model output for this turn — the single most important record for diagnosing a
+    // fabrication: it shows EXACTLY what the model emitted before any parsing/net/guard ran.
+    jlog('model.turn', {
+      conversationId: cid,
+      turn,
+      rawContent: truncate(msg.content || ''),
+      nativeToolCalls,
+      recoveredFromText,
+      toolCallNames: toolCalls.map((tc: any) => tc.function?.name).filter(Boolean),
+    });
 
     if (toolCalls.length > 0) {
       toolUsedThisSession = true;
@@ -598,18 +838,31 @@ export async function runLocalSession(
         let args: any = tc.function?.arguments;
         if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
         args = args || {};
-        console.log(`[local] tool_call ${name}(${JSON.stringify(args)})`);
+        jlog('tool.call', { conversationId: cid, turn, tool: name, args });
         if (name === 'search_movie' || name === 'search_tv') searchToolUsed = true;
         if (name === 'check_status') statusToolUsed = true;
         // If the user gave a clear season phrase this turn, hand it to add_tv so it overrides the
         // model's (often wrong) seasons array deterministically against the real season list.
         if (name === 'add_tv') args._seasonPhrase = userSeasonPhraseRaw;
-        const outcome = await runTool(name, args, senderPhone, activeJobs);
+        const provisionConvText = [userMessage, ...((conversationHistory || []).map((m) => m.text))].join(' \n ');
+        const outcome = await runTool(name, args, senderPhone, activeJobs, provisionConvText);
+        // FULL tool response — the arr-visible result the model sees, plus the side-channel search
+        // candidates (titles + ids + popularity the nets use) and any add job. This is what lets us
+        // see the EXACT lookup candidates / add outcome that drove the model's next move.
+        jlog('tool.result', {
+          conversationId: cid,
+          turn,
+          tool: name,
+          result: outcome.result,
+          searchCandidates: outcome.searchResults,
+          job: outcome.job,
+        });
         // Only count an add as "used" if it actually SUCCEEDED. A failed add (hallucinated
         // tmdb_id, lookup miss) must NOT suppress safety-net #2 — otherwise the model can call
         // add_movie, get ok:false, and still narrate "I added it" (the Ghost Dad / James bug,
         // 2026-05-22). Leaving addToolUsed false lets net #2 force a real, correct add.
         if ((name === 'add_movie' || name === 'add_tv') && outcome.result?.ok === true) addToolUsed = true;
+        if (name === 'provision_jellyfin' && outcome.result?.ok === true) { provisionSucceeded = true; provisionResult = outcome.result; }
         // An add that FAILED because the id didn't resolve (hallucinated/wrong id) while no search
         // has happened → flag that we must force a search+re-add (the Oppenheimer-bad-id punt,
         // 2026-05-22). Exclude already_in_library (a legit terminal state, handled by the model).
@@ -660,12 +913,14 @@ export async function runLocalSession(
       if (nudgedForStatusStall) statusStalls++;
       const STATUS_STALL_CAP = 3;
       if (statusStalls > STATUS_STALL_CAP) {
-        console.log(`[local] status-stall ${statusStalls}x without a check_status call — honest error`);
-        return { response: `I couldn't pull the status just now — give it another try in a sec.` };
+        net('status-stall.honest-error', { stalls: statusStalls, content: truncate(content, 300) });
+        const response = `I couldn't pull the status just now — give it another try in a sec.`;
+        jlog('delivery.decision', { conversationId: cid, turn, path: 'status-stall-cap', text: response });
+        return { response };
       }
       nudgedForStatusStall = true;
       const titlePart = statusTitle ? ` with title "${statusTitle}"` : '';
-      console.log(`[local] status-stall detected ("${content.slice(0, 60)}"), forcing check_status${statusTitle ? ` (title: ${statusTitle})` : ''} (stall ${statusStalls}/${STATUS_STALL_CAP})`);
+      net('status-stall', { content: truncate(content, 300), forced: 'check_status', statusTitle: statusTitle || undefined, stall: `${statusStalls}/${STATUS_STALL_CAP}` });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -694,13 +949,15 @@ export async function runLocalSession(
       const STALL_CAP = 3;
       if (forcedSearchStalls > STALL_CAP) {
         const title = failedAddTitle || 'that';
-        console.log(`[local] forced-search stalled ${forcedSearchStalls}x without a tool call — honest error`);
-        return { response: `I hit a snag adding ${title} just now — give it another try in a sec.` };
+        net('bad-id-add.honest-error', { stalls: forcedSearchStalls, title, content: truncate(content, 300) });
+        const response = `I hit a snag adding ${title} just now — give it another try in a sec.`;
+        jlog('delivery.decision', { conversationId: cid, turn, path: 'forced-search-stall-cap', text: response });
+        return { response };
       }
       const wasStall = nudgedForBadIdAdd && stallsWithoutTool(content);
       nudgedForBadIdAdd = true;
       const searchFn = failedAddIsTv ? 'search_tv' : 'search_movie';
-      console.log(`[local] bad-id-add-without-search detected ("${content.slice(0, 60)}")${wasStall ? ' [STALL]' : ''}, forcing ${searchFn} (stall ${forcedSearchStalls}/${STALL_CAP})`);
+      net('bad-id-add-without-search', { content: truncate(content, 300), wasStall, forced: searchFn, failedAddTitle, stall: `${forcedSearchStalls}/${STALL_CAP}` });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -723,7 +980,7 @@ export async function runLocalSession(
     if (addFailedNeedsSearch && searchToolUsed && !addToolUsed && !nudgedForRecoveryAdd) {
       nudgedForRecoveryAdd = true;
       const addFn = failedAddIsTv ? 'add_tv' : 'add_movie';
-      console.log(`[local] recovery re-ask after forced search detected ("${content.slice(0, 60)}"), forcing ${addFn}`);
+      net('recovery-re-ask', { content: truncate(content, 300), forced: addFn, failedAddTitle });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -738,7 +995,7 @@ export async function runLocalSession(
     // forcing turn and retry once.
     if (!toolUsedThisSession && !nudgedForPromise && promisesActionWithoutTool(content)) {
       nudgedForPromise = true;
-      console.log(`[local] promise-without-execute detected ("${content.slice(0, 60)}"), forcing a tool call`);
+      net('promise-without-execute', { content: truncate(content, 300), forced: 'a tool call' });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -753,13 +1010,18 @@ export async function runLocalSession(
     // which is to ASK seasons if a 3+ season show is pending (NOT auto-add all seasons), else add.
     if (addToolUsed === false && !nudgedForFakeAdd && claimsAddWithoutExecuting(content)) {
       nudgedForFakeAdd = true;
-      console.log(`[local] claims-added-without-adding detected ("${content.slice(0, 60)}"), forcing ${pendingSeasonQuestion ? 'a season question' : 'the add'}`);
+      net('claims-added-without-adding', { content: truncate(content, 300), forced: pendingSeasonQuestion ? 'a season question' : (searchToolUsed ? 'the add' : 'a search-then-add'), searchToolUsed, pendingSeasonQuestion });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
         content: pendingSeasonQuestion
           ? 'You have NOT added anything yet. This show has 3 or more seasons, so do not claim it is added — ask me which seasons I want (or "all") and wait for my answer. Reply with that question now.'
-          : 'You have NOT actually added it — no add tool was called. From the search results you already have, call add_movie (or add_tv) RIGHT NOW with the tmdb_id/tvdb_id of the entry that matches what I asked for (match the year if I gave one). Do not reply with words and do not search again — make the add call.',
+          : !searchToolUsed
+            // No search ran this turn (stateless resume — a prior turn's results are NOT in context),
+            // so the model has no real id to add with. Forcing "add from the results you have" is
+            // impossible — make it SEARCH first, then add (the live Star City bug, 2026-05-31).
+            ? 'You have NOT added anything and you have not looked it up this turn, so you do not have a real id to add. Call search_tv now (or search_movie for a film) for the title I asked about, then add it using the id from those results. Do NOT tell me it is added until the add tool actually returns success.'
+            : 'You have NOT actually added it — no add tool was called. From the search results you already have, call add_movie (or add_tv) RIGHT NOW with the tmdb_id/tvdb_id of the entry that matches what I asked for (match the year if I gave one). Do not reply with words and do not search again — make the add call.',
       });
       continue;
     }
@@ -774,11 +1036,33 @@ export async function runLocalSession(
     // second-guessed.
     if (!searchToolUsed && !nudgedForRefusal && userHasPlausibleTitle && (refusesWithoutSearching(content) || claimsResultsWithoutSearching(content))) {
       nudgedForRefusal = true;
-      console.log(`[local] claim-without-searching detected ("${content.slice(0, 60)}"), forcing a search`);
+      net('claim-without-searching', { content: truncate(content, 300), forced: 'a search' });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
         content: 'You have NOT actually searched yet — no search tool was called. Do not say you could not find it without looking. Call search_movie now (or search_tv for a show/series/cartoon) for the title I asked for, passing the year in the year param if I gave one. Make the tool call now, do not reply with words.',
+      });
+      continue;
+    }
+
+    // SAFETY NET #3b — fabricated search result: the model PRESENTS details about a title (FOUND it,
+    // a SEASON COUNT, a "which seasons?" offer) but NEVER called a search tool this session. qwen2.5:7b
+    // reconstructs this entirely from conversation history without looking anything up (the live Star
+    // City bug, 2026-05-31: "Found Star City. Which seasons would you like? ... Star City has 4 seasons
+    // available" — a 1-season show reported as 4, and it was never actually searched). Net #3's
+    // refusesWithoutSearching/claimsResultsWithoutSearching catch the "couldn't find" and "multiple
+    // results, which one?" shapes but NOT the single-show "found it / N seasons" shape. Force a real
+    // search so the match AND the season count come from Sonarr, not the model's memory. Gated on
+    // !searchToolUsed (a genuine post-search reply is untouched) and the non-status path (net #6 owns
+    // status). The user-has-a-title gate prevents hallucinating a title from a title-less message.
+    if (!searchToolUsed && !statusToolUsed && !userAskedStatus && !nudgedForFabricatedFound
+        && userHasPlausibleTitle && claimsFoundWithoutSearching(content)) {
+      nudgedForFabricatedFound = true;
+      net('fabricated-found-without-searching', { content: truncate(content, 300), forced: 'a search' });
+      messages.push({ role: 'assistant', content });
+      messages.push({
+        role: 'user',
+        content: 'You have NOT looked it up yet — do not tell me you found it, how many seasons it has, or ask which seasons until you actually search. Call search_tv now (or search_movie for a film) for the title I asked about, then use ONLY the season_count and id from those results. Make the tool call now, not a reply.',
       });
       continue;
     }
@@ -794,7 +1078,7 @@ export async function runLocalSession(
     if (searchToolUsed && !addToolUsed && !pendingSeasonQuestion && !nudgedForStall
         && !(addFailedNeedsSearch && !searchToolUsed) && stallsWithoutTool(content)) {
       nudgedForStall = true;
-      console.log(`[local] post-search stall detected ("${content.slice(0, 60)}"), forcing the add`);
+      net('post-search-stall', { content: truncate(content, 300), forced: 'the add' });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -823,14 +1107,18 @@ export async function runLocalSession(
         // job (JOB tag → scheduler reports when it lands), and tell them it's grabbing now. Gated to
         // movies (TV file-completeness is per-episode and murkier — left as a follow-up).
         if (!lastSearchWasTv && already.hasFile === false && typeof already.arr_id === 'number' && already.arr_id > 0) {
-          console.log(`[local] already-in-library net: "${already.title}" is in library but hasFile=false — triggering MoviesSearch(${already.arr_id})`);
+          net('already-in-library.movie-no-file', { title: already.title, arr_id: already.arr_id, forced: `MoviesSearch(${already.arr_id})` });
           try {
             await triggerMovieSearch(already.arr_id);
             const job = { type: 'movie' as const, arrId: already.arr_id, title: already.title! };
-            return { response: `${label} is already in your library but hasn't downloaded yet — I'm grabbing it now.\n<!--JOB:movie:${already.arr_id}:${already.title}-->`, job };
+            const response = `${label} is already in your library but hasn't downloaded yet — I'm grabbing it now.\n<!--JOB:movie:${already.arr_id}:${already.title}-->`;
+            jlog('delivery.decision', { conversationId: cid, turn, path: 'already-in-library.movie-no-file', text: response, job });
+            return { response, job };
           } catch (err) {
-            console.error(`[local] MoviesSearch trigger failed for "${already.title}":`, err);
-            return { response: `${label} is in your library but hasn't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.` };
+            jlog('error', { where: 'MoviesSearch-trigger', title: already.title, arr_id: already.arr_id, error: String(err) });
+            const response = `${label} is in your library but hasn't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.`;
+            jlog('delivery.decision', { conversationId: cid, turn, path: 'already-in-library.movie-no-file-error', text: response });
+            return { response };
           }
         }
         // TV analogue (2026-05-24): a SERIES in the library but missing episodes. The /series/lookup
@@ -849,17 +1137,21 @@ export async function runLocalSession(
               incomplete = (st.episodeFileCount ?? 0) < st.episodeCount;
             }
           } catch (err) {
-            console.error(`[local] couldn't fetch series ${already.arr_id} for completeness:`, err);
+            jlog('error', { where: 'getSonarrSeries-completeness', arr_id: already.arr_id, error: String(err) });
           }
           if (incomplete) {
-            console.log(`[local] already-in-library net: series "${already.title}" is in library but missing episodes — triggering SeriesSearch(${already.arr_id})`);
+            net('already-in-library.series-incomplete', { title: already.title, arr_id: already.arr_id, forced: `SeriesSearch(${already.arr_id})` });
             try {
               await triggerSeriesSearch(already.arr_id);
               const job = { type: 'tv' as const, arrId: already.arr_id, title: already.title! };
-              return { response: `${label} is already in your library but some episodes haven't downloaded yet — I'm grabbing them now.\n<!--JOB:tv:${already.arr_id}:${already.title}-->`, job };
+              const response = `${label} is already in your library but some episodes haven't downloaded yet — I'm grabbing them now.\n<!--JOB:tv:${already.arr_id}:${already.title}-->`;
+              jlog('delivery.decision', { conversationId: cid, turn, path: 'already-in-library.series-incomplete', text: response, job });
+              return { response, job };
             } catch (err) {
-              console.error(`[local] SeriesSearch trigger failed for "${already.title}":`, err);
-              return { response: `${label} is in your library but some episodes haven't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.` };
+              jlog('error', { where: 'SeriesSearch-trigger', title: already.title, arr_id: already.arr_id, error: String(err) });
+              const response = `${label} is in your library but some episodes haven't downloaded yet — I tried to kick off another search but hit a snag. Give it another try in a bit.`;
+              jlog('delivery.decision', { conversationId: cid, turn, path: 'already-in-library.series-incomplete-error', text: response });
+              return { response };
             }
           }
         }
@@ -867,8 +1159,10 @@ export async function runLocalSession(
         // reply if the model didn't already say so — never overwrite a good already-have answer.
         const saysAlready = /already (in|added|available|have|got)|in your library/i.test(content);
         if (!saysAlready) {
-          console.log(`[local] already-in-library net: "${already.title}" matches "${lastSearchQuery}" and is in library`);
-          return { response: `${label} is already in your library.` };
+          net('already-in-library.complete', { title: already.title, query: lastSearchQuery });
+          const response = `${label} is already in your library.`;
+          jlog('delivery.decision', { conversationId: cid, turn, path: 'already-in-library.complete', text: response });
+          return { response };
         }
       }
     }
@@ -902,22 +1196,31 @@ export async function runLocalSession(
         const rn = (r.title || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         return qNorm && rn.startsWith(qNorm + ' ');
       });
+      // Fire when the model ASKS ("which seasons?") on a short show OR when it FALSELY CLAIMS it
+      // added the show (claimsAddWithoutExecuting) — the post-search arm of the Star City false-add
+      // bug: net #2 forced a real search, the search found a clear short-show match, but the model
+      // narrated "I've added it" without calling add_tv. A short dominant show needs no season
+      // question, so add all its seasons deterministically instead of delivering the false claim.
       const shortShowDirectAdd = phrasePick === null && avail.length > 0 && avail.length < 3
-        && /\?/.test(content) && !siblingVersions;
+        && (/\?/.test(content) || claimsAddWithoutExecuting(content)) && !siblingVersions;
       const picked = phrasePick !== null ? phrasePick : (shortShowDirectAdd ? 'all' : null);
       if (picked !== null && top?.tvdb_id) {
         nudgedForSeasonSelect = true;
-        console.log(`[local] season-selection net: user="${userMessage}" -> ${JSON.stringify(picked)} for "${top.title}" (tvdb ${top.tvdb_id})${shortShowDirectAdd ? ' [short-show direct add]' : ''}`);
+        net('season-selection', { userMessage, picked, title: top.title, tvdb_id: top.tvdb_id, shortShowDirectAdd });
         const outcome = await runTool('add_tv', { tvdb_id: top.tvdb_id, title: top.title, seasons: picked === 'all' ? undefined : picked }, senderPhone, activeJobs);
+        jlog('tool.result', { conversationId: cid, turn, tool: 'add_tv', via: 'season-selection-net', result: outcome.result, job: outcome.job });
         if (outcome.result?.ok === true && outcome.job) {
           const seasonsAdded = (outcome.result.seasons as number[] | string);
           const seasonText = picked === 'all' || seasonsAdded === 'all'
             ? 'all seasons' : `season${(Array.isArray(seasonsAdded) ? seasonsAdded : []).length === 1 ? '' : 's'} ${(Array.isArray(seasonsAdded) ? seasonsAdded : []).join(', ')}`;
           const response = `Added ${top.title}${top.year ? ` (${top.year})` : ''} — grabbing ${seasonText} now.\n<!--JOB:tv:${outcome.job.arrId}:${outcome.job.title}-->`;
+          jlog('delivery.decision', { conversationId: cid, turn, path: 'season-selection-add', text: response, job: outcome.job });
           return { response, job: outcome.job };
         }
         if (outcome.result?.already_in_library === true) {
-          return { response: `${outcome.result.title} is already in your library.` };
+          const response = `${outcome.result.title} is already in your library.`;
+          jlog('delivery.decision', { conversationId: cid, turn, path: 'season-selection-already-in-library', text: response });
+          return { response };
         }
         // Add failed for some other reason — fall through to the existing nets / honest error.
       }
@@ -938,7 +1241,7 @@ export async function runLocalSession(
       nudgedForOverDisambig = true;
       const top = lastSearchResults[0];
       const count = Array.isArray(top?.seasons) ? top!.seasons!.length : 0;
-      console.log(`[local] tv show-disambig on multi-season show, forcing seasons question for "${top?.title}"`);
+      net('tv-show-disambig', { content: truncate(content, 300), title: top?.title, seasonCount: count, forced: 'seasons question' });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -969,12 +1272,56 @@ export async function runLocalSession(
       const otherIsTv = movieSearched && !tvSearched; // searched movie → now try TV
       const crossFn = otherIsTv ? 'search_tv' : 'search_movie';
       const crossTitle = lastSearchQuery || 'the title I asked for';
-      console.log(`[local] cross-type fallback: ${movieSearched ? 'movie' : 'tv'} search empty, forcing ${crossFn} for "${crossTitle}"`);
+      net('cross-type-fallback', { emptyType: movieSearched ? 'movie' : 'tv', forced: crossFn, crossTitle });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
         content: `Before you say you couldn't find it, check the other type — it might be a ${otherIsTv ? 'TV show' : 'movie'}. Call ${crossFn} RIGHT NOW with query "${crossTitle}". Only if THAT also returns nothing may you say you couldn't find it. Make the tool call now, not a reply.`,
       });
+      continue;
+    }
+
+    // SAFETY NET #14 — not-found DESPITE a real match (carry the search result forward, don't drop it).
+    // After a search returns a clearly-DOMINANT match for the title — most often the cross-type fallback
+    // (net #13) that just forced a search_tv and FOUND the show — the small model sometimes STILL replies
+    // "couldn't find it as a movie or TV show", discarding the result it already has (the live "U.S.
+    // Against the World" bug, 2026-06-16: movie search empty → net #13 forced search_tv → FOUND the
+    // docuseries → model said not-found anyway, so Jeff had to re-ask "it's a tv show"). A not-found
+    // reply is only honest after the search came up EMPTY — here it didn't. So when the model refuses
+    // as not-found but we hold a dominant top result, do NOT accept it: surface that result and force
+    // the right next action — ASK which seasons for a long (pending-season-question) show, otherwise
+    // force the ADD. Anti-bluff is unchanged: the model must still produce a real ok:true add before any
+    // "added" claim is delivered (the add path + FINAL GUARD own that; no add is fabricated here).
+    // Gated on a dominant top result (a genuine miss — search returned only near-miss/unrelated titles —
+    // is NOT dominant via topResultIsDominant, so a real not-found still stands) and fires once.
+    if (searchToolUsed && !addToolUsed && !nudgedForFoundButRefused
+        && refusesWithoutSearching(content) && topResultIsDominant(lastSearchQuery, lastSearchResults)) {
+      nudgedForFoundButRefused = true;
+      const top = lastSearchResults[0];
+      const label = `${top?.title}${top?.year ? ` (${top.year})` : ''}`;
+      // Base the long-vs-short decision on the DOMINANT top result's OWN season count, not the
+      // session-wide pendingSeasonQuestion (which can be set by a non-top result). >=3 → ask which
+      // seasons; otherwise (short show OR movie) → force the add directly.
+      const topSeasonCount = Array.isArray(top?.seasons) ? top!.seasons!.length : 0;
+      const isLongShow = lastSearchWasTv && topSeasonCount >= 3;
+      net('found-but-said-notfound', { content: truncate(content, 300), title: top?.title, isTv: lastSearchWasTv, topSeasonCount, isLongShow, pendingSeasonQuestion });
+      messages.push({ role: 'assistant', content });
+      if (isLongShow) {
+        // Mark over-disambig handled so net #10 doesn't also fire on the model's forced seasons reply.
+        nudgedForOverDisambig = true;
+        messages.push({
+          role: 'user',
+          content: `You DID find it — "${label}" came back in the search results, so do NOT say you couldn't find it. It has ${topSeasonCount} seasons. Ask me which seasons I want (or "all") in one short question. Do not add anything yet.`,
+        });
+      } else {
+        const addFn = lastSearchWasTv ? 'add_tv' : 'add_movie';
+        const idLabel = lastSearchWasTv ? 'tvdb_id' : 'tmdb_id';
+        const topId = lastSearchWasTv ? top?.tvdb_id : top?.tmdb_id;
+        messages.push({
+          role: 'user',
+          content: `You DID find it — "${label}" came back in the search results, so do NOT say you couldn't find it. Call ${addFn} RIGHT NOW using ${idLabel} ${topId ?? 'from the top search result'}. Make the add call now, not a not-found reply.`,
+        });
+      }
       continue;
     }
 
@@ -994,7 +1341,7 @@ export async function runLocalSession(
       const addFn = lastSearchWasTv ? 'add_tv' : 'add_movie';
       const idLabel = lastSearchWasTv ? 'tvdb_id' : 'tmdb_id';
       const topId = lastSearchWasTv ? top?.tvdb_id : top?.tmdb_id;
-      console.log(`[local] over-disambiguation detected ("${content.slice(0, 60)}"), forcing ${addFn} of dominant top result "${top?.title}"`);
+      net('over-disambiguation', { content: truncate(content, 300), forced: addFn, title: top?.title, id: topId });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -1016,12 +1363,14 @@ export async function runLocalSession(
       const STALL_BACKSTOP_CAP = 3;
       stallBackstopNudges++;
       if (stallBackstopNudges > STALL_BACKSTOP_CAP) {
-        console.log(`[local] universal stall backstop hit cap (${stallBackstopNudges}) without a tool call — honest error`);
-        return { response: `I couldn't get that done just now — give it another try in a sec.` };
+        net('universal-stall-backstop.honest-error', { nudges: stallBackstopNudges, content: truncate(content, 300) });
+        const response = `I couldn't get that done just now — give it another try in a sec.`;
+        jlog('delivery.decision', { conversationId: cid, turn, path: 'stall-backstop-cap', text: response });
+        return { response };
       }
       const looksStatus = userAskedStatus || /\b(status|check|ready|downloading|how'?s it|progress|update)\b/i.test(content);
       const titlePart = statusTitle ? ` with title "${statusTitle}"` : '';
-      console.log(`[local] universal stall backstop fired ("${content.slice(0, 60)}"), forcing ${looksStatus ? 'check_status' : 'a search/add'} (nudge ${stallBackstopNudges}/${STALL_BACKSTOP_CAP})`);
+      net('universal-stall-backstop', { content: truncate(content, 300), forced: looksStatus ? 'check_status' : 'a search/add', nudge: `${stallBackstopNudges}/${STALL_BACKSTOP_CAP}` });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -1042,10 +1391,12 @@ export async function runLocalSession(
       const RAW_TOOLCALL_CAP = 3;
       rawToolCallNudges++;
       if (rawToolCallNudges > RAW_TOOLCALL_CAP) {
-        console.log(`[local] raw tool-call string emitted ${rawToolCallNudges}x, unrecoverable — honest error (NOT delivering "${content.slice(0, 60)}")`);
-        return { response: `I hit a snag with that just now — give it another try in a sec.` };
+        net('raw-toolcall-string.honest-error', { nudges: rawToolCallNudges, suppressed: truncate(content, 300) });
+        const response = `I hit a snag with that just now — give it another try in a sec.`;
+        jlog('delivery.decision', { conversationId: cid, turn, path: 'raw-toolcall-cap', text: response, suppressed: truncate(content, 300) });
+        return { response };
       }
-      console.log(`[local] raw tool-call string detected ("${content.slice(0, 60)}"), suppressing + re-forcing (nudge ${rawToolCallNudges}/${RAW_TOOLCALL_CAP})`);
+      net('raw-toolcall-string', { content: truncate(content, 300), forced: 're-force proper tool call', nudge: `${rawToolCallNudges}/${RAW_TOOLCALL_CAP}` });
       messages.push({ role: 'assistant', content });
       messages.push({
         role: 'user',
@@ -1054,12 +1405,87 @@ export async function runLocalSession(
       continue;
     }
 
+    // FINAL GUARD — false add success. The model claims it added something but NO add tool returned
+    // ok:true this session (addToolUsed=false). NEVER tell the user it's added when it isn't — the
+    // live Star City bug (2026-05-31): the model fabricated the entire flow with ZERO tool calls,
+    // net #2 forced once, the model re-claimed success as text, and the lie reached the user. An
+    // "I've added X" reply is only honest after a real successful add (addToolUsed is set true ONLY
+    // on outcome.result.ok===true). The deterministic add nets (#8/#9/#11) return their own correct
+    // strings earlier, so anything reaching here with an unbacked add-claim is a fabrication —
+    // suppress it and deliver an honest failure instead. This is the hard guarantee for the
+    // false-success bug; it runs LAST, after every forcing net has had its chance to make a real add.
+    if (!addToolUsed && claimsAddWithoutExecuting(content)) {
+      const response = `I wasn't able to add that just now — something went wrong on my end and nothing was actually added. Tell me the exact title (and the year, if you know it) and I'll try again.`;
+      net('FINAL-GUARD.false-add', { suppressed: truncate(content, 500), reason: 'no successful add this session', delivered: response });
+      jlog('delivery.decision', { conversationId: cid, turn, path: 'final-guard-false-add', blocked: truncate(content, 500), text: response });
+      return { response };
+    }
+
+    // FINAL GUARD — false provision success. The model claims a Jellyfin invite/account was sent or
+    // created, but NO provision_jellyfin call returned ok:true this session. Same class as the
+    // false-add guard: never tell the owner an invite went out when it didn't. provisionSucceeded is
+    // set true ONLY on outcome.result.ok===true, so an unbacked "invite sent/account created" reply
+    // is a fabrication — suppress it and deliver an honest failure.
+    if (!provisionSucceeded && claimsProvisionWithoutExecuting(content)) {
+      const response = `I wasn't able to set that up just now — nothing was actually created or sent. Give me the email or phone again and I'll retry.`;
+      net('FINAL-GUARD.false-provision', { suppressed: truncate(content, 500), reason: 'no successful provision this session', delivered: response });
+      jlog('delivery.decision', { conversationId: cid, turn, path: 'final-guard-false-provision', blocked: truncate(content, 500), text: response });
+      return { response };
+    }
+
+    // FINAL GUARD — verified provision confirmation. A provision_jellyfin call returned ok:true this
+    // session, meaning the invite was created AND its code was read back from jfa-go (and, for the
+    // phone path, actually texted). The owner-facing confirmation MUST carry the REAL recipient + the
+    // read-back-verified link — never whatever the 7b narrates. The 2026-06-06 incident: a real invite
+    // WAS created, but the model reported a hallucinated "joey@example.com". So OVERRIDE the model's
+    // narration with a deterministic message built from the verified tool result. This is the hard
+    // guarantee for acceptance criteria #1 (real recipient, never a placeholder) and #3 (only the
+    // verified link + recipient). Runs only on a genuine success — failures are handled by the guard
+    // above and the model's own honest-error relays.
+    if (provisionSucceeded && provisionResult) {
+      // Enforce the invariant rather than assume it: an ok:true result must carry BOTH a real
+      // recipient and a verified link. If either is somehow missing, fail loud (honest error) rather
+      // than emit a malformed "...emailed it to  (single-use..." — never report a half-verified result.
+      if (!provisionResult.recipient || !provisionResult.invite_url) {
+        const response = `I wasn't able to confirm that invite just now — give me the email or phone again and I'll retry.`;
+        net('FINAL-GUARD.provision-confirm-incomplete', { result: provisionResult, delivered: response });
+        jlog('delivery.decision', { conversationId: cid, turn, path: 'final-guard-provision-incomplete', text: response, result: provisionResult });
+        return { response };
+      }
+      const response = buildProvisionConfirmation({
+        channel: provisionResult.channel,
+        recipient: provisionResult.recipient,
+        invite_url: provisionResult.invite_url,
+        hours: config.jfago.inviteValidityHours,
+        imessage_unverified: provisionResult.imessage_unverified === true,
+      });
+      net('FINAL-GUARD.provision-confirm', { channel: provisionResult.channel, recipient: provisionResult.recipient, model_narration: truncate(content, 500), delivered: response });
+      jlog('delivery.decision', { conversationId: cid, turn, path: 'final-guard-provision-confirm', text: response, model_narration: truncate(content, 500) });
+      return { response };
+    }
+
     // Strip any dangling "I'll check the other years if you're interested" style follow-up offer the
     // model tacks on after a complete answer (Jeff's no-future-promises rule; live Apex reply,
     // 2026-05-22). The answer is already complete — this only removes the trailing empty offer.
     let response = stripTrailingOffer(content);
+    const offerStripped = response !== content;
     if (lastJob) response += `\n<!--JOB:${lastJob.type}:${lastJob.arrId}:${lastJob.title}-->`;
+    jlog('delivery.decision', {
+      conversationId: cid, turn, path: 'model-final-text',
+      text: truncate(response, 2000), offerStripped, job: lastJob,
+      toolUsedThisSession, searchToolUsed, addToolUsed,
+    });
     return { response, job: lastJob };
+  }
+
+  // Net C — graceful multi-item fallback. The deterministic franchise handler runs before the loop,
+  // so reaching here on a multi-item request means it couldn't be resolved (e.g. no TMDB collection)
+  // and the model thrashed to exhaustion. Don't dead-end with "give it another try" (it'd fail the
+  // same way) — guide the user to ask one title at a time. Only for apparent multi-item requests.
+  if (looksLikeMultiItemRequest(userMessage)) {
+    net('hops-exhausted.multi-item-guidance', { hops: MAX_TOOL_HOPS });
+    jlog('delivery.decision', { conversationId: cid, turn, path: 'hops-exhausted-multi-item', text: MULTI_ITEM_GUIDANCE });
+    return { response: MULTI_ITEM_GUIDANCE };
   }
 
   // Hops exhausted. If we were mid-recovery on a failed add (owed a search/add that never
@@ -1068,14 +1494,19 @@ export async function runLocalSession(
   // other exhaustion (genuinely stuck) still throws and session-manager replies with an error.
   if (addFailedNeedsSearch && !addToolUsed) {
     const title = failedAddTitle || 'that';
-    console.log('[local] hops exhausted mid-recovery without a successful add — honest error');
-    return { response: `I hit a snag adding ${title} just now — give it another try in a sec.` };
+    net('hops-exhausted.mid-recovery-honest-error', { hops: MAX_TOOL_HOPS, title });
+    const response = `I hit a snag adding ${title} just now — give it another try in a sec.`;
+    jlog('delivery.decision', { conversationId: cid, turn, path: 'hops-exhausted-mid-recovery', text: response });
+    return { response };
   }
   // Status query that never resolved to a real check_status — honest error, not a dangling
   // "I'm checking now" promise (mirrors the add-recovery backstop, 2026-05-22).
   if (userAskedStatus && !statusToolUsed) {
-    console.log('[local] hops exhausted on a status query without a check_status — honest error');
-    return { response: `I couldn't pull the status just now — give it another try in a sec.` };
+    net('hops-exhausted.status-honest-error', { hops: MAX_TOOL_HOPS });
+    const response = `I couldn't pull the status just now — give it another try in a sec.`;
+    jlog('delivery.decision', { conversationId: cid, turn, path: 'hops-exhausted-status', text: response });
+    return { response };
   }
+  jlog('error', { conversationId: cid, turn, where: 'runLocalSession', error: 'exceeded max tool hops without a final reply', hops: MAX_TOOL_HOPS });
   throw new Error('local model exceeded max tool hops without a final reply');
 }

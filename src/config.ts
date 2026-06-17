@@ -31,11 +31,7 @@ export const config = {
     qualityProfileId: parseInt(process.env.SONARR_QUALITY_PROFILE_ID || '1'),
     rootFolder: requireEnv('SONARR_ROOT_FOLDER'),
   },
-  // Preferred audio/release language for adds. NOTE: enforcement lives in your Sonarr/Radarr
-  // quality profiles as Custom Formats (a "Language: <lang>" positive CF + a "Not <lang>" negative
-  // CF), NOT in this code. This value is just the documented source of truth for the preference; if
-  // you change it you must rebuild those Custom Formats to match. See README.
-  preferredLanguage: process.env.PREFERRED_LANGUAGE || 'English',
+  // Language preference is set in your Sonarr/Radarr quality profiles via Custom Formats, not here.
   radarr: {
     // Full base URL to your Radarr API v3 root, e.g. http://10.0.0.10:7878/radarr/api/v3
     baseUrl: (process.env.RADARR_URL || 'http://localhost:7878/api/v3').replace(/\/$/, ''),
@@ -68,6 +64,28 @@ export const config = {
     url: (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, ''),
     model: process.env.OLLAMA_MODEL || 'qwen2.5:7b',
   },
+  // jfa-go (Jellyfin account manager) — OPTIONAL. When configured, the OWNER can ask the bot to
+  // provision a new Jellyfin user: the bot creates a single-use jfa-go invite and either emails it
+  // (recipient email) or texts the invite link (recipient phone). All three of url/user/password
+  // must be set to enable it; otherwise provisioning is disabled and the bot says so to the owner.
+  //   - JFAGO_URL: the PUBLIC base, including the url_base path, e.g. https://example.com/accounts.
+  //     Used BOTH for admin API calls AND to build the public invite link (.../invite/<code>), so it
+  //     must be the externally-reachable URL (not a LAN IP) or invitees can't open the link.
+  //   - JFAGO_USER / JFAGO_PASSWORD: a jfa-go admin login (the Jellyfin service account).
+  //   - JFAGO_PROFILE: optional jfa-go profile name applied to new accounts (library access template).
+  //     Empty → jfa-go's default profile. JFAGO_INVITE_HOURS: invite validity window (default 24h).
+  jfago: {
+    url: (process.env.JFAGO_URL || '').replace(/\/$/, ''),
+    user: process.env.JFAGO_USER || '',
+    password: process.env.JFAGO_PASSWORD || '',
+    profile: process.env.JFAGO_PROFILE || '',
+    // `|| 24` also catches a malformed value (parseInt → NaN, which is falsy) and 0.
+    inviteValidityHours: parseInt(process.env.JFAGO_INVITE_HOURS || '24', 10) || 24,
+  },
+  // Public Jellyfin URL included in the invite Jedd texts a new user (so they know where to watch
+  // once they've created their login). Empty → the connect blurb is omitted. Set JELLYFIN_PUBLIC_URL
+  // to your externally-reachable Jellyfin (e.g. https://example.com/jellyfin).
+  jellyfinPublicUrl: (process.env.JELLYFIN_PUBLIC_URL || '').replace(/\/$/, ''),
   // Display name / persona used in prompts and replies.
   displayName: process.env.DISPLAY_NAME || 'Jedd',
   // Access control — DEFAULT DENY. A sender is allowed ONLY if they are the OWNER_PHONE or in the
@@ -84,6 +102,11 @@ export const config = {
 /** True if the sender is the configured owner (full access). */
 export function isOwner(phone: string): boolean {
   return !!config.ownerPhone && phone === config.ownerPhone;
+}
+
+/** True if jfa-go provisioning is fully configured (url + admin user + password all present). */
+export function isJfagoConfigured(): boolean {
+  return !!(config.jfago.url && config.jfago.user && config.jfago.password);
 }
 
 /** True if the sender may interact with the bot. DEFAULT DENY: only the owner and numbers in the

@@ -41,10 +41,16 @@ RESULT RULES:
 - Search returns no results -> reply "Couldn't find that one, sorry." Add nothing.
 - Movie or TV search result has in_library: true -> tell them it's already available, do not add again.
 
+SETTING UP A NEW JELLYFIN USER (account provisioning) — OWNER ONLY:
+- When the OWNER asks to invite / set up / create / add / make a NEW Jellyfin account (or "streaming"/"media server" account) for a person, call provision_jellyfin with that person's EMAIL ADDRESS or PHONE NUMBER in the recipient field (prefer the email if both are given). Examples that should call it: "make a Jellyfin account for my friend, their email is sam@example.com", "invite 801-555-1234 to Jellyfin", "set my buddy up on Jellyfin, his number is +1801...".
+- If they want to set someone up but did NOT include an email or phone, ASK for one ("What's their email or phone number?") and call NO tool yet. NEVER call provision_jellyfin without a real email or phone, and NEVER invent, guess, or use a placeholder like friend@example.com — only ever pass a contact the user literally typed.
+- This is ONLY for creating a PERSON'S account — never call provision_jellyfin for a movie/TV request.
+- After it returns, give the result in ONE message. If it returns ok:false (declined, not configured, not on iMessage, delivery failed, or error), relay its message honestly — do NOT claim an invite was sent when it wasn't.
+
 REPLY STYLE: plain text, casual, 1-3 sentences. No markdown. Never mention internal services or technical details.
 
 ${owner
-  ? `The sender is the owner. They have full access — help with anything.`
+  ? `The sender is the owner. They have full access — help with anything, including setting up new Jellyfin accounts via provision_jellyfin.`
   : `The sender is a family member. They may request movies and TV and check status — ALL of those are allowed, do them normally. The ONLY thing to refuse: if they ask something unrelated to getting media (chit-chat, questions about how you work, what model you are), call NO tool and reply exactly: "Hey! I can help you find movies and TV shows. Just tell me what you're looking for!"`}`;
 }
 
@@ -180,6 +186,34 @@ export function claimsResultsWithoutSearching(text: string): boolean {
     || /\bwhich (one|version)\b[^.!?]*(do you mean|did you mean|would you like)/.test(t);
 }
 
+// Detect a reply that PRESENTS search-derived details about a title — it FOUND the show, states a
+// SEASON COUNT, or offers a season selection ("which seasons would you like?", "I can add all") —
+// the kind of reply that is only legitimate AFTER a real search this session. qwen2.5:7b fabricates
+// this whole shape from CONVERSATION HISTORY without ever calling search_tv (the live Star City bug,
+// 2026-05-31: "Found Star City. It has 4 seasons. Which seasons would you like?" — the count was
+// invented and the show was never actually looked up; live Sonarr says Star City 2026 has 1 season).
+// Net #3b uses this (gated on !searchToolUsed) to force a real search so the match AND the season
+// count come from Sonarr, not the model's memory. The !searchToolUsed gate guarantees a GENUINE
+// post-search "found it / which seasons?" reply is never second-guessed — this fires only when no
+// search ran this turn. claimsResultsWithoutSearching covers the "multiple results, which one?"
+// shape; this covers the SINGLE-show "found it / N seasons" shape it deliberately leaves out.
+export function claimsFoundWithoutSearching(text: string): boolean {
+  const t = text.toLowerCase();
+  if (/i can help you find (movies|movies, tv)/.test(t)) return false;
+  // "already in your library / already added" is a legit terminal reply, handled elsewhere.
+  if (/already (added|in (the )?library|available|have)/.test(t)) return false;
+  // A NEGATED "found" ("couldn't find", "haven't found", "didn't find", "not found") is a refusal,
+  // not a found-claim — refusesWithoutSearching owns that. Don't double-handle it here.
+  if (/\b(could ?n'?t|can'?t|did ?n'?t|have ?n'?t|has ?n'?t|do ?n'?t|not|never|no)\s+(yet\s+)?(been\s+)?(able to\s+)?(seem to\s+)?(find|found|locate)\b/.test(t)) return false;
+  return /(^|[.!?]\s*)(i\s+)?found\b/.test(t)                    // "Found X" / "I found X"
+    || /\bhere'?s what i found\b/.test(t)
+    || /\bi\s+found\b/.test(t)
+    || /\b\d+\s+seasons?\b/.test(t)                              // "4 seasons", "has 4 seasons"
+    || /\bseasons?\b[^.!?]*\bavailable\b/.test(t)                // "... seasons available"
+    || /\bwhich seasons?\b[^.!?]*\b(would|do)\s+you\b/.test(t)   // "which seasons would you like"
+    || /\bi\s+can\s+add\s+(all|them|it|every)/.test(t);          // "I can add all"
+}
+
 // Detect a "stall / hold-on" reply that promises imminent work but contains NO tool call — the
 // model says it is busy ("I'm searching now", "give me a moment", "hang on", "let me look",
 // "one sec") and ENDS the turn without doing anything. This is the dangling-promise failure that
@@ -255,7 +289,7 @@ export function isStallReply(text: string): boolean {
 
 // The known tool names, duplicated here (local-prompt has ZERO runtime deps and can't import the
 // tool schema from local-backend without a cycle). Keep in sync with the `tools` array there.
-const KNOWN_TOOL_NAMES = ['search_movie', 'search_tv', 'add_movie', 'add_tv', 'check_status'];
+const KNOWN_TOOL_NAMES = ['search_movie', 'search_tv', 'add_movie', 'add_tv', 'check_status', 'provision_jellyfin'];
 // Match a function-call invocation emitted as PLAIN TEXT, e.g. `search_movie({"query": "Apex"})` or
 // `add_tv({"tvdb_id": 12345, "title": "X"})`. qwen2.5:7b sometimes prints the tool call as literal
 // content instead of making a real function/tool call — if that text is delivered, the user gets
@@ -601,4 +635,183 @@ export function stallsOnStatus(text: string): boolean {
   const holdShape = stallsWithoutTool(text)
     || /\b(wait|hold on|hang on|one (sec|moment|second|minute)|just a (sec|moment)|give me a (sec|moment|minute)|bear with|stand by)\b/.test(t);
   return checkShape || holdShape;
+}
+
+// --- Multi-movie / franchise request detection (sequential add + collection add, 2026-05-24) ---
+// Jeff's live failure: "Get 3 and 4 as well" and "get all the despicable me movies" — multi-title
+// requests in one message overwhelm the single-title-per-turn flow (the small model thrashes,
+// emits malformed tool calls, hallucinates ids). These detectors drive a DETERMINISTIC handler
+// (resolve the real TMDB collection + real ids, add the members) instead of trusting the model.
+
+// "get all the despicable me movies" / "download the whole star wars saga" → the franchise query
+// ("despicable me" / "star wars"). null when it's not a whole-franchise request. Conservative: needs
+// an explicit all/whole/every + a media noun (movies/films/series/collection/franchise/saga/trilogy).
+export function parseFranchiseAllRequest(msg: string): string | null {
+  if (!msg) return null;
+  const m = msg.match(/\b(?:all|every|the whole|the entire|each)\s+(?:of\s+)?(?:the\s+)?(.+?)\s+(?:movies|films|movie|film|series|collection|franchise|saga|trilogy)\b/i);
+  if (!m) return null;
+  let franchise = m[1].trim().replace(/^the\s+/i, '').trim();
+  // Drop a leading request verb if the capture swallowed one ("get all the X" already handled, but
+  // "all of the despicable me" is clean). Reject empties / too-generic single stopwords.
+  if (franchise.length < 2) return null;
+  if (/^(the|a|an|of|those|these|them|it|that|this|my|some|good|best|new|other)$/i.test(franchise)) return null;
+  return franchise;
+}
+
+// "get 3 and 4 as well" → [3,4]; "1, 2 and 3" → [1,2,3]; "2 & 3" → [2,3]. Requires a LIST of >=2
+// bare numbers joined by and/comma/&. null for a single number ("get 3" — leave to the model), an
+// ordinal ("the 3rd one"), a count ("get 3 movies"), or a season/episode phrase (handled elsewhere).
+export function parseSequelNumberList(msg: string): number[] | null {
+  if (!msg) return null;
+  const t = msg.toLowerCase();
+  if (/\b(seasons?|episodes?|eps?|series)\b/.test(t)) return null; // TV territory, not movie sequels
+  // Must look like a join of two numbers (list intent), not a lone number in a sentence.
+  if (!/\b\d{1,2}\s*(?:,|and|&|\+)\s*\d{1,2}\b/.test(t)) return null;
+  const nums: number[] = [];
+  // \b\d\b excludes ordinals like "3rd"/"4th" (no word boundary before the letters). Negative
+  // lookahead drops counts like "3 movies" / "4 films".
+  const re = /\b(\d{1,2})\b(?!\s*(?:movies?|films?|times?|of))/gi;
+  let mm: RegExpExecArray | null;
+  while ((mm = re.exec(t)) !== null) {
+    const n = parseInt(mm[1], 10);
+    if (n >= 1 && n <= 20 && !nums.includes(n)) nums.push(n);
+  }
+  return nums.length >= 2 ? nums.sort((a, b) => a - b) : null;
+}
+
+// Derive a franchise base name from recent conversation (for the bare "get 3 and 4" case where the
+// franchise is only in history). Pulls the most recent "Title (YYYY)" mention and strips a trailing
+// sequel number — "I've added Despicable Me 2 (2013)…" → "Despicable Me". null if none found.
+export function franchiseQueryFromHistory(history?: Array<{ role: string; text: string }>): string | null {
+  if (!history || history.length === 0) return null;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const text = history[i]?.text || '';
+    // Capture a Title (Year). Lowercase connector words (of/the/and/&/in/on/to/a/an/part/vol/chapter)
+    // are allowed WITHIN the run so multi-word titles survive ("The Lord of the Rings", not "Rings").
+    // Connector words are matched as WHOLE words (no trailing [\w]* — otherwise "a" would eat
+    // "added", "of" would eat "office"). Only the Title-case/number branch takes a suffix.
+    const m = text.match(/([A-Z][\w']*(?:\s+(?:the|and|of|an|a|in|on|to|part|vol\.?|chapter|&|[A-Z0-9][\w'.]*))*)\s*\((?:19|20)\d{2}\)/);
+    if (m) {
+      let base = m[1].trim();
+      // The capture can swallow a sentence-leading reply verb that's also capitalized ("Added
+      // Despicable Me 2 (2013)" → "Added Despicable Me 2"). Strip ONLY unambiguous reply-lead words
+      // (NOT title-plausible verbs like "Get"/"I"/"Finding" — those start real titles: Get Out, I Am
+      // Legend, Finding Nemo). Loop in case more than one leads.
+      let prev: string;
+      do {
+        prev = base;
+        base = base.replace(/^(?:added|adding|grabbing|grabbed|downloading|here'?s)\s+/i, '');
+      } while (base !== prev);
+      base = base.replace(/\s+\d{1,2}$/, '').trim(); // drop a trailing sequel number
+      if (base.length >= 2) return base;
+    }
+  }
+  return null;
+}
+
+// True when the message looks like it's asking for MORE THAN ONE title at once — used as a graceful
+// fallback (net C): if a turn exhausts tool hops on such a request, guide the user instead of the
+// dead-end "give it another try" (which just fails the same way). Broader than the two parsers above.
+export function looksLikeMultiItemRequest(msg: string): boolean {
+  if (!msg) return false;
+  if (parseFranchiseAllRequest(msg) !== null || parseSequelNumberList(msg) !== null) return true;
+  // A bare number list, but not a TV season/episode phrase (which is handled elsewhere).
+  return !/\b(seasons?|episodes?|eps?)\b/i.test(msg)
+    && /\b\d{1,2}\s*(?:,|and|&|\+)\s*\d{1,2}\b/.test(msg);
+}
+
+// The sequel index of a title within its franchise: a trailing integer ("Despicable Me 3" → 3), else
+// the first film is 1 ("Despicable Me" → 1). Used to map a number-list selection to real members.
+export function sequelNumberOfTitle(title: string): number {
+  const m = (title || '').match(/\b(\d{1,2})\s*$/);
+  return m ? parseInt(m[1], 10) : 1;
+}
+
+// --- jfa-go Jellyfin provisioning helpers (owner-only) ------------------------------------------
+// Provisioning is driven by the `provision_jellyfin` tool: the OWNER asks Jedd to set up a new
+// Jellyfin user, the model calls the tool with the recipient (email or phone), and runTool does the
+// owner gate + iMessage check + invite create/deliver. These helpers parse the recipient, build the
+// invite message a phone recipient is texted, and detect a fabricated "invite sent" claim (guard).
+
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+
+export interface InviteRecipient { kind: 'email' | 'phone'; value: string; }
+
+// Pull a single recipient out of a string — an email (preferred) or a phone number. Phone detection
+// requires a 10- or 11-digit run (optionally +-prefixed; spaces/dashes/parens/dots allowed) so it
+// won't grab a stray year or season number. Returns null if neither is present.
+export function extractInviteRecipient(msg: string): InviteRecipient | null {
+  if (!msg) return null;
+  const email = msg.match(EMAIL_RE);
+  if (email) return { kind: 'email', value: email[0] };
+  const phoneMatch = msg.match(/\+?\d[\d\s().-]{8,}\d/);
+  if (phoneMatch) {
+    const cleaned = phoneMatch[0].replace(/[^\d+]/g, '');
+    const onlyDigits = cleaned.replace(/\D/g, '');
+    if (onlyDigits.length === 10 || onlyDigits.length === 11) return { kind: 'phone', value: cleaned };
+  }
+  return null;
+}
+
+// Short "how to connect" blurb appended to a texted invite. Empty when no public Jellyfin URL is set.
+export function connectBlurb(jellyfinUrl: string): string {
+  if (!jellyfinUrl) return '';
+  return `Once you've picked a username and password, watch at ${jellyfinUrl} — open it in any web browser, or get the free Jellyfin app (iPhone/iPad, Android, Apple TV, Fire TV) and point it at that URL, then sign in.`;
+}
+
+// "How to request media via Jedd" explainer appended to a new user's invite. The live Jedd accepts
+// media requests from ALL senders (ALLOW_ALL_SENDERS=true), so a freshly-invited user CAN text Jedd
+// to request movies/shows. Apostrophes are intentional (don't / you're / I'll) — keep them correct.
+// The iMESSAGE variant says "just text this number": the recipient already has Jedd's number in the
+// same thread. For the EMAIL path the recipient has no number — that explainer (with Jedd's iMessage
+// handle jeffreylunt@outlook.com) is delivered by jfa-go's email footer ([messages].message) and the
+// post-signup success page, configured server-side on the jfa-go host, NOT built here.
+export const MEDIA_REQUEST_BLURB =
+  'Want to watch something we don\'t have yet? Just text this number what you\'re looking for — e.g. "add Dune Part Two" or "can you get The Bear" — and I\'ll add it automatically.';
+
+// The full invite message Jedd TEXTS a phone recipient: the single-use signup link, how to connect,
+// and how to request new media. (This is the iMessage path only; the email path is sent by jfa-go.)
+export function buildInviteText(link: string, hours: number, jellyfinUrl: string): string {
+  const blurb = connectBlurb(jellyfinUrl);
+  const base = `You've been invited to set up a Jellyfin account! Create your login here (single-use link, expires in ${hours}h): ${link}`;
+  const parts = [base];
+  if (blurb) parts.push(blurb);
+  parts.push(MEDIA_REQUEST_BLURB);
+  return parts.join('\n\n');
+}
+
+// Build the OWNER-facing confirmation for a SUCCESSFUL provision, using ONLY the verified tool result
+// — the REAL recipient (the email/phone the user actually gave) and the read-back-verified invite
+// link (createInviteAndGetLink confirmed the code via GET /invites before this runs). The success
+// reply must NEVER be the local 7b's free narration: on 2026-06-06 a real invite WAS created, yet the
+// model reported a hallucinated "joey@example.com". runLocalSession therefore OVERRIDES the model's
+// final text with this builder whenever a provision_jellyfin call returned ok:true, guaranteeing the
+// owner always sees the true recipient + the verified link (acceptance criteria #1 and #3).
+export function buildProvisionConfirmation(r: {
+  channel?: string; recipient?: string; invite_url?: string; hours?: number; imessage_unverified?: boolean;
+}): string {
+  const hours = typeof r.hours === 'number' && r.hours > 0 ? r.hours : 24;
+  const to = r.recipient || '';
+  const link = r.invite_url || '';
+  if (r.channel === 'email') {
+    return `Done — I created a Jellyfin invite and emailed it to ${to} (single-use, expires in ${hours}h). If it doesn't arrive, share this link directly: ${link}`;
+  }
+  // phone / iMessage path
+  if (r.imessage_unverified) {
+    return `Done — I created a Jellyfin invite and texted it to ${to} (single-use, expires in ${hours}h). I couldn't fully confirm it landed on iMessage, so if it doesn't show up, share this link directly: ${link}`;
+  }
+  return `Done — I created a Jellyfin invite and texted it to ${to} (single-use, expires in ${hours}h). If it doesn't show up, share this link directly: ${link}`;
+}
+
+// Detect a reply that CLAIMS a Jellyfin account/invite was set up or sent. Used as a FINAL DELIVERY
+// GUARD: if the model claims provisioning success but no provision_jellyfin call returned ok this
+// session, the claim is a fabrication and must be suppressed (mirrors claimsAddWithoutExecuting).
+export function claimsProvisionWithoutExecuting(text: string): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  // Must reference an account/invite/jellyfin so it doesn't fire on a movie "I've added X" reply.
+  if (!/\b(invite|account|jellyfin)\b/.test(t)) return false;
+  return /\b(invite|account)\b[^.!?]*\b(sent|created|set up|emailed|texted|sent over|on its way|is ready)\b/.test(t)
+    || /\b(sent|emailed|texted|created|set up)\b[^.!?]*\b(invite|account)\b/.test(t)
+    || /\b(i'?ve|i have|just)\b[^.!?]*\b(set up|created|sent|emailed|texted)\b[^.!?]*\b(invite|account|jellyfin)\b/.test(t);
 }
