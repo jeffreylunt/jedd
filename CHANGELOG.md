@@ -3,6 +3,22 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [1.4.4] — 2026-06-16
+
+Always search both movies and TV, and ask which you meant when a title is both.
+
+### Added
+- **Every title request now searches BOTH movies and TV.** When you ask for something without saying
+  whether it's a movie or a show, Jedd now looks it up in both libraries at once and considers the
+  results together — instead of guessing one type and only checking the other as a fallback.
+- **A movie-and-a-show with the same name now asks which you want.** If a title matches both a movie
+  *and* a TV show (or a few comparable options), Jedd presents a short numbered list and lets you
+  pick — *"1. Twisted Metal (2017) — movie / 2. Twisted Metal (2023) — TV show"*. Reply with the
+  number (or just "movie" / "show"), and Jedd adds the movie (or short show) or asks which seasons
+  for a long series. A single clear match still goes straight through with no extra question, so the
+  common case is unchanged. The anti-fabrication guard is intact — Jedd never claims it added
+  something unless the add really succeeded.
+
 ## [1.4.3] — 2026-06-16
 
 Bugfix release for the cross-type (movie↔TV) search fallback.

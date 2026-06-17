@@ -8,7 +8,7 @@ process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
 
 const { promisesActionWithoutTool, claimsAddWithoutExecuting, splitQueryYear, titlesRoughlyMatch } = await import('./local-backend.js');
-const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle } = await import('./local-prompt.js');
+const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, buildCrossTypeChoiceList, parseCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle } = await import('./local-prompt.js');
 
 // --- splitQueryYear: derive year from param OR a year stuffed into the query (Eternity regression) ---
 
@@ -757,4 +757,76 @@ test('sequelNumberOfTitle maps title to franchise index', () => {
   assert.equal(sequelNumberOfTitle('Despicable Me'), 1);
   assert.equal(sequelNumberOfTitle('Despicable Me 2'), 2);
   assert.equal(sequelNumberOfTitle('Despicable Me 4'), 4);
+});
+
+// --- Cross-type (movie ⇄ TV) disambiguation helpers (always-search-both, 2026-06-16) ------------
+
+test('buildCrossTypeChoiceList → parseCrossTypeChoiceList round-trips candidates', () => {
+  const cands = [
+    { type: 'movie' as const, title: 'U.S. Against the World', year: 2020 },
+    { type: 'tv' as const, title: 'U.S. Against the World', year: 2023 },
+  ];
+  const list = buildCrossTypeChoiceList('U.S. Against the World', cands);
+  assert.match(list, /1\./);
+  assert.match(list, /2\./);
+  assert.match(list, /movie/i);
+  assert.match(list, /tv show/i);
+  const parsed = parseCrossTypeChoiceList(list);
+  assert.ok(parsed, 'list must parse back out');
+  assert.equal(parsed!.length, 2);
+  assert.equal(parsed![0].type, 'movie');
+  assert.equal(parsed![0].year, 2020);
+  assert.equal(parsed![1].type, 'tv');
+  assert.equal(parsed![1].year, 2023);
+});
+
+test('parseCrossTypeChoiceList returns null for ordinary prose (no false match)', () => {
+  assert.equal(parseCrossTypeChoiceList('Added The Matrix (1999) — grabbing it now.'), null);
+  assert.equal(parseCrossTypeChoiceList('Couldn\'t find that one, sorry.'), null);
+  assert.equal(parseCrossTypeChoiceList(''), null);
+});
+
+test('findCrossTypeChoiceInHistory only honors the MOST RECENT assistant message', () => {
+  const list = buildCrossTypeChoiceList('The Bear', [
+    { type: 'movie' as const, title: 'The Bear', year: 1988 },
+    { type: 'tv' as const, title: 'The Bear', year: 2022 },
+  ]);
+  // List is the last assistant turn → found.
+  assert.ok(findCrossTypeChoiceInHistory([
+    { role: 'user', text: 'get the bear' },
+    { role: 'assistant', text: list },
+  ]));
+  // A later non-list assistant turn shadows it → not a live pick context.
+  assert.equal(findCrossTypeChoiceInHistory([
+    { role: 'assistant', text: list },
+    { role: 'user', text: 'never mind' },
+    { role: 'assistant', text: 'No worries!' },
+  ]), null);
+});
+
+test('resolveCrossTypePick maps number / year / type word / title to the right candidate', () => {
+  const cands = [
+    { type: 'movie' as const, title: 'The Bear', year: 1988 },
+    { type: 'tv' as const, title: 'The Bear', year: 2022 },
+  ];
+  assert.equal(resolveCrossTypePick('1', cands)!.type, 'movie');
+  assert.equal(resolveCrossTypePick('the second one', cands)!.type, 'tv');
+  assert.equal(resolveCrossTypePick('the 2022 one', cands)!.type, 'tv');
+  assert.equal(resolveCrossTypePick('the show', cands)!.type, 'tv');
+  assert.equal(resolveCrossTypePick('the movie', cands)!.type, 'movie');
+  // A season-phrase reply signals TV intent — the "season" keyword must win over the bare digit
+  // (otherwise "season 1" would map to position 1 = the movie). Regression guard for the fix.
+  assert.equal(resolveCrossTypePick('season 1', cands)!.type, 'tv');
+  assert.equal(resolveCrossTypePick('I want seasons 1 and 2', cands)!.type, 'tv');
+  // Unresolvable → null (falls through to the model loop).
+  assert.equal(resolveCrossTypePick('something totally different', cands), null);
+});
+
+test('extractRequestTitle strips request framing but preserves single-word titles', () => {
+  assert.equal(extractRequestTitle('Can you get The Bear'), 'The Bear');
+  assert.equal(extractRequestTitle('add Severance'), 'Severance');
+  assert.equal(extractRequestTitle('download Dune please'), 'Dune');
+  assert.equal(extractRequestTitle('I want to watch The Office'), 'The Office');
+  // The trailing \s+ after the verb protects single-token titles.
+  assert.equal(extractRequestTitle('Watchmen'), 'Watchmen');
 });

@@ -727,6 +727,132 @@ export function sequelNumberOfTitle(title: string): number {
   return m ? parseInt(m[1], 10) : 1;
 }
 
+// --- Always-search-both + cross-type (movie ⇄ TV) disambiguation (2026-06-16) ---------------------
+// Jeff's ask: for a type-AMBIGUOUS bare title request, search BOTH Radarr (movie) and Sonarr (TV)
+// and consider the result sets together. When a title matches a clearly-dominant MOVIE *and* a
+// clearly-dominant SHOW (or several comparable works), don't silently pick one — present a numbered
+// list and let the user choose. A SINGLE dominant match proceeds straight through (the existing
+// model loop / nets add it). These helpers are the zero-dep presentation + pick-parsing layer; the
+// arr-driven orchestration lives in local-backend's handleCrossTypeRequest.
+
+export interface CrossTypeCandidate {
+  type: 'movie' | 'tv';
+  title: string;
+  year?: number;
+  // Optional ids/season-count when known from a fresh search (the handler re-searches before adding,
+  // so the id is always taken from a live result, never from this candidate's stale value).
+  tmdb_id?: number;
+  tvdb_id?: number;
+  season_count?: number;
+}
+
+// Build the user-facing numbered choice list. Movies are listed before shows, each in the order
+// given. The "N. Title (Year) — movie|TV show" shape is parseable back out of history on the pick
+// turn (parseCrossTypeChoiceList), so a stateless resume can map a "1" / "the show" reply to a pick.
+export function buildCrossTypeChoiceList(query: string, candidates: CrossTypeCandidate[]): string {
+  const lines = candidates.map((c, i) => {
+    const yr = c.year ? ` (${c.year})` : '';
+    const kind = c.type === 'movie' ? 'movie' : 'TV show';
+    return `${i + 1}. ${c.title}${yr} — ${kind}`;
+  });
+  const q = query ? ` for "${query}"` : '';
+  return `I found a couple of matches${q} — there's both a movie and a show (or a few options). Which one do you want?\n${lines.join('\n')}\nJust reply with the number (or say "movie" or "show").`;
+}
+
+// Parse a previously-presented choice list back into ordered candidates, or null when the text is not
+// one. Requires >= 2 numbered "N. Title (Year) — movie|TV show" lines so it never false-matches prose.
+const CHOICE_LINE_RE = /^\s*(\d{1,2})[.)]\s+(.+?)\s*(?:\((\d{4})\))?\s*[—–-]\s*(movie|tv show)\s*$/i;
+export function parseCrossTypeChoiceList(text: string): CrossTypeCandidate[] | null {
+  if (!text) return null;
+  const out: CrossTypeCandidate[] = [];
+  for (const raw of text.split('\n')) {
+    const m = raw.match(CHOICE_LINE_RE);
+    if (!m) continue;
+    out.push({
+      type: /tv/i.test(m[4]) ? 'tv' : 'movie',
+      title: m[2].trim(),
+      year: m[3] ? Number(m[3]) : undefined,
+    });
+  }
+  return out.length >= 2 ? out : null;
+}
+
+// The most recent cross-type choice list Jedd presented, so a stateless resume can resolve the user's
+// pick against it. Only the MOST RECENT assistant message counts — if Jedd's last message wasn't a
+// choice list, the user isn't replying to one (returns null → treat as a fresh request).
+export function findCrossTypeChoiceInHistory(history?: Array<{ role: string; text: string }>): CrossTypeCandidate[] | null {
+  if (!history) return null;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role !== 'assistant') continue;
+    return parseCrossTypeChoiceList(history[i].text);
+  }
+  return null;
+}
+
+// Map the user's reply to one of the presented candidates: a year ("the 2023 one"), a position number
+// or ordinal ("2", "the second", "option 1"), a type word ("the movie" / "show" / "tv" / "series"), or
+// a title match. Returns the chosen candidate, or null when the reply doesn't clearly select one (the
+// caller then falls through to the model loop — it may be a brand-new request, not a pick).
+export function resolveCrossTypePick(userMessage: string, candidates: CrossTypeCandidate[]): CrossTypeCandidate | null {
+  if (!userMessage || !candidates || candidates.length === 0) return null;
+  const t = userMessage.toLowerCase().trim();
+  // 1) Year ("the 2023 one") — a 4-digit year that uniquely matches one candidate.
+  const yearMatch = t.match(/\b(?:19|20|21)\d{2}\b/);
+  if (yearMatch) {
+    const byYear = candidates.filter(c => c.year === Number(yearMatch[0]));
+    if (byYear.length === 1) return byYear[0];
+  }
+  // 2) Type word — checked BEFORE the bare position number so a reply like "season 1" / "the show"
+  //   resolves to the TV candidate (TV intent) rather than position 1 (which would be the movie).
+  //   Works only when there is exactly one candidate of that type.
+  const wantsMovie = /\b(movie|film)\b/.test(t);
+  const wantsTv = /\b(show|series|tv|cartoon|seasons?|episodes?)\b/.test(t);
+  if (wantsMovie && !wantsTv) {
+    const movies = candidates.filter(c => c.type === 'movie');
+    if (movies.length === 1) return movies[0];
+  }
+  if (wantsTv && !wantsMovie) {
+    const tvs = candidates.filter(c => c.type === 'tv');
+    if (tvs.length === 1) return tvs[0];
+  }
+  // 3) Position number ("2", "number 2", "option 1") — 1-2 digits, never inside a 4-digit year.
+  const numMatch = t.match(/\b(\d{1,2})\b/);
+  if (numMatch) {
+    const n = Number(numMatch[1]);
+    if (n >= 1 && n <= candidates.length) return candidates[n - 1];
+  }
+  // 4) Ordinal words.
+  const ordinals: Array<[RegExp, number]> = [
+    [/\b(first|1st)\b/, 1], [/\b(second|2nd)\b/, 2], [/\b(third|3rd)\b/, 3], [/\b(fourth|4th)\b/, 4],
+  ];
+  for (const [re, n] of ordinals) if (re.test(t) && n <= candidates.length) return candidates[n - 1];
+  // 5) Title match — the reply names exactly one candidate's title.
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const tn = norm(userMessage);
+  if (tn) {
+    const hits = candidates.filter(c => { const cn = norm(c.title); return cn && (tn === cn || tn.includes(cn)); });
+    if (hits.length === 1) return hits[0];
+  }
+  return null;
+}
+
+// Pull the media TITLE out of a request message by stripping a leading request frame ("can you get",
+// "add", "download", "i want to watch", a greeting/please) and trailing politeness. ANCHORED so it
+// only removes a clear lead, never the middle of a title; the trailing `\s+` after each verb protects
+// single-word titles ("Watchmen" is not "watch" + "men"). Imperfect by design — it only gates the
+// cross-type handler, and a slightly-off title just yields no dominant match → safe fall-through.
+export function extractRequestTitle(userMessage: string): string {
+  if (!userMessage) return '';
+  let s = userMessage.trim().replace(/[?!.]+\s*$/, '').replace(/["“”'`]/g, '').trim();
+  s = s.replace(/^(?:hey|hi|hello)[,!\s]+/i, '');
+  s = s.replace(/^(?:can|could|would|will)\s+(?:you|we|u|i)\s+(?:please\s+)?/i, '');
+  s = s.replace(/^(?:please|pls|plz)\s+/i, '');
+  s = s.replace(/^(?:i\s+(?:want|need)|i'?d\s+like|i\s+would\s+like|lemme|let\s+me)\s+(?:to\s+(?:watch|see|get|download|add)\s+)?/i, '');
+  s = s.replace(/^(?:get|add|download|grab|find|put on|pull up|watch|see)\s+(?:me\s+|us\s+)?/i, '');
+  s = s.replace(/\s+(?:for me|please|pls|plz|thanks?|thx)\s*$/i, '').trim();
+  return s;
+}
+
 // --- jfa-go Jellyfin provisioning helpers (owner-only) ------------------------------------------
 // Provisioning is driven by the `provision_jellyfin` tool: the OWNER asks Jedd to set up a new
 // Jellyfin user, the model calls the tool with the recipient (email or phone), and runTool does the

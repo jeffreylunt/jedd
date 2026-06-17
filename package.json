@@ -1,6 +1,6 @@
 {
   "name": "jedd",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Self-hosted iMessage bot that adds movie/TV requests to Sonarr/Radarr via a local Ollama model",
   "license": "MIT",
   "type": "module",

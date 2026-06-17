@@ -1357,3 +1357,144 @@ test('net C — unresolvable multi-item request → graceful guidance, not a dea
     stub.restore();
   }
 });
+
+// --- Always-search-both + cross-type (movie ⇄ TV) disambiguation (2026-06-16) -------------------
+// Jeff's ask: for a bare title, search BOTH Radarr and Sonarr; when it matches a dominant movie AND a
+// dominant show, present a numbered choice (don't auto-pick); after the user picks, add the movie /
+// short show or ask seasons for a long show. A single dominant match proceeds straight through.
+
+test('cross-type: bare title that is BOTH a movie and a show → searches both, presents a numbered choice, adds nothing', async () => {
+  const movieResults = [{ tmdbId: 50001, title: 'The Outsider', year: 2018, id: 0, popularity: 12 }];
+  const tvResults = [{ tvdbId: 60001, title: 'The Outsider', year: 2020, id: 0, popularity: 11,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }] }];
+  // No model turns are needed — the deterministic handler answers BEFORE the loop. (A fallback turn
+  // is provided in case the handler ever fell through, so the test fails loudly rather than hanging.)
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'The Outsider': movieResults },
+    sonarrByTerm: { 'The Outsider': tvResults },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'can you get The Outsider', []);
+    assert.equal(r.job, undefined, 'must NOT add anything — the user has to pick first');
+    assert.match(r.response, /which one/i, 'should present a choice');
+    assert.match(r.response, /1\./, 'numbered option 1');
+    assert.match(r.response, /2\./, 'numbered option 2');
+    assert.match(r.response, /movie/i);
+    assert.match(r.response, /tv show/i);
+    assert.doesNotMatch(r.response, /FALLBACK/, 'the deterministic handler must answer, not the model');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'BOTH types searched: movie');
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'BOTH types searched: TV');
+    assert.equal(calls.filter(c => c.startsWith('POST')).length, 0, 'no add POST before a pick');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('cross-type pick: user picks the MOVIE from a prior choice list → adds the movie', async () => {
+  const movieResults = [{ tmdbId: 50001, title: 'The Outsider', year: 2018, id: 0, popularity: 12 }];
+  const tvResults = [{ tvdbId: 60001, title: 'The Outsider', year: 2020, id: 0, popularity: 11,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }] }];
+  const choiceList = '1. The Outsider (2018) — movie\n2. The Outsider (2020) — TV show';
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'The Outsider': movieResults },
+    radarrByTmdb: { 50001: [{ tmdbId: 50001, title: 'The Outsider', year: 2018 }] },
+    sonarrByTerm: { 'The Outsider': tvResults },
+    onMovieAdd: (b) => ({ id: 701, title: b.title, tmdbId: b.tmdbId, year: 2018 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'the movie', [], [
+      { role: 'user', text: 'can you get The Outsider', timestamp: 't' },
+      { role: 'assistant', text: choiceList, timestamp: 't' },
+    ]);
+    assert.ok(r.job, 'should add the chosen movie');
+    assert.equal(r.job!.type, 'movie');
+    assert.equal(r.job!.arrId, 701);
+    assert.match(r.response, /Added The Outsider/i);
+    assert.doesNotMatch(r.response, /FALLBACK/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('cross-type pick: user picks a LONG show → asks which seasons, adds nothing', async () => {
+  const tvResults = [{ tvdbId: 60002, title: 'The Outsider', year: 2020, id: 0, popularity: 11,
+    seasons: [{ seasonNumber: 1 }, { seasonNumber: 2 }, { seasonNumber: 3 }, { seasonNumber: 4 }] }];
+  const choiceList = '1. The Outsider (2018) — movie\n2. The Outsider (2020) — TV show';
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'The Outsider': [{ tmdbId: 50001, title: 'The Outsider', year: 2018, id: 0 }] },
+    sonarrByTerm: { 'The Outsider': tvResults },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'the show', [], [
+      { role: 'user', text: 'can you get The Outsider', timestamp: 't' },
+      { role: 'assistant', text: choiceList, timestamp: 't' },
+    ]);
+    assert.equal(r.job, undefined, 'a long show must ask seasons before adding');
+    assert.match(r.response, /season/i, 'should ask which seasons');
+    assert.match(r.response, /The Outsider/i);
+    const calls = stub.calls();
+    assert.equal(calls.filter(c => /\/series(\?|$)/.test((c.split(' ')[1] || c)) && c.startsWith('POST')).length, 0, 'no series add before a season pick');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('cross-type pick: user picks a SHORT show by number → adds all seasons', async () => {
+  const tvResults = [{ tvdbId: 60003, title: 'Twisted Metal', year: 2023, id: 0, popularity: 9,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }, { seasonNumber: 2 }] }];
+  const choiceList = '1. Twisted Metal (2017) — movie\n2. Twisted Metal (2023) — TV show';
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  let addBody: any;
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { 'Twisted Metal': [{ tmdbId: 50009, title: 'Twisted Metal', year: 2017, id: 0 }] },
+    sonarrByTerm: { 'Twisted Metal': tvResults },
+    sonarrByTvdb: { 60003: tvResults },
+    onTvAdd: (b) => { addBody = b; return { id: 702, title: b.title, tvdbId: b.tvdbId, seasons: b.seasons }; },
+  });
+  try {
+    const r = await runLocalSession('+15551234567', '2', [], [
+      { role: 'user', text: 'can you get Twisted Metal', timestamp: 't' },
+      { role: 'assistant', text: choiceList, timestamp: 't' },
+    ]);
+    assert.ok(r.job, 'should add the chosen short show');
+    assert.equal(r.job!.type, 'tv');
+    assert.equal(r.job!.arrId, 702);
+    assert.match(r.response, /Added Twisted Metal/i);
+    assert.match(r.response, /all seasons/i);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('cross-type: a SINGLE dominant match (movie only) → NO disambiguation, falls through to the normal add', async () => {
+  // Inception is a dominant movie and NOT a show. The handler searches both, finds only one dominant
+  // candidate, and falls through to the model loop — which adds it straight through (no choice list).
+  const movieResults = [{ tmdbId: 27205, title: 'Inception', year: 2010, id: 0, popularity: 30 }];
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Inception' }),
+    { content: 'I found Inception (2010). Which one did you mean?' },   // needless ask → net #8 forces add
+    tc('add_movie', { tmdb_id: 27205, title: 'Inception' }),
+    { content: 'Done — Inception (2010) is downloading now.' },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { Inception: movieResults },
+    radarrByTmdb: { 27205: [{ tmdbId: 27205, title: 'Inception', year: 2010 }] },
+    sonarrByTerm: { Inception: [] },                                     // not a show
+    onMovieAdd: (b) => ({ id: 705, title: b.title, tmdbId: b.tmdbId, year: 2010 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get Inception', []);
+    assert.ok(r.job, 'a single dominant match should be added straight through');
+    assert.equal(r.job!.arrId, 705);
+    assert.doesNotMatch(r.response, /which one do you want/i, 'must NOT present a cross-type choice for a single dominant match');
+    const calls = stub.calls();
+    assert.ok(calls.some(c => c.includes('/movie/lookup')), 'movie searched');
+    assert.ok(calls.some(c => c.includes('/series/lookup')), 'TV searched too (always-search-both)');
+  } finally {
+    stub.restore();
+  }
+});

@@ -19,7 +19,7 @@ import {
   searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue, triggerMovieSearch,
   searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue, getSonarrSeries, triggerSeriesSearch,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, extractInviteRecipient, buildInviteText, buildProvisionConfirmation, claimsProvisionWithoutExecuting } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, extractInviteRecipient, buildInviteText, buildProvisionConfirmation, claimsProvisionWithoutExecuting, buildCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle, type CrossTypeCandidate } from './local-prompt.js';
 import { jlog, truncate } from './logger.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
@@ -663,6 +663,178 @@ async function handleMultiMovieRequest(
   return { response, job: firstJob };
 }
 
+// --- Always-search-both + cross-type (movie ⇄ TV) disambiguation (2026-06-16) ---
+// Jeff's ask: for a type-AMBIGUOUS bare title request, search BOTH Radarr and Sonarr and consider
+// both result sets together. When a title has a clearly-dominant MOVIE *and* a clearly-dominant SHOW,
+// don't silently pick one (the model defaults to movie-first and would never surface the show) —
+// present a numbered choice and let the user pick. After they pick (number / "movie" / "show" /
+// title), add the movie (or short show) or ASK which seasons for a long show. A SINGLE dominant match
+// returns null → the existing model loop (+ nets #8/#9/#13/#14) adds it straight through. Runs BEFORE
+// the model loop; returns null whenever it can't confidently act (no regression to the common case).
+//
+// Anti-bluff is unchanged: this NEVER fabricates an add — it only ADDS when an arr add actually
+// returns an id, and emits the same <!--JOB:--> tag + "Added X" wording the existing add paths use.
+
+// Probe season list for "is this message a season phrase?" (an answer to a pending season question,
+// not a new title). Covers far more seasons than any real show has.
+const SEASON_PROBE = Array.from({ length: 40 }, (_, i) => i + 1);
+
+interface CrossTypeMappedMovie { title?: string; year?: number; in_library?: boolean; tmdb_id?: number; hasFile?: boolean; arr_id?: number; popularity?: number }
+interface CrossTypeMappedTv { title?: string; year?: number; in_library?: boolean; tvdb_id?: number; season_count?: number; seasons?: number[]; arr_id?: number; popularity?: number }
+
+function mapMovieResultsForDominance(results: RadarrMovie[]): CrossTypeMappedMovie[] {
+  return (Array.isArray(results) ? results : []).slice(0, 8).map((m: RadarrMovie) => ({
+    title: m.title, year: m.year, tmdb_id: m.tmdbId,
+    in_library: m.id > 0 || m.hasFile === true,
+    hasFile: m.hasFile === true, arr_id: m.id, popularity: m.popularity,
+  }));
+}
+function mapTvResultsForDominance(results: SonarrSeries[]): CrossTypeMappedTv[] {
+  return (Array.isArray(results) ? results : []).slice(0, 8).map((s: SonarrSeries) => {
+    const seasonNums = (s.seasons || []).map(x => x.seasonNumber).filter(n => n > 0).sort((a, b) => a - b);
+    return {
+      title: s.title, year: s.year, tvdb_id: s.tvdbId,
+      season_count: seasonNums.length || s.seasonCount || 0,
+      seasons: seasonNums, in_library: s.id > 0, arr_id: s.id, popularity: s.popularity,
+    };
+  });
+}
+
+const titleLabel = (title?: string, year?: number) => `${title}${year ? ` (${year})` : ''}`;
+
+// Proceed with the user's CHOSEN candidate from a cross-type list (or the single dominant match): a
+// fresh search resolves the real id, then add the movie / short show, or ASK seasons for a long show.
+// The id always comes from this live search — never the (possibly stale) candidate id.
+async function addChosenTitle(pick: CrossTypeCandidate, senderPhone: string, activeJobs: DownloadJob[]): Promise<LocalBackendResult> {
+  const { term } = splitQueryYear(pick.title);
+  if (pick.type === 'movie') {
+    const results = await searchRadarr(term);
+    const movie = (Array.isArray(results) ? results : []).find((m: RadarrMovie) =>
+      titlesRoughlyMatch(pick.title, m.title) && (!pick.year || m.year === pick.year)) || results[0];
+    if (!movie) return { response: `I couldn't pull up ${pick.title} just now — give it another try in a sec.` };
+    const existing = await checkMovieExists(movie.tmdbId);
+    if (existing) {
+      // In the library but no file (requested earlier, never downloaded) → re-trigger a search rather
+      // than the misleading "already in your library" (the net #11 Hook behavior, applied here too).
+      if (existing.hasFile === false && existing.id > 0) {
+        await triggerMovieSearch(existing.id);
+        const job = { type: 'movie' as const, arrId: existing.id, title: existing.title };
+        return { response: `${titleLabel(existing.title, existing.year)} is already in your library but hasn't downloaded yet — I'm grabbing it now.\n<!--JOB:movie:${existing.id}:${existing.title}-->`, job };
+      }
+      return { response: `${titleLabel(existing.title, existing.year)} is already in your library.` };
+    }
+    const added = await addRadarrMovie(movie);
+    if (!added?.id) return { response: `Something went wrong adding ${pick.title} just now — give it another try in a sec.` };
+    const job = { type: 'movie' as const, arrId: added.id, title: added.title };
+    return { response: `Added ${titleLabel(added.title, added.year)} — grabbing it now.\n<!--JOB:movie:${added.id}:${added.title}-->`, job };
+  }
+  // TV
+  const results = await searchSonarr(term);
+  const series = (Array.isArray(results) ? results : []).find((s: SonarrSeries) =>
+    titlesRoughlyMatch(pick.title, s.title) && (!pick.year || s.year === pick.year)) || results[0];
+  if (!series) return { response: `I couldn't pull up ${pick.title} just now — give it another try in a sec.` };
+  const existing = await checkSeriesExists(series.tvdbId);
+  if (existing) {
+    // In the library but missing episodes → trigger a series search rather than a misleading "already
+    // in your library" (the net #11 TV behavior). /series/lookup zeroes statistics, so fetch /series/{id}
+    // for real counts; incomplete when monitored-aired episodes exceed episodes that have files. On any
+    // error / complete series, fall back to the clean "already in your library" reply.
+    if (existing.id > 0) {
+      try {
+        const full = await getSonarrSeries(existing.id);
+        const st = full.statistics;
+        if (st && typeof st.episodeCount === 'number' && st.episodeCount > 0 && (st.episodeFileCount ?? 0) < st.episodeCount) {
+          await triggerSeriesSearch(existing.id);
+          const job = { type: 'tv' as const, arrId: existing.id, title: existing.title };
+          return { response: `${titleLabel(existing.title, existing.year)} is already in your library but some episodes haven't downloaded yet — I'm grabbing them now.\n<!--JOB:tv:${existing.id}:${existing.title}-->`, job };
+        }
+      } catch (err) {
+        jlog('error', { where: 'cross-type.series-completeness', arr_id: existing.id, error: String(err) });
+      }
+    }
+    return { response: `${titleLabel(existing.title, existing.year)} is already in your library.` };
+  }
+  const seasonNums = (series.seasons || []).map(s => s.seasonNumber).filter(n => n > 0);
+  if (seasonNums.length >= 3) {
+    // Long show — ASK which seasons (don't add). The user's next reply (a season phrase) goes back
+    // through the model loop, which calls search_tv + add_tv; net #9 then overrides the season math
+    // deterministically from the user's phrase. (Net #9 needs a fresh search_tv in that session, so
+    // the guarantee is "the model searches + adds, net #9 corrects the seasons" — not a direct add here.)
+    return { response: `${titleLabel(series.title, series.year)} has ${seasonNums.length} seasons — which seasons do you want, or all?` };
+  }
+  const added = await addSonarrSeries(series, 'all');
+  if (!added?.id) return { response: `Something went wrong adding ${pick.title} just now — give it another try in a sec.` };
+  const job = { type: 'tv' as const, arrId: added.id, title: added.title };
+  return { response: `Added ${titleLabel(added.title, added.year)} — grabbing all seasons now.\n<!--JOB:tv:${added.id}:${added.title}-->`, job };
+}
+
+async function handleCrossTypeRequest(
+  userMessage: string,
+  conversationHistory: Array<{ role: string; text: string }> | undefined,
+  senderPhone: string,
+  activeJobs: DownloadJob[],
+): Promise<LocalBackendResult | null> {
+  // PATH A — the user is replying to a cross-type choice list Jedd presented last turn.
+  const priorChoices = findCrossTypeChoiceInHistory(conversationHistory);
+  if (priorChoices) {
+    const pick = resolveCrossTypePick(userMessage, priorChoices);
+    if (!pick) return null; // not a recognizable pick → could be a brand-new request → fall through
+    jlog('cross-type.pick', { userMessage, picked: pick, options: priorChoices.length });
+    try {
+      const result = await addChosenTitle(pick, senderPhone, activeJobs);
+      jlog('delivery.decision', { path: 'cross-type-pick', deterministic: true, text: truncate(result.response, 2000), job: result.job });
+      return result;
+    } catch (err) {
+      jlog('error', { where: 'cross-type.addChosen', pick, error: String(err) });
+      return null; // arr error → fall through to the model loop rather than dead-end
+    }
+  }
+
+  // PATH B — a NEW type-ambiguous bare title request. Search both, present a choice on a collision.
+  if (isStatusQuery(userMessage)) return null;
+  if (looksLikeMultiItemRequest(userMessage)) return null;
+  // A Jellyfin account/provisioning request ("set my friend up on Jellyfin", "invite sam@x.com") is
+  // NOT a media request — never search arr for it (let the model's provision_jellyfin path own it).
+  if (/\b(jellyfin|streaming account|media server)\b/i.test(userMessage) || extractInviteRecipient(userMessage)) return null;
+  if (requestSpecifiesType(userMessage) !== null) return null;             // explicit movie/TV → loop
+  if (!messageHasPlausibleTitle(userMessage)) return null;                 // gibberish / non-media
+  if (parseSeasonSelection(userMessage, SEASON_PROBE) !== null) return null; // a season answer, not a title
+  const title = extractRequestTitle(userMessage);
+  if (!title) return null;
+
+  let movieResults: RadarrMovie[] = [];
+  let tvResults: SonarrSeries[] = [];
+  try {
+    const { term } = splitQueryYear(title);
+    [movieResults, tvResults] = await Promise.all([searchRadarr(term), searchSonarr(term)]);
+  } catch (err) {
+    jlog('error', { where: 'cross-type.search', title, error: String(err) });
+    return null; // arr error → fall through to the model loop
+  }
+
+  const movieMapped = mapMovieResultsForDominance(movieResults);
+  const tvMapped = mapTvResultsForDominance(tvResults);
+  const candidates: CrossTypeCandidate[] = [];
+  if (topResultIsDominant(title, movieMapped)) {
+    const top = movieMapped[0];
+    candidates.push({ type: 'movie', title: top.title!, year: top.year, tmdb_id: top.tmdb_id });
+  }
+  if (topResultIsDominant(title, tvMapped)) {
+    const top = tvMapped[0];
+    candidates.push({ type: 'tv', title: top.title!, year: top.year, tvdb_id: top.tvdb_id, season_count: top.season_count });
+  }
+
+  // 0 or 1 dominant match → let the existing model loop handle it (single dominant proceeds straight
+  // through; nothing-dominant → model does not-found / within-type which-one). Only a genuine
+  // CROSS-TYPE collision (a dominant movie AND a dominant show) gets the new numbered choice.
+  if (candidates.length < 2) return null;
+
+  const response = buildCrossTypeChoiceList(title, candidates);
+  jlog('cross-type.disambiguate', { title, candidates });
+  jlog('delivery.decision', { path: 'cross-type-disambiguate', deterministic: true, text: truncate(response, 2000) });
+  return { response };
+}
+
 export async function runLocalSession(
   senderPhone: string,
   userMessage: string,
@@ -734,6 +906,16 @@ export async function runLocalSession(
   if (multiResult) {
     jlog('delivery.decision', { conversationId: cid, path: 'multi-movie-handler', deterministic: true, text: truncate(multiResult.response, 2000), job: multiResult.job });
     return multiResult;
+  }
+
+  // Always-search-both + cross-type disambiguation: search Radarr AND Sonarr for a type-ambiguous
+  // bare title and, on a movie+show collision, present a numbered choice (don't auto-pick); resolve a
+  // reply to a prior choice list into the chosen add / seasons question. Returns null (fall through to
+  // the model loop) for the single-dominant common case and anything it can't confidently act on.
+  const crossTypeResult = await handleCrossTypeRequest(userMessage, conversationHistory, senderPhone, activeJobs);
+  if (crossTypeResult) {
+    jlog('delivery.decision', { conversationId: cid, path: 'cross-type-handler', deterministic: true, text: truncate(crossTypeResult.response, 2000), job: crossTypeResult.job });
+    return crossTypeResult;
   }
 
   let lastJob: LocalBackendResult['job'];
