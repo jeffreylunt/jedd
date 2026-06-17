@@ -1498,3 +1498,117 @@ test('cross-type: a SINGLE dominant match (movie only) → NO disambiguation, fa
     stub.restore();
   }
 });
+
+// --- Fuzzy "did you mean?" typo / wrong-title handling (2026-06-16) ------------------------------
+// Goal: a typo or slightly-wrong title degrades gracefully instead of a flat "couldn't find it" —
+// the original search comes back empty, Jedd retries with a looser query, and if plausible candidates
+// surface it presents a numbered "did you mean?" list (or auto-adds only a near-exact dominant hit).
+
+test('did-you-mean (a): typo → 0 results → cleaned retry finds it → presents a numbered list → pick adds', async () => {
+  // "the outsider reboot" matches nothing; cleaning drops the junk trailing word → "the outsider",
+  // which surfaces BOTH a movie and a show. Two equally-good fuzzy matches → ASK (don't auto-pick).
+  const movie = [{ tmdbId: 50001, title: 'The Outsider', year: 2018, id: 0, popularity: 8 }];
+  const show = [{ tvdbId: 60001, title: 'The Outsider', year: 2020, id: 0, popularity: 8,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }] }];
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  const stub = installCrossTypeFetchStub(turns, {
+    // Original (typo'd) term → nothing for either type.
+    radarrByTerm: { 'the outsider reboot': [], 'outsider reboot': [], 'the outsider': movie, 'The Outsider': movie },
+    sonarrByTerm: { 'the outsider reboot': [], 'outsider reboot': [], 'the outsider': show },
+    onMovieAdd: (b) => ({ id: 770, title: b.title, tmdbId: b.tmdbId, year: 2018 }),
+  });
+  try {
+    // Step 1: the typo → did-you-mean list, nothing added yet.
+    const r1 = await runLocalSession('+15551234567', 'can you get the outsider reboot', []);
+    assert.equal(r1.job, undefined, 'must NOT add anything before the user confirms');
+    assert.match(r1.response, /did you mean/i, 'should present a "did you mean?" list');
+    assert.match(r1.response, /The Outsider/i);
+    assert.match(r1.response, /1\./);
+    assert.match(r1.response, /2\./);
+    assert.doesNotMatch(r1.response, /FALLBACK/, 'the deterministic handler must answer, not the model');
+    assert.equal(stub.calls().filter(c => c.startsWith('POST')).length, 0, 'no add before a pick');
+
+    // Step 2: the user picks the movie from that list → it gets added (reuses the cross-type pick path).
+    const r2 = await runLocalSession('+15551234567', 'the movie', [], [
+      { role: 'user', text: 'can you get the outsider reboot', timestamp: 't' },
+      { role: 'assistant', text: r1.response, timestamp: 't' },
+    ]);
+    assert.ok(r2.job, 'picking a candidate should add it');
+    assert.equal(r2.job!.type, 'movie');
+    assert.equal(r2.job!.arrId, 770);
+    assert.match(r2.response, /Added The Outsider/i);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('did-you-mean (b): low-confidence near-miss → ASKS, does NOT auto-add', async () => {
+  // "Severence" is a misspelling; the provider returns "Severance" as a fuzzy hit (not a near-exact
+  // match). Confidence is below the auto-add bar, so Jedd must ASK rather than silently add the show.
+  const show = [{ tvdbId: 70044, title: 'Severance', year: 2022, id: 0, popularity: 40,
+    seasons: [{ seasonNumber: 0 }, { seasonNumber: 1 }, { seasonNumber: 2 }] }];
+  const turns: Turn[] = [{ content: 'FALLBACK — handler should have answered' }];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { Severence: [] },          // not a movie
+    sonarrByTerm: { Severence: show },        // provider fuzzily returns the real show
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'can you get Severence', []);
+    assert.equal(r.job, undefined, 'a low-confidence fuzzy match must NOT be auto-added');
+    assert.match(r.response, /did you mean/i, 'should ask with a "did you mean?" suggestion');
+    assert.match(r.response, /Severance/i, 'should name the closest real title');
+    assert.doesNotMatch(r.response, /FALLBACK/);
+    assert.equal(stub.calls().filter(c => c.startsWith('POST')).length, 0, 'no add — Jedd only asked');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('did-you-mean (c): a clean exact title still goes straight through (no new friction)', async () => {
+  // The common case must be untouched: an exact, dominant single match is added directly — no typo
+  // retry, no "did you mean?" prompt.
+  const movie = [{ tmdbId: 27205, title: 'Inception', year: 2010, id: 0, popularity: 30 }];
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'Inception' }),
+    { content: 'I found Inception (2010). Which one did you mean?' },   // needless ask → net #8 forces add
+    tc('add_movie', { tmdb_id: 27205, title: 'Inception' }),
+    { content: 'Done — Inception (2010) is downloading now.' },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: { Inception: movie },
+    radarrByTmdb: { 27205: [{ tmdbId: 27205, title: 'Inception', year: 2010 }] },
+    sonarrByTerm: { Inception: [] },
+    onMovieAdd: (b) => ({ id: 780, title: b.title, tmdbId: b.tmdbId, year: 2010 }),
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'get Inception', []);
+    assert.ok(r.job, 'a clean dominant title is added straight through');
+    assert.equal(r.job!.arrId, 780);
+    assert.doesNotMatch(r.response, /did you mean/i, 'no did-you-mean prompt on a clean exact match');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('did-you-mean (d): a genuinely-unknown title still says not-found honestly', async () => {
+  // Nothing matches even after the looser retry → fall through to the model loop, which (after the
+  // cross-type fallback also comes back empty) delivers an honest not-found. No fabricated suggestion.
+  const turns: Turn[] = [
+    tc('search_movie', { query: 'zxqwlk plooble nonsense' }),
+    { content: "Couldn't find that one, sorry." },
+    tc('search_tv', { query: 'zxqwlk plooble nonsense' }),
+    { content: "Couldn't find that one, sorry." },
+  ];
+  const stub = installCrossTypeFetchStub(turns, {
+    radarrByTerm: {},   // every term → []
+    sonarrByTerm: {},
+  });
+  try {
+    const r = await runLocalSession('+15551234567', 'can you get zxqwlk plooble nonsense', []);
+    assert.equal(r.job, undefined, 'nothing should be added');
+    assert.match(r.response, /couldn'?t find|could not find/i, 'should say not-found honestly');
+    assert.doesNotMatch(r.response, /did you mean/i, 'no did-you-mean when nothing is plausible');
+  } finally {
+    stub.restore();
+  }
+});

@@ -3,6 +3,27 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [1.4.5] — 2026-06-16
+
+Handle typos and slightly-wrong titles gracefully instead of a flat "couldn't find it."
+
+### Added
+- **"Did you mean…?" for misspelled or slightly-wrong titles.** When a request doesn't match anything
+  exactly, Jedd now retries with a looser version of the title (dropping stray punctuation, a wrong
+  trailing year, or extra words) and — if it turns up plausible matches — offers a short numbered list
+  ranked by how closely each result matches what you typed: *"I couldn't find an exact match for
+  'the outsdier' — did you mean one of these? 1. The Outsider (2018) — movie / 2. The Outsider (2020)
+  — TV show."* Reply with the number (or the name) and Jedd adds the movie (or short show) or asks
+  which seasons for a long series — reusing the same pick flow as the movie/show chooser.
+- **Confident corrections just go through.** When the closest match is a near-exact, clearly-dominant
+  hit (e.g. a single-letter typo), Jedd adds it directly without an extra question.
+
+### Changed
+- **Low-confidence matches always ask first.** Jedd never silently adds a fuzzy match that isn't a
+  near-exact hit — if it's unsure, it shows the "did you mean?" list rather than guessing. A clean,
+  exact request is unaffected and still goes straight through with no added friction, and the
+  anti-fabrication guard is intact — Jedd never claims an add unless it really succeeded.
+
 ## [1.4.4] — 2026-06-16
 
 Always search both movies and TV, and ask which you meant when a title is both.

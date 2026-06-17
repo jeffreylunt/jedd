@@ -547,7 +547,7 @@ const POP_DOMINANCE_FLOOR = 3;   // ...and have at least this absolute popularit
 // equality or equal after dropping a leading article, with a trailing year stripped from the query.
 // STRICTER than titlesRoughlyMatch (which matches on any shared content word) so a sequel like
 // "Matrix Reloaded" never counts as "The Matrix".
-function closeTitleMatch(query: string, resultTitle: string): boolean {
+export function closeTitleMatch(query: string, resultTitle: string): boolean {
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
   const q = norm(query);
   const r = norm(resultTitle);
@@ -761,7 +761,11 @@ export function buildCrossTypeChoiceList(query: string, candidates: CrossTypeCan
 
 // Parse a previously-presented choice list back into ordered candidates, or null when the text is not
 // one. Requires >= 2 numbered "N. Title (Year) — movie|TV show" lines so it never false-matches prose.
+// A SINGLE numbered line is accepted only when the text also carries an explicit choice/did-you-mean
+// sentinel — that covers the one-candidate "did you mean X?" prompt without risking a prose match on a
+// stray "1. ..." line.
 const CHOICE_LINE_RE = /^\s*(\d{1,2})[.)]\s+(.+?)\s*(?:\((\d{4})\))?\s*[—–-]\s*(movie|tv show)\s*$/i;
+const CHOICE_SENTINEL_RE = /did you mean|which one do you want|reply with the number/i;
 export function parseCrossTypeChoiceList(text: string): CrossTypeCandidate[] | null {
   if (!text) return null;
   const out: CrossTypeCandidate[] = [];
@@ -774,7 +778,9 @@ export function parseCrossTypeChoiceList(text: string): CrossTypeCandidate[] | n
       year: m[3] ? Number(m[3]) : undefined,
     });
   }
-  return out.length >= 2 ? out : null;
+  if (out.length >= 2) return out;
+  if (out.length === 1 && CHOICE_SENTINEL_RE.test(text)) return out;
+  return null;
 }
 
 // The most recent cross-type choice list Jedd presented, so a stateless resume can resolve the user's
@@ -796,6 +802,16 @@ export function findCrossTypeChoiceInHistory(history?: Array<{ role: string; tex
 export function resolveCrossTypePick(userMessage: string, candidates: CrossTypeCandidate[]): CrossTypeCandidate | null {
   if (!userMessage || !candidates || candidates.length === 0) return null;
   const t = userMessage.toLowerCase().trim();
+  // 0) A bare affirmation ("yes", "yeah", "do it") only resolves when there is exactly ONE candidate
+  //    — i.e. confirming a single-item "did you mean X?" prompt. With multiple options "yes" is
+  //    ambiguous, so it falls through to the position/type/title logic below. A negation or
+  //    "something else" correction is explicitly excluded so "please don't add it" / "no, the other
+  //    one" never read as a confirmation.
+  if (candidates.length === 1
+      && !/\b(no|not|don'?t|doesn'?t|never|nope|nah|wrong|else|different|other)\b/.test(t)
+      && /^(yes|yep|yeah|yup|sure|ok|okay|that one|do it|add it|correct|right)\b/.test(t)) {
+    return candidates[0];
+  }
   // 1) Year ("the 2023 one") — a 4-digit year that uniquely matches one candidate.
   const yearMatch = t.match(/\b(?:19|20|21)\d{2}\b/);
   if (yearMatch) {
@@ -834,6 +850,88 @@ export function resolveCrossTypePick(userMessage: string, candidates: CrossTypeC
     if (hits.length === 1) return hits[0];
   }
   return null;
+}
+
+// --- Fuzzy "did you mean?" typo / wrong-title handling (2026-06-16) ------------------------------
+// When a request returns no near-exact match (a typo or slightly-wrong title), Jedd retries with
+// looser queries and, if plausible candidates surface, presents a numbered "did you mean?" list that
+// REUSES the cross-type choice format ("N. Title (Year) — movie|TV show") so the existing pick path
+// (findCrossTypeChoiceInHistory → parseCrossTypeChoiceList → resolveCrossTypePick) resolves the reply.
+// Candidates are ranked by string-similarity to what the user typed, then provider popularity; a match
+// is only auto-added when it is a near-exact, dominant hit, otherwise Jedd asks (the low-confidence guard).
+
+const DYM_STOPWORDS = new Set(['the', 'a', 'an', 'and', 'of', 'to', 'in', 'on', 'for', 'part', 'movie', 'film', 'show', 'series', 'season', 'seasons']);
+
+// Looser query variants to retry when the original search came back empty: punctuation stripped, a
+// trailing year dropped, and the first few significant words (for an over-long / partly-wrong query).
+// Returns deduped non-empty variants in priority order; the caller skips any equal to the term it
+// already searched. Imperfect by design — a bad variant just yields no results → honest not-found.
+export function cleanedQueryVariants(title: string): string[] {
+  const variants: string[] = [];
+  const push = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); if (t && !variants.includes(t)) variants.push(t); };
+  const noPunct = (title || '').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (!noPunct) return [];
+  push(noPunct);
+  push(noPunct.replace(/\b(?:19|20|21)\d\d\b\s*$/, '').trim());
+  const sig = noPunct.split(' ').filter(w => w.length > 1 && !/^\d+$/.test(w) && !DYM_STOPWORDS.has(w.toLowerCase()));
+  if (sig.length > 4) push(sig.slice(0, 4).join(' '));
+  if (sig.length > 2) push(sig.slice(0, 3).join(' '));
+  if (sig.length > 1) push(sig.slice(0, 2).join(' '));
+  const toks = noPunct.split(' ');
+  if (toks.length > 2) push(toks.slice(0, -1).join(' '));
+  return variants;
+}
+
+function normForSim(s: string): string {
+  return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// Similarity in [0,1] between two titles — the MAX of normalized edit-distance similarity (catches a
+// misspelling) and token Jaccard overlap (catches reordering / a missing or extra word); a full
+// substring relationship scores high too. 1 = identical (after normalization), 0 = nothing in common.
+export function titleSimilarity(a: string, b: string): number {
+  const x = normForSim(a);
+  const y = normForSim(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  const maxLen = Math.max(x.length, y.length);
+  const lev = maxLen ? 1 - levenshtein(x, y) / maxLen : 0;
+  const ax = new Set(x.split(' ').filter(Boolean));
+  const ay = new Set(y.split(' ').filter(Boolean));
+  let inter = 0; for (const w of ax) if (ay.has(w)) inter++;
+  const union = new Set([...ax, ...ay]).size;
+  const jac = union ? inter / union : 0;
+  const contains = (x.includes(y) || y.includes(x)) ? 0.9 : 0;
+  return Math.max(lev, jac, contains);
+}
+
+// Build the user-facing "did you mean?" list. Same parseable "N. Title (Year) — movie|TV show" line
+// shape as buildCrossTypeChoiceList, so the reply resolves through the exact same pick path; the
+// "did you mean" lead-in also acts as the sentinel that lets a SINGLE-candidate list parse back out.
+export function buildDidYouMeanList(query: string, candidates: CrossTypeCandidate[]): string {
+  const lines = candidates.map((c, i) => {
+    const yr = c.year ? ` (${c.year})` : '';
+    const kind = c.type === 'movie' ? 'movie' : 'TV show';
+    return `${i + 1}. ${c.title}${yr} — ${kind}`;
+  });
+  const q = query ? ` an exact match for "${query}"` : ' an exact match';
+  return `I couldn't find${q} — did you mean one of these?\n${lines.join('\n')}\nReply with the number (or the name), or tell me the exact title.`;
 }
 
 // Pull the media TITLE out of a request message by stripping a leading request frame ("can you get",

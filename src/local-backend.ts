@@ -19,7 +19,7 @@ import {
   searchRadarr, addRadarrMovie, checkMovieExists, getRadarrQueue, triggerMovieSearch,
   searchSonarr, addSonarrSeries, checkSeriesExists, getSonarrQueue, getSonarrSeries, triggerSeriesSearch,
 } from './arr-client.js';
-import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, extractInviteRecipient, buildInviteText, buildProvisionConfirmation, claimsProvisionWithoutExecuting, buildCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle, type CrossTypeCandidate } from './local-prompt.js';
+import { systemPromptV2 as buildSystemPrompt, promisesActionWithoutTool, claimsAddWithoutExecuting, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, stallsWithoutTool, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, requestSpecifiesType, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, extractInviteRecipient, buildInviteText, buildProvisionConfirmation, claimsProvisionWithoutExecuting, buildCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle, closeTitleMatch, cleanedQueryVariants, titleSimilarity, buildDidYouMeanList, type CrossTypeCandidate } from './local-prompt.js';
 import { jlog, truncate } from './logger.js';
 import type { RadarrMovie, SonarrSeries } from './types.js';
 
@@ -768,6 +768,102 @@ async function addChosenTitle(pick: CrossTypeCandidate, senderPhone: string, act
   return { response: `Added ${titleLabel(added.title, added.year)} — grabbing all seasons now.\n<!--JOB:tv:${added.id}:${added.title}-->`, job };
 }
 
+// "Did you mean?" confidence knobs. A candidate must clear DYM_FUZZY_FLOOR to be a plausible
+// suggestion at all; the top is AUTO-added only when it's a near-exact hit (>= DYM_HIGH_CONFIDENCE)
+// AND clearly ahead of the runner-up (by DYM_DOMINANCE_GAP) — otherwise Jedd ASKS (low-confidence guard).
+const DYM_FUZZY_FLOOR = 0.34;
+const DYM_HIGH_CONFIDENCE = 0.9;
+const DYM_DOMINANCE_GAP = 0.15;
+
+// Graceful typo / wrong-title recovery. Reached only when the original both-type search produced NO
+// near-exact (dominant) match. If both searches were empty, retry with looser query variants; then
+// rank whatever surfaced by similarity to what the user typed. A near-exact, dominant top is added
+// straight through; otherwise present a numbered "did you mean?" list (reusing the cross-type pick UX).
+// Returns null when nothing is plausible → the model loop delivers an honest not-found.
+async function handleDidYouMean(
+  title: string,
+  movieMapped: CrossTypeMappedMovie[],
+  tvMapped: CrossTypeMappedTv[],
+  senderPhone: string,
+  activeJobs: DownloadJob[],
+): Promise<LocalBackendResult | null> {
+  let movies = movieMapped;
+  let tvs = tvMapped;
+
+  // Both searches empty → the title is probably mistyped. Retry with looser variants until one hits.
+  if (movies.length === 0 && tvs.length === 0) {
+    const origTerm = splitQueryYear(title).term.toLowerCase();
+    for (const variant of cleanedQueryVariants(title)) {
+      const term = splitQueryYear(variant).term;
+      if (!term || term.toLowerCase() === origTerm) continue;
+      let mr: RadarrMovie[] = [];
+      let tr: SonarrSeries[] = [];
+      try {
+        [mr, tr] = await Promise.all([searchRadarr(term), searchSonarr(term)]);
+      } catch (err) {
+        jlog('error', { where: 'did-you-mean.retry', variant, error: String(err) });
+        continue;
+      }
+      if ((Array.isArray(mr) && mr.length) || (Array.isArray(tr) && tr.length)) {
+        movies = mapMovieResultsForDominance(mr);
+        tvs = mapTvResultsForDominance(tr);
+        jlog('did-you-mean.retry', { title, variant, term, movies: movies.length, tvs: tvs.length });
+        break;
+      }
+    }
+  }
+
+  // Score the top of each type by similarity to what the user typed. Skip in-library items (a
+  // different reply path owns those) and require a real title.
+  interface Scored { cand: CrossTypeCandidate; sim: number; pop: number }
+  const pool: Scored[] = [];
+  for (const m of movies.slice(0, 4)) {
+    if (!m.title || m.in_library) continue;
+    pool.push({ cand: { type: 'movie', title: m.title, year: m.year, tmdb_id: m.tmdb_id }, sim: titleSimilarity(title, m.title), pop: Number(m.popularity) || 0 });
+  }
+  for (const s of tvs.slice(0, 4)) {
+    if (!s.title || s.in_library) continue;
+    pool.push({ cand: { type: 'tv', title: s.title, year: s.year, tvdb_id: s.tvdb_id, season_count: s.season_count }, sim: titleSimilarity(title, s.title), pop: Number(s.popularity) || 0 });
+  }
+
+  // Keep plausible matches, best first (similarity, then popularity), deduped by type+title, top 3.
+  const seen = new Set<string>();
+  const ranked = pool
+    .filter(p => p.sim >= DYM_FUZZY_FLOOR)
+    .sort((a, b) => (b.sim - a.sim) || (b.pop - a.pop))
+    .filter(p => { const k = `${p.cand.type}:${p.cand.title.toLowerCase()}`; if (seen.has(k)) return false; seen.add(k); return true; })
+    .slice(0, 3);
+
+  if (ranked.length === 0) return null; // nothing plausible → model loop says not-found honestly
+
+  // Auto-add only a near-exact, clearly-dominant top (never a merely-fuzzy match — Jeff's guard).
+  const top = ranked[0];
+  const runnerUp = ranked[1];
+  const dominant = !runnerUp || (top.sim - runnerUp.sim) >= DYM_DOMINANCE_GAP;
+  // Strict `>`: a substring-only match scores exactly DYM_HIGH_CONFIDENCE (0.9) via titleSimilarity's
+  // `contains` branch — that's an ASK, not an auto-add. Only a genuine near-exact spelling match (a
+  // higher edit-distance similarity) clears the bar and is added without confirmation.
+  if (top.sim > DYM_HIGH_CONFIDENCE && dominant) {
+    try {
+      const result = await addChosenTitle(top.cand, senderPhone, activeJobs);
+      jlog('did-you-mean.autoadd', { title, picked: top.cand, sim: top.sim });
+      jlog('delivery.decision', { path: 'did-you-mean-autoadd', deterministic: true, text: truncate(result.response, 2000), job: result.job });
+      return result;
+    } catch (err) {
+      jlog('error', { where: 'did-you-mean.autoadd', pick: top.cand, error: String(err) });
+      // fall through to ASK rather than dead-end on an arr error
+    }
+  }
+
+  // Low confidence (or a tie at the top) → ASK. Present a numbered "did you mean?" list; the reply
+  // resolves through the same pick path as a cross-type choice (PATH A).
+  const candidates = ranked.map(r => r.cand);
+  const response = buildDidYouMeanList(title, candidates);
+  jlog('did-you-mean.suggest', { title, candidates, sims: ranked.map(r => Number(r.sim.toFixed(3))) });
+  jlog('delivery.decision', { path: 'did-you-mean-suggest', deterministic: true, text: truncate(response, 2000) });
+  return { response };
+}
+
 async function handleCrossTypeRequest(
   userMessage: string,
   conversationHistory: Array<{ role: string; text: string }> | undefined,
@@ -824,15 +920,26 @@ async function handleCrossTypeRequest(
     candidates.push({ type: 'tv', title: top.title!, year: top.year, tvdb_id: top.tvdb_id, season_count: top.season_count });
   }
 
-  // 0 or 1 dominant match → let the existing model loop handle it (single dominant proceeds straight
-  // through; nothing-dominant → model does not-found / within-type which-one). Only a genuine
-  // CROSS-TYPE collision (a dominant movie AND a dominant show) gets the new numbered choice.
-  if (candidates.length < 2) return null;
+  // ≥2 dominant → a genuine CROSS-TYPE collision (a dominant movie AND a dominant show) → numbered choice.
+  if (candidates.length >= 2) {
+    const response = buildCrossTypeChoiceList(title, candidates);
+    jlog('cross-type.disambiguate', { title, candidates });
+    jlog('delivery.decision', { path: 'cross-type-disambiguate', deterministic: true, text: truncate(response, 2000) });
+    return { response };
+  }
 
-  const response = buildCrossTypeChoiceList(title, candidates);
-  jlog('cross-type.disambiguate', { title, candidates });
-  jlog('delivery.decision', { path: 'cross-type-disambiguate', deterministic: true, text: truncate(response, 2000) });
-  return { response };
+  // Exactly 1 dominant → the common single-match case → straight through (the model loop adds it). No
+  // new friction here (Jeff's clean-case rule).
+  if (candidates.length === 1) return null;
+
+  // 0 dominant. If the TOP result of either type is still a near-exact title match, this is a correct
+  // (just ambiguous, e.g. two same-name films) title → leave it to the model loop / net #8. Only when
+  // NOTHING close matches do we treat it as a typo / wrong title and try graceful "did you mean?" recovery.
+  const topClose = (!!movieMapped[0]?.title && closeTitleMatch(title, movieMapped[0].title!))
+    || (!!tvMapped[0]?.title && closeTitleMatch(title, tvMapped[0].title!));
+  if (topClose) return null;
+
+  return handleDidYouMean(title, movieMapped, tvMapped, senderPhone, activeJobs);
 }
 
 export async function runLocalSession(

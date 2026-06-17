@@ -8,7 +8,7 @@ process.env.RADARR_ROOT_FOLDER ??= '/movies';
 process.env.BLUEBUBBLES_PASSWORD ??= 'test';
 
 const { promisesActionWithoutTool, claimsAddWithoutExecuting, splitQueryYear, titlesRoughlyMatch } = await import('./local-backend.js');
-const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, buildCrossTypeChoiceList, parseCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle } = await import('./local-prompt.js');
+const { systemPromptV2, refusesWithoutSearching, claimsResultsWithoutSearching, claimsFoundWithoutSearching, isStatusQuery, extractStatusTitle, stallsOnStatus, isStallReply, asksWhichOne, topResultIsDominant, parseSeasonSelection, topResultAlreadyInLibrary, parseInlineToolCall, looksLikeRawToolCall, messageHasPlausibleTitle, stripTrailingOffer, parseFranchiseAllRequest, parseSequelNumberList, franchiseQueryFromHistory, looksLikeMultiItemRequest, sequelNumberOfTitle, buildCrossTypeChoiceList, parseCrossTypeChoiceList, findCrossTypeChoiceInHistory, resolveCrossTypePick, extractRequestTitle, cleanedQueryVariants, titleSimilarity, buildDidYouMeanList } = await import('./local-prompt.js');
 
 // --- splitQueryYear: derive year from param OR a year stuffed into the query (Eternity regression) ---
 
@@ -829,4 +829,81 @@ test('extractRequestTitle strips request framing but preserves single-word title
   assert.equal(extractRequestTitle('I want to watch The Office'), 'The Office');
   // The trailing \s+ after the verb protects single-token titles.
   assert.equal(extractRequestTitle('Watchmen'), 'Watchmen');
+});
+
+// --- Fuzzy "did you mean?" typo handling helpers (2026-06-16) ------------------------------------
+
+test('titleSimilarity: identical/near-miss/unrelated rank as expected', () => {
+  assert.equal(titleSimilarity('Severance', 'Severance'), 1);
+  // A single-character typo is highly similar but NOT exact (used to gate auto-add vs ask).
+  const near = titleSimilarity('Sevrance', 'Severance');
+  assert.ok(near > 0.8 && near < 1, `single-char typo should be high but <1, got ${near}`);
+  // Word reordering / a missing word still scores via token overlap.
+  assert.ok(titleSimilarity('Office The', 'The Office') >= 0.5);
+  // Unrelated titles score low (below the plausibility floor 0.34).
+  assert.ok(titleSimilarity('Severance', 'Breaking Bad') < 0.34);
+  assert.equal(titleSimilarity('', 'anything'), 0);
+});
+
+test('titleSimilarity ranks the right candidate highest for a typo', () => {
+  const typed = 'Breakin Bad';
+  const right = titleSimilarity(typed, 'Breaking Bad');
+  const wrong = titleSimilarity(typed, 'Better Call Saul');
+  assert.ok(right > wrong, `the correct show must score higher (${right} vs ${wrong})`);
+  assert.ok(right >= 0.8, `a one-letter typo should be a strong match, got ${right}`);
+});
+
+test('cleanedQueryVariants: strips punctuation, drops trailing year, shortens long queries', () => {
+  // Punctuation stripped.
+  assert.ok(cleanedQueryVariants('Spider-Man: Far From Home!!!').includes('Spider Man Far From Home'));
+  // Trailing wrong year dropped (a variant without the year is offered).
+  assert.ok(cleanedQueryVariants('The Office 1999').includes('The Office'));
+  // A long query offers shorter significant-word variants.
+  const v = cleanedQueryVariants('the lord of the rings the fellowship of the ring');
+  assert.ok(v.some(x => x.split(' ').length <= 4), 'should offer a shortened variant');
+  // Empty / punctuation-only input yields nothing.
+  assert.deepEqual(cleanedQueryVariants('!!!'), []);
+});
+
+test('buildDidYouMeanList round-trips through the cross-type pick parser', () => {
+  const candidates = [
+    { type: 'tv' as const, title: 'Severance', year: 2022 },
+    { type: 'movie' as const, title: 'Severance', year: 2006 },
+  ];
+  const text = buildDidYouMeanList('Sevrance', candidates);
+  assert.match(text, /did you mean/i);
+  const parsed = parseCrossTypeChoiceList(text);
+  assert.ok(parsed, 'a did-you-mean list must parse back into candidates');
+  assert.equal(parsed!.length, 2);
+  assert.equal(parsed![0].type, 'tv');
+  assert.equal(parsed![0].title, 'Severance');
+  assert.equal(parsed![1].year, 2006);
+});
+
+test('parseCrossTypeChoiceList accepts a SINGLE item only with a did-you-mean sentinel', () => {
+  // A single numbered line WITH the sentinel (one-candidate did-you-mean) parses.
+  const single = buildDidYouMeanList('Sevrance', [{ type: 'tv', title: 'Severance', year: 2022 }]);
+  const parsed = parseCrossTypeChoiceList(single);
+  assert.ok(parsed && parsed.length === 1 && parsed[0].title === 'Severance');
+  // A lone numbered line in PROSE (no sentinel) must NOT false-match.
+  assert.equal(parseCrossTypeChoiceList('Here is item 1. The Matrix (1999) — movie was great'), null);
+});
+
+test('resolveCrossTypePick: a bare "yes" confirms a single did-you-mean candidate but not a multi list', () => {
+  const one = [{ type: 'tv' as const, title: 'Severance', year: 2022 }];
+  assert.deepEqual(resolveCrossTypePick('yes', one), one[0]);
+  assert.deepEqual(resolveCrossTypePick('yes please', one), one[0]);
+  // With multiple options, "yes" is ambiguous → no pick (falls through).
+  const two = [
+    { type: 'tv' as const, title: 'Severance', year: 2022 },
+    { type: 'movie' as const, title: 'Severance', year: 2006 },
+  ];
+  assert.equal(resolveCrossTypePick('yes', two), null);
+  // A number still resolves a single-item list.
+  assert.deepEqual(resolveCrossTypePick('1', one), one[0]);
+  // Negations / corrections must NOT read as a confirmation (review fix).
+  assert.equal(resolveCrossTypePick("please don't add it", one), null);
+  assert.equal(resolveCrossTypePick('no thanks', one), null);
+  assert.equal(resolveCrossTypePick('yes but the other one', one), null);
+  assert.equal(resolveCrossTypePick('ok but search something else', one), null);
 });
