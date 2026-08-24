@@ -87,8 +87,10 @@ None of this is phrased as an instruction the model could be argued out of.
 
 ## Known limitations
 
-- **The unprivileged ssh account is not provisioned**, so the OS boundary is not yet real. It will
-  also need a read-only docker socket proxy, or `hp_shell` loses `docker ps/inspect/logs` entirely.
+- **The unprivileged ssh account is not provisioned**, so the OS boundary is not yet real. It does
+  **not** need a docker socket proxy: `docker ps/inspect/logs` are read-only, fixed-shape and
+  parameterized only by a container name, so they belong as structured tools on the admin identity.
+  A boundary that appears to cost a capability usually just relocates the call.
 - Blast-radius **tiers** are missing: the protected-container set is flat, so an unclassified
   container defaults *permissive*, which is the wrong default.
 - `docker exec` is blocked by the gate, which also blocks legitimate read-only diagnostics that need
