@@ -29,7 +29,29 @@ import { dirname } from 'node:path';
  */
 
 /** Code-owned. The model cannot introduce a new kind of follow-up. */
-export type FollowupKind = 'restore-qbit-throttle';
+export type FollowupKind = 'restore-qbit-throttle' | 'media-add';
+
+/**
+ * What a `media-add` follow-up is about.
+ *
+ * 🔴 THE REQUIREMENT THIS SERVES: **a turn ends when the user has been told the
+ * outcome, not when the tool returned.**
+ *
+ * Live instance from V1, 2026-04-02: a guest asked for *Peppa Pig* seasons 1-3.
+ * The add was REAL — Sonarr shows it 8 seconds later — and V1 said *"I'll check
+ * back in a bit and let you know when they're ready."* Five months on, seasons 2
+ * and 3 have **zero files** and the user was never told anything.
+ *
+ * The add succeeding is not the outcome. **The user learning what happened is.**
+ */
+export interface MediaAddSubject {
+  arr: 'series' | 'movie';
+  /** tvdbId for a series, tmdbId for a movie — never the internal row id. */
+  id: number;
+  title: string;
+  /** Empty for a movie. For a series, ONLY the seasons actually requested. */
+  seasons: number[];
+}
 
 export interface Followup {
   id: string;
@@ -41,6 +63,8 @@ export interface Followup {
   reason: string;
   /** What was observed when it was scheduled, so the follow-up can say what changed. */
   observed: string;
+  /** Set for `media-add`: what to go and check when this comes due. */
+  subject?: MediaAddSubject;
   /** How many times this has come due and been deferred. Bounded — see MAX_ATTEMPTS. */
   attempts: number;
   status: 'pending' | 'done' | 'abandoned';
@@ -113,6 +137,7 @@ export class FollowupStore {
     dueAt: Date;
     reason: string;
     observed: string;
+    subject?: MediaAddSubject;
     now?: Date;
   }): Followup {
     const now = input.now ?? new Date();
@@ -124,6 +149,7 @@ export class FollowupStore {
       dueAt: input.dueAt.toISOString(),
       reason: input.reason,
       observed: input.observed,
+      ...(input.subject ? { subject: input.subject } : {}),
       attempts: 0,
       status: 'pending',
     };
@@ -140,6 +166,23 @@ export class FollowupStore {
    */
   pendingOfKind(kind: FollowupKind): Followup | undefined {
     return [...this.items.values()].find((f) => f.kind === kind && f.status === 'pending');
+  }
+
+  /**
+   * Is this exact title already being followed up for this person?
+   *
+   * Scheduling a second watch for the same add would produce two unprompted
+   * messages about one event — the same reason `pendingOfKind` exists, but a
+   * media add is per-title rather than one-at-a-time, so the key is finer.
+   */
+  pendingForSubject(senderHandle: string, arr: string, id: number): Followup | undefined {
+    return [...this.items.values()].find(
+      (f) =>
+        f.status === 'pending' &&
+        f.senderHandle === senderHandle &&
+        f.subject?.arr === arr &&
+        f.subject?.id === id,
+    );
   }
 
   due(now = new Date()): Followup[] {

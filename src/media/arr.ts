@@ -310,6 +310,65 @@ export class ArrClient {
     return { state: 'failed', detail: `Add refused (http ${res.status}): ${res.detail.slice(0, 160)}` };
   }
 
+  /**
+   * How far along is something we added? Three-state, like everything else.
+   *
+   * This is what a `media-add` follow-up goes and looks at, and it must be able
+   * to say **"I could not check"** distinctly from **"nothing has arrived"** —
+   * the second is news the user needs, the first is not something to report as
+   * if it were.
+   */
+  async progress(
+    id: number,
+    seasons: number[],
+  ): Promise<
+    | { state: 'complete'; detail: string }
+    | { state: 'partial'; detail: string; have: number; want: number }
+    | { state: 'none'; detail: string }
+    | { state: 'unknown'; detail: string }
+  > {
+    const res = await this.call(`/${this.kind}`);
+    if (!res.ok) return { state: 'unknown', detail: res.detail };
+    const rows = Array.isArray(res.body) ? (res.body as Record<string, unknown>[]) : [];
+    const idField = this.kind === 'series' ? 'tvdbId' : 'tmdbId';
+    const row = rows.find((r) => Number(r[idField]) === id);
+    if (!row) {
+      return {
+        state: 'unknown',
+        detail:
+          `"${id}" is not in the library listing at all, so I cannot tell whether it was removed, ` +
+          'never added, or added under a different id. Not reporting this as "nothing arrived".',
+      };
+    }
+    const title = String(row['title'] ?? id);
+    if (this.kind === 'movie') {
+      const hasFile = row['hasFile'] === true;
+      return hasFile
+        ? { state: 'complete', detail: `"${title}" has downloaded.` }
+        : { state: 'none', detail: `"${title}" is added but has not downloaded yet.` };
+    }
+    const all = Array.isArray(row['seasons']) ? (row['seasons'] as Record<string, unknown>[]) : [];
+    const wanted = all.filter((se) => seasons.includes(Number(se['seasonNumber'])));
+    if (wanted.length === 0) {
+      return { state: 'unknown', detail: `could not find season data for "${title}".` };
+    }
+    let have = 0;
+    let want = 0;
+    const perSeason: string[] = [];
+    for (const se of wanted) {
+      const st = (se['statistics'] ?? {}) as Record<string, unknown>;
+      const got = Number(st['episodeFileCount'] ?? 0);
+      const tot = Number(st['totalEpisodeCount'] ?? 0);
+      have += got;
+      want += tot;
+      perSeason.push(`S${se['seasonNumber']} ${got}/${tot}`);
+    }
+    const detail = `"${title}": ${perSeason.join(', ')}`;
+    if (want > 0 && have >= want) return { state: 'complete', detail };
+    if (have > 0) return { state: 'partial', detail, have, want };
+    return { state: 'none', detail };
+  }
+
   /** Reachability, distinguishing a wrong URL from a dead service. */
   async probe(): Promise<{ reachable: boolean; detail: string }> {
     const res = await this.call('/system/status');
