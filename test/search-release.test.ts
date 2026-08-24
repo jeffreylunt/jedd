@@ -323,3 +323,63 @@ test('add_audiobook is reachable end to end: search stores, consumer resolves', 
   assert.match(out.content, /Writes are disabled/);
   assert.doesNotMatch(out.content, /NONE —|no list/i);
 });
+
+// ── the SECOND axis: a tool that NAMES a producer in its description ────────
+
+test('🔴 removing catalogue_search fails add_movie AND add_series', async () => {
+  /**
+   * The mutation team-lead specified. This axis catches a different set from the
+   * structural one and neither subsumes the other: `add_movie` takes a
+   * `tmdb_id`, not a `choice`, so the choice-kind check cannot see its
+   * dependency — it is stated only in prose ("use the tmdbId from
+   * catalogue_search") that nothing read until now.
+   */
+  for (const consumer of ['add_movie', 'add_series']) {
+    const without = ALL_TOOLS.filter((t) => t.name === consumer);
+    assert.throws(
+      () => registerable(without, testConfig({ readOnly: false })),
+      new RegExp(`Tool "${consumer}" tells the model to use "catalogue_search", which is NOT registered`),
+      `${consumer} must not register without its named producer`,
+    );
+  }
+});
+
+test('CONTROL: both register fine WITH catalogue_search present', async () => {
+  const withIt = ALL_TOOLS.filter((t) =>
+    ['add_movie', 'add_series', 'catalogue_search'].includes(t.name),
+  );
+  assert.equal(withIt.length, 3);
+  assert.doesNotThrow(() => registerable(withIt, testConfig({ readOnly: false })));
+});
+
+test('🔴 the two axes catch DIFFERENT tools — neither check is redundant', async () => {
+  // A name scan cannot see add_audiobook's dependency ("an audiobook search" is
+  // not a tool name); the structural check cannot see add_movie's (it takes a
+  // tmdb_id, not a choice). Both are needed, and this pins that.
+  const audiobook = ALL_TOOLS.find((t) => t.name === 'add_audiobook')!;
+  assert.doesNotMatch(audiobook.description, /search_audiobook/, 'names no producer — only the structural check sees it');
+  assert.equal(audiobook.consumesChoiceKind, 'release');
+
+  const movie = ALL_TOOLS.find((t) => t.name === 'add_movie')!;
+  assert.match(movie.description, /catalogue_search/, 'names its producer — only the name check sees it');
+  assert.equal(movie.consumesChoiceKind, undefined, 'and it consumes no choice at all');
+});
+
+test('🔴 the EBOOK PAIR is atomic: no SMTP credential means neither half registers', async () => {
+  // search_ebook's description says "call send_ebook with their number". With no
+  // SMTP credential send_ebook does not exist, so search_ebook shipped a flow
+  // whose second step was absent — books found, none sendable. Caught by the
+  // name check on its first run.
+  const withSmtp = buildTools(testConfig({ readOnly: false }), undefined, {
+    ebook: { send: async () => ({ messageId: 'x' }) },
+  }).map((t) => t.name);
+  assert.ok(withSmtp.includes('send_ebook') && withSmtp.includes('search_ebook'), 'both, with a credential');
+
+  const noSmtp = buildTools(
+    testConfig({ readOnly: false, kindle: { smtpHost: 'x', smtpPort: 1, fromEmail: 'a@b', smtpPassword: '' } }),
+    undefined,
+    { ebook: { send: async () => ({ messageId: 'x' }) } },
+  ).map((t) => t.name);
+  assert.equal(noSmtp.includes('send_ebook'), false);
+  assert.equal(noSmtp.includes('search_ebook'), false, 'and the producer goes with it');
+});

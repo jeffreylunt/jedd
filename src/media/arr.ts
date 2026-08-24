@@ -85,6 +85,35 @@ export type SeasonAnswer =
   | { state: 'untracked'; searched: number }
   | { state: 'unknown'; detail: string };
 
+export interface EpisodeRow {
+  id: number;
+  season: number;
+  episode: number;
+  title: string;
+  monitored: boolean;
+  hasFile: boolean;
+  airDate: string | null;
+}
+
+/** One row of Sonarr's interactive release search, with WHY it was refused. */
+export interface ReleaseOption {
+  guid: string;
+  indexerId: number;
+  title: string;
+  indexer: string;
+  /** Sonarr's PARSED quality name, e.g. `WEBDL-1080p`. Not scraped from the title. */
+  quality: string;
+  /** Parsed vertical resolution: 2160, 1080, 720, 480, or 0 when unknown. */
+  resolution: number;
+  seeders: number;
+  sizeBytes: number;
+  approved: boolean;
+  /** Empty when approved. Otherwise Sonarr's own reasons, verbatim. */
+  rejections: string[];
+  customFormatScore: number;
+  languages: string[];
+}
+
 export type CatalogueAnswer =
   | { state: 'results'; candidates: Candidate[] }
   | { state: 'unknown'; detail: string };
@@ -314,6 +343,145 @@ export class ArrClient {
       addOptions: { monitor: 'none', searchForMissingEpisodes: true },
     });
     return this.interpretAdd(res, input.seasons, input.title);
+  }
+
+  /**
+   * Which EPISODES of a series are missing — the gap list.
+   *
+   * 🔴 `/episode?seriesId=` AND NEVER `/wanted/missing?seriesId=`.
+   *
+   * **`wanted/missing` SILENTLY IGNORES the seriesId filter.** Measured against
+   * the live instance: asking for series 80 returned **1651 records carrying
+   * seriesId 191 and 73**. It is well-formed, plausible, and about the whole
+   * library — so any per-series conclusion drawn from it is wrong in a way
+   * nothing about the response reveals.
+   *
+   * ⚠️ SCOPED TO ONE SERIES, ON REQUEST. There are ~1600 wanted episodes
+   * instance-wide and the overwhelming majority are unsourceable archive shows
+   * (Mister Rogers ~750, Suits ~108). Anything that sweeps them hammers indexers
+   * for approximately zero yield. There is deliberately no all-series entry point.
+   */
+  async episodes(
+    seriesId: number,
+  ): Promise<{ state: 'episodes'; rows: EpisodeRow[] } | { state: 'unknown'; detail: string }> {
+    if (this.kind !== 'series') {
+      return { state: 'unknown', detail: 'episodes() is a Sonarr call; a movie has none.' };
+    }
+    const res = await this.call(`/episode?seriesId=${seriesId}`);
+    if (!res.ok) return { state: 'unknown', detail: res.detail };
+    if (!Array.isArray(res.body)) {
+      return { state: 'unknown', detail: `Sonarr's episode list for series ${seriesId} was not an array.` };
+    }
+    const rows: EpisodeRow[] = [];
+    for (const r of res.body as Record<string, unknown>[]) {
+      const id = Number(r['id']);
+      const season = Number(r['seasonNumber']);
+      const episode = Number(r['episodeNumber']);
+      if (!Number.isFinite(id) || !Number.isFinite(season) || !Number.isFinite(episode)) continue;
+      rows.push({
+        id,
+        season,
+        episode,
+        title: String(r['title'] ?? '').trim(),
+        monitored: r['monitored'] === true,
+        hasFile: r['hasFile'] === true,
+        airDate: String(r['airDateUtc'] ?? '') || null,
+      });
+    }
+    return { state: 'episodes', rows };
+  }
+
+  /**
+   * Every release an indexer has for one episode, INCLUDING the ones the quality
+   * profile refuses — with the reason it refused them.
+   *
+   * ── 🔴 WHY THIS INSTEAD OF CHANGING THE QUALITY PROFILE ──────────────────
+   *
+   * Jeff asked to *"change the quality profile in order to get more options (or
+   * whatever the best way is to fill in gaps)"*. The goal is binding; the
+   * mechanism was a guess, and it is the wrong one — **a profile change
+   * PERSISTS**. Widen a series to fill one gap and it keeps that profile forever,
+   * grabbing unattended: theater rips (`The.Mandalorian.and.Grogu.2026.1080p.HDTS`
+   * was auto-grabbed exactly this way) and foreign-language releases that only
+   * the `Not English` custom format's **-1000** score is holding back. Those
+   * rejections are the system WORKING.
+   *
+   * This asks the indexers directly, shows what exists and why each was refused,
+   * and grabs the one the person picks. **The gap gets filled, the profile is
+   * never touched, and the quality call is a human decision instead of a config
+   * change that outlives it.**
+   *
+   * Measured live: 2.0 s for 12 releases on a Seinfeld episode — 2 approved at
+   * 720p, and 1080p WEB-DLs sitting there rejected as "not wanted in profile",
+   * which is precisely the case Jeff was trying to solve.
+   */
+  async releasesFor(
+    episodeId: number,
+  ): Promise<{ state: 'releases'; rows: ReleaseOption[] } | { state: 'unknown'; detail: string }> {
+    const res = await this.call(`/release?episodeId=${episodeId}`);
+    if (!res.ok) return { state: 'unknown', detail: res.detail };
+    if (!Array.isArray(res.body)) {
+      return { state: 'unknown', detail: `Sonarr's release search for episode ${episodeId} was not an array.` };
+    }
+    const rows: ReleaseOption[] = [];
+    for (const r of res.body as Record<string, unknown>[]) {
+      const guid = String(r['guid'] ?? '');
+      const indexerId = Number(r['indexerId']);
+      if (!guid || !Number.isFinite(indexerId)) continue;
+      const q = ((r['quality'] as Record<string, unknown>)?.['quality'] ?? {}) as Record<string, unknown>;
+      rows.push({
+        guid,
+        indexerId,
+        title: String(r['title'] ?? ''),
+        indexer: String(r['indexer'] ?? '?'),
+        // 🔴 A PARSED FIELD, not the release name. `2160p`, `UHD`, `4K` come and
+        // go from titles arbitrarily; this is Sonarr's own determination.
+        quality: String(q['name'] ?? 'Unknown'),
+        resolution: Number(q['resolution']) || 0,
+        seeders: Number(r['seeders'] ?? 0),
+        sizeBytes: Number(r['size'] ?? 0),
+        approved: r['approved'] === true,
+        rejections: Array.isArray(r['rejections']) ? (r['rejections'] as unknown[]).map(String) : [],
+        customFormatScore: Number(r['customFormatScore'] ?? 0),
+        languages: Array.isArray(r['languages'])
+          ? (r['languages'] as Record<string, unknown>[]).map((l) => String(l['name'] ?? '')).filter(Boolean)
+          : [],
+      });
+    }
+    return { state: 'releases', rows };
+  }
+
+  /**
+   * Grab one specific release.
+   *
+   * 🔴 THIS DOES NOT CONSULT THE QUALITY PROFILE. That is the point — it is how
+   * a 1080p release the profile refuses can still fill a gap — and it is also
+   * why the profile stops being a safety net here. Whatever this is handed, it
+   * takes.
+   *
+   * ⚠️ Sonarr answers 201 with the release echoed back. That echo is NOT
+   * evidence the download started; it is evidence the command was accepted. The
+   * caller must re-read the queue to say anything stronger.
+   */
+  async grabRelease(guid: string, indexerId: number): Promise<{ state: 'accepted' | 'failed' | 'unknown'; detail: string }> {
+    if (!guid || !Number.isFinite(indexerId)) {
+      return { state: 'failed', detail: 'a release needs both a guid and an indexerId.' };
+    }
+    const res = await this.post('/release', { guid, indexerId });
+    if (res.status === 0) {
+      return {
+        state: 'unknown',
+        detail: `Could not reach Sonarr to grab this, so I do NOT know whether it started. (${res.detail})`,
+      };
+    }
+    if (res.status >= 500) {
+      return {
+        state: 'unknown',
+        detail: `Sonarr answered http ${res.status}, a server error rather than a refusal, so the grab MAY have landed.`,
+      };
+    }
+    if (!res.ok) return { state: 'failed', detail: `Sonarr refused the grab (http ${res.status}): ${res.detail.slice(0, 160)}` };
+    return { state: 'accepted', detail: 'Sonarr accepted the release and handed it to the download client.' };
   }
 
   /**

@@ -19,6 +19,7 @@ import { makeCheckStatus } from './check-status.js';
 import { resolveChoice } from './choice.js';
 import { kindleStatus, saveKindleEmail } from './kindle.js';
 import { librarySearch } from './library.js';
+import { makeFindGaps, makeGrabRelease, makeSearchEpisode } from './fill-gaps.js';
 import { makeInviteTool, type InviteDeps } from './invite.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
@@ -63,7 +64,11 @@ const GUEST_TOOLS: Tool[] = [
   // them and were uncallable. Reads: they search and store a list; nothing is
   // grabbed until the consumer runs. See search-release.ts.
   makeSearchAudiobook(),
-  makeSearchEbook(),
+  // Filling gaps in a series. Both READS: they list what is missing and what
+  // releases exist. Only grab_release writes. See fill-gaps.ts for why none of
+  // this touches a quality profile.
+  makeFindGaps(),
+  makeSearchEpisode(),
 ];
 
 /**
@@ -81,6 +86,7 @@ const GUEST_WRITE_TOOLS: Tool[] = [
   // scopes seasons at CREATE time only, so a show Sonarr already holds had no
   // path at all. Jeff hit it on his first real test, asking for Seinfeld S3.
   makeAddSeason(),
+  makeGrabRelease(),
   saveKindleEmail,
   addAudiobook,
 ];
@@ -190,7 +196,20 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   if (deps.invite && config.jfago.password) tools.push(makeInviteTool(deps.invite));
   // Same rule: no SMTP credential, no tool. A send_ebook that cannot mail would
   // tell somebody their book is on the way and then fail at the last step.
-  if (deps.ebook && config.kindle.smtpPassword) tools.push(makeSendEbook(deps.ebook));
+  /**
+   * 🔴 THE EBOOK PAIR IS ATOMIC — both halves, or neither.
+   *
+   * `send_ebook` is conditional on an SMTP credential, so on a deploy without
+   * one it does not exist. `search_ebook` sat in the unconditional list and its
+   * description tells the model to *"call send_ebook with their number"* — so it
+   * shipped a flow whose second step was absent: books found, none sendable.
+   *
+   * That is the same dead-end as the orphaned consumers, pointing the other way,
+   * and `assertNamedProducersExist` caught it on its first run rather than a
+   * user finding it. A producer whose only consumer is absent is not a
+   * capability either.
+   */
+  if (deps.ebook && config.kindle.smtpPassword) tools.push(makeSendEbook(deps.ebook), makeSearchEbook());
   // Same rule again: no TMDB token, no tool. A registered whats_popular with no
   // credential would answer every "what's good right now" with a failure, after
   // the model has already offered to look.
@@ -227,6 +246,7 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
     }
   }
   assertChoiceProducersExist(tools);
+  assertNamedProducersExist(tools);
   return config.readOnly ? tools.filter((t) => !t.writes) : tools;
 }
 
@@ -281,6 +301,48 @@ export function assertChoiceProducersExist(tools: Tool[]): void {
 }
 
 /**
+ * 🔴 A TOOL THAT NAMES ANOTHER TOOL IN ITS DESCRIPTION DEPENDS ON IT.
+ *
+ * The SECOND axis of the same defect, and it catches a different set from
+ * `assertChoiceProducersExist`. Neither subsumes the other:
+ *
+ *  - The structural check catches `add_audiobook` and `send_ebook`, whose
+ *    dependency is a `choice` in their schema. **A name scan would have missed
+ *    them entirely** — `add_audiobook` says *"an audiobook search"*, which is
+ *    not a tool name.
+ *  - This one catches `add_movie` and `add_series`, which say *"use the tmdbId
+ *    from catalogue_search"*. Their dependency is real, load-bearing, and
+ *    expressed only in prose that nothing read.
+ *
+ * Every tool in this registry already names its producer where it has one, so
+ * the declaration exists — it was just never checked. Deleting `catalogue_search`
+ * now fails `add_movie` and `add_series` instead of shipping two tools whose
+ * instructions point at nothing.
+ *
+ * ⚠️ Matched on whole `snake_case` words against the set of tool names actually
+ * present, so ordinary prose cannot trip it: a name only counts as a reference
+ * if some tool in this repo really is called that.
+ */
+export function assertNamedProducersExist(tools: Tool[]): void {
+  const present = new Set(tools.map((t) => t.name));
+  // Every tool name this repo defines, so a MISSING one is still recognised as a
+  // reference. Checking only against `present` would make the rule vacuous: a
+  // name that is absent would simply stop looking like a tool name.
+  const known = new Set(ALL_TOOLS.map((t) => t.name));
+  for (const t of tools) {
+    const named = new Set((t.description.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? []).filter((w) => known.has(w)));
+    named.delete(t.name);
+    for (const dep of named) {
+      if (present.has(dep)) continue;
+      throw new Error(
+        `Tool "${t.name}" tells the model to use "${dep}", which is NOT registered. Its instructions ` +
+          'would point at a tool that does not exist. Register it, or stop naming it.',
+      );
+    }
+  }
+}
+
+/**
  * The tools a given role may use.
  *
  * ⚠️ This filters what is DECLARED. It is not the security check — the loop
@@ -310,6 +372,10 @@ export const ALL_TOOLS: Tool[] = [
   // invariant quantified over ALL_TOOLS silently skips it.
   makeTrending(),
   makeTitleDetails(),
+  // ⚠️ Conditionally registered with `send_ebook` (both halves or neither), so
+  // like `read_runbook` it must be hand-listed here or every invariant
+  // quantified over ALL_TOOLS silently skips it.
+  makeSearchEbook(),
 ];
 
 export type { Tool } from './types.js';
