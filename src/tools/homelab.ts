@@ -1,0 +1,267 @@
+import { commandGate } from '../command-gate.js';
+import { jellyfinGet } from '../jellyfin.js';
+import { renderOutcome, runOnHp, clip } from '../hp.js';
+import { assertSafeToRestart, parseSessions } from '../safety.js';
+import { fail, ok, type Tool } from './types.js';
+
+/**
+ * The generic capability. One tool instead of twenty curated verbs — the model
+ * is assumed competent at composing shell, and the gate decides what may run.
+ */
+export const hpShell: Tool = {
+  name: 'hp_shell',
+  description:
+    'Run a READ-ONLY shell command on the homelab host (hp, 192.168.1.7) over ssh. ' +
+    'Use this for anything diagnostic: docker ps/inspect/logs/stats, curl against a local service, ' +
+    'reading files, checking load. Returns exit code, stdout and stderr separately — always read the ' +
+    'exit code, because an empty stdout with a non-zero exit is an ERROR, not an empty result. ' +
+    'Commands that would change the system are refused by a code gate; restarting a container is a ' +
+    'separate tool.',
+  minRole: 'owner',
+  parameters: {
+    type: 'object',
+    properties: {
+      command: {
+        type: 'string',
+        description: 'The shell command to run on hp, e.g. `docker ps --format "{{.Names}} {{.Status}}"`',
+      },
+    },
+    required: ['command'],
+  },
+  async run(args, ctx) {
+    const command = typeof args['command'] === 'string' ? args['command'] : '';
+    if (!command.trim()) return fail('No command supplied.');
+
+    const verdict = commandGate(command);
+    if (!verdict.allowed) {
+      return fail(`REFUSED by the command gate: ${verdict.reason}\nThe command was NOT run.`);
+    }
+
+    const outcome = await runOnHp(ctx.config.hpSshHost, command);
+    const rendered = `$ ${command}\n\n${renderOutcome(outcome)}`;
+    return outcome.exitCode === 0 ? ok(rendered) : fail(rendered);
+  },
+};
+
+/** Who is connected to Jellyfin and what, if anything, is playing. */
+export const jellyfinSessions: Tool = {
+  name: 'jellyfin_sessions',
+  description:
+    'List current Jellyfin sessions and what each is playing. Use this to answer "is anyone watching" ' +
+    'and before proposing anything disruptive.',
+  minRole: 'owner',
+  parameters: { type: 'object', properties: {}, required: [] },
+  async run(_args, ctx) {
+    const res = await jellyfinGet(ctx.config, '/Sessions');
+    if (!res.ok) return fail(`Could not read Jellyfin /Sessions: ${res.error}. Playback state is UNKNOWN.`);
+    const check = parseSessions(res.body);
+    if (!check.known) return fail(check.detail);
+    const lines = check.activeSessions.length
+      ? check.activeSessions.map((s) => `  - ${s}`).join('\n')
+      : '  (nobody is playing anything)';
+    return ok(`${check.detail}\n${lines}`);
+  },
+};
+
+/** Search the Jellyfin library — the "do we already have it" question. */
+export const jellyfinSearch: Tool = {
+  name: 'library_search',
+  description:
+    'Search the Jellyfin library for a movie, show or episode by title. Returns what is ACTUALLY in the ' +
+    'library. Call this before telling anyone whether something is available.',
+  minRole: 'guest',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Title to search for.' },
+    },
+    required: ['query'],
+  },
+  async run(args, ctx) {
+    const query = typeof args['query'] === 'string' ? args['query'].trim() : '';
+    if (!query) return fail('No search query supplied.');
+    const path =
+      `/Items?searchTerm=${encodeURIComponent(query)}` +
+      '&IncludeItemTypes=Movie,Series&Recursive=true&Limit=10&Fields=ProductionYear';
+    const res = await jellyfinGet(ctx.config, path);
+    if (!res.ok) return fail(`Library search failed: ${res.error}. Library state is UNKNOWN.`);
+    const body = res.body as { Items?: unknown[] } | undefined;
+    const items = Array.isArray(body?.Items) ? body.Items : [];
+    if (items.length === 0) return ok(`NOT IN LIBRARY: no Jellyfin item matches "${query}".`);
+    const lines = items.map((raw) => {
+      const item = raw as Record<string, unknown>;
+      const name = typeof item['Name'] === 'string' ? item['Name'] : '(untitled)';
+      const year = item['ProductionYear'] ?? '?';
+      const type = item['Type'] ?? '?';
+      return `  - ${name} (${year}) [${type}]`;
+    });
+    return ok(`IN LIBRARY — ${items.length} match(es) for "${query}":\n${lines.join('\n')}`);
+  },
+};
+
+/**
+ * Live TV health, which is the thing that actually breaks.
+ *
+ * Reads the surface a viewer experiences (Jellyfin's tuner services and channel
+ * list) and pairs it with Dispatcharr's own recent errors. Each half is reported
+ * with its own success flag — a failure on one side never reads as "fine".
+ */
+export const livetvStatus: Tool = {
+  name: 'livetv_status',
+  description:
+    'Check Live TV health end to end: Jellyfin tuner service status, how many channels Jellyfin can see, ' +
+    'whether the Dispatcharr container is up, and its recent error lines. Use this for any "live TV is ' +
+    'broken / channel not working" question.',
+  minRole: 'owner',
+  parameters: {
+    type: 'object',
+    properties: {
+      log_lines: {
+        type: 'number',
+        description: 'How many recent Dispatcharr log lines to scan for errors (default 200).',
+      },
+    },
+    required: [],
+  },
+  async run(args, ctx) {
+    const logLines = Math.min(
+      Math.max(typeof args['log_lines'] === 'number' ? args['log_lines'] : 200, 20),
+      1000,
+    );
+    const sections: string[] = [];
+    let anyFailure = false;
+
+    const info = await jellyfinGet(ctx.config, '/LiveTv/Info');
+    if (!info.ok) {
+      anyFailure = true;
+      sections.push(`Jellyfin Live TV service: UNKNOWN — ${info.error}`);
+    } else {
+      const body = info.body as { Services?: unknown[]; IsEnabled?: unknown } | undefined;
+      const services = Array.isArray(body?.Services) ? body.Services : [];
+      const rendered = services
+        .map((raw) => {
+          const s = raw as Record<string, unknown>;
+          return `${s['Name'] ?? '?'}=${s['Status'] ?? '?'}`;
+        })
+        .join(', ');
+      sections.push(
+        `Jellyfin Live TV: enabled=${body?.IsEnabled ?? '?'} services: ${rendered || '(none)'}`,
+      );
+    }
+
+    const channels = await jellyfinGet(ctx.config, '/LiveTv/Channels?limit=1');
+    if (!channels.ok) {
+      anyFailure = true;
+      sections.push(`Jellyfin channel count: UNKNOWN — ${channels.error}`);
+    } else {
+      const body = channels.body as { TotalRecordCount?: unknown } | undefined;
+      const total = body?.TotalRecordCount;
+      sections.push(`Jellyfin visible channels: ${total ?? 'unknown'}`);
+      if (typeof total === 'number' && total === 0) {
+        anyFailure = true;
+        sections.push('  ⚠ ZERO channels visible — the tuner is not returning a channel list.');
+      }
+    }
+
+    const up = await runOnHp(
+      ctx.config.hpSshHost,
+      'docker ps --format "{{.Names}}|{{.Status}}" | grep -E "^(dispatcharr|gluetun)\\|"',
+    );
+    sections.push(
+      up.exitCode === 0 && up.stdout.trim()
+        ? `Container status:\n${up.stdout.trim()}`
+        : `Container status: UNKNOWN (exit=${up.exitCode}, stderr=${up.stderr.trim() || '(empty)'})`,
+    );
+    if (up.exitCode !== 0) anyFailure = true;
+
+    const logs = await runOnHp(
+      ctx.config.hpSshHost,
+      `docker logs --tail ${logLines} dispatcharr 2>&1 | grep -iE "error|traceback|refused|timeout|failed" | tail -25`,
+    );
+    // grep exits 1 on "no matches" — that is a clean result, not a failure.
+    if (logs.exitCode > 1) {
+      anyFailure = true;
+      sections.push(
+        `Dispatcharr recent errors: UNKNOWN (exit=${logs.exitCode}, stderr=${logs.stderr.trim() || '(empty)'})`,
+      );
+    } else {
+      sections.push(
+        logs.stdout.trim()
+          ? `Dispatcharr error lines in last ${logLines}:\n${clip(logs.stdout, 3000)}`
+          : `Dispatcharr error lines in last ${logLines}: none`,
+      );
+    }
+
+    const text = sections.join('\n\n');
+    return anyFailure ? fail(text) : ok(text);
+  },
+};
+
+/**
+ * The one mutating tool, and the only place a restart can happen.
+ *
+ * It gathers its own evidence rather than trusting arguments: whether the
+ * container is up, and whether anyone is watching. The verdict is computed by
+ * `assertSafeToRestart`, which refuses on UNKNOWN.
+ */
+export const restartContainer: Tool = {
+  name: 'restart_container',
+  description:
+    'Restart a homelab container. Protected containers (jellyfin, dispatcharr, gluetun) are restarted ' +
+    'ONLY when completely down and only when Jellyfin reports nobody watching. The preconditions are ' +
+    'checked in code and cannot be overridden — if this refuses, report the refusal.',
+  minRole: 'owner',
+  parameters: {
+    type: 'object',
+    properties: {
+      container: { type: 'string', description: 'Exact container name.' },
+    },
+    required: ['container'],
+  },
+  async run(args, ctx) {
+    const container = typeof args['container'] === 'string' ? args['container'].trim() : '';
+    if (!container) return fail('No container name supplied.');
+    if (!/^[A-Za-z0-9._-]+$/.test(container)) {
+      return fail(`"${container}" is not a valid container name.`);
+    }
+    if (container.startsWith('gluetun')) {
+      return fail(
+        'Refusing: gluetun carries the VPN for the whole arr stack and its settings must never be ' +
+          'changed by Jedd. A gluetun restart is a human decision.',
+      );
+    }
+
+    // Evidence, gathered here rather than taken on trust.
+    const ps = await runOnHp(
+      ctx.config.hpSshHost,
+      `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${container}\\|"`,
+    );
+    if (ps.exitCode !== 0 || !ps.stdout.trim()) {
+      return fail(
+        `Could not determine the state of "${container}" (exit=${ps.exitCode}, ` +
+          `stderr=${ps.stderr.trim() || '(empty)'}). Refusing to restart something I cannot see.`,
+      );
+    }
+    const status = ps.stdout.trim().split('|')[1] ?? '';
+    const containerIsUp = status.startsWith('Up');
+
+    const sessionsRes = await jellyfinGet(ctx.config, '/Sessions');
+    const playback = sessionsRes.ok
+      ? parseSessions(sessionsRes.body)
+      : { known: false, activeSessions: [], detail: `/Sessions unreadable: ${sessionsRes.error}` };
+
+    const verdict = assertSafeToRestart(container, {
+      containerIsUp,
+      playback,
+      readOnly: ctx.config.readOnly,
+    });
+    if (!verdict.allowed) {
+      return fail(`NOT RESTARTED. ${verdict.reason} (observed status: ${status})`);
+    }
+
+    const restart = await runOnHp(ctx.config.hpSshHost, `docker restart ${container}`, 90_000);
+    return restart.exitCode === 0
+      ? ok(`Restarted ${container}. ${verdict.reason}\n${renderOutcome(restart)}`)
+      : fail(`Restart of ${container} FAILED.\n${renderOutcome(restart)}`);
+  },
+};
