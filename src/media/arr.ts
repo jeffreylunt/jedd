@@ -1,5 +1,6 @@
-import type { Candidate } from './matching.js';
+import { plausible, type Candidate } from './matching.js';
 import { parseQueue, type Release } from './queue.js';
+import { parseShowSeasons, type ShowSeasons } from './seasons.js';
 
 /**
  * Sonarr / Radarr.
@@ -64,6 +65,24 @@ export interface ArrOptions {
 export type LibraryAnswer =
   | { state: 'owned'; matches: Candidate[] }
   | { state: 'absent'; searched: number }
+  | { state: 'unknown'; detail: string };
+
+/**
+ * Which SEASONS of an owned show are there.
+ *
+ * 🔴 THREE STATES AGAIN, AND `untracked` IS NOT `unknown`.
+ *
+ *  - `tracked`   — Sonarr knows this show; here is the per-season truth.
+ *  - `untracked` — Sonarr was read successfully and does not have it. A real
+ *                  answer: it means nothing is being fetched for it.
+ *  - `unknown`   — Sonarr could not be read. Never rendered as "no seasons".
+ *
+ * Collapsing the middle two is the failure that matters: "Sonarr does not track
+ * this" and "I could not ask Sonarr" lead to opposite actions.
+ */
+export type SeasonAnswer =
+  | { state: 'tracked'; shows: ShowSeasons[] }
+  | { state: 'untracked'; searched: number }
   | { state: 'unknown'; detail: string };
 
 export type CatalogueAnswer =
@@ -177,6 +196,30 @@ export class ArrClient {
     const matches = match(title, all);
     if (matches.length > 0) return { state: 'owned', matches };
     return { state: 'absent', searched: all.length };
+  }
+
+  /**
+   * Per-season availability for every owned show resembling `title`.
+   *
+   * Same endpoint and same reasoning as `owned()`: the COMPLETE library is
+   * filtered here rather than searched remotely, so there is no result window a
+   * title can fall outside of.
+   *
+   * ⚠️ Series only. Calling it on a Radarr client is a programming error, not a
+   * runtime one — a movie has no seasons, and answering "no seasons found" for
+   * a film would be a true sentence that reads as a defect.
+   */
+  async seasons(title: string): Promise<SeasonAnswer> {
+    if (this.kind !== 'series') {
+      return { state: 'unknown', detail: 'seasons() is a Sonarr call; a movie has no seasons.' };
+    }
+    const res = await this.call('/series');
+    if (!res.ok) return { state: 'unknown', detail: res.detail };
+    const rows = Array.isArray(res.body) ? (res.body as unknown[]) : [];
+    const shows = rows.map(parseShowSeasons).filter((s): s is ShowSeasons => s !== null);
+    const matches = plausible(title, shows);
+    if (matches.length === 0) return { state: 'untracked', searched: shows.length };
+    return { state: 'tracked', shows: matches };
   }
 
   /** What COULD be added. Bounded and relevance-ordered — never used to answer "do you have". */

@@ -74,13 +74,23 @@ export interface Pick {
  * for one film could add a completely unrelated one. If no candidate resembles
  * the query, the answer is NOTHING, and the caller must ask rather than pick.
  */
+/**
+ * How much resemblance is enough to be worth showing a person.
+ *
+ * 🔴 ONE CONSTANT, TWO CALLERS. `pickBest` and `plausible` must agree about what
+ * "resembles the query" means: a title good enough to be picked but not good
+ * enough to be listed — or the reverse — is a disagreement between two answers
+ * about the same library, which is the shape this project keeps eliminating.
+ */
+export const MATCH_FLOOR = 0.34;
+
 export function pickBest(query: string, candidates: Candidate[]): Pick | null {
   if (candidates.length === 0) return null;
   const scored = candidates
     .map((c) => ({ c, s: matchScore(query, c.title) }))
     .sort((a, b) => b.s - a.s);
   const top = scored[0]!;
-  if (top.s < 0.34) return null; // resembles nothing; do not fall back to [0]
+  if (top.s < MATCH_FLOOR) return null; // resembles nothing; do not fall back to [0]
   const runner = scored[1];
   const contested = Boolean(runner && top.s - runner.s < 0.15);
   return { best: top.c, score: top.s, contested };
@@ -141,4 +151,24 @@ export function typeVerdict(
     type: 'none',
     detail: `Nothing in either catalogue resembles "${query}". Say so; do not offer the closest thing.`,
   };
+}
+
+/**
+ * EVERY title that resembles the query, best first — not just the best one.
+ *
+ * `pickBest` answers *"which one did they mean"* and is deliberately willing to
+ * answer nothing. This answers *"which ones are worth telling them about"*,
+ * which is a different question: a query like *"star trek"* legitimately matches
+ * several owned shows, and collapsing them to one would hide the rest of the
+ * library from the person asking what is in it.
+ *
+ * Same floor as `pickBest`, so the two never disagree about what resembles what.
+ */
+export function plausible<T extends { title: string }>(query: string, rows: T[], limit = 3): T[] {
+  return rows
+    .map((r) => ({ r, s: matchScore(query, r.title) }))
+    .filter((x) => x.s >= MATCH_FLOOR)
+    .sort((a, b) => b.s - a.s)
+    .slice(0, limit)
+    .map((x) => x.r);
 }

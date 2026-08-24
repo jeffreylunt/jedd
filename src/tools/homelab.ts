@@ -73,43 +73,6 @@ export const jellyfinSessions: Tool = {
   },
 };
 
-/** Search the Jellyfin library — the "do we already have it" question. */
-export const jellyfinSearch: Tool = {
-  name: 'library_search',
-  description:
-    'Search the Jellyfin library for a movie, show or episode by title. Returns what is ACTUALLY in the ' +
-    'library. Call this before telling anyone whether something is available.',
-  minRole: 'guest',
-  writes: false,
-  parameters: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Title to search for.' },
-    },
-    required: ['query'],
-  },
-  async run(args, ctx) {
-    const query = typeof args['query'] === 'string' ? args['query'].trim() : '';
-    if (!query) return fail('No search query supplied.');
-    const path =
-      `/Items?searchTerm=${encodeURIComponent(query)}` +
-      '&IncludeItemTypes=Movie,Series&Recursive=true&Limit=10&Fields=ProductionYear';
-    const res = await jellyfinGet(ctx.config, path);
-    if (!res.ok) return fail(`Library search failed: ${res.error}. Library state is UNKNOWN.`);
-    const body = res.body as { Items?: unknown[] } | undefined;
-    const items = Array.isArray(body?.Items) ? body.Items : [];
-    if (items.length === 0) return ok(`NOT IN LIBRARY: no Jellyfin item matches "${query}".`);
-    const lines = items.map((raw) => {
-      const item = raw as Record<string, unknown>;
-      const name = typeof item['Name'] === 'string' ? item['Name'] : '(untitled)';
-      const year = item['ProductionYear'] ?? '?';
-      const type = item['Type'] ?? '?';
-      return `  - ${name} (${year}) [${type}]`;
-    });
-    return ok(`IN LIBRARY — ${items.length} match(es) for "${query}":\n${lines.join('\n')}`);
-  },
-};
-
 /**
  * Live TV health, which is the thing that actually breaks.
  *

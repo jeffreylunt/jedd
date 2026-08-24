@@ -4,7 +4,6 @@ import { roleSatisfies, type Role } from '../permissions.js';
 import { containerNetns, dockerInspect, dockerLogs, dockerPs } from './docker.js';
 import {
   hpShell,
-  jellyfinSearch,
   jellyfinSessions,
   livetvStatus,
   restartArrStack,
@@ -16,6 +15,7 @@ import { makeCatalogueSearch } from './catalogue.js';
 import { makeCheckStatus } from './check-status.js';
 import { resolveChoice } from './choice.js';
 import { kindleStatus, saveKindleEmail } from './kindle.js';
+import { librarySearch } from './library.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
@@ -45,7 +45,7 @@ import type { Tool } from './types.js';
  */
 
 const GUEST_TOOLS: Tool[] = [
-  jellyfinSearch,
+  librarySearch,
   homelabStatus,
   makeCatalogueSearch(),
   makeCheckStatus(),
