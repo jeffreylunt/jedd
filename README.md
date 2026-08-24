@@ -44,10 +44,40 @@ not *impossible to misstate*. A model can still narrate a write it never perform
 harmless here is that writes are unreachable except through gated tools — so a bluffed claim moves
 no bytes, and shows up as a turn with no matching tool call.
 
+## 🔴 The security boundary is the OS, not the command filter
+
+`src/command-gate.ts` is defence-in-depth, **not** the boundary. A review found
+`awk 'BEGIN{system("docker restart gluetun")}'` passed it — and the lesson was not "add awk to a
+denylist" but that a filter reading command *text* to predict its *effect* is the same losing game
+as V1's prose nets. Every allowlisted binary is a potential interpreter.
+
+So `hp_shell` connects to hp as an **unprivileged ssh identity with no docker group**
+(`HP_SHELL_SSH_HOST`), while structured tools use a privileged one (`HP_ADMIN_SSH_HOST`) and carry
+the safety preconditions. A smuggled interpreter then fails at the kernel regardless of what the
+filter believed. **`hp_shell` is not registered at all when the two are equal.**
+
+⚠️ The unprivileged account **does not exist yet**. The POC runs with
+`JEDD_ALLOW_SHARED_SSH_IDENTITY=true`, which warns on every boot. **Do not deploy `hp_shell` in that
+state.**
+
+## Identity comes from the transport, never from the message
+
+The system prompt does not say who it is talking to. An identity assertion in the context window can
+be contended with by anything else in that window. Identity is resolved from the sender handle in
+code and expressed as **which tools exist this turn** — a guest's list has no admin tools in it, and
+no text can add one.
+
+Two orthogonal axes, kept apart on purpose:
+- **Authorisation** — who you are → which tools exist.
+- **Safety preconditions** — is this action safe *right now* → binds the owner just as hard.
+
+Owner authorisation unlocks the restart tool. It does not unlock restarting while someone is
+watching.
+
 ## Safety lives in code, not in the prompt
 
 - `hp_shell` runs on **hp only** — never on this machine. Deny-by-default allowlist; every pipeline
-  segment is checked, command substitution and redirection are refused.
+  segment is checked, command substitution and file redirection are refused.
 - `restart_container` gathers its own evidence (is it up? is anyone watching?) and refuses on
   UNKNOWN. Protected containers restart only when completely down and nobody is watching.
 - gluetun is never restarted and its settings are never touched — no tool expresses it.
@@ -57,9 +87,15 @@ None of this is phrased as an instruction the model could be argued out of.
 
 ## Known limitations
 
+- **The unprivileged ssh account is not provisioned**, so the OS boundary is not yet real. It will
+  also need a read-only docker socket proxy, or `hp_shell` loses `docker ps/inspect/logs` entirely.
+- Blast-radius **tiers** are missing: the protected-container set is flat, so an unclassified
+  container defaults *permissive*, which is the wrong default.
 - `docker exec` is blocked by the gate, which also blocks legitimate read-only diagnostics that need
   it (e.g. the netns-inode check, `docker exec <c> readlink /proc/self/ns/net`). Fixing this means
   gating the nested command with the same allowlist.
 - Conversation history is in memory; a restart forgets everything.
-- Only the Ollama client exists. `LlmClient` is the seam for an Anthropic one.
+- Pinned to `qwen3.8:27b-mlx` via Ollama. `LlmClient` is a seam, not an abstraction to build out.
+  There is **no forced tool calling** on this stack (`tool_choice` is silently ignored — verified),
+  so nothing may depend on it.
 - No BlueBubbles connector yet — `Connector` is the seam.
