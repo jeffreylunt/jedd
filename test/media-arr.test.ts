@@ -194,3 +194,32 @@ test('a row missing its kind-specific id yields 0 rather than a foreign id', asy
   if (r.state !== 'owned') throw new Error('unreachable');
   assert.equal(r.matches[0]?.id, 0);
 });
+
+// ── shapes taken from the LIVE lookup endpoints, 2026-08-24 ──────────────────
+
+test('🔴 MONEYBALL is genuinely ambiguous in PRODUCTION data, not just in a fixture', async () => {
+  // Verbatim from the live endpoints:
+  //   /series/lookup?term=moneyball -> Moneyball (2021) tvdbId 411987 tmdbId 137592 id 202
+  //   /movie/lookup?term=moneyball  -> Moneyball (2011) tmdbId 60308  imdbId tt1210166
+  // So the ambiguity rule fires on the real defect case, and the kind-based id
+  // selection is required on the LOOKUP path too -- a Sonarr lookup row carries
+  // tmdbId as well, so the old ?? chain would have returned 137592 for a series.
+  const series = await client(async () =>
+    json([{ title: 'Moneyball', year: 2021, id: 202, tvdbId: 411987, tmdbId: 137592 }]),
+  ).catalogue('moneyball');
+  assert.equal(series.state, 'results');
+  if (series.state !== 'results') throw new Error('unreachable');
+  assert.equal(series.candidates[0]?.id, 411987, 'a series lookup row must yield tvdbId');
+
+  const movie = await new ArrClient(
+    {
+      baseUrl: 'http://radarr.invalid/radarr/api/v3',
+      apiKey: 'k',
+      fetchImpl: async () => json([{ title: 'Moneyball', year: 2011, tmdbId: 60308, imdbId: 'tt1210166' }]),
+    },
+    'movie',
+  ).catalogue('moneyball');
+  assert.equal(movie.state, 'results');
+  if (movie.state !== 'results') throw new Error('unreachable');
+  assert.equal(movie.candidates[0]?.id, 60308);
+});
