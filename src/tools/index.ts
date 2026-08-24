@@ -10,8 +10,9 @@ import {
   restartArrStack,
   restartContainer,
 } from './homelab.js';
+import { makeAddMovie, makeAddSeries } from './add-media.js';
 import { makeCatalogueSearch } from './catalogue.js';
-import { homelabStatus, requestMedia } from './media.js';
+import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import type { Tool } from './types.js';
@@ -39,7 +40,17 @@ import type { Tool } from './types.js';
  * identity — see `src/tools/docker.ts`.
  */
 
-const GUEST_TOOLS: Tool[] = [requestMedia, jellyfinSearch, homelabStatus, makeCatalogueSearch()];
+const GUEST_TOOLS: Tool[] = [jellyfinSearch, homelabStatus, makeCatalogueSearch()];
+
+/**
+ * 🔴 GUEST WRITES. Jeff, 2026-08-24: "yes guests can request real media and add users."
+ *
+ * These are `writes: true` at `minRole: 'guest'` — the combination that did not
+ * exist when `buildTools` inferred write-ness from which array a tool sat in,
+ * and the reason `registerable()` now quantifies the kill switch over the whole
+ * registry instead. This is the first real member of that combination.
+ */
+const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries()];
 const OWNER_READ_TOOLS: Tool[] = [
   jellyfinSessions,
   livetvStatus,
@@ -72,7 +83,7 @@ const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLo
  * string comparison. Fail closed by construction, not by remembering to check.
  */
 export function buildTools(config: Config, shellIdentity?: IdentityVerdict): Tool[] {
-  const tools = [...GUEST_TOOLS, ...OWNER_READ_TOOLS, ...OWNER_WRITE_TOOLS];
+  const tools = [...GUEST_TOOLS, ...GUEST_WRITE_TOOLS, ...OWNER_READ_TOOLS, ...OWNER_WRITE_TOOLS];
   if (shellIdentity?.safe) tools.push(hpShell);
   if (config.runbookPath) tools.push(makeRunbookTool(config.runbookPath));
   return registerable(tools, config);
@@ -121,6 +132,12 @@ export function toolsForRole(tools: Tool[], role: Role): Tool[] {
 }
 
 /** Every tool that exists, regardless of config. For tests and documentation. */
-export const ALL_TOOLS: Tool[] = [...GUEST_TOOLS, ...OWNER_READ_TOOLS, ...OWNER_WRITE_TOOLS, hpShell];
+export const ALL_TOOLS: Tool[] = [
+  ...GUEST_TOOLS,
+  ...GUEST_WRITE_TOOLS,
+  ...OWNER_READ_TOOLS,
+  ...OWNER_WRITE_TOOLS,
+  hpShell,
+];
 
 export type { Tool } from './types.js';

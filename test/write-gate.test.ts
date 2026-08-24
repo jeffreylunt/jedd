@@ -109,3 +109,31 @@ test('every tool in the shipped registry declares its write-ness', () => {
     assert.equal(typeof t.writes, 'boolean', `${t.name} does not declare writes`);
   }
 });
+
+// ── 🔴 the combination that did not exist when the gate was built ────────────
+
+test('🔴 GUEST WRITE tools are absent when writes are disabled', async () => {
+  // add_movie/add_series are the first real writes:true at minRole:'guest'.
+  // Before registerable() quantified the invariant, exactly these would have been
+  // registered with JEDD_ALLOW_WRITES unset.
+  const off = buildTools(testConfig({ readOnly: true })).map((t) => t.name);
+  const on = buildTools(testConfig({ readOnly: false })).map((t) => t.name);
+  for (const name of ['add_movie', 'add_series']) {
+    assert.ok(!off.includes(name), `${name} must be absent when read-only`);
+    assert.ok(on.includes(name), `${name} must be present when writes are enabled`);
+  }
+});
+
+test('🔴 writes:true and the guest gate are paired explicitly, not implied', async () => {
+  const tools = buildTools(testConfig({ readOnly: false }));
+  for (const name of ['add_movie', 'add_series']) {
+    const t = tools.find((x) => x.name === name)!;
+    assert.equal(t.writes, true, `${name} mutates and must say so`);
+    assert.equal(t.minRole, 'guest', `${name} is available to guests by Jeff's decision`);
+  }
+});
+
+test('the request_media stub is gone — it reported a queue position for work nothing performed', async () => {
+  const on = buildTools(testConfig({ readOnly: false })).map((t) => t.name);
+  assert.ok(!on.includes('request_media'), 'the stub must not ship alongside a real add path');
+});
