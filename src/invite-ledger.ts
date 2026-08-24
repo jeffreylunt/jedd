@@ -89,9 +89,16 @@ export class InviteLedger {
   /**
    * Was this recipient invited very recently?
    *
-   * Counts ANY outcome: a duplicate request within ten minutes is the same
-   * request whether the first one landed or not, and re-minting for it would
-   * create a second live credential for one intention.
+   * 🔴 Counts ANY outcome, and the reason matters because it will be reused.
+   *
+   * **NOT** "re-minting would create a second live credential" — after a
+   * SUCCESSFUL revoke there is no live credential, so a retry creates one, not
+   * two. That reason is wrong and would mis-rank the case it fails to cover.
+   *
+   * The reason it actually holds is the **orphaned** and **revoke-failed**
+   * cases: precisely the ones where **we do not know whether a credential
+   * survived**. Branching on the revoke outcome would buy precision we cannot
+   * reliably compute, so all failures are treated alike.
    */
   recentlyInvited(recipient: string, now = new Date()): boolean {
     const cutoff = now.getTime() - DEDUPE_MS;

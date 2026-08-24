@@ -48,9 +48,10 @@ test('quota is per-sender and windowed', async () => {
 // ── dedupe counts ANY outcome ────────────────────────────────────────────────
 
 test('🔴 per-recipient dedupe counts FAILED attempts too', async () => {
-  // A duplicate request within ten minutes is the same request whether the first
-  // landed or not; re-minting would create a SECOND live credential for one
-  // intention.
+  // NOT because re-minting would create a second live credential -- after a
+  // successful revoke there is none. It holds for the ORPHANED and
+  // REVOKE-FAILED cases, where we do not know whether a credential survived, and
+  // branching on the revoke outcome buys precision we cannot reliably compute.
   const l = new InviteLedger(tmp());
   l.record(rec({ recipient: '+15550009', outcome: 'failed' }));
   assert.equal(l.recentlyInvited('+15550009', now), true);
