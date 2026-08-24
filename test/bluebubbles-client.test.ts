@@ -75,7 +75,22 @@ test('boot accepts the expected identity', async () => {
 
 test('an unreadable server/info is UNKNOWN and still refuses — it is not "probably fine"', async () => {
   const { impl } = scripted(() => ({ status: 500, body: { message: 'boom' } }));
-  await assert.rejects(() => client(impl, 'jeffreylunt@outlook.com').assertIdentity());
+  // Assert the REASON, not merely that it threw. A mutation survived this test
+  // when it only checked `rejects`: with the unreadable-check removed, the empty
+  // identity still failed the equality test, so the suite stayed green while the
+  // UNKNOWN guard was gone. A refusal for the wrong reason is not a passing test.
+  await assert.rejects(
+    () => client(impl, 'jeffreylunt@outlook.com').assertIdentity(),
+    /could not read|unknown/i,
+  );
+});
+
+test('🔴 an unreadable server/info refuses even with NO expected identity configured', async () => {
+  // `expectedIdentity` is optional, so this is the path where the equality check
+  // cannot stand in for the unreadable check. Without it, a server that answers
+  // nothing at all reads as a successful boot.
+  const { impl } = scripted(() => ({ status: 500, body: { message: 'boom' } }));
+  await assert.rejects(() => client(impl).assertIdentity(), /could not read|unknown/i);
 });
 
 // ── 🔴 webhook registration must UPDATE, never orphan ────────────────────────
