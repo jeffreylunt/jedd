@@ -265,8 +265,17 @@ test('🔴 deferral is BOUNDED — a follow-up cannot retry forever in silence',
     reason: 'r',
     observed: 'o',
   });
+  // ⚠️ BOUNDED on purpose. An unbounded `while (store.defer(...))` is the
+  // obvious way to write this and it HANGS FOREVER under the mutation that
+  // removes the cap — node:test has no default per-test timeout, so the suite
+  // stops rather than failing, and a mutation sweep stalls on it indefinitely.
+  // A test that hangs when the guard is removed has not detected the removal.
   let deferrals = 0;
-  while (store.defer(f.id, new Date(Date.now() + 1000), 'still unknown')) deferrals++;
+  const ceiling = MAX_ATTEMPTS * 10;
+  while (deferrals < ceiling && store.defer(f.id, new Date(Date.now() + 1000), 'still unknown')) {
+    deferrals++;
+  }
+  assert.ok(deferrals < ceiling, 'defer() must eventually refuse — it did not stop on its own');
   assert.equal(deferrals, MAX_ATTEMPTS - 1);
   assert.equal(store.defer(f.id, new Date(), 'one more'), false, 'must eventually refuse to defer');
 });

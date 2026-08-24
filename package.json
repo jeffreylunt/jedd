@@ -6,7 +6,7 @@
   "description": "Jedd V2 \u2014 a thin agent loop for the homelab. The tool-call record is the source of truth.",
   "scripts": {
     "chat": "tsx src/index.ts",
-    "test": "tsx --test test/*.test.ts",
+    "test": "tsx --test --test-timeout=30000 test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "history": "tsx scripts/history.mjs"
   },
