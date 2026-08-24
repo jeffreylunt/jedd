@@ -1,7 +1,7 @@
 import { commandGate } from '../command-gate.js';
 import { jellyfinGet } from '../jellyfin.js';
 import { renderOutcome, runOnHp, clip } from '../hp.js';
-import { assertSafeToRestart, parseSessions } from '../safety.js';
+import { assertSafeToRestart, parseContainerState, parseSessions } from '../safety.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -237,14 +237,14 @@ export const restartContainer: Tool = {
       ctx.config.adminSshHost,
       `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${container}\\|"`,
     );
-    if (ps.exitCode !== 0 || !ps.stdout.trim()) {
+    const state = parseContainerState(ps.stdout, ps.exitCode);
+    if (!state.known) {
       return fail(
         `Could not determine the state of "${container}" (exit=${ps.exitCode}, ` +
           `stderr=${ps.stderr.trim() || '(empty)'}). Refusing to restart something I cannot see.`,
       );
     }
-    const status = ps.stdout.trim().split('|')[1] ?? '';
-    const containerIsUp = status.startsWith('Up');
+    const { status, isUp: containerIsUp } = state;
 
     const sessionsRes = await jellyfinGet(ctx.config, '/Sessions');
     const playback = sessionsRes.ok

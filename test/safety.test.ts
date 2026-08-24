@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assertSafeToRestart, isNeverRestartable, parseSessions } from '../src/safety.js';
+import {
+  assertSafeToRestart,
+  isNeverRestartable,
+  parseContainerState,
+  parseSessions,
+} from '../src/safety.js';
 
 const idle = parseSessions([
   { UserName: 'jeff', Client: 'Jellyfin Web' },
@@ -166,4 +171,50 @@ test('an unprotected container still requires known-idle playback', () => {
     }).allowed,
     false,
   );
+});
+
+test('parseContainerState reads docker ps output correctly', () => {
+  assert.deepEqual(parseContainerState('jellyfin|Up 5 days (healthy)', 0), {
+    known: true,
+    isUp: true,
+    status: 'Up 5 days (healthy)',
+  });
+  assert.deepEqual(parseContainerState('jellyfin|Exited (0) 2 minutes ago', 0), {
+    known: true,
+    isUp: false,
+    status: 'Exited (0) 2 minutes ago',
+  });
+  for (const status of ['Created', 'Restarting (1) 3 seconds ago', 'Dead', 'Paused']) {
+    assert.equal(parseContainerState(`x|${status}`, 0).isUp, false, `${status} is not up`);
+  }
+});
+
+test('🔴 an unreadable docker ps is UNKNOWN, never "down"', () => {
+  // Collapsing these is how "I could not tell" becomes "it is down" — and "it is
+  // down" is precisely the input that unlocks a restart.
+  for (const [stdout, exit] of [
+    ['', 0],
+    ['   ', 0],
+    ['anything', 1],
+    ['jellyfin', 0],
+    ['jellyfin|', 0],
+  ] as [string, number][]) {
+    const state = parseContainerState(stdout, exit);
+    assert.equal(state.known, false, `stdout=${JSON.stringify(stdout)} exit=${exit} must be UNKNOWN`);
+    assert.equal(state.isUp, false);
+  }
+});
+
+test('a failed /Sessions fetch must map to UNKNOWN, not to idle', () => {
+  // This mirrors what restart_container does when jellyfinGet fails. If that
+  // mapping ever became `{known: true, activeSessions: []}` the viewer gate would
+  // silently pass on every Jellyfin outage.
+  const onFetchFailure = { known: false, activeSessions: [], detail: '/Sessions unreadable' };
+  const verdict = assertSafeToRestart('dispatcharr', {
+    containerIsUp: false,
+    playback: onFetchFailure,
+    readOnly: false,
+  });
+  assert.equal(verdict.allowed, false);
+  assert.match(verdict.reason, /UNKNOWN/);
 });

@@ -76,6 +76,39 @@ export function parseSessions(raw: unknown): PlaybackCheck {
   };
 }
 
+export interface ContainerState {
+  /** false when the container's state could not be determined AT ALL. */
+  known: boolean;
+  isUp: boolean;
+  status: string;
+}
+
+/**
+ * Read a container's state from `docker ps -a --format "{{.Names}}|{{.Status}}"`.
+ *
+ * Two failure modes are deliberately distinguished, because collapsing them is
+ * how "I could not tell" becomes "it is down" — and "it is down" is the input
+ * that unlocks a restart:
+ *   - non-zero exit / empty output → `known: false` (refuse; we saw nothing)
+ *   - a real row → `known: true` with `isUp` from the Status column
+ *
+ * ⚠️ `docker ps --filter name=X` is a SUBSTRING match and would report
+ * `audiobookshelf-audiobookshelf-1` as `audiobookshelf`. The caller greps for an
+ * anchored exact name instead; this function assumes that has been done.
+ */
+export function parseContainerState(stdout: string, exitCode: number): ContainerState {
+  if (exitCode !== 0) return { known: false, isUp: false, status: '' };
+  const line = stdout.trim().split('\n')[0]?.trim() ?? '';
+  if (!line) return { known: false, isUp: false, status: '' };
+  const parts = line.split('|');
+  if (parts.length < 2) return { known: false, isUp: false, status: line };
+  const status = (parts[1] ?? '').trim();
+  if (!status) return { known: false, isUp: false, status: line };
+  // Docker's Status column starts with "Up …" only when running. Everything else
+  // ("Exited (0) 2 minutes ago", "Created", "Restarting", "Dead") is not up.
+  return { known: true, isUp: status.startsWith('Up'), status };
+}
+
 export interface RestartVerdict {
   allowed: boolean;
   reason: string;
