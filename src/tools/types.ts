@@ -1,5 +1,6 @@
 import type { ChoiceStore } from '../choices.js';
 import type { Config } from '../config.js';
+import type { KindleRegistry } from '../kindle.js';
 import type { FollowupStore } from '../followups.js';
 import type { ExecImpl } from '../hp.js';
 import type { Role } from '../permissions.js';
@@ -40,6 +41,19 @@ export interface ToolContext {
    * the search that generated them, so the only thing the model does is choose.
    */
   choices?: ChoiceStore;
+  /**
+   * 🔴 ONLY what THIS sender actually typed, this conversation. Never the
+   * assistant's prose, never another sender's history.
+   *
+   * It is a plain `string[]` rather than a filtered message list on purpose:
+   * V1's grounding corpus took `Array<{role: string; text: string}>` and
+   * filtered to `role === 'user'`, so adding a third role would have silently
+   * admitted it. **The filtering happens once, at the Agent, and what reaches a
+   * tool cannot contain anything else.**
+   */
+  userTurns?: string[];
+  /** Verified delivery addresses, keyed by sender. Never model-supplied. */
+  kindle?: KindleRegistry;
 }
 
 /**

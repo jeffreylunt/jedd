@@ -1,0 +1,153 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { KindleRegistry, normaliseKindleAddress } from '../src/kindle.js';
+
+function tempFile(): string {
+  return join(mkdtempSync(join(tmpdir(), 'jedd-kindle-')), 'kindle.jsonl');
+}
+
+const JEFF = '+15555550100';
+const OTHER = '+13854346068';
+
+// ── 🔴 the fabricated address ────────────────────────────────────────────────
+
+test('🔴 THE ACTUAL INCIDENT: a fabricated address cannot be stored', async () => {
+  // Verbatim from the corpus: Jeff typed jeffreylunt_27e778@kindle.com at
+  // 2026-08-23 16:49. The address persisted for a DIFFERENT user 1h43m later was
+  // jeff_27e778@kindle.com -- the same string with the middle removed. The
+  // `_27e778` suffix is an exact match on a random token, so it reached the
+  // model's context from somewhere; it was never typed by that user.
+  const reg = new KindleRegistry(tempFile());
+  const otherUserTurns = ['Can you get Way of Kings on my kindle?', 'Number 1 is great'];
+  const r = reg.save(OTHER, 'jeff_27e778@kindle.com', otherUserTurns);
+  assert.equal(r.ok, false);
+  if (r.ok) throw new Error('unreachable');
+  assert.match(r.reason, /does not appear in anything this person typed/i);
+  assert.equal(reg.get(OTHER), undefined, 'and nothing was stored');
+});
+
+test('🔴 a syntactically PERFECT address is still refused without provenance', async () => {
+  // The point: no property of the STRING distinguishes a real address from a
+  // plausible fabrication. A validator would have passed the one that shipped.
+  const reg = new KindleRegistry(tempFile());
+  const r = reg.save(OTHER, 'korbyn96_yo0FhQ@kindle.com', ['hi', 'can you get me a book']);
+  assert.equal(r.ok, false);
+});
+
+test('CONTROL: an address the person DID type is stored', async () => {
+  // Without this, "refused" would be consistent with the store never accepting
+  // anything, which would be a passing test that proves nothing.
+  const reg = new KindleRegistry(tempFile());
+  const r = reg.save(OTHER, 'korbyn96_yo0FhQ@kindle.com', ['korbyn96_yo0FhQ@kindle.com']);
+  assert.equal(r.ok, true);
+  assert.equal(reg.get(OTHER)?.address, 'korbyn96_yo0FhQ@kindle.com');
+});
+
+test("🔴 one person's address is not provenance for another's", async () => {
+  // This is the cross-session shape of the real incident.
+  const reg = new KindleRegistry(tempFile());
+  reg.save(JEFF, 'jeffreylunt_27e778@kindle.com', ['jeffreylunt_27e778@kindle.com']);
+  const r = reg.save(OTHER, 'jeffreylunt_27e778@kindle.com', ['get me the anxious generation']);
+  assert.equal(r.ok, false, "another person's turns are not this person's provenance");
+});
+
+test('🔴 the ASSISTANT saying an address is not provenance', async () => {
+  // userTurns must contain ONLY what the user typed. V1's grounding corpus bug
+  // was exactly this: a loose role filter let assistant text count as evidence.
+  const reg = new KindleRegistry(tempFile());
+  const onlyUserTurns = ['what do you need?'];
+  const r = reg.save(OTHER, 'invented_abc@kindle.com', onlyUserTurns);
+  assert.equal(r.ok, false);
+});
+
+// ── the address itself ───────────────────────────────────────────────────────
+
+test('🔴 the local part is stored VERBATIM; only the domain is lowercased', async () => {
+  // V1 lowercased the whole address in front of the user, corrupting it and
+  // forcing a re-onboarding.
+  assert.equal(normaliseKindleAddress('Korbyn96_yO0FhQ@KINDLE.COM'), 'Korbyn96_yO0FhQ@kindle.com');
+});
+
+test('an Amazon LOGIN address is refused — it is not a delivery address', async () => {
+  // The common user mistake. Sending there silently does nothing.
+  assert.equal(normaliseKindleAddress('someone@gmail.com'), null);
+  assert.equal(normaliseKindleAddress('someone@amazon.com'), null);
+  assert.equal(normaliseKindleAddress('not-an-address'), null);
+});
+
+test('matching is case-insensitive even though storage is not', async () => {
+  const reg = new KindleRegistry(tempFile());
+  const r = reg.save(OTHER, 'Korbyn96_yO0FhQ@kindle.com', ['my kindle is korbyn96_yo0fhq@KINDLE.COM']);
+  assert.equal(r.ok, true, 'the user typing it in a different case is still the same address');
+});
+
+test('an address survives a restart', async () => {
+  const path = tempFile();
+  new KindleRegistry(path).save(OTHER, 'a_b@kindle.com', ['a_b@kindle.com']);
+  assert.equal(new KindleRegistry(path).get(OTHER)?.address, 'a_b@kindle.com');
+});
+
+test('the source text is kept, so provenance is auditable after the fact', async () => {
+  const reg = new KindleRegistry(tempFile());
+  reg.save(OTHER, 'a_b@kindle.com', ['here you go: a_b@kindle.com thanks']);
+  assert.match(reg.get(OTHER)!.sourceText, /here you go/);
+});
+
+// ── through the TOOL, which is where the model actually reaches it ───────────
+
+test('🔴 the TOOL refuses a fabricated address even though it is well-formed', async () => {
+  const { saveKindleEmail } = await import('../src/tools/kindle.js');
+  const { testConfig } = await import('./helpers.js');
+  const reg = new KindleRegistry(tempFile());
+  const r = await saveKindleEmail.run(
+    { address: 'jeff_27e778@kindle.com' },
+    {
+      role: 'guest',
+      senderHandle: OTHER,
+      config: testConfig({ readOnly: false }),
+      kindle: reg,
+      userTurns: ['Can you get Way of Kings on my kindle?'],
+    },
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.content, /does not appear in anything this person typed/i);
+  assert.equal(reg.get(OTHER), undefined);
+});
+
+test('CONTROL: the tool stores an address the person did type', async () => {
+  const { saveKindleEmail } = await import('../src/tools/kindle.js');
+  const { testConfig } = await import('./helpers.js');
+  const reg = new KindleRegistry(tempFile());
+  const r = await saveKindleEmail.run(
+    { address: 'korbyn96_yo0FhQ@kindle.com' },
+    {
+      role: 'guest',
+      senderHandle: OTHER,
+      config: testConfig({ readOnly: false }),
+      kindle: reg,
+      userTurns: ['my kindle is korbyn96_yo0FhQ@kindle.com'],
+    },
+  );
+  assert.equal(r.ok, true);
+  assert.match(r.content, /approved-senders/i, 'and it owes them the Amazon reminder');
+});
+
+test('🔴 there is NO send tool that takes an address', async () => {
+  // The delivery pipeline does not exist yet, and a send tool that cannot send
+  // would be the request_media mistake. When it lands it will take a choice
+  // number, never an address -- the model cannot supply what the schema will not
+  // accept.
+  const { ALL_TOOLS } = await import('../src/tools/index.js');
+  for (const t of ALL_TOOLS) {
+    const props = (t.parameters as { properties?: Record<string, unknown> }).properties ?? {};
+    for (const key of Object.keys(props)) {
+      assert.ok(
+        !/mail|address|recipient|send_to/i.test(key) || t.name === 'save_kindle_email',
+        `${t.name} takes "${key}" — a delivery address must never be a model-supplied parameter`,
+      );
+    }
+  }
+});

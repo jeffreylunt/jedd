@@ -1,6 +1,7 @@
 import type { Config } from './config.js';
 import type { ChoiceStore } from './choices.js';
 import type { FollowupStore } from './followups.js';
+import type { KindleRegistry } from './kindle.js';
 import type { LlmClient, LlmMessage } from './llm.js';
 import type { HistoryStore } from './store.js';
 import { roleFor, roleSatisfies, type Role } from './permissions.js';
@@ -119,6 +120,7 @@ export class Agent {
     private readonly store?: HistoryStore,
     private readonly followups?: FollowupStore,
     private readonly choices?: ChoiceStore,
+    private readonly kindle?: KindleRegistry,
   ) {
     this.registry = registry;
   }
@@ -132,6 +134,9 @@ export class Agent {
       config: this.config,
       followups: this.followups,
       choices: this.choices,
+      kindle: this.kindle,
+      // Filtered ONCE, here. A tool receives only what this person typed.
+      userTurns: [],
     };
 
     // History is keyed by sender, so one process serves many conversations and
@@ -151,6 +156,10 @@ export class Agent {
       this.histories.set(key, history);
     }
     history.push({ role: 'user', content: userText });
+    ctx.userTurns = history
+      .filter((m) => m.role === 'user')
+      .map((m) => m.content)
+      .filter((c): c is string => typeof c === 'string' && c.length > 0);
 
     const toolCalls: ToolInvocation[] = [];
     let replyText = '';

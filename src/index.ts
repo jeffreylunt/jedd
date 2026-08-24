@@ -7,6 +7,7 @@ import { FollowupStore } from './followups.js';
 import { runDueFollowups } from './followup-runner.js';
 import { createLlmClient } from './llm.js';
 import { ChoiceStore } from './choices.js';
+import { KindleRegistry } from './kindle.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
   const history = new HistoryStore(`${DATA_DIR}history.jsonl`);
   const followups = new FollowupStore(`${DATA_DIR}followups.jsonl`);
   const choices = new ChoiceStore(`${DATA_DIR}choices.jsonl`);
-  const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices);
+  const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, new KindleRegistry(`${DATA_DIR}kindle.jsonl`));
   const connector = new StdoutConnector(process.argv[2] ?? config.ownerHandle);
 
   console.error(
