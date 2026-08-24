@@ -91,6 +91,50 @@ export interface Tool {
    * Neither satisfies the other.
    */
   writes: boolean;
+  /**
+   * 🔴 WHICH KIND OF STORED OPTION THIS TOOL RESOLVES A `choice` INTO.
+   *
+   * ── THE HOLE THIS CLOSES ─────────────────────────────────────────────────
+   *
+   * `add_audiobook` shipped registered, booting, present in the live tool line
+   * — and UNCALLABLE. Its own description says *"Start downloading an audiobook
+   * that an audiobook search found. Pass the number they chose."* **Nothing
+   * produced that number.** V2 shipped the consumer without the producer, and
+   * `send_ebook` was in exactly the same state.
+   *
+   * Every invariant we had passed. `registerable()` quantifies over
+   * DECLARATIONS — `writes` declared, present in `ALL_TOOLS`, reachable from
+   * `buildTools` — and the coverage test proves every `make*` export is
+   * registered. **None of that knows about TOOL-TO-TOOL DATA DEPENDENCIES.** A
+   * tool whose required argument is another tool's output has one, and an
+   * orphaned consumer was indistinguishable from a working capability at every
+   * layer we asserted on. It is the more instructive sibling of `add_season`:
+   * that one was honestly absent; this one passed every green check.
+   *
+   * ── WHY IT CANNOT BE FORGOTTEN ───────────────────────────────────────────
+   *
+   * The trigger is STRUCTURAL, not a declaration: a tool whose `parameters`
+   * REQUIRE a `choice` is a consumer, read straight off its schema. Having
+   * detected that, `registerable()` refuses to register it unless it says which
+   * kind — the same discipline as `writes`, and for the same reason: defaulting
+   * picks the convenient answer for an author who forgot.
+   *
+   * `'*'` means kind-agnostic and belongs only to `resolve_choice`, which is the
+   * generic resolver and genuinely does not care.
+   */
+  consumesChoiceKind?: string;
+  /**
+   * Which kinds of option this tool STORES via `ctx.choices.present`.
+   *
+   * The other half of the pair above: a consumed kind that nothing registered
+   * produces is a capability that cannot be reached, and `registerable()`
+   * throws rather than booting it.
+   *
+   * ⚠️ Forgetting this on a new PRODUCER causes a false alarm at startup, not a
+   * silent gap. That is the fail-closed direction and it is the intended
+   * asymmetry — the consumer side is the one that cannot be forgotten.
+   */
+  presentsChoiceKinds?: string[];
   /** JSON Schema for the arguments object. */
   parameters: Record<string, unknown>;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;

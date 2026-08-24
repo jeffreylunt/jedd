@@ -28,6 +28,9 @@ export const resolveChoice: Tool = {
     'gone or the number is out of range, ASK — never guess which one they meant.',
   minRole: 'guest',
   writes: false,
+  // The generic resolver: it maps an ordinal back to whatever was offered and
+  // genuinely does not care what kind that was. The only legitimate '*'.
+  consumesChoiceKind: '*',
   parameters: {
     type: 'object',
     properties: {

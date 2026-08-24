@@ -44,6 +44,9 @@ export function makeTitleDetails(fetchImpl?: FetchImpl): Tool {
       'Otherwise pass `title` with what they called it. Do NOT pass an id — you never need one.',
     minRole: 'guest',
     writes: false,
+    // Optional here — it also works from a bare title — but declared so the
+    // dependency is visible and checked.
+    consumesChoiceKind: 'media-choice',
     parameters: {
       type: 'object',
       properties: {

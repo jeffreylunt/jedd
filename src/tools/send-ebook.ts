@@ -50,6 +50,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       'already stored, and if it is not, ask them for it and save it first.',
     minRole: 'guest',
     writes: true,
+    consumesChoiceKind: 'release',
     parameters: {
       type: 'object',
       properties: {

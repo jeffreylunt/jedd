@@ -23,6 +23,7 @@ import { makeInviteTool, type InviteDeps } from './invite.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
+import { makeSearchAudiobook, makeSearchEbook } from './search-release.js';
 import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
 import { makeTitleDetails } from './title-details.js';
 import { makeTrending } from './trending.js';
@@ -58,6 +59,11 @@ const GUEST_TOOLS: Tool[] = [
   makeCheckStatus(),
   resolveChoice,
   kindleStatus,
+  // 🔴 The PRODUCERS for add_audiobook and send_ebook, which shipped without
+  // them and were uncallable. Reads: they search and store a list; nothing is
+  // grabbed until the consumer runs. See search-release.ts.
+  makeSearchAudiobook(),
+  makeSearchEbook(),
 ];
 
 /**
@@ -220,7 +226,58 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
       );
     }
   }
+  assertChoiceProducersExist(tools);
   return config.readOnly ? tools.filter((t) => !t.writes) : tools;
+}
+
+/** Does this tool's own schema say a `choice` is REQUIRED? */
+function requiresChoice(t: Tool): boolean {
+  const required = (t.parameters as { required?: unknown }).required;
+  return Array.isArray(required) && required.includes('choice');
+}
+
+/**
+ * 🔴 A CONSUMER WITHOUT A PRODUCER IS NOT A CAPABILITY.
+ *
+ * `add_audiobook` was registered, booted, appeared in the live tool line, and
+ * could never be called: it resolves a pick from an audiobook search, and no
+ * audiobook search existed. `send_ebook` was identical. Both passed every check
+ * this file had, because all of them quantify over DECLARATIONS and none knew
+ * that one tool's argument is another tool's output.
+ *
+ * So the dependency is now declared and checked, in the direction that cannot be
+ * forgotten: **consuming is detected from the schema**, and a tool that requires
+ * a `choice` must name the kind it needs. Then that kind must be produced by
+ * something registered, or this throws at construction rather than shipping a
+ * capability the model will offer and never deliver.
+ *
+ * ⚠️ Checked over the tools actually being registered, so the read-only build is
+ * checked AS the read-only build — if a producer were a write tool it would
+ * genuinely vanish when writes are off, and that would be a real hole.
+ */
+export function assertChoiceProducersExist(tools: Tool[]): void {
+  const produced = new Set<string>();
+  for (const t of tools) for (const k of t.presentsChoiceKinds ?? []) produced.add(k);
+
+  for (const t of tools) {
+    const declared = t.consumesChoiceKind;
+    if (requiresChoice(t) && !declared) {
+      throw new Error(
+        `Tool "${t.name}" REQUIRES a "choice" argument but does not declare consumesChoiceKind. A ` +
+          'choice comes from a list some other tool stored, so this tool has a dependency on that ' +
+          'tool. Name the kind so the registry can check a producer exists. Not defaulted on purpose.',
+      );
+    }
+    if (!declared || declared === '*') continue;
+    if (!produced.has(declared)) {
+      throw new Error(
+        `Tool "${t.name}" resolves a "${declared}" choice, but NO registered tool presents one. It ` +
+          'would boot, appear in the tool list, and be uncallable — which is exactly how ' +
+          'add_audiobook and send_ebook shipped. Register the search tool that produces it, or ' +
+          'remove this one.',
+      );
+    }
+  }
 }
 
 /**

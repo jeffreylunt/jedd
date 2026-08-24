@@ -34,6 +34,7 @@ export const addAudiobook: Tool = {
     'said they did not want one, or did not mention it, leave it false.',
   minRole: 'guest',
   writes: true,
+  consumesChoiceKind: 'release',
   parameters: {
     type: 'object',
     properties: {

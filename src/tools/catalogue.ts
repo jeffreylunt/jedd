@@ -29,6 +29,7 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
       'as both a film and a show: present both and ask which they meant, and add neither.',
     minRole: 'guest',
     writes: false,
+    presentsChoiceKinds: ['media-choice'],
     parameters: {
       type: 'object',
       properties: {

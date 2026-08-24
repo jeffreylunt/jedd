@@ -57,6 +57,7 @@ export function makeTrending(fetchImpl?: FetchImpl): Tool {
       'with its title.',
     minRole: 'guest',
     writes: false,
+    presentsChoiceKinds: ['media-choice'],
     parameters: {
       type: 'object',
       properties: {
