@@ -45,8 +45,8 @@ export interface Config {
    * The bare host serves a web app, so a wrong URL returns 200 + HTML and reads
    * as a broken homelab when it is really a config error.
    */
-  sonarr: { baseUrl: string; apiKey: string };
-  radarr: { baseUrl: string; apiKey: string };
+  sonarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
+  radarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   bluebubbles: {
     /**
      * 🔴 `:1234` is JEDD (jeffreylunt@outlook.com). `:1235` is Jeff's PERSONAL
@@ -131,10 +131,14 @@ export function loadConfig(): Config {
     sonarr: {
       baseUrl: process.env.SONARR_URL ?? 'http://192.168.1.7:8989/sonarr/api/v3',
       apiKey: process.env.SONARR_API_KEY ?? '',
+      rootFolder: process.env.SONARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/TV',
+      qualityProfileId: Number(process.env.SONARR_QUALITY_PROFILE_ID ?? 9),
     },
     radarr: {
       baseUrl: process.env.RADARR_URL ?? 'http://192.168.1.7:7878/radarr/api/v3',
       apiKey: process.env.RADARR_API_KEY ?? '',
+      rootFolder: process.env.RADARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/Movies',
+      qualityProfileId: Number(process.env.RADARR_QUALITY_PROFILE_ID ?? 6),
     },
     bluebubbles: {
       baseUrl: process.env.BLUEBUBBLES_URL ?? 'http://127.0.0.1:1234',

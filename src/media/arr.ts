@@ -24,6 +24,22 @@ import type { Candidate } from './matching.js';
 
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * 🔴 FOUR STATES, AND THEY ARE NEVER COLLAPSED.
+ *
+ * V1's ebook path read qBittorrent's duplicate-add rejection as a download
+ * FAILURE and told the user to retry — the one action guaranteed never to work,
+ * wearing a helpful message. **A duplicate add is the SUCCESS case.**
+ *
+ * `unknown` is not a failure either: it means the write may or may not have
+ * happened, which is a different thing to tell a user than "it didn't".
+ */
+export type AddOutcome =
+  | { state: 'started'; detail: string; confirmed: number[] }
+  | { state: 'already-have'; detail: string }
+  | { state: 'failed'; detail: string }
+  | { state: 'unknown'; detail: string };
+
 export interface ArrOptions {
   /**
    * ⚠️ Base URL INCLUDING the path prefix: `http://host:8989/sonarr/api/v3`.
@@ -167,6 +183,131 @@ export class ArrClient {
     const res = await this.call(`/${this.kind}/lookup?term=${encodeURIComponent(term)}`);
     if (!res.ok) return { state: 'unknown', detail: res.detail };
     return { state: 'results', candidates: this.toCandidates(res.body) };
+  }
+
+  private async post(path: string, body: unknown): Promise<{ ok: boolean; status: number; body: unknown; detail: string }> {
+    const url = `${this.opts.baseUrl}${path}`;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: { 'X-Api-Key': this.opts.apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (e) {
+      // Could not reach it: the write may or may not have landed. UNKNOWN.
+      return { ok: false, status: 0, body: null, detail: `could not reach ${url}: ${(e as Error).message}` };
+    }
+    let parsed: unknown = null;
+    let raw = '';
+    try {
+      raw = await res.text();
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+    return { ok: res.ok, status: res.status, body: parsed, detail: raw.slice(0, 300) };
+  }
+
+  /**
+   * Add a series, monitoring ONLY the seasons asked for.
+   *
+   * 🔴 THE SEASON-SCOPING DEFECT THIS EXISTS TO NOT HAVE.
+   *
+   * Live instance: a guest asked for *Peppa Pig* "the first 3 seasons" and V1
+   * monitored **seasons 1-9**, then grabbed S5 at 52/52 — a season nobody
+   * requested — while the requested S2 and S3 sit at 0/52 five months later.
+   *
+   * The mechanism is `addOptions.monitor`: leaving it at Sonarr's default lets
+   * the SERVICE decide, and its decision overrides the per-season flags we set.
+   * So the per-season `monitored` array is authoritative AND `monitor: 'none'`
+   * is sent explicitly, so nothing downstream re-expands the scope.
+   */
+  async addSeries(input: {
+    tvdbId: number;
+    title: string;
+    seasons: number[];
+    availableSeasons: number[];
+    rootFolder: string;
+    qualityProfileId: number;
+  }): Promise<AddOutcome> {
+    if (!input.tvdbId) {
+      return { state: 'failed', detail: 'no tvdbId — a series cannot be added without one.' };
+    }
+    const unknownSeasons = input.seasons.filter((n) => !input.availableSeasons.includes(n));
+    if (unknownSeasons.length) {
+      return {
+        state: 'failed',
+        detail:
+          `season(s) ${unknownSeasons.join(', ')} do not exist for "${input.title}" ` +
+          `(it has ${input.availableSeasons.join(', ')}). Nothing was added.`,
+      };
+    }
+    const res = await this.post('/series', {
+      tvdbId: input.tvdbId,
+      title: input.title,
+      qualityProfileId: input.qualityProfileId,
+      rootFolderPath: input.rootFolder,
+      monitored: true,
+      seasons: input.availableSeasons.map((n) => ({
+        seasonNumber: n,
+        monitored: input.seasons.includes(n),
+      })),
+      // 🔴 'none' so the service does not re-expand what we scoped above.
+      addOptions: { monitor: 'none', searchForMissingEpisodes: true },
+    });
+    return this.interpretAdd(res, input.seasons, input.title);
+  }
+
+  async addMovie(input: {
+    tmdbId: number;
+    title: string;
+    rootFolder: string;
+    qualityProfileId: number;
+  }): Promise<AddOutcome> {
+    if (!input.tmdbId) {
+      return { state: 'failed', detail: 'no tmdbId — a movie cannot be added without one.' };
+    }
+    const res = await this.post('/movie', {
+      tmdbId: input.tmdbId,
+      title: input.title,
+      qualityProfileId: input.qualityProfileId,
+      rootFolderPath: input.rootFolder,
+      monitored: true,
+      addOptions: { searchForMovie: true },
+    });
+    return this.interpretAdd(res, [], input.title);
+  }
+
+  /** Map an arr response onto the four states. Never collapses them. */
+  private interpretAdd(
+    res: { ok: boolean; status: number; body: unknown; detail: string },
+    seasons: number[],
+    title: string,
+  ): AddOutcome {
+    if (res.ok) {
+      return {
+        state: 'started',
+        detail: `"${title}" added and searching${seasons.length ? ` (season(s) ${seasons.join(', ')})` : ''}.`,
+        confirmed: seasons,
+      };
+    }
+    // 🔴 ALREADY PRESENT IS SUCCESS, NOT FAILURE. The arrs answer 400 with a
+    // validation error whose text names the collision. Telling the user to retry
+    // is the one action guaranteed never to work.
+    if (res.status === 400 && /already been added|already exists/i.test(res.detail)) {
+      return { state: 'already-have', detail: `"${title}" is already in the library — nothing to do.` };
+    }
+    if (res.status === 0) {
+      return {
+        state: 'unknown',
+        detail:
+          `Could not reach the service adding "${title}", so I do NOT know whether it was added. ` +
+          `This is not a "no" — check before trying again. (${res.detail})`,
+      };
+    }
+    return { state: 'failed', detail: `Add refused (http ${res.status}): ${res.detail.slice(0, 160)}` };
   }
 
   /** Reachability, distinguishing a wrong URL from a dead service. */
