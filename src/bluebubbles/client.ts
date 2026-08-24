@@ -251,6 +251,30 @@ export class BlueBubblesClient {
   }
 
   /**
+   * The newest `originalROWID` the server knows about, for seeding a watermark.
+   *
+   * 🔴 EXISTS SO A FIRST BOOT DOES NOT REPLY TO HISTORY. See
+   * `BlueBubblesReceiver.replayMissed()` — a virgin `SeenStore` has watermark 0,
+   * and replaying from 0 would walk back up to 20 pages and hand every one of
+   * those messages to the agent as if it had just arrived.
+   *
+   * `null` when the server cannot be read or has no messages. The caller must
+   * treat that as "do not know", never as 0 — 0 is the value that causes the
+   * flood.
+   */
+  async newestRowid(): Promise<number | null> {
+    const { body } = await this.call('/message/query', {
+      method: 'POST',
+      body: JSON.stringify({ limit: 1, sort: 'DESC', with: ['handle'] }),
+    });
+    const rows = BlueBubblesClient.data(body);
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const raw = (rows[0] as Record<string, unknown>)['originalROWID'];
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  /**
    * Everything after `sinceRowid`, oldest first, paging until the watermark is
    * reached or the page budget runs out.
    *

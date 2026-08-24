@@ -355,3 +355,87 @@ test('a suppressed send resolves quietly — it is not an error the loop should 
   const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, []);
   await connector.send('+15551112222', 'hi');
 });
+
+// ── 🔴 the first boot must not answer history ────────────────────────────────
+
+/** A server holding `history` messages, newest rowid 2601. */
+function historyClient(history: number, calls: string[]): BlueBubblesClient {
+  const rows = Array.from({ length: history }, (_, i) => ({
+    originalROWID: 2601 - i,
+    guid: `g${2601 - i}`,
+    text: 'an old message',
+    isFromMe: false,
+    handle: { address: '+15555550100' },
+  }));
+  return new BlueBubblesClient({
+    baseUrl: 'http://bb.invalid:1234',
+    password: 'pw',
+    fetchImpl: async (url, init) => {
+      const u = String(url);
+      calls.push(u);
+      const body = init?.body ? (JSON.parse(String(init.body)) as { limit?: number; offset?: number }) : {};
+      const limit = body.limit ?? 50;
+      const offset = body.offset ?? 0;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: rows.slice(offset, offset + limit) }),
+      } as Response;
+    },
+  });
+}
+
+test('🔴 a first boot SEEDS the watermark instead of replaying the backlog', async () => {
+  // A virgin SeenStore has watermark 0, and replaying from 0 walks back up to
+  // 20 pages and hands every inbound message to the agent as if it had just
+  // arrived — so V2's very first live start would answer weeks of history in a
+  // burst, looking exactly like a normal startup.
+  const calls: string[] = [];
+  const seen = new SeenStore(tempFile());
+  assert.equal(seen.watermark(), 0, 'precondition: the store really is virgin');
+
+  await withReceiver({ seen, client: historyClient(300, calls) }, async (receiver, _port, got) => {
+    const outcome = await receiver.replayMissed(async (m) => {
+      got.push(m);
+    });
+    assert.equal(got.length, 0, 'not one historical message may be handled');
+    assert.equal(outcome.delivered, 0);
+    assert.match(outcome.detail, /first boot/);
+    assert.match(outcome.detail, /rather than replying to history/);
+  });
+
+  // And the watermark is now set, so the NEXT boot is a real replay.
+  assert.equal(seen.watermark(), 2601);
+});
+
+test('a second boot with a stored watermark DOES replay — the seeding is not a blanket off switch', async () => {
+  const calls: string[] = [];
+  const seen = new SeenStore(tempFile());
+  seen.advanceWatermark(2598);
+
+  await withReceiver({ seen, client: historyClient(10, calls) }, async (receiver, _port, got) => {
+    const outcome = await receiver.replayMissed(async (m) => {
+      got.push(m);
+    });
+    assert.equal(outcome.delivered, 3, 'rowids 2599, 2600, 2601');
+    assert.equal(got.length, 3);
+  });
+});
+
+test('🔴 an unreadable server on first boot skips replay — null is not zero', async () => {
+  const seen = new SeenStore(tempFile());
+  const client = new BlueBubblesClient({
+    baseUrl: 'http://bb.invalid:1234',
+    password: 'pw',
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) }) as Response,
+  });
+  await withReceiver({ seen, client }, async (receiver, _port, got) => {
+    const outcome = await receiver.replayMissed(async (m) => {
+      got.push(m);
+    });
+    // Guessing 0 here is what produces the flood, so it fails CLOSED.
+    assert.equal(got.length, 0);
+    assert.match(outcome.detail, /unseeded/);
+  });
+  assert.equal(seen.watermark(), 0, 'nothing implausible was stored');
+});

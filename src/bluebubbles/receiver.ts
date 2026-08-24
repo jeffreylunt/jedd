@@ -153,6 +153,40 @@ export class BlueBubblesReceiver {
    */
   async replayMissed(handler?: Handler): Promise<ReplayOutcome> {
     const since = this.opts.seen.watermark();
+
+    /**
+     * 🔴 A FIRST BOOT HAS NO DOWNTIME TO RECOVER FROM, AND MUST NOT REPLAY.
+     *
+     * A virgin `SeenStore` has watermark 0. Replaying from 0 walks back up to
+     * `MAX_REPLAY_PAGES` × 50 messages and hands every inbound one to the agent
+     * as if it had just arrived — so the very first start of the live entry
+     * point would answer a backlog of weeks-old messages, to the whole
+     * household, in a burst. It would look exactly like a normal startup.
+     *
+     * Replay exists to cover the gap between "was running" and "is running
+     * again". If there has never been a run, there is no gap: seed the watermark
+     * to the newest rowid and start from now.
+     *
+     * ⚠️ A server we cannot read gives `null`, and `null` is NOT 0. Seeding
+     * fails closed — no replay at all — because guessing 0 is the flood.
+     */
+    if (since === 0) {
+      const newest = await this.opts.client.newestRowid();
+      if (newest !== null) {
+        this.opts.seen.advanceWatermark(newest);
+        const detail =
+          `first boot: no watermark stored, so there is no downtime to recover. Seeded at rowid ` +
+          `${newest} and starting from now rather than replying to history.`;
+        this.log(`[bb] ${detail}`);
+        return { delivered: 0, saturated: false, detail };
+      }
+      const detail =
+        '🔴 first boot AND the newest rowid could not be read, so the watermark is unseeded. ' +
+        'Skipping replay entirely — replaying from 0 would answer a backlog of old messages.';
+      this.log(`[bb] ${detail}`);
+      return { delivered: 0, saturated: false, detail };
+    }
+
     const res = await this.opts.client.replaySince(since);
     for (const row of res.messages) {
       await this.ingest({ type: 'new-message', data: row }, 'replay', handler);
