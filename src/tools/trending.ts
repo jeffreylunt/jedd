@@ -175,5 +175,17 @@ function describe(i: PopularItem): string {
  */
 function optionValue(i: PopularItem): Record<string, unknown> {
   if (i.media === 'film') return { arr: 'movie', id: i.tmdbId, title: i.title };
-  return { arr: 'series', title: i.title, needs: 'a tvdbId — call catalogue_search with this title' };
+  /**
+   * ⚠️ `year` and NOT an id. A show still emits no number that could be
+   * misrouted — a year cannot be mistaken for a tmdbId or a tvdbId by anything.
+   * It is here because `title_details` resolves a show by NAME, and "Lioness"
+   * matches one show and three films on TMDB; the year is what picks correctly
+   * without reintroducing the id.
+   */
+  return {
+    arr: 'series',
+    title: i.title,
+    year: i.year ?? undefined,
+    needs: 'a tvdbId — call catalogue_search with this title',
+  };
 }

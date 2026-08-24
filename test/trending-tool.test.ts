@@ -146,14 +146,41 @@ test('🔴 a SHOW EMITS ITS TMDB ID NOWHERE — not in the line, the label, or t
   const value = JSON.parse(picked.content.slice(picked.content.indexOf('{'))) as Record<string, unknown>;
   assert.deepEqual(
     value,
-    { arr: 'series', title: 'Lanterns', needs: 'a tvdbId — call catalogue_search with this title' },
-    'a show option carries a title and no number at all',
+    {
+      arr: 'series',
+      title: 'Lanterns',
+      year: 2026,
+      needs: 'a tvdbId — call catalogue_search with this title',
+    },
+    'a show option carries a title, a year, and no id',
   );
+  /**
+   * ⚠️ This assertion used to be "no numeric field may survive, whatever it is
+   * called", and it fired when `year` was added for `title_details`. Loosening
+   * it to allow any number would have reopened the exact hole it exists to
+   * close, so it now forbids THE ID specifically, under any key — which is what
+   * was always meant. A year cannot be misrouted; an id can.
+   */
   assert.equal(
-    Object.values(value).some((v) => typeof v === 'number'),
+    Object.values(value).includes(1396),
     false,
-    'no numeric field may survive, whatever it is called',
+    'the TMDB id must not appear under ANY key, however it is named',
   );
+});
+
+test('🔴 the year on a show option is a YEAR, and is not the id wearing a different name', async () => {
+  // The guard above is only as good as the two numbers being distinguishable, so
+  // this pins that they are: the id is nowhere, and the year is the air date's.
+  const path = tempFile();
+  await run(
+    () => page([{ id: 2026, media_type: 'tv', name: 'Coincidence', first_air_date: '2019-04-01' }]),
+    'trending',
+    { choices: new ChoiceStore(path) },
+  );
+  const picked = await resolveChoice.run({ choice: 1 }, ctx({ choices: new ChoiceStore(path) }));
+  const value = JSON.parse(picked.content.slice(picked.content.indexOf('{'))) as Record<string, unknown>;
+  assert.equal(value['year'], 2019, 'the year comes from the air date');
+  assert.equal(Object.values(value).includes(2026), false, 'and the id is absent even when it LOOKS like a year');
 });
 
 // ── what /trending/all actually returns ─────────────────────────────────────

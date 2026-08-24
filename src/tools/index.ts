@@ -24,6 +24,7 @@ import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
+import { makeTitleDetails } from './title-details.js';
 import { makeTrending } from './trending.js';
 import type { Tool } from './types.js';
 
@@ -187,7 +188,7 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   // Same rule again: no TMDB token, no tool. A registered whats_popular with no
   // credential would answer every "what's good right now" with a failure, after
   // the model has already offered to look.
-  if (config.tmdb.readToken) tools.push(makeTrending());
+  if (config.tmdb.readToken) tools.push(makeTrending(), makeTitleDetails());
   return registerable(tools, config);
 }
 
@@ -251,6 +252,7 @@ export const ALL_TOOLS: Tool[] = [
   // the same shape as `read_runbook` and must be listed here by hand or every
   // invariant quantified over ALL_TOOLS silently skips it.
   makeTrending(),
+  makeTitleDetails(),
 ];
 
 export type { Tool } from './types.js';
