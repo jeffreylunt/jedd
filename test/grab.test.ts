@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ExecImpl } from '../src/hp.js';
-import { grabTorrent } from '../src/media/grab.js';
+import { grabStatus, grabTorrent } from '../src/media/grab.js';
 
 const HASH = 'abcdef0123456789abcdef0123456789abcdef01';
 
@@ -110,4 +110,55 @@ test('🔴 a failed queue-jump does NOT downgrade a successful grab', async () =
   const r = await grabTorrent({ ...base, exec });
   assert.equal(r.state, 'started', 'the torrent was added; priority is cosmetic');
   assert.match(r.detail, /could not change its queue position/i);
+});
+
+// ── completion polling ───────────────────────────────────────────────────────
+
+const info = (t: Record<string, unknown>) => ({ stdout: JSON.stringify([t]) });
+
+test('🔴 a torrent qBittorrent never heard of is MISSING, not unknown', async () => {
+  // The grab did not land -- actionable. Different from "I could not ask".
+  const { exec } = ssh([{ stdout: '[]' }]);
+  const r = await grabStatus({ ...base, exec });
+  assert.equal(r.state, 'missing');
+  if (r.state !== 'missing') throw new Error('unreachable');
+  assert.match(r.detail, /did not land/);
+});
+
+test('🔴 being unable to ask is UNKNOWN, never missing', async () => {
+  const { exec } = ssh([{ stdout: '', code: 255 }]);
+  const r = await grabStatus({ ...base, exec });
+  assert.equal(r.state, 'unknown');
+  assert.match(r.detail, /Not a finding that it is absent/);
+});
+
+test('a finished torrent reports complete with its content path', async () => {
+  const { exec } = ssh([
+    info({ name: 'The Anxious Generation', progress: 1, content_path: '/downloads/ebooks/tag.epub', state: 'stalledUP' }),
+  ]);
+  const r = await grabStatus({ ...base, exec });
+  assert.equal(r.state, 'complete');
+  if (r.state !== 'complete') throw new Error('unreachable');
+  assert.equal(r.contentPath, '/downloads/ebooks/tag.epub');
+});
+
+test('🔴 progress decides completion, not the state string', async () => {
+  // qBittorrent spells "finished" many ways: uploading, stalledUP, pausedUP,
+  // forcedUP. Matching on the string is how a complete download reads as stuck.
+  for (const state of ['uploading', 'stalledUP', 'pausedUP', 'forcedUP', 'queuedUP']) {
+    const { exec } = ssh([info({ name: 'x', progress: 1, content_path: '/downloads/x.epub', state })]);
+    assert.equal((await grabStatus({ ...base, exec })).state, 'complete', `${state} must read as complete`);
+  }
+  const { exec } = ssh([info({ name: 'x', progress: 0.4, content_path: '/downloads/x.epub', state: 'stalledDL' })]);
+  const partial = await grabStatus({ ...base, exec });
+  assert.equal(partial.state, 'downloading');
+  if (partial.state !== 'downloading') throw new Error('unreachable');
+  assert.match(partial.detail, /40% done/);
+});
+
+test('complete-but-no-path is NOT reported as complete', async () => {
+  // Without a path there is nothing to send, so calling it complete would hand
+  // the next step an empty string.
+  const { exec } = ssh([info({ name: 'x', progress: 1, content_path: '', state: 'uploading' })]);
+  assert.equal((await grabStatus({ ...base, exec })).state, 'downloading');
 });

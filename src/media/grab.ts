@@ -159,3 +159,81 @@ export async function grabTorrent(input: GrabInput): Promise<GrabOutcome> {
       (bumped.exitCode === 0 ? ' and moved to the front of the queue.' : ' (could not change its queue position).'),
   };
 }
+
+/**
+ * Where a grab has got to.
+ *
+ * 🔴 Four states, and `missing` is NOT `unknown`. A torrent qBittorrent has
+ * never heard of means the grab did not land — actionable, and different from
+ * "I could not ask", which means try again later. V1's ebook path collapsed
+ * these and told a user to retry something that had already succeeded.
+ */
+export type GrabStatus =
+  | { state: 'complete'; contentPath: string; name: string }
+  | { state: 'downloading'; progress: number; name: string; detail: string }
+  | { state: 'missing'; detail: string }
+  | { state: 'unknown'; detail: string };
+
+/**
+ * ⚠️ `content_path` is used VERBATIM.
+ *
+ * It is qBittorrent's own view of where the file is, and that view is inside its
+ * container's mount namespace. Any consumer must resolve it against the SAME
+ * mount, or it will look in a path that does not exist and report a missing file
+ * for a download that completed. V1 mounted `/home/jeff/gluetun/downloads` as
+ * `/downloads:ro` precisely so the two agreed.
+ */
+export async function grabStatus(input: {
+  adminSshHost: string;
+  qbitBaseUrl: string;
+  infoHash: string;
+  exec?: ExecImpl;
+}): Promise<GrabStatus> {
+  if (!isValidInfoHash(input.infoHash)) {
+    return { state: 'unknown', detail: `"${input.infoHash}" is not a valid infoHash.` };
+  }
+  const out = await runOnHp(
+    input.adminSshHost,
+    `curl -s --max-time 10 ${shellQuote(
+      `${input.qbitBaseUrl}/api/v2/torrents/info?hashes=${input.infoHash.toLowerCase()}`,
+    )}`,
+    20_000,
+    input.exec,
+  );
+  if (out.exitCode !== 0) {
+    return {
+      state: 'unknown',
+      detail: `Could not ask qBittorrent (exit ${out.exitCode}). Not a finding that it is absent.`,
+    };
+  }
+  let rows: unknown;
+  try {
+    rows = JSON.parse(out.stdout.trim() || '[]');
+  } catch {
+    return { state: 'unknown', detail: 'qBittorrent returned something that is not JSON.' };
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      state: 'missing',
+      detail:
+        'qBittorrent has no torrent with that hash. The grab did not land — this is actionable, ' +
+        'and different from being unable to check.',
+    };
+  }
+  const t = rows[0] as Record<string, unknown>;
+  const name = String(t['name'] ?? 'the download');
+  const progress = Number(t['progress'] ?? 0);
+  const contentPath = String(t['content_path'] ?? '');
+  const state = String(t['state'] ?? '');
+  // `progress` is 0..1. Trust it over the state string, which has many spellings
+  // for finished (uploading, stalledUP, pausedUP, forcedUP...).
+  if (progress >= 1 && contentPath) {
+    return { state: 'complete', contentPath, name };
+  }
+  return {
+    state: 'downloading',
+    progress,
+    name,
+    detail: `"${name}" is ${Math.round(progress * 100)}% done (qBittorrent state: ${state}).`,
+  };
+}
