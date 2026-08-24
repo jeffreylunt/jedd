@@ -9,6 +9,7 @@ import {
   restartContainer,
 } from './homelab.js';
 import { homelabStatus, requestMedia } from './media.js';
+import { makeRunbookTool } from './runbook.js';
 import type { Tool } from './types.js';
 
 /**
@@ -41,6 +42,7 @@ const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack];
 export function buildTools(config: Config): Tool[] {
   const tools = [...GUEST_TOOLS, ...OWNER_READ_TOOLS];
   if (assertShellIdentityIsSafe(config).safe) tools.push(hpShell);
+  if (config.runbookPath) tools.push(makeRunbookTool(config.runbookPath));
   if (!config.readOnly) tools.push(...OWNER_WRITE_TOOLS);
   return tools;
 }

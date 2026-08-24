@@ -54,6 +54,11 @@ export interface Config {
    * decides whether write tools do anything at all. Neither satisfies the other.
    */
   readOnly: boolean;
+  /**
+   * Path to the fetchable runbook. When unset, `read_runbook` is not registered —
+   * an absent tool is better than one that always errors.
+   */
+  runbookPath?: string;
 }
 
 function required(name: string): string {
@@ -93,6 +98,7 @@ export function loadConfig(): Config {
     },
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',
+    runbookPath: process.env.RUNBOOK_PATH,
   };
 }
 
