@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   assertSafeToRestart,
+  blastRadiusFor,
   isNeverRestartable,
   parseContainerState,
   parseSessions,
+  tunnelVerdict,
 } from '../src/safety.js';
 
 const idle = parseSessions([
@@ -64,11 +66,15 @@ test('CARVE-OUT: a DOWN jellyfin may be restarted despite unreadable /Sessions',
   assert.match(verdict.reason, /completely down/);
 });
 
-test('the carve-out is narrow: it does NOT extend to other containers', () => {
+test('the carve-out is narrow: it does NOT extend to other live-TV-tier containers', () => {
   // The failing control for the case above. If the carve-out were written as
   // "down + unknown -> allow" without pinning the container, this would pass and
   // dispatcharr would be restartable on no evidence at all.
-  for (const container of ['dispatcharr', 'sonarr', 'radarr']) {
+  //
+  // Only LIVE-TV-tier containers belong here: sonarr/radarr are SAFE tier and are
+  // allowed for a different and correct reason, so including them would make this
+  // test fail for a reason that has nothing to do with the carve-out.
+  for (const container of ['dispatcharr', 'some-unclassified-service']) {
     const verdict = assertSafeToRestart(container, {
       containerIsUp: false,
       playback: parseSessions('connection refused'),
@@ -153,22 +159,58 @@ test('read-only mode refuses every restart, including the otherwise-safe one', (
   assert.match(verdict.reason, /read-only/);
 });
 
-test('an unprotected container still requires known-idle playback', () => {
+test('SAFE tier restarts are allowed even mid-stream', () => {
+  // Deliberate loosening from the flat-protected-set version. These containers
+  // serve no video, and the stale-netns fix is documented safe mid-match — so
+  // gating on idle would block the correct action exactly when it is needed.
+  for (const container of ['sonarr', 'radarr', 'prowlarr', 'flaresolverr', 'qbittorrent']) {
+    for (const playback of [idle, watching, parseSessions('boom')]) {
+      const verdict = assertSafeToRestart(container, {
+        containerIsUp: true,
+        playback,
+        readOnly: false,
+      });
+      assert.equal(verdict.allowed, true, `${container} should be restartable in the SAFE tier`);
+    }
+  }
+});
+
+test('🔴 an UNCLASSIFIED container defaults to the MOST RESTRICTIVE tier', () => {
+  // The flat "protected" set had this exactly backwards: anything not on the
+  // list was treated as unprotected, so a container nobody had considered got
+  // the permissive path *because* nobody had considered it.
+  for (const container of ['some-new-service', 'audiobookshelf', 'jfa-go', 'inadyn']) {
+    assert.equal(blastRadiusFor(container), 'live-tv', `${container} must default to live-tv`);
+    // Up + idle would have been ALLOWED under the old flat rule.
+    const verdict = assertSafeToRestart(container, {
+      containerIsUp: true,
+      playback: idle,
+      readOnly: false,
+    });
+    assert.equal(verdict.allowed, false, `${container} must not be restartable while up`);
+  }
+});
+
+test('blastRadiusFor classifies the known tiers', () => {
+  for (const c of ['sonarr', 'radarr', 'prowlarr', 'flaresolverr', 'janitorr', 'qbittorrent']) {
+    assert.equal(blastRadiusFor(c), 'safe', `${c} is SAFE tier`);
+  }
+  for (const c of ['jellyfin', 'dispatcharr', 'gluetun', 'gluetun-torrents']) {
+    assert.equal(blastRadiusFor(c), 'live-tv', `${c} is LIVE-TV tier`);
+  }
+});
+
+test('the live-TV tier still requires completely-down and no viewer', () => {
+  // Failing control for the SAFE-tier loosening: if the loosening had leaked
+  // into the live-TV path, these would pass.
   assert.equal(
-    assertSafeToRestart('sonarr', { containerIsUp: true, playback: idle, readOnly: false }).allowed,
-    true,
-  );
-  assert.equal(
-    assertSafeToRestart('sonarr', { containerIsUp: true, playback: watching, readOnly: false })
+    assertSafeToRestart('dispatcharr', { containerIsUp: true, playback: idle, readOnly: false })
       .allowed,
     false,
   );
   assert.equal(
-    assertSafeToRestart('sonarr', {
-      containerIsUp: true,
-      playback: parseSessions('boom'),
-      readOnly: false,
-    }).allowed,
+    assertSafeToRestart('dispatcharr', { containerIsUp: false, playback: watching, readOnly: false })
+      .allowed,
     false,
   );
 });
@@ -217,4 +259,46 @@ test('a failed /Sessions fetch must map to UNKNOWN, not to idle', () => {
   });
   assert.equal(verdict.allowed, false);
   assert.match(verdict.reason, /UNKNOWN/);
+});
+
+test('🔴 tunnelVerdict: matching exit IPs means LEAKING', () => {
+  // The container is reaching the internet on the home connection. Jeff's rule is
+  // that VPN protection is non-negotiable, so this is the one failure that matters.
+  const v = tunnelVerdict({ exitCode: 0, ip: '136.38.228.79' }, { exitCode: 0, ip: '136.38.228.79' });
+  assert.equal(v.verdict, 'leaking');
+});
+
+test('tunnelVerdict: differing exit IPs means PROTECTED', () => {
+  // Real values measured on hp 2026-08-24: sonarr exits via the SLC VPN endpoint,
+  // the host via the home WAN.
+  const v = tunnelVerdict({ exitCode: 0, ip: '194.62.107.209\n' }, { exitCode: 0, ip: '136.38.228.79\n' });
+  assert.equal(v.verdict, 'protected');
+});
+
+test('🔴 tunnelVerdict: an unreadable probe is UNKNOWN, never protected', () => {
+  const cases: [{ exitCode: number; ip: string }, { exitCode: number; ip: string }][] = [
+    [{ exitCode: 1, ip: '' }, { exitCode: 0, ip: '136.38.228.79' }],
+    [{ exitCode: 0, ip: '' }, { exitCode: 0, ip: '136.38.228.79' }],
+    [{ exitCode: 0, ip: '194.62.107.209' }, { exitCode: 1, ip: '' }],
+    [{ exitCode: 0, ip: '194.62.107.209' }, { exitCode: 0, ip: '' }],
+    // bare `ifconfig.me` returns HTML; it must not be mistaken for an address
+    [{ exitCode: 0, ip: '<!DOCTYPE html><html>' }, { exitCode: 0, ip: '136.38.228.79' }],
+  ];
+  for (const [container, host] of cases) {
+    const v = tunnelVerdict(container, host);
+    assert.equal(v.verdict, 'unknown', `${JSON.stringify([container, host])} must be UNKNOWN`);
+    assert.notEqual(v.verdict, 'protected');
+  }
+});
+
+test('tunnelVerdict pins no provider prefix', () => {
+  // Pinning `191.96.` false-alarmed when gluetun moved to the SLC exit. Any two
+  // different addresses must read as protected, whatever the provider.
+  for (const ip of ['191.96.106.220', '194.62.107.209', '5.6.7.8']) {
+    assert.equal(
+      tunnelVerdict({ exitCode: 0, ip }, { exitCode: 0, ip: '136.38.228.79' }).verdict,
+      'protected',
+      `${ip} should read as protected`,
+    );
+  }
 });

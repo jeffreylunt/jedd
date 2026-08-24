@@ -8,7 +8,45 @@
  * `assertSafeToRestart`.
  */
 
-/** Containers whose restart can interrupt something a human is doing right now. */
+/**
+ * Blast-radius tiers.
+ *
+ * 🔴 THE DEFAULT IS THE POINT. An unclassified container is `live-tv`, the most
+ * restrictive tier — never `safe`.
+ *
+ * The previous design was a flat "protected" set, which meant anything NOT on
+ * the list was treated as unprotected. That inverts the requirement: a container
+ * nobody had thought about (a newly added service, a renamed one) got the
+ * PERMISSIVE treatment precisely because nobody had considered it.
+ */
+export type BlastRadius = 'safe' | 'live-tv';
+
+/**
+ * Containers that serve no video and therefore cannot interrupt a viewer.
+ * Restarting the arrs is documented safe **mid-match** and is the single most
+ * common real fix on this homelab.
+ *
+ * Adding to this list is a safety decision, not a convenience. The test is not
+ * "does restarting it usually work" but "can restarting it interrupt a stream
+ * someone is watching right now".
+ */
+const SAFE_TIER = new Set([
+  'sonarr',
+  'radarr',
+  'prowlarr',
+  'flaresolverr',
+  'janitorr',
+  'qbittorrent',
+]);
+
+export function blastRadiusFor(container: string): BlastRadius {
+  return SAFE_TIER.has(container) ? 'safe' : 'live-tv';
+}
+
+/**
+ * Containers in the live-TV tier that are ALSO explicitly named in Jeff's rules.
+ * Kept for message clarity; `blastRadiusFor` already covers them by default.
+ */
 export const PROTECTED_CONTAINERS = new Set([
   'jellyfin',
   'dispatcharr',
@@ -73,6 +111,54 @@ export function parseSessions(raw: unknown): PlaybackCheck {
     detail: active.length
       ? `${active.length} session(s) with media loaded: ${active.join('; ')}`
       : `${raw.length} session(s) connected, none with media loaded`,
+  };
+}
+
+export type TunnelVerdict = 'protected' | 'leaking' | 'unknown';
+
+/**
+ * Decide whether a container's traffic is actually inside the VPN tunnel, by
+ * comparing its exit IP with the host's own exit IP.
+ *
+ * 🔴 Three states, and **`unknown` must never be treated as protected.** A probe
+ * that could not run has shown nothing. This is the same discipline as UNKNOWN
+ * playback, applied to the diagnosis side.
+ *
+ * Deliberately compares against the HOST rather than a pinned VPN prefix.
+ * Pinning `191.96.` false-alarmed once gluetun moved to the SLC exit
+ * (`194.62.x`, which is what it is on today), and re-pinning only re-brittles
+ * it. "Differs from the host" holds whenever the tunnel does, with no value to
+ * maintain and no provider assumption baked in.
+ */
+export function tunnelVerdict(
+  container: { exitCode: number; ip: string },
+  host: { exitCode: number; ip: string },
+): { verdict: TunnelVerdict; detail: string } {
+  const looksLikeIp = (s: string) => /^[0-9a-f.:]+$/i.test(s) && s.length >= 7;
+  const inner = container.ip.trim();
+  const outer = host.ip.trim();
+
+  if (container.exitCode !== 0 || !looksLikeIp(inner)) {
+    return {
+      verdict: 'unknown',
+      detail: `could not read the container's exit IP (exit=${container.exitCode}, got ${JSON.stringify(inner.slice(0, 80))})`,
+    };
+  }
+  if (host.exitCode !== 0 || !looksLikeIp(outer)) {
+    return {
+      verdict: 'unknown',
+      detail: `could not read the host's exit IP to compare against (exit=${host.exitCode}, got ${JSON.stringify(outer.slice(0, 80))})`,
+    };
+  }
+  if (inner === outer) {
+    return {
+      verdict: 'leaking',
+      detail: `the container's exit IP equals the host's (${outer}) — it is NOT in the tunnel`,
+    };
+  }
+  return {
+    verdict: 'protected',
+    detail: `Tunnel verified: container exits via ${inner}, host via ${outer} (different).`,
   };
 }
 
@@ -158,30 +244,35 @@ export function assertSafeToRestart(
     };
   }
 
-  if (!PROTECTED_CONTAINERS.has(container)) {
-    // Unprotected containers still require known-idle playback, because a
-    // restart of e.g. sonarr can still churn the box mid-stream.
-    if (!opts.playback.known) {
-      return {
-        allowed: false,
-        reason: `Refusing: Jellyfin playback state is UNKNOWN (${opts.playback.detail}). UNKNOWN is not idle.`,
-      };
-    }
-    if (opts.playback.activeSessions.length > 0) {
-      return {
-        allowed: false,
-        reason: `Refusing: someone is watching right now — ${opts.playback.detail}`,
-      };
-    }
-    return { allowed: true, reason: `${container} is not a protected container and nothing is playing.` };
+  if (blastRadiusFor(container) === 'safe') {
+    // ⚠️ The SAFE tier deliberately does NOT gate on playback, and that is a
+    // loosening from the previous version — recorded so nobody "restores" it.
+    //
+    // These containers serve no video, so a restart cannot interrupt a stream.
+    // Requiring idle would block the most common real fix (stale netns after a
+    // gluetun restart) at exactly the moment it is most needed: someone is
+    // watching, the arrs are down, and the fix is safe mid-match. A precondition
+    // that blocks the correct action is not caution, it is a bug.
+    //
+    // Playback is still OBSERVED and reported, just not used as a gate.
+    return {
+      allowed: true,
+      reason:
+        `${container} is in the SAFE tier — it serves no video, so a restart cannot interrupt a ` +
+        `viewer. Playback at the time: ${opts.playback.known ? opts.playback.detail : 'UNKNOWN'}.`,
+    };
   }
 
   if (opts.containerIsUp) {
     return {
       allowed: false,
       reason:
-        `Refusing: ${container} is a protected container and it is currently UP. ` +
-        'Protected containers are restarted only when completely down.',
+        `Refusing: ${container} is in the LIVE-TV tier and it is currently UP. ` +
+        'Live-TV-tier containers are restarted only when completely down with no viewer possible.' +
+        (PROTECTED_CONTAINERS.has(container)
+          ? ''
+          : ' (It is in that tier because it is not on the SAFE list — an unclassified container ' +
+            'always gets the most restrictive treatment.)'),
     };
   }
 

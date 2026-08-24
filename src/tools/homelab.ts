@@ -1,7 +1,12 @@
 import { commandGate } from '../command-gate.js';
 import { jellyfinGet } from '../jellyfin.js';
 import { renderOutcome, runOnHp, clip } from '../hp.js';
-import { assertSafeToRestart, parseContainerState, parseSessions } from '../safety.js';
+import {
+  assertSafeToRestart,
+  parseContainerState,
+  parseSessions,
+  tunnelVerdict,
+} from '../safety.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -317,8 +322,65 @@ export const restartArrStack: Tool = {
       `docker restart ${containers.join(' ')}`,
       120_000,
     );
-    return restart.exitCode === 0
-      ? ok(`Restarted ${containers.join(', ')}. ${playback.detail}\n${renderOutcome(restart)}`)
-      : fail(`Restart FAILED.\n${renderOutcome(restart)}`);
+    if (restart.exitCode !== 0) {
+      return fail(`Restart FAILED.\n${renderOutcome(restart)}`);
+    }
+
+    // 🔴 THE POST-CHECK, AND IT IS NOT OPTIONAL.
+    //
+    // These containers live in gluetun's network namespace. Restarting a
+    // `container:gluetun` dependent is exactly the operation that can leave it
+    // on a stale or detached namespace — and `docker ps` reports "Up" either
+    // way, so exit code 0 proves nothing about whether traffic is still in the
+    // tunnel. Jeff's standing rule is that VPN protection is non-negotiable.
+    const verify = await verifyTunnel(ctx.config.adminSshHost, 'sonarr');
+    const summary = `Restarted ${containers.join(', ')}. ${playback.detail}`;
+    if (verify.verdict === 'leaking') {
+      return fail(
+        `🔴 ${summary}\n\nBUT THE TUNNEL IS NOT PROTECTING THEM: ${verify.detail}\n` +
+          'A container that comes back on the naked home connection is worse than one that is down. ' +
+          'Escalate to a human immediately; do not attempt a repair.',
+      );
+    }
+    if (verify.verdict === 'unknown') {
+      return fail(
+        `${summary}\n\n⚠️ Could NOT verify the tunnel: ${verify.detail}\n` +
+          'Treat VPN protection as UNCONFIRMED until a human checks. UNKNOWN is not "protected".',
+      );
+    }
+    return ok(`${summary}\n${verify.detail}\n${renderOutcome(restart)}`);
   },
 };
+
+/**
+ * Is this container's traffic actually leaving through the VPN?
+ *
+ * Compares the container's exit IP against the HOST's exit IP. If they MATCH,
+ * the container is not in the tunnel.
+ *
+ * Deliberately does NOT pin an expected VPN prefix: pinning `191.96.` produced a
+ * false alarm once gluetun moved to a different exit, and re-pinning just
+ * re-brittles it. "Differs from the host" is true whenever the tunnel holds and
+ * false whenever it does not, with no value to maintain.
+ *
+ * Returns three states. **`unknown` must never be treated as protected** — a
+ * probe that could not run has not shown anything.
+ */
+async function verifyTunnel(
+  sshHost: string,
+  container: string,
+): Promise<{ verdict: 'protected' | 'leaking' | 'unknown'; detail: string }> {
+  // `ifconfig.me/ip` returns a bare address; bare `ifconfig.me` returns ~200
+  // lines of HTML that would parse into nonsense.
+  const containerIp = await runOnHp(
+    sshHost,
+    `docker exec ${container} curl -s --max-time 15 ifconfig.me/ip`,
+    40_000,
+  );
+  const hostIp = await runOnHp(sshHost, 'curl -s --max-time 15 ifconfig.me/ip', 40_000);
+
+  return tunnelVerdict(
+    { exitCode: containerIp.exitCode, ip: containerIp.stdout },
+    { exitCode: hostIp.exitCode, ip: hostIp.stdout },
+  );
+}
