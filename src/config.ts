@@ -83,7 +83,9 @@ export function loadConfig(): Config {
   const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'hp';
   // Defaults to the admin host so a missing variable is CONSPICUOUS (it trips the
   // shared-identity refusal) rather than silently pointing somewhere unexpected.
-  const shellSshHost = process.env.HP_SHELL_SSH_HOST ?? adminSshHost;
+  // `??` does NOT fire on an empty string, so an unset-but-present variable used
+  // to sail through the inequality check as a "different" host. Trim first.
+  const shellSshHost = (process.env.HP_SHELL_SSH_HOST ?? '').trim() || adminSshHost;
   return {
     ownerHandle: required('OWNER_HANDLE'),
     shellSshHost,

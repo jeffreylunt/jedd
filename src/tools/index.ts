@@ -1,4 +1,5 @@
-import { assertShellIdentityIsSafe, type Config } from '../config.js';
+import { type Config } from '../config.js';
+import type { IdentityVerdict } from '../identity-probe.js';
 import { roleSatisfies, type Role } from '../permissions.js';
 import { containerNetns, dockerInspect, dockerLogs, dockerPs } from './docker.js';
 import {
@@ -62,10 +63,16 @@ const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLo
  * never registered cannot be argued for:
  *  - `hp_shell` is omitted entirely when the ssh identity split is missing.
  *  - write tools are omitted entirely when running read-only.
+ *
+ * 🔴 `shellIdentity` is the verdict from `proveShellIdentityIsSafe()`, which
+ * RUNS `id` and a docker crossing against both hosts. **Omitting it means
+ * `hp_shell` is not registered at all** — a caller that forgets to prove the
+ * boundary gets no free-form shell, rather than getting one on the strength of a
+ * string comparison. Fail closed by construction, not by remembering to check.
  */
-export function buildTools(config: Config): Tool[] {
+export function buildTools(config: Config, shellIdentity?: IdentityVerdict): Tool[] {
   const tools = [...GUEST_TOOLS, ...OWNER_READ_TOOLS];
-  if (assertShellIdentityIsSafe(config).safe) tools.push(hpShell);
+  if (shellIdentity?.safe) tools.push(hpShell);
   if (config.runbookPath) tools.push(makeRunbookTool(config.runbookPath));
   if (!config.readOnly) tools.push(...OWNER_WRITE_TOOLS);
   return tools;

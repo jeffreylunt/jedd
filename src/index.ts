@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, type TurnRecord } from './agent.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
+import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { StdoutConnector } from './connector.js';
 import { FollowupStore } from './followups.js';
 import { runDueFollowups } from './followup-runner.js';
@@ -25,20 +26,29 @@ const TICK_MS = 60_000;
 async function main(): Promise<void> {
   const config = loadConfig();
   const llm = createLlmClient(config);
-  const tools = buildTools(config);
+
+  // The cheap string check first — it catches an obvious misconfiguration
+  // without a network round trip. It is NOT the boundary and never was.
+  const preflight = assertShellIdentityIsSafe(config);
+  // Then the one that actually runs something.
+  const shellIdentity = preflight.safe
+    ? await proveShellIdentityIsSafe(config)
+    : { safe: false, reason: preflight.reason, evidence: ['pre-flight refused; probe not attempted'] };
+
+  const tools = buildTools(config, shellIdentity);
   const history = new HistoryStore(`${DATA_DIR}history.jsonl`);
   const followups = new FollowupStore(`${DATA_DIR}followups.jsonl`);
   const agent = new Agent(config, llm, recordTurn, tools, history, followups);
   const connector = new StdoutConnector(process.argv[2] ?? config.ownerHandle);
 
-  const shellSafety = assertShellIdentityIsSafe(config);
   console.error(
     `model=${llm.label} owner=${config.ownerHandle} ` +
       `shell-ssh=${config.shellSshHost} admin-ssh=${config.adminSshHost} ` +
       `writes=${config.readOnly ? 'DISABLED' : 'ENABLED'}`,
   );
   console.error(`tools=${tools.map((t) => t.name).join(', ')}`);
-  console.error(`hp_shell: ${shellSafety.safe ? 'enabled' : 'DISABLED'} — ${shellSafety.reason}`);
+  console.error(`hp_shell: ${shellIdentity.safe ? 'enabled' : 'DISABLED'} — ${shellIdentity.reason}`);
+  for (const line of shellIdentity.evidence) console.error(`  [identity] ${line}`);
 
   // The thing that wakes up. A follow-up whose work is not done when the turn
   // ends is not finished until the user has been told the outcome, and this is

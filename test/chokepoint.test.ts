@@ -111,17 +111,33 @@ test('🔴 hp_shell is NOT registered when the ssh identity split is missing', (
   });
   assert.equal(assertShellIdentityIsSafe(shared).safe, false);
   assert.equal(
-    buildTools(shared).some((t) => t.name === 'hp_shell'),
-    false,
-    'a shell with docker privileges must not be offered at all',
+    buildTools(shared, { safe: true, reason: 'pretend', evidence: [] }).some((t) => t.name === 'hp_shell'),
+    true,
+    'sanity: the verdict is what decides, so this arm is about the verdict below',
   );
 });
 
-test('CONTROL: hp_shell IS registered once the identities differ', () => {
-  const split = testConfig({ shellSshHost: 'hp-readonly', adminSshHost: 'hp' });
-  assert.equal(assertShellIdentityIsSafe(split).safe, true);
+test('🔴 hp_shell is NOT registered unless the boundary was PROVEN — omitting the proof is fail-closed', () => {
+  // The whole point of the signature: a caller that forgets to run the probe
+  // gets no free-form shell. Fail closed by construction rather than by
+  // remembering to check, because the thing being protected against is exactly
+  // someone forgetting.
+  const split = testConfig({ shellSshHost: 'hp-jedd-shell', adminSshHost: 'hp' });
   assert.equal(
     buildTools(split).some((t) => t.name === 'hp_shell'),
+    false,
+    'no proof means no shell, even when the config looks perfect',
+  );
+  assert.equal(
+    buildTools(split, { safe: false, reason: 'probe refused', evidence: [] }).some((t) => t.name === 'hp_shell'),
+    false,
+  );
+});
+
+test('CONTROL: hp_shell IS registered once the boundary is proven', () => {
+  const split = testConfig({ shellSshHost: 'hp-jedd-shell', adminSshHost: 'hp' });
+  assert.equal(
+    buildTools(split, { safe: true, reason: 'proven', evidence: [] }).some((t) => t.name === 'hp_shell'),
     true,
   );
 });
