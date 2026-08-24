@@ -265,6 +265,27 @@ test('🔴 container_netns resolves the container:<id> form docker really report
   );
 });
 
+test('🔴 container_netns validates the peer reference DOCKER supplied before interpolating it', async () => {
+  // The peer id comes from docker, not from the model — which is exactly the
+  // reasoning that stops an injection sink from being reviewed. A compromised or
+  // simply weird NetworkMode value must not become a second privileged command.
+  const spy = sshSpy((command) => {
+    if (command.includes('HostConfig.NetworkMode')) {
+      return { stdout: 'container:abc; docker restart gluetun\n' };
+    }
+    if (command.startsWith('docker ps -a')) return { stdout: 'sonarr|Up 2 hours\n' };
+    if (command.includes('readlink')) return { stdout: 'net:[4026532519]\n' };
+    return {};
+  });
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.equal(
+    spy.calls.some((c) => c.command.includes('docker restart')),
+    false,
+    `an unusable peer reference reached ssh: ${spy.calls.map((c) => c.command).join(' ;; ')}`,
+  );
+});
+
 test('container_netns: an unresolvable peer id is UNKNOWN, not a pass', async () => {
   const spy = netnsSpy(
     { status: 'Up 10 hours', inode: '4026532519' },

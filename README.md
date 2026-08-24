@@ -56,9 +56,21 @@ So `hp_shell` connects to hp as an **unprivileged ssh identity with no docker gr
 the safety preconditions. A smuggled interpreter then fails at the kernel regardless of what the
 filter believed. **`hp_shell` is not registered at all when the two are equal.**
 
-⚠️ The unprivileged account **does not exist yet**. The POC runs with
-`JEDD_ALLOW_SHARED_SSH_IDENTITY=true`, which warns on every boot. **Do not deploy `hp_shell` in that
-state.**
+**The account exists and the boundary is live** (`jedd-shell@hp`, uid 1001, sole group
+`jedd-shell` — no docker, no sudo, key auth only, Unix password locked). Provisioned 2026-08-24;
+`JEDD_ALLOW_SHARED_SSH_IDENTITY` is gone from `.env` and the UNSAFE boot warning with it.
+
+**Verified by crossing it, not by reading the config.** From that account: `docker ps` →
+`permission denied … unix:///var/run/docker.sock`; the same through `awk 'BEGIN{system(…)}')`, through
+`curl --unix-socket`, and through `python3`'s raw `AF_UNIX` connect → all denied; `sudo -n true` →
+`a password is required`; `/etc/shadow` and `/home/jeff` → denied. **Control: every one of those
+succeeds as `jeff`**, so the refusals are caused by the identity and not by something being broken.
+
+**Docker reads are structured tools now** (`docker_ps`, `docker_inspect`, `docker_logs`,
+`container_netns`) on the admin identity, parameterized by a validated container name and clamped
+numbers. **No socket proxy was built** — those reads were never shell-shaped, so the boundary cost
+no capability. A live run confirmed the model routes correctly: host questions to `hp_shell`,
+container questions to the structured tools, no permission-denied in between.
 
 ## Identity comes from the transport, never from the message
 
