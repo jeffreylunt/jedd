@@ -325,12 +325,22 @@ export class ArrClient {
    * unmonitored and empty, and V2 had no verb for it at all. V1 does. This is
    * the regression that closes.
    *
-   * ── WHAT IS READ BACK, AND WHY IT IS NOT WHAT WE SENT ────────────────────
+   * ── 🔴 THE TRUTH IS A RE-READ, NOT THE PUT'S ECHO ────────────────────────
    *
-   * `confirmed` comes from **Sonarr's PUT response**, intersected with what was
-   * asked for. Never from the request. A tool that reports the seasons it *sent*
-   * is reporting its own intention, which is true of a write that silently did
-   * nothing as well as one that worked.
+   * Sonarr's PUT response echoes the object we just sent, so believing it means
+   * believing ourselves with extra steps. It looks like verification and it
+   * cannot fail in the direction that matters. **So the state is READ BACK with
+   * a fresh GET after the write**, and every claim — which seasons are on,
+   * whether the series flag stuck, what else moved — comes from that read.
+   *
+   * This is what catches the LOST UPDATE. Two turns run concurrently (the
+   * receiver dispatches inbound messages fire-and-forget), so A can GET, B can
+   * GET+PUT, and A's PUT then reverts B's season from a stale snapshot. B's echo
+   * agreed with B, so B told someone their season was on while it was being
+   * turned back off. Against a re-read, A sees B's season go dark and reports
+   * it. `withSeriesLock` then prevents the interleaving outright for the case we
+   * control; the re-read covers the one we do not, which is Jeff clicking in
+   * Sonarr's own UI.
    *
    * ── ⚠️ IT SENDS THE WHOLE SERIES OBJECT BACK ─────────────────────────────
    *
@@ -340,14 +350,23 @@ export class ArrClient {
    *
    * ⚠️ The second of those two places is the SERIES-level `monitored` flag: a
    * series toggled off grabs nothing however many seasons are switched on. It is
-   * flipped when it was off, and **reported**, because it is a state change
-   * beyond the seasons that were asked for.
+   * flipped when it was off, **read back like everything else**, and reported —
+   * because it is a state change beyond the seasons that were asked for, and
+   * because seasons monitored under an unmonitored series download nothing.
    */
   async monitorSeasons(
     seriesId: number,
     seasons: number[],
   ): Promise<
-    | { state: 'updated'; confirmed: number[]; seriesWasUnmonitored: boolean; othersChanged: number[] }
+    | {
+        state: 'updated';
+        confirmed: number[];
+        /** Read back, never assumed. False means the seasons will grab nothing. */
+        seriesMonitored: boolean;
+        seriesWasUnmonitored: boolean;
+        /** Seasons nobody asked about whose monitored flag moved, or that vanished. */
+        othersChanged: number[];
+      }
     | { state: 'failed'; detail: string }
     | { state: 'unknown'; detail: string }
   > {
@@ -357,21 +376,63 @@ export class ArrClient {
     if (!Number.isFinite(seriesId) || seriesId <= 0) {
       return { state: 'failed', detail: 'no sonarr series id — nothing to update.' };
     }
+    // 🔴 One writer per series at a time. See the header: without this, two
+    // concurrent turns lose each other's seasons and both report success.
+    return withSeriesLock(`${this.opts.baseUrl}#${seriesId}`, () => this.monitorSeasonsUnlocked(seriesId, seasons));
+  }
+
+  private async monitorSeasonsUnlocked(
+    seriesId: number,
+    seasons: number[],
+  ): Promise<
+    | { state: 'updated'; confirmed: number[]; seriesMonitored: boolean; seriesWasUnmonitored: boolean; othersChanged: number[] }
+    | { state: 'failed'; detail: string }
+    | { state: 'unknown'; detail: string }
+  > {
     const got = await this.call(`/series/${seriesId}`);
     if (!got.ok) {
-      return { state: 'unknown', detail: `could not read series ${seriesId} before updating it: ${got.detail}` };
+      return {
+        state: 'unknown',
+        detail: `could not read series ${seriesId} before updating it, so NOTHING was changed: ${got.detail}`,
+      };
     }
     const series = got.body as Record<string, unknown> | null;
-    if (!series || typeof series !== 'object') {
-      return { state: 'unknown', detail: `series ${seriesId} came back in a shape I do not recognise.` };
+    if (!series || typeof series !== 'object' || Array.isArray(series)) {
+      return {
+        state: 'unknown',
+        detail: `series ${seriesId} came back in a shape I do not recognise, so NOTHING was changed.`,
+      };
+    }
+
+    const rows = Array.isArray(series['seasons']) ? (series['seasons'] as Record<string, unknown>[]) : [];
+    const before = seasonMap(rows);
+    /**
+     * 🔴 NO SEASON LIST, NO WRITE.
+     *
+     * `seasons: []` against an endpoint that REPLACES the resource is a
+     * destructive body, and what Sonarr does with it is exactly what we have not
+     * verified. An unrecognised read is a reason not to write, not a reason to
+     * write something simpler.
+     */
+    if (before.size === 0) {
+      return {
+        state: 'unknown',
+        detail:
+          `series ${seriesId} came back with no season list. Refusing to PUT an empty one at an ` +
+          `endpoint that replaces the resource, so NOTHING was changed.`,
+      };
     }
 
     const wanted = new Set(seasons.filter((n) => Number.isFinite(n) && n >= 0));
-    const rows = Array.isArray(series['seasons']) ? (series['seasons'] as Record<string, unknown>[]) : [];
-    // ⚠️ Recorded BEFORE the write, so "no other season changed" is checkable
-    // against what was actually there rather than against what we assume.
-    const before = new Map<number, boolean>();
-    for (const r of rows) before.set(Number(r['seasonNumber']), r['monitored'] === true);
+    const present = [...wanted].filter((n) => before.has(n));
+    if (present.length === 0) {
+      // Nothing we were asked for exists on this series. Writing would flip the
+      // series-level flag and change nothing else — a side effect with no point.
+      return {
+        state: 'failed',
+        detail: `series ${seriesId} has none of season ${[...wanted].join(', ')}. Nothing was changed.`,
+      };
+    }
 
     const seriesWasUnmonitored = series['monitored'] !== true;
     const updated = {
@@ -389,36 +450,60 @@ export class ArrClient {
           `seasons were turned on. This is not a "no". (${res.detail})`,
       };
     }
+    /**
+     * 🔴 5xx IS UNKNOWN, NOT FAILED.
+     *
+     * A 4xx is Sonarr refusing — the write did not happen and saying so is
+     * honest. A 502 from a reverse proxy, or a 500 raised after the change was
+     * applied, means the write may well have landed. "Nothing was started" is
+     * then a claim we cannot back up, which is the same defect as a false
+     * success wearing the other coat.
+     */
     if (!res.ok) {
+      if (res.status >= 500) {
+        return {
+          state: 'unknown',
+          detail:
+            `Sonarr answered http ${res.status} updating series ${seriesId}. That is a server-side ` +
+            `error, not a refusal, so the change MAY have landed: ${res.detail.slice(0, 160)}`,
+        };
+      }
       return { state: 'failed', detail: `Sonarr refused the update (http ${res.status}): ${res.detail.slice(0, 160)}` };
     }
 
-    const back = res.body as Record<string, unknown> | null;
-    const backRows = back && Array.isArray(back['seasons']) ? (back['seasons'] as Record<string, unknown>[]) : null;
+    // 🔴 A FRESH READ, not the PUT's echo. See the header.
+    const after = await this.call(`/series/${seriesId}`);
+    const back = after.ok ? (after.body as Record<string, unknown> | null) : null;
+    const backRows = back && !Array.isArray(back) && Array.isArray(back['seasons'])
+      ? (back['seasons'] as Record<string, unknown>[])
+      : null;
     if (!backRows) {
-      // 🔴 An unreadable read-back is UNKNOWN, not success. Sonarr accepted
-      // something; what it accepted is exactly what we cannot say.
       return {
         state: 'unknown',
-        detail: `Sonarr accepted the update but its reply carried no season list, so I cannot confirm what changed.`,
+        detail:
+          `Sonarr accepted the update to series ${seriesId} but could not be re-read afterwards, so ` +
+          `I cannot confirm what actually changed. ${after.ok ? '' : after.detail}`,
       };
     }
-    const confirmed: number[] = [];
+
+    const now = seasonMap(backRows);
+    const confirmed = [...wanted].filter((n) => now.get(n) === true).sort((a, b) => a - b);
     const othersChanged: number[] = [];
-    for (const r of backRows) {
-      const n = Number(r['seasonNumber']);
-      const now = r['monitored'] === true;
-      if (wanted.has(n)) {
-        if (now) confirmed.push(n);
-        continue;
-      }
-      // Anything we did NOT ask about that moved is reported, not ignored.
-      const was = before.get(n);
-      if (was !== undefined && was !== now) othersChanged.push(n);
+    for (const [n, was] of before) {
+      if (wanted.has(n)) continue;
+      // ⚠️ A season that VANISHED is the largest possible "something else
+      // changed", and iterating only the rows that came back cannot see it.
+      const isNow = now.get(n);
+      if (isNow === undefined || isNow !== was) othersChanged.push(n);
     }
-    confirmed.sort((a, b) => a - b);
     othersChanged.sort((a, b) => a - b);
-    return { state: 'updated', confirmed, seriesWasUnmonitored, othersChanged };
+    return {
+      state: 'updated',
+      confirmed,
+      seriesMonitored: back!['monitored'] === true,
+      seriesWasUnmonitored,
+      othersChanged,
+    };
   }
 
   /**
@@ -482,6 +567,24 @@ export class ArrClient {
         detail:
           `Could not reach the service adding "${title}", so I do NOT know whether it was added. ` +
           `This is not a "no" — check before trying again. (${res.detail})`,
+      };
+    }
+    /**
+     * 🔴 5xx IS UNKNOWN, NOT "REFUSED". Same rule as `monitorSeasons`.
+     *
+     * A 4xx is the service declining, and "nothing was added" is then true. A
+     * 502 from a reverse proxy — or a 500 raised AFTER the add was applied —
+     * means it may well have landed, and `Add refused` is a claim we cannot back
+     * up. This was reported to users as a refusal by `add_movie` and
+     * `add_series` before `add_season` existed; fixed here rather than in the
+     * new caller, because the defect lives in the shared component.
+     */
+    if (res.status >= 500) {
+      return {
+        state: 'unknown',
+        detail:
+          `The service answered http ${res.status} adding "${title}". That is a server-side error, ` +
+          `not a refusal, so it MAY have been added — check before trying again. (${res.detail.slice(0, 160)})`,
       };
     }
     return { state: 'failed', detail: `Add refused (http ${res.status}): ${res.detail.slice(0, 160)}` };
@@ -587,5 +690,49 @@ export class ArrClient {
   async probe(): Promise<{ reachable: boolean; detail: string }> {
     const res = await this.call('/system/status');
     return { reachable: res.ok, detail: res.ok ? 'reachable' : res.detail };
+  }
+}
+
+/**
+ * `seasonNumber -> monitored`, skipping rows without a usable season number.
+ *
+ * ⚠️ Skipping is the point. `Number(undefined)` is `NaN`, every such row
+ * collides on one Map key, and the difference surfaces to a user as
+ * "⚠️ SNaN also changed state, which was not asked for" — a blast-radius alarm
+ * about a season that does not exist.
+ */
+function seasonMap(rows: Record<string, unknown>[]): Map<number, boolean> {
+  const m = new Map<number, boolean>();
+  for (const r of rows) {
+    const n = Number(r['seasonNumber']);
+    if (!Number.isFinite(n)) continue;
+    m.set(n, r['monitored'] === true);
+  }
+  return m;
+}
+
+/**
+ * 🔴 ONE WRITER PER SERIES AT A TIME.
+ *
+ * `monitorSeasons` is a read-modify-write over the WHOLE series object, and the
+ * BlueBubbles receiver dispatches inbound messages fire-and-forget — so two
+ * turns genuinely overlap. Interleaved, A's PUT is built from a snapshot taken
+ * before B's, and it reverts B's season while both calls report success.
+ *
+ * Chaining per series removes the case we control. It is deliberately NOT a
+ * general mutex: it is keyed by base URL + series id, so unrelated shows still
+ * proceed in parallel, and it cannot deadlock because nothing takes two.
+ */
+const seriesLocks = new Map<string, Promise<unknown>>();
+
+async function withSeriesLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prior = seriesLocks.get(key) ?? Promise.resolve();
+  // `.catch` so one failed write does not poison every later one on this series.
+  const mine = prior.catch(() => undefined).then(fn);
+  seriesLocks.set(key, mine);
+  try {
+    return await mine;
+  } finally {
+    if (seriesLocks.get(key) === mine) seriesLocks.delete(key);
   }
 }

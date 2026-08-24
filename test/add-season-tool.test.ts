@@ -48,32 +48,55 @@ interface Recorded {
 }
 
 /**
- * A Sonarr that behaves. `putResponse` lets a test bend only the read-back,
- * which is the surface every honesty claim in this tool rests on.
+ * 🔴 A STATEFUL Sonarr: the PUT REPLACES the stored series, and every later GET
+ * returns what was stored.
+ *
+ * The first version of this helper echoed the PUT body back and served the
+ * ORIGINAL row from GET — which quietly made it the wrong instrument the moment
+ * the tool started verifying with a fresh read. A fake whose write does not
+ * persist cannot tell a write that landed from one that did not, which is the
+ * only question this tool asks.
+ *
+ * `putResponse` / `afterResponse` bend the two reads independently:
+ *   putResponse   — what the PUT itself answers (status codes, refusals)
+ *   afterResponse — what the VERIFYING GET sees, i.e. what really persisted.
+ * That second seam is how a lost update is expressed: Sonarr accepted us, and
+ * the world afterwards does not match.
  */
 function sonarr(
   row: Record<string, unknown>,
   opts: {
     putResponse?: (sent: Record<string, unknown>) => Promise<Response>;
+    afterResponse?: (stored: Record<string, unknown>) => Promise<Response>;
     commandResponse?: () => Promise<Response>;
     listResponse?: () => Promise<Response>;
   } = {},
 ): { fetchImpl: FetchImpl; rec: Recorded } {
   const rec: Recorded = { puts: [], commands: [], gets: [] };
+  let stored = row;
+  let writes = 0;
   const fetchImpl: FetchImpl = async (url, init) => {
     const u = String(url);
     const method = init?.method ?? 'GET';
     if (method === 'GET') {
       rec.gets.push(u);
       if (opts.listResponse && u.endsWith('/series')) return opts.listResponse();
-      if (u.endsWith('/series')) return json([row]);
-      if (/\/series\/\d+$/.test(u)) return json(row);
+      if (u.endsWith('/series')) return json([stored]);
+      if (/\/series\/\d+$/.test(u)) {
+        // The VERIFYING read is any single-series GET after a write.
+        if (writes > 0 && opts.afterResponse) return opts.afterResponse(stored);
+        return json(stored);
+      }
       return json([]);
     }
     const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
     if (method === 'PUT') {
       rec.puts.push({ path: u, body });
-      return opts.putResponse ? opts.putResponse(body) : json(body);
+      writes += 1;
+      const res = opts.putResponse ? await opts.putResponse(body) : await json(body);
+      // A refused write changes nothing, exactly as Sonarr behaves.
+      if (res.ok) stored = body;
+      return res;
     }
     rec.commands.push(body);
     return opts.commandResponse ? opts.commandResponse() : json({ id: 1 });
@@ -161,7 +184,8 @@ test('🔴 a PUT that ACCEPTS but does not actually monitor is a FAILURE, not a 
   // Sonarr answers 200 with a series whose season is still off. Reporting the
   // seasons we SENT would call this a win — that is reporting our own intention.
   const { fetchImpl, rec } = sonarr(SEINFELD, {
-    putResponse: () => json(SEINFELD), // unchanged: S3 still monitored:false
+    // Sonarr answers 200 and the world afterwards is unchanged: S3 still off.
+    afterResponse: () => json(SEINFELD),
   });
   const r = await run(fetchImpl, [3]);
   assert.equal(r.ok, false);
@@ -171,11 +195,11 @@ test('🔴 a PUT that ACCEPTS but does not actually monitor is a FAILURE, not a 
 });
 
 test('🔴 a 200 whose read-back has NO season list is UNKNOWN, not success', async () => {
-  const { fetchImpl } = sonarr(SEINFELD, { putResponse: () => json({ ok: true }) });
+  const { fetchImpl } = sonarr(SEINFELD, { afterResponse: () => json({ ok: true }) });
   const r = await run(fetchImpl, [3]);
   assert.equal(r.ok, false);
   assert.match(r.content, /UNKNOWN/);
-  assert.match(r.content, /cannot confirm what changed/);
+  assert.match(r.content, /could not be re-read afterwards/);
 });
 
 // ── 🔴 UNREACHABLE SONARR IS UNKNOWN, NEVER A FALSE SUCCESS ─────────────────
@@ -294,11 +318,11 @@ test('🔴 a season that moved WITHOUT being asked for is flagged — the blast 
   const row = seriesRow({ stats: { 2: [0, 12, true], 3: [0, 23, false] } });
   // Sonarr answers with S2 silently turned OFF, which nobody requested.
   const { fetchImpl } = sonarr(row, {
-    putResponse: () => json(seriesRow({ stats: { 2: [0, 12, false], 3: [0, 23, true] } })),
+    afterResponse: () => json(seriesRow({ stats: { 2: [0, 12, false], 3: [0, 23, true] } })),
   });
   const r = await run(fetchImpl, [3]);
   assert.equal(r.ok, true);
-  assert.match(r.content, /S2 also changed state, which was not asked for/);
+  assert.match(r.content, /S2 also changed state or vanished, which was not asked for/);
 });
 
 // ── resolution and gating ───────────────────────────────────────────────────
@@ -386,4 +410,219 @@ test('🔴 no tvdbId means NO follow-up and no promise of one', async () => {
   assert.match(r.content, /S3 monitored and searching/);
   assert.equal(scheduled.length, 0);
   assert.doesNotMatch(r.content, /I will check back/);
+});
+
+// ── findings from review: every one gets a test that can fail ───────────────
+
+test('🔴 LOST UPDATE: two concurrent turns on one show cannot revert each other', async () => {
+  /**
+   * The read-modify-write over a whole series object, run twice at once. The
+   * receiver dispatches inbound messages fire-and-forget, so two turns really do
+   * overlap — two guests, or one guest sending twice.
+   *
+   * Unserialised: A GETs, B GETs, B PUTs S3 on, A PUTs from its stale snapshot
+   * and puts S3 back off. B already told someone S3 was on. Both report success
+   * and the season is dark.
+   */
+  const store = seriesRow({ stats: { 3: [0, 23, false], 5: [0, 22, false] } });
+  let stored: Record<string, unknown> = store;
+  let gets = 0;
+  const fetchImpl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    if ((init?.method ?? 'GET') === 'GET') {
+      gets += 1;
+      // A real interleaving needs the reads to actually overlap; yield here so
+      // an unlocked implementation is genuinely given the chance to fail.
+      await new Promise((r) => setTimeout(r, 1));
+      return u.endsWith('/series') ? json([stored]) : json(stored);
+    }
+    if ((init?.method ?? '') === 'PUT') {
+      stored = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return json(stored);
+    }
+    return json({ id: 1 });
+  };
+
+  const [a, b] = await Promise.all([
+    makeAddSeason(fetchImpl).run({ title: 'seinfeld', seasons: [5] }, ctx()),
+    makeAddSeason(fetchImpl).run({ title: 'seinfeld', seasons: [3] }, ctx()),
+  ]);
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  assert.ok(gets > 0, 'CONTROL: the fake was actually exercised');
+
+  /**
+   * ⚠️ THE FINAL STATE IS THE WRONG PROBE ON ITS OWN, and asserting only it is
+   * how this test would pass while the bug was live. Measured: with the lock
+   * removed the revert really happens — A writes S3 back to false — but B's
+   * later PUT repairs it, so the end state is correct in THIS interleaving and
+   * wrong in another. An order-dependent assertion is not a guard.
+   *
+   * What is order-independent is that a revert HAPPENED AT ALL: the losing call
+   * sees another season go dark between its snapshot and its re-read, and says
+   * so. That warning is the direct observable of the lost update, and under the
+   * lock neither call can produce it.
+   */
+  for (const [who, r] of [
+    ['A', a],
+    ['B', b],
+  ] as const) {
+    assert.doesNotMatch(
+      r.content,
+      /also changed state or vanished/,
+      `${who} observed a concurrent revert — the two turns interleaved`,
+    );
+  }
+
+  const final = (stored['seasons'] as { seasonNumber: number; monitored: boolean }[])
+    .map((x) => [x.seasonNumber, x.monitored])
+    .sort((x, y) => Number(x[0]) - Number(y[0]));
+  assert.deepEqual(
+    final,
+    [
+      [3, true],
+      [5, true],
+    ],
+    'and both seasons survive',
+  );
+});
+
+test('🔴 the SERIES flag is read back too: seasons under an unmonitored show are INERT, not started', async () => {
+  // Seasons monitored under an unmonitored series download nothing, so claiming
+  // STARTED would be the "looks like on its way, is doing nothing" failure with
+  // the one flag that governs all the others.
+  const row = seriesRow({ monitored: false, stats: { 3: [0, 23, false] } });
+  const { fetchImpl, rec } = sonarr(row, {
+    // Sonarr accepted the write, but the series flag did not stick.
+    afterResponse: () => json(seriesRow({ monitored: false, stats: { 3: [0, 23, true] } })),
+  });
+  const r = await run(fetchImpl, [3]);
+  assert.equal(r.ok, false);
+  assert.match(r.content, /MONITORED BUT INERT/);
+  assert.match(r.content, /NOTHING IS DOWNLOADING/);
+  assert.equal(rec.commands.length, 0, 'and no search is fired for something that cannot grab');
+});
+
+test('🔴 a 5xx on the PUT is UNKNOWN — a server error is not a refusal', async () => {
+  // 502 from a reverse proxy, or a 500 raised AFTER the change applied, means
+  // the write may well have landed. "Nothing was started" is then unbackable.
+  const { fetchImpl } = sonarr(SEINFELD, { putResponse: () => json({ error: 'bad gateway' }, 502) });
+  const r = await run(fetchImpl, [3]);
+  assert.equal(r.ok, false);
+  assert.match(r.content, /UNKNOWN/);
+  assert.match(r.content, /MAY have landed/);
+  assert.doesNotMatch(r.content, /Nothing was started/);
+});
+
+test('a show Sonarr lists with NO seasons says so, instead of "It has ."', async () => {
+  const { fetchImpl, rec } = sonarr({ id: 77, tvdbId: 79169, title: 'Seinfeld', monitored: true, seasons: [] });
+  const r = await run(fetchImpl, [3]);
+  assert.equal(r.ok, false);
+  assert.match(r.content, /no seasons at all/);
+  assert.doesNotMatch(r.content, /It has \./, 'a sentence with the answer missing reads as a bug');
+  assert.equal(rec.puts.length, 0, 'no PUT is attempted');
+  assert.equal(rec.commands.length, 0);
+});
+
+test('🔴 CLIENT LAYER: monitorSeasons refuses to PUT an empty season list', async () => {
+  /**
+   * `seasons: []` at an endpoint that REPLACES the resource is a destructive
+   * body, and what Sonarr does with it is exactly what we have not verified.
+   *
+   * ⚠️ Asserted against the CLIENT, not the tool. `add_season` checks the season
+   * list first, so this guard is unreachable through it — testing it through the
+   * tool would have exercised the tool's message and called it coverage. It is
+   * defence in depth for any future caller, and it is tested where it lives.
+   */
+  const { ArrClient } = await import('../src/media/arr.js');
+  let puts = 0;
+  const client = new ArrClient(
+    {
+      baseUrl: 'http://sonarr.invalid/api/v3',
+      apiKey: 'k',
+      fetchImpl: async (_u, i) => {
+        if ((i?.method ?? 'GET') !== 'GET') puts += 1;
+        return json({ id: 77, title: 'Seinfeld', monitored: true, seasons: [] });
+      },
+    },
+    'series',
+  );
+  const out = await client.monitorSeasons(77, [3]);
+  assert.equal(out.state, 'unknown');
+  assert.match((out as { detail: string }).detail, /Refusing to PUT an empty one/);
+  assert.equal(puts, 0, 'and nothing was written');
+});
+
+test('🔴 a season that VANISHED from the read-back is flagged, not invisible', async () => {
+  // Iterating only the rows that came back cannot see a season that is gone —
+  // the largest possible "something else changed".
+  const row = seriesRow({ stats: { 2: [0, 12, true], 3: [0, 23, false] } });
+  const { fetchImpl } = sonarr(row, {
+    afterResponse: () => json(seriesRow({ stats: { 3: [0, 23, true] } })), // S2 is simply gone
+  });
+  const r = await run(fetchImpl, [3]);
+  assert.equal(r.ok, true);
+  assert.match(r.content, /S2 also changed state or vanished/);
+});
+
+test('a row with no seasonNumber never becomes "SNaN also changed"', async () => {
+  // ⚠️ The two reads must DISAGREE about the junk rows. Identical junk on both
+  // sides collides on the same NaN key and diffs to nothing, so a version that
+  // does not skip them would pass — the fixture would be hiding the defect.
+  const junk = (monitored: boolean) => ({ monitored, statistics: {} });
+  const row = {
+    ...seriesRow({ stats: { 3: [0, 23, false] } }),
+    seasons: [
+      { seasonNumber: 3, monitored: false, statistics: { episodeFileCount: 0, totalEpisodeCount: 23 } },
+      junk(false),
+    ],
+  };
+  const { fetchImpl } = sonarr(row, {
+    afterResponse: () =>
+      json({
+        ...seriesRow({ stats: { 3: [0, 23, true] } }),
+        seasons: [
+          { seasonNumber: 3, monitored: true, statistics: {} },
+          junk(true),
+        ],
+      }),
+  });
+  const r = await run(fetchImpl, [3]);
+  assert.equal(r.ok, true);
+  assert.match(r.content, /S3 monitored and searching/, 'CONTROL: the real season still resolved');
+  assert.doesNotMatch(r.content, /NaN/);
+});
+
+test('a pre-write read failure says NOTHING WAS CHANGED, not "I cannot say"', async () => {
+  // Before the PUT there is no ambiguity to hedge about: nothing was written.
+  // Hedging there trains the reader to discount the hedge where it is real.
+  let n = 0;
+  const { fetchImpl, rec } = sonarr(SEINFELD, {});
+  const routed: FetchImpl = async (url, init) => {
+    // The LIST read succeeds; the single-series read before the PUT fails.
+    if (/\/series\/\d+$/.test(String(url)) && ++n === 1) return json({}, 503);
+    return fetchImpl(url, init);
+  };
+  const r = await makeAddSeason(routed).run({ title: 'seinfeld', seasons: [3] }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /NOTHING was changed/);
+  assert.equal(rec.puts.length, 0);
+});
+
+test('too many seasons at once is refused before any write', async () => {
+  const { fetchImpl, rec } = sonarr(SEINFELD);
+  const r = await run(fetchImpl, Array.from({ length: 20 }, (_, i) => i + 1));
+  assert.equal(r.ok, false);
+  assert.match(r.content, /at most 12 at once/);
+  assert.equal(rec.puts.length, 0);
+  assert.equal(rec.gets.length, 0, 'and no read either — the cap is on the argument');
+});
+
+test('a FAILED result still carries what else was true', async () => {
+  const { fetchImpl } = sonarr(SEINFELD, { afterResponse: () => json(SEINFELD) });
+  const r = await run(fetchImpl, [1, 3, 77]);
+  assert.equal(r.ok, false);
+  assert.match(r.content, /did not come back monitored/);
+  assert.match(r.content, /S1 already complete, left alone/);
+  assert.match(r.content, /no season 77 exists/);
 });

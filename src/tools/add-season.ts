@@ -45,6 +45,9 @@ import { fail, ok, type Tool } from './types.js';
  * A tool that collapsed those two would report "downloading" for a show that is
  * doing nothing at all, which is the failure this file is mostly built around.
  */
+/** One turn holds open for every search it fires; this bounds that. */
+const MAX_SEASONS_PER_CALL = 12;
+
 export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'add_season',
@@ -81,6 +84,18 @@ export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
         return fail(
           'No seasons given. ASK which season they want — do not add every season. An unspecified ' +
             'ask is a question, not a request for the whole show.',
+        );
+      }
+      /**
+       * ⚠️ BOUNDED, because each season is a separate search with its own
+       * timeout and the turn is held open for all of them. The live library
+       * holds a 57-season show; asking for all of it would hold one inbound
+       * message for minutes. Refusing and asking for fewer is the honest cap.
+       */
+      if (requested.length > MAX_SEASONS_PER_CALL) {
+        return fail(
+          `That is ${requested.length} seasons in one go, and I search them one at a time — ask for ` +
+            `at most ${MAX_SEASONS_PER_CALL} at once. Nothing was changed.`,
         );
       }
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was changed.');
@@ -120,6 +135,14 @@ export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
       }
 
       const available = show.seasons.map((s) => s.season);
+      if (available.length === 0) {
+        // ⚠️ Otherwise the branch below renders "It has ." — a sentence with the
+        // answer missing, which reads as a bug rather than as a state.
+        return fail(
+          `Sonarr lists "${show.title}" with no seasons at all, so there is nothing to turn on. ` +
+            'Nothing was changed.',
+        );
+      }
       const unknownSeasons = requested.filter((n) => !available.includes(n));
       const valid = requested.filter((n) => available.includes(n));
       if (valid.length === 0) {
@@ -150,13 +173,49 @@ export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
         return fail(`FAILED — ${monitored.detail} Nothing was started.`);
       }
 
-      // 🔴 `confirmed` is Sonarr's read-back, not our request.
+      // 🔴 `confirmed` is a fresh READ of Sonarr, not our request and not the
+      // PUT's echo of it. See `ArrClient.monitorSeasons`.
       const confirmed = monitored.confirmed;
       const refused = toGet.filter((n) => !confirmed.includes(n));
+
+      // Everything that changed beyond the plain ask, collected once so every
+      // exit below carries it — a FAILED that omits "S1 was already complete"
+      // is a less useful answer than the success would have been.
+      const notes: string[] = [];
+      if (complete.length) notes.push(`${listSeasons(complete)} already complete, left alone`);
+      if (unknownSeasons.length) notes.push(`no season ${unknownSeasons.join(', ')} exists for this show`);
+      if (refused.length) notes.push(`${listSeasons(refused)} did NOT switch on`);
+      if (monitored.seriesWasUnmonitored && monitored.seriesMonitored) {
+        // A change beyond what was asked for — a series toggled off grabs
+        // nothing however many seasons are on, so it has to be flipped, and
+        // flipping it has to be said out loud.
+        notes.push('the show itself was unmonitored and has been switched back on');
+      }
+      if (monitored.othersChanged.length) {
+        notes.push(`⚠️ ${listSeasons(monitored.othersChanged)} also changed state or vanished, which was not asked for`);
+      }
+      const suffix = notes.length ? ` (${notes.join('; ')})` : '';
+
       if (confirmed.length === 0) {
         return fail(
           `FAILED — Sonarr accepted the update but ${listSeasons(toGet)} did not come back monitored, ` +
-            'so the change did not stick and nothing was queued.',
+            `so the change did not stick and nothing was queued.${suffix}`,
+        );
+      }
+
+      /**
+       * 🔴 SEASONS UNDER AN UNMONITORED SERIES DOWNLOAD NOTHING.
+       *
+       * The series flag is read back like everything else. If it did not stick,
+       * the seasons are on and inert — which reads, to anyone looking, exactly
+       * like "on its way". Searching would be pointless and claiming STARTED
+       * would be false, so neither happens.
+       */
+      if (!monitored.seriesMonitored) {
+        return fail(
+          `MONITORED BUT INERT — "${show.title}" ${listSeasons(confirmed)} switched on, but the SHOW ` +
+            `itself came back unmonitored, so Sonarr will grab nothing for it and NOTHING IS ` +
+            `DOWNLOADING. Do not say it is on its way.${suffix}`,
         );
       }
 
@@ -173,20 +232,6 @@ export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
         if (r.ok) searched.push(n);
         else unsearched.push({ season: n, why: r.detail });
       }
-
-      const notes: string[] = [];
-      if (complete.length) notes.push(`${listSeasons(complete)} already complete, left alone`);
-      if (unknownSeasons.length) notes.push(`no season ${unknownSeasons.join(', ')} exists for this show`);
-      if (refused.length) notes.push(`${listSeasons(refused)} did NOT switch on`);
-      if (monitored.seriesWasUnmonitored) {
-        // Reported because it is a change beyond what was asked for — a series
-        // toggled off grabs nothing however many seasons are on.
-        notes.push('the show itself was unmonitored and has been switched back on');
-      }
-      if (monitored.othersChanged.length) {
-        notes.push(`⚠️ ${listSeasons(monitored.othersChanged)} also changed state, which was not asked for`);
-      }
-      const suffix = notes.length ? ` (${notes.join('; ')})` : '';
 
       if (searched.length === 0) {
         const why = unsearched.map((u) => `S${u.season}: ${u.why}`).join('; ');
