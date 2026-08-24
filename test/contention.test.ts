@@ -62,11 +62,32 @@ test('🔴 too few usable probes is UNKNOWN, never "fast"', () => {
   assert.equal(short.known, false);
   assert.match(short.detail, /UNKNOWN/);
 
-  // A failed probe is an ABSENT reading, not a slow one. Counting non-200s would
-  // invent a number out of an error.
+  // A failed probe is an ABSENT reading, not a slow one.
   const errors = `${probeLines(0.001, 0.001)}\nhttp=000 total=20.000000\nhttp=502 total=0.003000`;
   const mixed = parseLatencySamples(errors, 0);
   assert.equal(mixed.known, false, 'non-200 samples must not pad the count to reach the minimum');
+});
+
+test('🔴 a Jellyfin that is TIMING OUT must not read as fast because the good samples were fast', () => {
+  // The case the test above could not see. Four clean 1 ms probes and three
+  // 20-second timeouts: if non-200 lines were counted as timings, there would be
+  // seven "samples", the count would clear the minimum, and the median of
+  // [1,1,1,1,20000,20000,20000] is 1 ms — so a Jellyfin failing 3 requests in 7
+  // would be reported as HEALTHY, and the contention check would wave it through.
+  //
+  // The earlier assertion could not distinguish this: its bad samples did not
+  // push the count over the minimum, so it passed either way. That is a control
+  // that cannot fail for the reason it exists.
+  const partial =
+    `${probeLines(0.001, 0.0011, 0.001, 0.0012)}\n` +
+    'http=000 total=20.000000\nhttp=000 total=20.000000\nhttp=000 total=20.000000';
+  const reading = parseLatencySamples(partial, 0);
+  assert.equal(reading.known, false, 'four usable probes out of seven is UNKNOWN, not fast');
+
+  // CONTROL: the same seven lines, all successful, DO parse — so the refusal is
+  // about the failures and not about the sample count.
+  const allGood = parseLatencySamples(probeLines(0.001, 0.0011, 0.001, 0.0012, 0.001, 0.001, 0.001), 0);
+  assert.equal(allGood.known, true);
 });
 
 test('a non-zero exit from the probe itself is UNKNOWN', () => {
