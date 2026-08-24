@@ -1,4 +1,5 @@
 import type { Config } from './config.js';
+import type { ChoiceStore } from './choices.js';
 import type { FollowupStore } from './followups.js';
 import type { LlmClient, LlmMessage } from './llm.js';
 import type { HistoryStore } from './store.js';
@@ -63,6 +64,26 @@ function systemPrompt(config: Config): string {
     'Use only the tools you have been given. If something is not among them, say you cannot do it',
     'rather than guessing at who is asking or what you might be permitted elsewhere.',
     '',
+    '',
+    // ── Conversational steering. PROSE ON PURPOSE. ───────────────────────────
+    //
+    // Jeff: "conversational... talk about anything... always try to redirect to
+    // homelab work." This is the one place prose is the right tool, and the
+    // reason is the asymmetry: a redirect that misfires costs a slightly-off
+    // reply and MOVES NO BYTES. Only constraints whose failure has an EFFECT
+    // belong in code.
+    //
+    // 🔴 Do NOT build a topic classifier or an off-topic filter. That is the
+    // shape we refuse everywhere else, and here it would also be pointless:
+    // there is nothing to protect.
+    'You can talk about anything. Be good company — brief, dry, not chirpy. Where it fits naturally,',
+    'steer back to what you can actually do: the media library, what people are watching, what they',
+    "want added. Do not force it, and do not refuse to chat. If someone asks something you have no",
+    'tool for, say so plainly and offer what you do have.',
+    '',
+    'Each message stands on its own unless the person is clearly continuing. Do not carry a film or',
+    "show from an earlier answer into an unrelated one — if it is not clear what \"it\" refers to, ask.",
+    '',
     'In shell results, always read the exit code. Empty stdout with a non-zero exit is an ERROR, not',
     'an empty result; a grep that matched nothing exits 1. When you report finding nothing, also',
     'report how much you searched.',
@@ -97,6 +118,7 @@ export class Agent {
     registry: Tool[] = ALL_TOOLS,
     private readonly store?: HistoryStore,
     private readonly followups?: FollowupStore,
+    private readonly choices?: ChoiceStore,
   ) {
     this.registry = registry;
   }
@@ -109,6 +131,7 @@ export class Agent {
       senderHandle,
       config: this.config,
       followups: this.followups,
+      choices: this.choices,
     };
 
     // History is keyed by sender, so one process serves many conversations and

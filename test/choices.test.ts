@@ -141,3 +141,55 @@ test('pending() reports what is waiting, and nothing once expired', () => {
   assert.equal(store.pending('+18015550123', t0)?.subject, 'Dune');
   assert.equal(store.pending('+18015550123', new Date(t0.getTime() + CHOICE_TTL_MS + 1)), undefined);
 });
+
+// ── end to end through the TOOLS, which is what V1 could not do ──────────────
+
+test('🔴 catalogue_search stores its own options, and resolve_choice maps a later pick back', async () => {
+  // V1's flow was structurally incapable of this: the list did not survive to
+  // the next message. It survives here because the tool that PRODUCED it stored
+  // it -- not because the model remembered to record it.
+  const { makeCatalogueSearch } = await import('../src/tools/catalogue.js');
+  const { resolveChoice } = await import('../src/tools/choice.js');
+  const { testConfig } = await import('./helpers.js');
+
+  const path = tempFile();
+  const json = (b: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(b) }) as Response;
+  const fetchImpl = async (url: string) =>
+    String(url).includes('/radarr/')
+      ? json([{ title: 'Severance', year: 2006, tmdbId: 9001 }])
+      : json([{ title: 'Severance', year: 2022, tvdbId: 371980 }]);
+
+  const ctx = {
+    role: 'guest' as const,
+    senderHandle: '+18015550123',
+    config: testConfig(),
+    choices: new ChoiceStore(path),
+  };
+  const search = await makeCatalogueSearch(fetchImpl as never).run({ title: 'severance' }, ctx);
+  assert.match(search.content, /AMBIGUOUS/);
+  assert.match(search.content, /1\. Severance \(2006\) — film/);
+  assert.match(search.content, /2\. Severance \(2022\) — show/);
+
+  // ── the next message, with a FRESH store: the restart V1 could not survive ──
+  const later = {
+    ...ctx,
+    choices: new ChoiceStore(path),
+  };
+  const picked = await resolveChoice.run({ choice: 2 }, later);
+  assert.equal(picked.ok, true);
+  assert.match(picked.content, /Severance \(2022\)/);
+  assert.match(picked.content, /"arr":"series"/);
+  assert.match(picked.content, /371980/);
+});
+
+test('🔴 a pick with no stored list re-asks rather than resolving to anything', async () => {
+  const { resolveChoice } = await import('../src/tools/choice.js');
+  const { testConfig } = await import('./helpers.js');
+  const r = await resolveChoice.run(
+    { choice: 1 },
+    { role: 'guest', senderHandle: '+1555', config: testConfig(), choices: new ChoiceStore(tempFile()) },
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.content, /NONE/);
+  assert.match(r.content, /do not guess/i);
+});

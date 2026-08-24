@@ -65,6 +65,24 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
         );
       }
 
+      /**
+       * Record the options as a side effect of producing them.
+       *
+       * The pick-a-number flow failed in V1 because the list did not survive to
+       * the next message. It survives here because the tool that generated it
+       * persisted it — not because the model remembered to.
+       */
+      const remember = (opts: { label: string; value: Record<string, unknown> }[]) => {
+        if (!ctx.choices || opts.length === 0) return '';
+        ctx.choices.present({
+          senderHandle: ctx.senderHandle,
+          subject: title,
+          kind: 'media-choice',
+          options: opts.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
+        });
+        return opts.map((o, i) => `\n  ${i + 1}. ${o.label}`).join('');
+      };
+
       const verdict = typeVerdict(title, films.candidates, shows.candidates);
       switch (verdict.type) {
         case 'none':
@@ -72,22 +90,34 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
             `NO MATCH — ${verdict.detail} (searched ${films.candidates.length} film and ` +
               `${shows.candidates.length} show result(s)).`,
           );
-        case 'ambiguous':
+        case 'ambiguous': {
+          const listed = remember([
+            { label: `${describe(verdict.movie.best)} — film`, value: { arr: 'movie', id: verdict.movie.best.id, title: verdict.movie.best.title } },
+            { label: `${describe(verdict.series.best)} — show`, value: { arr: 'series', id: verdict.series.best.id, title: verdict.series.best.title } },
+          ]);
           return ok(
-            `AMBIGUOUS — ${verdict.detail}\n` +
-              `  film:  ${describe(verdict.movie.best)}\n` +
-              `  show:  ${describe(verdict.series.best)}`,
+            `AMBIGUOUS — ${verdict.detail}` +
+              (listed ? `${listed}\n  (offer these as a numbered choice; resolve_choice maps their reply back)` : ''),
           );
-        case 'movie':
-          return ok(
-            `FILM — ${describe(verdict.pick.best)} (radarr tmdbId ${verdict.pick.best.id}).` +
-              contestedNote(films.candidates, verdict.pick.contested),
-          );
-        case 'series':
-          return ok(
-            `SHOW — ${describe(verdict.pick.best)} (sonarr tvdbId ${verdict.pick.best.id}).` +
-              contestedNote(shows.candidates, verdict.pick.contested),
-          );
+        }
+        case 'movie': {
+          if (verdict.pick.contested) {
+            const listed = remember(
+              films.candidates.slice(0, 5).map((c) => ({ label: `${describe(c)} — film`, value: { arr: 'movie', id: c.id, title: c.title } })),
+            );
+            return ok(`FILM (CONTESTED) — do NOT add without asking. Offer these:${listed}`);
+          }
+          return ok(`FILM — ${describe(verdict.pick.best)} (radarr tmdbId ${verdict.pick.best.id}).`);
+        }
+        case 'series': {
+          if (verdict.pick.contested) {
+            const listed = remember(
+              shows.candidates.slice(0, 5).map((c) => ({ label: `${describe(c)} — show`, value: { arr: 'series', id: c.id, title: c.title } })),
+            );
+            return ok(`SHOW (CONTESTED) — do NOT add without asking. Offer these:${listed}`);
+          }
+          return ok(`SHOW — ${describe(verdict.pick.best)} (sonarr tvdbId ${verdict.pick.best.id}).`);
+        }
       }
     },
   };
@@ -97,21 +127,4 @@ function describe(c: Candidate): string {
   return `${c.title}${c.year ? ` (${c.year})` : ''}`;
 }
 
-/**
- * When the runner-up is close, say so and list the options.
- *
- * A near-tie — *Dune (2021)* against *Dune (1984)* — is a question, not a pick.
- * Resolving it silently is how someone gets the wrong version of a film they
- * asked for by name.
- */
-function contestedNote(all: Candidate[], contested: boolean): string {
-  if (!contested) return '';
-  const top = all
-    .slice(0, 5)
-    .map((c, i) => `${i + 1}. ${describe(c)}`)
-    .join('; ');
-  return (
-    ' ⚠️ CONTESTED — another result matches almost as well, so do NOT add without asking. ' +
-    `Present these and let them choose: ${top}`
-  );
-}
+

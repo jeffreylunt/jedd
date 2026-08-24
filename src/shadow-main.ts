@@ -7,6 +7,7 @@ import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { FollowupStore } from './followups.js';
 import { createLlmClient } from './llm.js';
+import { ChoiceStore } from './choices.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
@@ -71,6 +72,7 @@ async function main(): Promise<void> {
     tools,
     history,
     followups,
+    new ChoiceStore(`${DATA_DIR}shadow-choices.jsonl`),
   );
 
   const receiver = new BlueBubblesReceiver({

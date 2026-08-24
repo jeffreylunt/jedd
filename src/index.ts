@@ -6,6 +6,7 @@ import { StdoutConnector } from './connector.js';
 import { FollowupStore } from './followups.js';
 import { runDueFollowups } from './followup-runner.js';
 import { createLlmClient } from './llm.js';
+import { ChoiceStore } from './choices.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
@@ -38,7 +39,8 @@ async function main(): Promise<void> {
   const tools = buildTools(config, shellIdentity);
   const history = new HistoryStore(`${DATA_DIR}history.jsonl`);
   const followups = new FollowupStore(`${DATA_DIR}followups.jsonl`);
-  const agent = new Agent(config, llm, recordTurn, tools, history, followups);
+  const choices = new ChoiceStore(`${DATA_DIR}choices.jsonl`);
+  const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices);
   const connector = new StdoutConnector(process.argv[2] ?? config.ownerHandle);
 
   console.error(

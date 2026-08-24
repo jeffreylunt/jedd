@@ -1,3 +1,4 @@
+import type { ChoiceStore } from '../choices.js';
 import type { Config } from '../config.js';
 import type { FollowupStore } from '../followups.js';
 import type { ExecImpl } from '../hp.js';
@@ -30,6 +31,15 @@ export interface ToolContext {
    * manage to schedule.
    */
   followups?: FollowupStore;
+  /**
+   * Where numbered options live between turns.
+   *
+   * 🔴 THE TOOL THAT PRODUCES OPTIONS STORES THEM. The model is never asked to
+   * "remember to record the list" — that is bookkeeping we would be relying on
+   * it to perform, and the failure is silent. The options are a side effect of
+   * the search that generated them, so the only thing the model does is choose.
+   */
+  choices?: ChoiceStore;
 }
 
 /**

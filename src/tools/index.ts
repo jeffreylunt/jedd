@@ -12,6 +12,7 @@ import {
 } from './homelab.js';
 import { makeAddMovie, makeAddSeries } from './add-media.js';
 import { makeCatalogueSearch } from './catalogue.js';
+import { resolveChoice } from './choice.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
@@ -40,7 +41,7 @@ import type { Tool } from './types.js';
  * identity — see `src/tools/docker.ts`.
  */
 
-const GUEST_TOOLS: Tool[] = [jellyfinSearch, homelabStatus, makeCatalogueSearch()];
+const GUEST_TOOLS: Tool[] = [jellyfinSearch, homelabStatus, makeCatalogueSearch(), resolveChoice];
 
 /**
  * 🔴 GUEST WRITES. Jeff, 2026-08-24: "yes guests can request real media and add users."
