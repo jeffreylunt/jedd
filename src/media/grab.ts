@@ -237,3 +237,48 @@ export async function grabStatus(input: {
     detail: `"${name}" is ${Math.round(progress * 100)}% done (qBittorrent state: ${state}).`,
   };
 }
+
+/**
+ * Translate qBittorrent's path into one that exists where V2 can read it.
+ *
+ * ── 🔴 MEASURED, NOT INFERRED (2026-08-24) ───────────────────────────────────
+ *
+ * qBittorrent reports, live:
+ *   `/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB`
+ * and **`/downloads` does not exist on hp's filesystem.** It is a path inside
+ * qBittorrent's own container.
+ *
+ * V1 never had to care: its container mounted the same host directory at
+ * `/downloads`, so the two views agreed by construction — that is exactly what
+ * its config comment means by *"mounting it anywhere else silently breaks every
+ * send with 'file not found' while the download itself looks perfectly
+ * healthy."*
+ *
+ * **V2 reaches the file over ssh and therefore sees the HOST filesystem, so the
+ * agreement is gone and the translation has to be explicit.** Without it every
+ * send fails as a missing file while the download is plainly complete — the same
+ * defect V1 warned about, arriving through a different door.
+ *
+ * ⚠️ Prefix-aware on purpose: sonarr's torrents report `/external/Downloads/…`,
+ * a different mount entirely, so a blanket string replace would corrupt them.
+ */
+export interface MountMap {
+  /** What qBittorrent calls it, e.g. `/downloads`. */
+  containerPrefix: string;
+  /** What it is on hp, e.g. `/home/jeff/gluetun/downloads`. */
+  hostPrefix: string;
+}
+
+export function toHostPath(contentPath: string, mounts: MountMap[]): string | null {
+  if (!contentPath) return null;
+  for (const m of mounts) {
+    // Match on a path BOUNDARY so `/downloads` never matches `/downloads-old`.
+    if (contentPath === m.containerPrefix || contentPath.startsWith(`${m.containerPrefix}/`)) {
+      return m.hostPrefix + contentPath.slice(m.containerPrefix.length);
+    }
+  }
+  // 🔴 Unmapped is NULL, not the original. Returning the container path would
+  // hand the next step something that cannot exist on this filesystem, and the
+  // failure would read as a missing download rather than a missing mapping.
+  return null;
+}

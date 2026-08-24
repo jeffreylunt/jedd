@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ExecImpl } from '../src/hp.js';
-import { grabStatus, grabTorrent } from '../src/media/grab.js';
+import { grabStatus, grabTorrent, toHostPath } from '../src/media/grab.js';
 
 const HASH = 'abcdef0123456789abcdef0123456789abcdef01';
 
@@ -161,4 +161,35 @@ test('complete-but-no-path is NOT reported as complete', async () => {
   // the next step an empty string.
   const { exec } = ssh([info({ name: 'x', progress: 1, content_path: '', state: 'uploading' })]);
   assert.equal((await grabStatus({ ...base, exec })).state, 'downloading');
+});
+
+// ── 🔴 the container/host path split ─────────────────────────────────────────
+
+const MOUNTS = [{ containerPrefix: '/downloads', hostPrefix: '/home/jeff/gluetun/downloads' }];
+
+test('🔴 qBittorrent\'s real reported path is translated to one that exists on hp', () => {
+  // Verbatim from the live API today. /downloads does NOT exist on the host.
+  assert.equal(
+    toHostPath('/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB', MOUNTS),
+    '/home/jeff/gluetun/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB',
+  );
+});
+
+test('🔴 an UNMAPPED path returns null, never the original', () => {
+  // Sonarr's torrents live on a different mount entirely -- also observed live.
+  // Returning the container path would hand the next step something that cannot
+  // exist here, and the failure would read as a missing DOWNLOAD rather than a
+  // missing MAPPING.
+  assert.equal(toHostPath('/external/Downloads/Fringe.S02E18.mkv', MOUNTS), null);
+});
+
+test('🔴 prefix matching respects path boundaries', () => {
+  // A blanket startsWith would rewrite /downloads-old into the wrong mount.
+  assert.equal(toHostPath('/downloads-old/x.epub', MOUNTS), null);
+  assert.equal(toHostPath('/downloads', MOUNTS), '/home/jeff/gluetun/downloads');
+});
+
+test('an empty content path is null, matching the complete-but-no-path guard', () => {
+  // One live torrent really does report an empty content_path.
+  assert.equal(toHostPath('', MOUNTS), null);
 });
