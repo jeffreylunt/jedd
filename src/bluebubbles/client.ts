@@ -7,6 +7,29 @@
 
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * iMessage has no renderer, so markdown ships as literal punctuation: a reply
+ * reading `**Dune** is ready` arrives with the asterisks visible.
+ *
+ * Deliberately conservative. This runs on EVERY outbound message, so an
+ * over-eager rule corrupts real text — a title like `*batteries not included`
+ * or a path like `some_file_name` must survive. It strips only the markers that
+ * wrap content, and leaves anything it is unsure about alone. **Stripping is a
+ * cosmetic fix; mangling a title is a correctness bug**, so the asymmetry
+ * decides the default.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/```[a-z]*\n?([\s\S]*?)```/g, '$1')   // fenced blocks
+    .replace(/`([^`\n]+)`/g, '$1')                  // inline code
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')           // bold
+    .replace(/__([^_\n]+)__/g, '$1')                // bold (underscore)
+    .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, '$1 ($2)') // links keep the url
+    .replace(/^#{1,6}\s+/gm, '')                    // headings
+    .replace(/^\s*[-*]\s+/gm, '• ')                 // bullets
+    .trim();
+}
+
 export interface BlueBubblesOptions {
   baseUrl: string;
   password: string;
@@ -240,7 +263,7 @@ export class BlueBubblesClient {
       method: 'POST',
       body: JSON.stringify({
         chatGuid: `iMessage;-;${to}`,
-        message: text,
+        message: stripMarkdown(text),
         tempGuid: `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       }),
     });

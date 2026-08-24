@@ -220,3 +220,21 @@ test('the password is sent as a query param and never in the body', async () => 
   assert.match(calls[0]!.url, /password=pw/);
   assert.ok(!JSON.stringify(calls[0]!.body).includes('pw'));
 });
+
+// ── markdown does not render in iMessage ─────────────────────────────────────
+
+test('markdown is stripped before sending, because iMessage has no renderer', async () => {
+  const { impl, calls } = scripted(() => ({ body: { data: { guid: 'g' } } }));
+  await client(impl).sendText('+1555', '**Dune** is ready. See `logs` or [here](https://x.invalid/a)');
+  const sent = (calls[0]!.body as { message: string }).message;
+  assert.equal(sent, 'Dune is ready. See logs or here (https://x.invalid/a)');
+});
+
+test('🔴 stripping does NOT mangle ordinary titles and filenames', async () => {
+  // This runs on every outbound message, so an over-eager rule corrupts real
+  // text. Stripping is cosmetic; mangling a title is a correctness bug.
+  const { impl, calls } = scripted(() => ({ body: { data: { guid: 'g' } } }));
+  const awkward = '*batteries not included (1987) is in some_file_name.mkv — 2*3 is 6';
+  await client(impl).sendText('+1555', awkward);
+  assert.equal((calls[0]!.body as { message: string }).message, awkward);
+});
