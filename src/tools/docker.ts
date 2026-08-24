@@ -204,6 +204,15 @@ export const dockerLogs: Tool = {
 };
 
 /**
+ * Network modes that mean "this container shares nobody else's namespace".
+ * `host` shares the HOST's, which is still not another container's — either way
+ * there is no peer container to compare inodes with. A user-defined network name
+ * is also legal here, hence the trailing alternative, but it must still look like
+ * a name rather than like an error message.
+ */
+const STANDALONE_NETWORK_MODES = /^(bridge|host|none|default|[a-zA-Z0-9][a-zA-Z0-9_.-]*)$/;
+
+/**
  * The netns-inode diagnostic, as its own structured tool.
  *
  * 🔴 THE FAULT THIS EXISTS FOR: after a gluetun restart, a
@@ -280,9 +289,20 @@ export const containerNetns: Tool = {
     // alarm here trains the reader to ignore the real one.
     const peerRef = /^container:(.+)$/.exec(networkMode)?.[1];
     if (!peerRef) {
+      // Fail CLOSED on a mode we do not recognise. Anything that is not one of
+      // docker's own network modes is a read that did not return what we think,
+      // and answering "nothing to compare" would turn a garbled read into a
+      // reassuring green — the UNKNOWN-as-fine bug class this repo exists to
+      // avoid. `readNetns` already applies exactly this discipline to the inode.
+      if (!STANDALONE_NETWORK_MODES.test(networkMode)) {
+        return fail(
+          `${name} reported an UNRECOGNISED network mode "${networkMode}". That is not a namespace ` +
+            'verdict, it is a read that did not return what was expected. Namespace state is UNKNOWN.',
+        );
+      }
       return ok(
-        `${name}: netns inode ${self.inode}, network_mode=${networkMode}. This container has its own ` +
-          'network namespace by configuration, so there is nothing to compare.',
+        `${name}: netns inode ${self.inode}, network_mode=${networkMode}. This container does not ` +
+          'share another container\'s network namespace by configuration, so there is nothing to compare.',
       );
     }
 
@@ -346,6 +366,18 @@ async function resolvePeerName(
   return { ok: true, name };
 }
 
+/**
+ * Escape the one regex metacharacter a valid container name may contain.
+ *
+ * `isValidContainerName` permits `[a-zA-Z0-9_.-]`, of which only `.` is special
+ * in an ERE outside a bracket expression. This is not defence against injection
+ * — the name is already validated — it is defence against matching the WRONG
+ * container, which decides an up/down verdict that elsewhere unlocks a restart.
+ */
+export function escapeForGrep(name: string): string {
+  return name.replace(/\./g, '\\.');
+}
+
 /** Read one container's kernel netns inode. Name must already be validated. */
 async function readNetns(
   ctx: ToolContext,
@@ -355,7 +387,10 @@ async function readNetns(
   // a message that reads like a namespace problem and is not one.
   const ps = await runOnHp(
     ctx.config.adminSshHost,
-    `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${container}\\|"`,
+    // `.` is legal in a container name AND a regex metacharacter, so an
+    // unescaped name matches other containers: `^my_app.v2-1\\|` also matches a
+    // row for `my_appXv2-1`, and only the FIRST row is read.
+    `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${escapeForGrep(container)}\\|"`,
     30_000,
     ctx.exec,
   );

@@ -3,10 +3,12 @@ import { jellyfinGet } from '../jellyfin.js';
 import { renderOutcome, runOnHp, clip } from '../hp.js';
 import {
   assertSafeToRestart,
+  isValidContainerName,
   parseContainerState,
   parseSessions,
   tunnelVerdict,
 } from '../safety.js';
+import { escapeForGrep } from './docker.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -141,8 +143,14 @@ export const livetvStatus: Tool = {
     required: [],
   },
   async run(args, ctx) {
+    // Finiteness matters: NaN survives Math.min/Math.max and would interpolate
+    // as the TEXT "NaN" into a command running on the privileged identity.
+    const requested = args['log_lines'];
     const logLines = Math.min(
-      Math.max(typeof args['log_lines'] === 'number' ? args['log_lines'] : 200, 20),
+      Math.max(
+        typeof requested === 'number' && Number.isFinite(requested) ? Math.trunc(requested) : 200,
+        20,
+      ),
       1000,
     );
     const sections: string[] = [];
@@ -232,8 +240,13 @@ export const restartContainer: Tool = {
   async run(args, ctx) {
     const container = typeof args['container'] === 'string' ? args['container'].trim() : '';
     if (!container) return fail('No container name supplied.');
-    if (!/^[A-Za-z0-9._-]+$/.test(container)) {
-      return fail(`"${container}" is not a valid container name.`);
+    // The CANONICAL validator, shared with the structured docker tools. An
+    // inline near-copy lived here and was weaker: it accepted `-sonarr` and
+    // `.sonarr`, which the docker-tool tests list as names that are not names.
+    // Two validators guarding the same privileged identity means tightening one
+    // silently leaves the other — and this is the one on the WRITE path.
+    if (!isValidContainerName(container)) {
+      return fail(`"${container}" is not a valid container name. Nothing was restarted.`);
     }
     // The gluetun invariant is NOT checked here. It lives inside
     // assertSafeToRestart, so it holds for every caller rather than for this one.
@@ -241,7 +254,7 @@ export const restartContainer: Tool = {
     // Evidence, gathered here rather than taken on trust.
     const ps = await runOnHp(
       ctx.config.adminSshHost,
-      `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${container}\\|"`,
+      `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${escapeForGrep(container)}\\|"`,
     );
     const state = parseContainerState(ps.stdout, ps.exitCode);
     if (!state.known) {
