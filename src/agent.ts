@@ -73,8 +73,15 @@ function systemPrompt(config: Config): string {
 /**
  * The agent loop.
  *
- * There is no output filtering here. The only enforcement is at the tool
- * boundary, where it cannot be talked around.
+ * There is no output filtering here. Enforcement happens at the tool boundary:
+ * the role check below decides which tools may be CALLED.
+ *
+ * ⚠️ That gate decides which TOOL runs. It says nothing about what a tool can
+ * then do — a tool holding privileged credentials can perform an action the
+ * gate never authorised, which is exactly how `hp_shell` once reached
+ * `docker restart` through `awk`. Authorisation at this boundary is necessary
+ * and not sufficient; the capability the tool actually holds is the other half,
+ * and it lives in `config.ts` (ssh identity) and `safety.ts` (preconditions).
  */
 export class Agent {
   private readonly histories = new Map<string, LlmMessage[]>();
