@@ -11,6 +11,7 @@ import { JfagoClient } from './jfago.js';
 import { runDueFollowups } from './followup-runner.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { KindleRegistry } from './kindle.js';
+import { realMailSender } from './media/kindle-send.js';
 import { createLlmClient } from './llm.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
@@ -108,7 +109,7 @@ async function main(): Promise<void> {
    *     `JEDD_SEND_TO`. The audience gate is not re-implemented here; there is
    *     one send path.
    *  2. **A SUPPRESSED SEND MUST READ AS A FAILED SEND**, so the invite is
-   *     revoked. `connector.send` reports what happened; anything that is not a
+   *     revoked. `sendReporting` reports what happened; anything that is not a
    *     confirmed non-failure destroys the credential. Silently swallowing a
    *     suppression would leave a live single-use invite behind for a message
    *     nobody ever received — the exact V1 defect this tool was built to not
@@ -126,7 +127,18 @@ async function main(): Promise<void> {
     ledger: invites,
     send: (to: string, text: string) => connector.sendReporting(to, text),
   };
-  const tools = buildTools(config, shellIdentity, { invite });
+  /**
+   * ⚠️ `send_ebook` IS RESTRICTED TO THE OWNER IN THIS BUILD.
+   *
+   * It is `minRole: 'guest'` by declaration and the address it mails is
+   * provenance-verified per sender, so widening it is one line — delete
+   * `onlySendTo`. It is narrow here because the path has had exactly ONE live
+   * send ever, and this is its first exposure to real household traffic. A guest
+   * who asks gets a visible refusal naming the restriction, which is the safe
+   * direction: annoying beats an unrecallable email.
+   */
+  const ebook = { send: await realMailSender(config), onlySendTo: config.ownerHandle };
+  const tools = buildTools(config, shellIdentity, { invite, ebook });
   const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, kindle);
 
   console.error(

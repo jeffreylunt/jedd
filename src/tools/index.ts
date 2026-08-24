@@ -22,6 +22,7 @@ import { makeInviteTool, type InviteDeps } from './invite.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
+import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
 import type { Tool } from './types.js';
 
 /**
@@ -85,6 +86,15 @@ const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries(), saveKindleEm
 export interface ToolDeps {
   /** Absent → `invite_to_jellyfin` is not registered at all. */
   invite?: InviteDeps;
+  /**
+   * Absent → `send_ebook` is not registered at all.
+   *
+   * 🔴 `send_ebook` had the SAME omission as the invite tool and it is the one
+   * that shows the shape of the trap: it was **verified live end to end, a real
+   * book reached a real Kindle**, through a script that constructed it directly.
+   * "It works" and "it is reachable" were both true, of different objects.
+   */
+  ebook?: SendEbookDeps;
 }
 
 /**
@@ -100,6 +110,13 @@ export interface ToolDeps {
  * it is a documentation surface rather than a runnable registry. Do not start
  * treating it as one.
  */
+const INERT_SEND_EBOOK: SendEbookDeps = {
+  send: async () => {
+    throw new Error('ALL_TOOLS carries an INERT send_ebook; it cannot mail. Use buildTools(deps).');
+  },
+  onlySendTo: 'nobody@invalid',
+};
+
 const INERT_INVITE: InviteDeps = {
   jfago: new JfagoClient({
     baseUrl: 'http://jfa-go.invalid:8056',
@@ -153,6 +170,9 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   // invite tool that cannot reach jfa-go would offer a capability that fails
   // AFTER the model has promised it to someone.
   if (deps.invite && config.jfago.password) tools.push(makeInviteTool(deps.invite));
+  // Same rule: no SMTP credential, no tool. A send_ebook that cannot mail would
+  // tell somebody their book is on the way and then fail at the last step.
+  if (deps.ebook && config.kindle.smtpPassword) tools.push(makeSendEbook(deps.ebook));
   return registerable(tools, config);
 }
 
@@ -206,6 +226,12 @@ export const ALL_TOOLS: Tool[] = [
   ...OWNER_WRITE_TOOLS,
   hpShell,
   makeInviteTool(INERT_INVITE),
+  makeSendEbook(INERT_SEND_EBOOK),
+  // ⚠️ `read_runbook` is registered conditionally by `buildTools` and was missing
+  // from here, so every invariant quantified over ALL_TOOLS — role gating, the
+  // writes declaration, the delivery-address rule — silently skipped it.
+  // Reachable in production is not the same as covered by the guards.
+  makeRunbookTool('/nonexistent/enumeration-only.md'),
 ];
 
 export type { Tool } from './types.js';
