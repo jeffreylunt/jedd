@@ -255,6 +255,8 @@ export const restartContainer: Tool = {
     const ps = await runOnHp(
       ctx.config.adminSshHost,
       `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${escapeForGrep(container)}\\|"`,
+      30_000,
+      ctx.exec,
     );
     const state = parseContainerState(ps.stdout, ps.exitCode);
     if (!state.known) {
@@ -279,7 +281,12 @@ export const restartContainer: Tool = {
       return fail(`NOT RESTARTED. ${verdict.reason} (observed status: ${status})`);
     }
 
-    const restart = await runOnHp(ctx.config.adminSshHost, `docker restart ${container}`, 90_000);
+    const restart = await runOnHp(
+      ctx.config.adminSshHost,
+      `docker restart ${container}`,
+      90_000,
+      ctx.exec,
+    );
     return restart.exitCode === 0
       ? ok(`Restarted ${container}. ${verdict.reason}\n${renderOutcome(restart)}`)
       : fail(`Restart of ${container} FAILED.\n${renderOutcome(restart)}`);
