@@ -33,6 +33,23 @@ import { buildTools } from '../src/tools/index.js';
 const CORPUS = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v1-parity-corpus.jsonl';
 const OUT = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v2-replay.jsonl';
 
+/** Jeff's real handle. Set as owner so the OWNER path is measured, not assumed. */
+const REAL_OWNER = '+15555550100';
+
+/**
+ * 🔴 CONVERSATIONS, NOT ISOLATED TURNS.
+ *
+ * The first version of this harness replayed each turn with a fresh agent, so V2
+ * got NO history while V1's reply had been made WITH it. Continuations —
+ * *"The first one"*, *"is season 2 of it all there?"*, *"How about now?"* — were
+ * then scored against a V1 that could see the thread. That is not an unfavourable
+ * comparison, it is a MEANINGLESS one, and continuations are common traffic.
+ *
+ * Turns are grouped into conversations by sender and gap, and one Agent serves a
+ * whole conversation so history accumulates exactly as it would live.
+ */
+const CONVERSATION_GAP_MS = 30 * 60 * 1000;
+
 interface CorpusTurn {
   rowid: number;
   at: string;
@@ -74,13 +91,33 @@ async function main(): Promise<void> {
     .filter(Boolean)
     .map((l) => JSON.parse(l) as CorpusTurn);
 
-  // Spread the sample across the whole 5.5 months rather than taking the tail,
-  // or the result describes one week's traffic and calls it the corpus.
-  const step = Math.max(1, Math.floor(all.length / limit));
-  const sample = all.filter((_, i) => i % step === 0).slice(0, limit);
+  // Group into conversations: same sender, and no gap longer than the threshold.
+  const convs: CorpusTurn[][] = [];
+  for (const t of all) {
+    const last = convs[convs.length - 1];
+    const prev = last?.[last.length - 1];
+    const sameThread =
+      prev && prev.sender === t.sender &&
+      Date.parse(t.at) - Date.parse(prev.at) < CONVERSATION_GAP_MS;
+    if (sameThread) last!.push(t);
+    else convs.push([t]);
+  }
+  // Prefer MULTI-TURN conversations: single-turn ones cannot exercise the very
+  // thing this rewrite exists to measure.
+  const multi = convs.filter((c) => c.length > 1);
+  const step = Math.max(1, Math.floor(multi.length / limit));
+  const sample = multi.filter((_, i) => i % step === 0).slice(0, limit);
+  console.error(
+    `${all.length} turns -> ${convs.length} conversations (${multi.length} multi-turn); ` +
+      `replaying ${sample.length} conversations`,
+  );
 
-  const config = loadConfig();
-  if (!config.readOnly) throw new Error('replay refuses to run with JEDD_ALLOW_WRITES set');
+  const base = loadConfig();
+  if (!base.readOnly) throw new Error('replay refuses to run with JEDD_ALLOW_WRITES set');
+  // 🔴 Measure the OWNER path. It carries the write privileges, so it cannot ship
+  // unmeasured — and offline, with writes blocked at the transport, setting this
+  // costs nothing. The live shadow keeps the synthetic handle.
+  const config = { ...base, ownerHandle: REAL_OWNER };
 
   const llm = stub
     ? {
@@ -100,10 +137,12 @@ async function main(): Promise<void> {
   let noTool = 0;
   let errors = 0;
 
-  for (const [i, turn] of sample.entries()) {
-    // A fresh Agent per turn: the corpus has no session continuity, and reusing
-    // one would leak an earlier sender's history into a later turn.
-    const agent = new Agent(config, llm as never, undefined, tools);
+  for (const [ci, conv] of sample.entries()) {
+   // ONE agent per conversation, so history accumulates as it would live.
+   const agent = new Agent(config, llm as never, undefined, tools);
+   const role = conv[0]!.sender === REAL_OWNER ? 'owner' : 'guest';
+   console.error(`\n-- conversation ${ci + 1}/${sample.length} (${role}, ${conv.length} turns) --`);
+   for (const turn of conv) {
     const started = Date.now();
     let replyText = '';
     let toolNames: string[] = [];
@@ -122,6 +161,8 @@ async function main(): Promise<void> {
     appendFileSync(
       OUT,
       `${JSON.stringify({
+        conversation: ci,
+        role,
         rowid: turn.rowid,
         at: turn.at,
         sender: turn.sender,
@@ -136,12 +177,14 @@ async function main(): Promise<void> {
       'utf8',
     );
     console.error(
-      `  [${i + 1}/${sample.length}] ${turn.user.slice(0, 44).padEnd(44)} ` +
-        `-> ${toolNames.join(',') || '(no tool)'} ${Date.now() - started}ms${error ? ' ERROR' : ''}`,
+      `  ${turn.user.slice(0, 46).padEnd(46)} -> ${toolNames.join(',') || '(no tool)'} ` +
+        `${Date.now() - started}ms${error ? ' ERROR' : ''}`,
     );
+   }
   }
 
-  console.error(`\ndone: ${sample.length} turns, ${noTool} with no tool call, ${errors} errors`);
+  const turns = sample.reduce((n, c) => n + c.length, 0);
+  console.error(`\ndone: ${turns} turns in ${sample.length} conversations, ${noTool} with no tool call, ${errors} errors`);
   console.error(
     blocked.attempts.length
       ? `🔴 ${blocked.attempts.length} WRITE ATTEMPT(S) BLOCKED: ${blocked.attempts.join('; ')}`
