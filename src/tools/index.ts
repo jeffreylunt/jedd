@@ -13,6 +13,7 @@ import {
 import { addAudiobook } from './add-audiobook.js';
 import { makeAddMovie, makeAddSeries } from './add-media.js';
 import { makeCatalogueSearch } from './catalogue.js';
+import { makeCheckStatus } from './check-status.js';
 import { resolveChoice } from './choice.js';
 import { kindleStatus, saveKindleEmail } from './kindle.js';
 import { homelabStatus } from './media.js';
@@ -43,7 +44,14 @@ import type { Tool } from './types.js';
  * identity — see `src/tools/docker.ts`.
  */
 
-const GUEST_TOOLS: Tool[] = [jellyfinSearch, homelabStatus, makeCatalogueSearch(), resolveChoice, kindleStatus];
+const GUEST_TOOLS: Tool[] = [
+  jellyfinSearch,
+  homelabStatus,
+  makeCatalogueSearch(),
+  makeCheckStatus(),
+  resolveChoice,
+  kindleStatus,
+];
 
 /**
  * 🔴 GUEST WRITES. Jeff, 2026-08-24: "yes guests can request real media and add users."

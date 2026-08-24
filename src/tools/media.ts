@@ -1,80 +1,26 @@
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { jellyfinGet } from '../jellyfin.js';
 import { fail, ok, type Tool } from './types.js';
 
-const DATA_DIR = new URL('../../data/', import.meta.url).pathname;
-const QUEUE_PATH = `${DATA_DIR}requests.jsonl`;
-
 /**
- * The guest capability.
+ * 🔴 `request_media` USED TO LIVE HERE AND WAS DELETED ON PURPOSE.
  *
- * In the POC this does NOT add to Radarr/Sonarr — the homelab stays read-only.
- * It checks the library for real, and records the request to a durable queue.
- * The tool result reports the queue position, so "did you do it" is answered by
- * a file that either has the line or does not.
+ * It was the POC's stand-in for a homelab that was still read-only: it checked
+ * Jellyfin, then appended the request to `data/requests.jsonl` and reported a
+ * queue position. Harmless then. Now that `add_movie` and `add_series` really do
+ * add, that file would be a SECOND STORE describing what is being fetched,
+ * sitting beside the arr queue and answering the same question with different
+ * facts.
+ *
+ * That is the exact V1 defect `check_status` exists to not have — Jedd's own
+ * job store reported an empty queue while Sonarr had 26 active downloads. It was
+ * never registered in `buildTools`, so it was one import away from being live
+ * and looked entirely reasonable sitting here. Deleted rather than left dormant:
+ * dead code that solves a problem we no longer have is a trap for whoever finds
+ * it next and assumes it was left out by mistake.
+ *
+ * If a request queue is ever wanted again, it must record REQUESTS THAT WERE NOT
+ * ACTED ON, and it must never be a place anyone reads download state from.
  */
-export const requestMedia: Tool = {
-  name: 'request_media',
-  description:
-    'Record a request for a movie or TV show. Checks the Jellyfin library first — if it is already ' +
-    'there, nothing is queued and you should just tell the person it is available. Returns the queue ' +
-    'position when a request is actually recorded.',
-  minRole: 'guest',
-  writes: false,
-  parameters: {
-    type: 'object',
-    properties: {
-      title: { type: 'string', description: 'Title of the movie or show.' },
-      media_type: { type: 'string', enum: ['movie', 'tv'], description: 'movie or tv' },
-    },
-    required: ['title', 'media_type'],
-  },
-  async run(args, ctx) {
-    const title = typeof args['title'] === 'string' ? args['title'].trim() : '';
-    const mediaType = args['media_type'] === 'tv' ? 'tv' : 'movie';
-    if (!title) return fail('No title supplied.');
-
-    const search = await jellyfinGet(
-      ctx.config,
-      `/Items?searchTerm=${encodeURIComponent(title)}` +
-        `&IncludeItemTypes=${mediaType === 'tv' ? 'Series' : 'Movie'}&Recursive=true&Limit=5`,
-    );
-    if (!search.ok) {
-      return fail(
-        `Could not check the library (${search.error}), so nothing was queued. Library state is UNKNOWN.`,
-      );
-    }
-    const body = search.body as { Items?: unknown[] } | undefined;
-    const items = Array.isArray(body?.Items) ? body.Items : [];
-    if (items.length > 0) {
-      const first = items[0] as Record<string, unknown>;
-      return ok(
-        `ALREADY IN LIBRARY — "${first['Name'] ?? title}" is on Jellyfin already. Nothing queued.`,
-      );
-    }
-
-    const entry = {
-      requestedBy: ctx.senderHandle,
-      title,
-      mediaType,
-      requestedAt: new Date().toISOString(),
-    };
-    try {
-      await mkdir(DATA_DIR, { recursive: true });
-      await appendFile(QUEUE_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
-    } catch (e) {
-      return fail(`Failed to record the request: ${(e as Error).message}. Nothing was queued.`);
-    }
-    let position = 1;
-    try {
-      const contents = await readFile(QUEUE_PATH, 'utf8');
-      position = contents.split('\n').filter((l) => l.trim()).length;
-    } catch {
-      /* position stays 1; the append above already succeeded */
-    }
-    return ok(`QUEUED: "${title}" (${mediaType}) recorded as request #${position}.`);
-  },
-};
 
 /** A status summary any user may ask for. */
 export const homelabStatus: Tool = {

@@ -136,4 +136,17 @@ test('🔴 writes:true and the guest gate are paired explicitly, not implied', a
 test('the request_media stub is gone — it reported a queue position for work nothing performed', async () => {
   const on = buildTools(testConfig({ readOnly: false })).map((t) => t.name);
   assert.ok(!on.includes('request_media'), 'the stub must not ship alongside a real add path');
+
+  // 🔴 THE ASSERTION ABOVE WAS TRUE FOR A MONTH WHILE THE TRAP WAS STILL LIVE.
+  // Un-registering the tool left `requestMedia` exported from tools/media.ts,
+  // appending to `data/requests.jsonl` — a second store of what is being
+  // fetched, one import away from shipping beside the arr queue, and looking for
+  // all the world like something left out by mistake. A registry-absence test
+  // cannot see a tool that is not registered YET. Assert the SYMBOL is gone.
+  const media = await import('../src/tools/media.js');
+  assert.ok(
+    !('requestMedia' in media),
+    'requestMedia must not exist at all — a dormant second source of download state is the ' +
+      'exact defect check_status was built to make unrepresentable.',
+  );
 });

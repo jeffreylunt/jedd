@@ -1,4 +1,5 @@
 import type { Candidate } from './matching.js';
+import { parseQueue, type Release } from './queue.js';
 
 /**
  * Sonarr / Radarr.
@@ -367,6 +368,43 @@ export class ArrClient {
     if (want > 0 && have >= want) return { state: 'complete', detail };
     if (have > 0) return { state: 'partial', detail, have, want };
     return { state: 'none', detail };
+  }
+
+  /**
+   * The download queue, grouped into RELEASES.
+   *
+   * 🔴 THE ONLY SOURCE OF TRUTH FOR "WHAT IS DOWNLOADING". There is deliberately
+   * no cache in front of this and no local job store beside it — see
+   * `src/media/queue.ts` for why the second source is the defect rather than the
+   * staleness.
+   *
+   * `includeSeries` / `includeMovie` are what put a human-readable SUBJECT on
+   * each row. Without them the only title present is the RELEASE name
+   * (`Fringe.S02E18.720p.HDTV.X264-DIMENSION`), which a person asking "is Fringe
+   * downloading?" would not match.
+   *
+   * ⚠️ `saturated` is reported rather than swallowed. A truncated queue read
+   * looks exactly like a shorter queue, and "fewer things are downloading than
+   * you think" is precisely the wrong thing to say by accident.
+   */
+  async queue(): Promise<
+    | { state: 'queue'; releases: Release[]; totalRecords: number; saturated: boolean }
+    | { state: 'unknown'; detail: string }
+  > {
+    const pageSize = 500;
+    const include =
+      this.kind === 'series'
+        ? 'includeUnknownSeriesItems=true&includeSeries=true'
+        : 'includeUnknownMovieItems=true&includeMovie=true';
+    const res = await this.call(`/queue?pageSize=${pageSize}&${include}`);
+    if (!res.ok) return { state: 'unknown', detail: res.detail };
+    const total = Number((res.body as { totalRecords?: unknown })?.totalRecords ?? 0);
+    return {
+      state: 'queue',
+      releases: parseQueue(res.body, this.kind === 'series' ? 'sonarr' : 'radarr'),
+      totalRecords: Number.isFinite(total) ? total : 0,
+      saturated: Number.isFinite(total) && total > pageSize,
+    };
   }
 
   /** Reachability, distinguishing a wrong URL from a dead service. */
