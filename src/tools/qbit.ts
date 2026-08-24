@@ -1,6 +1,5 @@
 import { runOnHp } from '../hp.js';
 import {
-  CONTENTION_MS,
   MIN_LATENCY_SAMPLES,
   hostContentionVerdict,
   parseLatencySamples,
@@ -58,8 +57,33 @@ const SHED_UP_BYTES_PER_SEC = 256 * 1024;
 /** How long to let the shed take effect before re-measuring the symptom. */
 const SETTLE_MS = 20_000;
 
-/** Number of latency probes per measurement. Must exceed MIN_LATENCY_SAMPLES. */
-const PROBE_COUNT = 7;
+/**
+ * Number of latency probes per measurement.
+ *
+ * ⚠️ MUST exceed `MIN_LATENCY_SAMPLES`, or every measurement is permanently
+ * UNKNOWN and the tool can never act again. Asserted at module load rather than
+ * left as a comment — the comment version of this invariant survived a mutation
+ * that set it to 4 with the whole suite green.
+ */
+export const PROBE_COUNT = 7;
+if (PROBE_COUNT <= MIN_LATENCY_SAMPLES) {
+  throw new Error(
+    `PROBE_COUNT (${PROBE_COUNT}) must exceed MIN_LATENCY_SAMPLES (${MIN_LATENCY_SAMPLES}) or every ` +
+      'latency measurement is UNKNOWN and no fix can ever be applied.',
+  );
+}
+
+/** Seconds between probes, so the sample window is seconds rather than milliseconds. */
+const PROBE_SPACING_S = 0.5;
+/** Per-probe budget. 20 s is the standing rule for every Jellyfin curl. */
+const PROBE_MAX_TIME_S = 20;
+/**
+ * The ssh call must outlast the worst case it can produce, or the tool becomes
+ * LESS able to measure exactly as the box gets slower. 7 probes x 20 s plus
+ * spacing needs ~145 s; an earlier version allowed 60 s for work it had budgeted
+ * 140 s of, so a genuinely contended box killed its own measurement.
+ */
+const PROBE_SSH_TIMEOUT_MS = Math.ceil(PROBE_COUNT * (PROBE_MAX_TIME_S + PROBE_SPACING_S) * 1000) + 20_000;
 
 async function settle(ctx: ToolContext, ms: number): Promise<void> {
   if (ctx.sleep) return ctx.sleep(ms);
@@ -80,12 +104,12 @@ async function measureLatency(ctx: ToolContext): Promise<LatencyReading> {
   const url = `${ctx.config.jellyfin.baseUrl}/System/Info/Public`;
   const outcome = await runOnHp(
     ctx.config.adminSshHost,
-    `for i in $(seq 1 ${PROBE_COUNT}); do curl -s -o /dev/null --max-time 20 ` +
-      `-w "http=%{http_code} total=%{time_total}\\n" ${url}; done`,
-    60_000,
+    `for i in $(seq 1 ${PROBE_COUNT}); do curl -s -o /dev/null --max-time ${PROBE_MAX_TIME_S} ` +
+      `-w "http=%{http_code} total=%{time_total}\\n" ${url}; sleep ${PROBE_SPACING_S}; done`,
+    PROBE_SSH_TIMEOUT_MS,
     ctx.exec,
   );
-  return parseLatencySamples(outcome.stdout, outcome.exitCode);
+  return parseLatencySamples(outcome.stdout, outcome.exitCode, outcome.timedOut);
 }
 
 /** Read qBittorrent's current throughput. */
@@ -203,6 +227,35 @@ export const shedHostLoad: Tool = {
       );
     }
 
+    // 🔴 CORROBORATE THE WRITE BEFORE FLIPPING THE MODE. This is the most
+    // dangerous moment in the file, and an HTTP 200 does not cover it.
+    //
+    // `POST /app/preferences` returns 200 for any syntactically valid `json=`
+    // payload and reports nothing per key — a renamed or dropped preference
+    // across a qBittorrent version bump is accepted and silently ignored. If
+    // that happened, the alternate limits would still be 0/0, which on this box
+    // means UNLIMITED, and flipping to alternate mode would REMOVE the 5 MB/s
+    // upload cap that is currently the only one in force. The tool would then
+    // report a throttle it had not applied, on a box someone just told us was
+    // stuttering. Uncapping qBittorrent in response to a stutter report is the
+    // exact inversion this whole file exists to prevent.
+    const confirm = await runOnHp(
+      ctx.config.adminSshHost,
+      `curl -s --max-time 8 ${ctx.config.qbittorrent.baseUrl}/api/v2/app/preferences`,
+      20_000,
+      ctx.exec,
+    );
+    const landed = parseAltLimits(confirm.stdout, confirm.exitCode);
+    if (!landed.known || landed.altDown !== SHED_DOWN_BYTES_PER_SEC || landed.altUp !== SHED_UP_BYTES_PER_SEC) {
+      return fail(
+        'NOT APPLIED. qBittorrent accepted the shed limits with HTTP 200 but reading them back gave ' +
+          `${landed.known ? `down ${landed.altDown}, up ${landed.altUp}` : landed.detail} instead of ` +
+          `down ${SHED_DOWN_BYTES_PER_SEC}, up ${SHED_UP_BYTES_PER_SEC}. I have NOT switched qBittorrent into ` +
+          'alternate mode: doing so with the alternate limits unset would remove the upload cap that is ' +
+          'currently in force and make the problem worse. Nothing was changed.',
+      );
+    }
+
     const mode = await setSpeedLimitsMode(ctx, 1);
     if (!mode.ok) {
       return fail(
@@ -227,6 +280,18 @@ export const shedHostLoad: Tool = {
 
     if (recovery.verdict === 'improved') {
       return ok(`FIXED. ${recovery.detail}\n\n${applied}`);
+    }
+    if (recovery.verdict === 'partially-improved') {
+      // Deliberately NOT ok(): the symptom is still present, and a viewer whose
+      // stream is still stuttering has not been fixed. But it is reported as a
+      // real improvement rather than a failure, because calling a nine-fold
+      // latency drop "did not help" would steer the next action toward a
+      // restart — the one action this tool exists to avoid.
+      return fail(
+        `PARTIALLY FIXED. ${recovery.detail}\n\n${applied}\n` +
+          'Something else is loading the host as well. Do NOT restart anything in the live-TV path on ' +
+          'the strength of this; the person reporting the problem is watching right now.',
+      );
     }
     if (recovery.verdict === 'not-improved') {
       // Deliberately NOT auto-reverted. A second automatic write on top of a
@@ -257,9 +322,62 @@ export const restoreQbitSpeed: Tool = {
     if (ctx.config.readOnly) {
       return fail('Jedd is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was changed.');
     }
+    // ⚠️ Do not cancel a throttle that is not ours.
+    //
+    // qBittorrent's own scheduler can put the box into alternate mode, and this
+    // tool clearing it would silently undo a limit somebody set on purpose —
+    // the mirror image of the clobber the shed path refuses to commit. Ours is
+    // identifiable: alternate mode ON with exactly our two shed constants.
+    const current = await runOnHp(
+      ctx.config.adminSshHost,
+      `curl -s --max-time 8 ${ctx.config.qbittorrent.baseUrl}/api/v2/app/preferences`,
+      20_000,
+      ctx.exec,
+    );
+    const limits = parseAltLimits(current.stdout, current.exitCode);
+    if (!limits.known) {
+      return fail(
+        `NOT RESTORED. Could not read qBittorrent's preferences (${limits.detail}), so I cannot tell ` +
+          'whether the throttle in force is mine to remove.',
+      );
+    }
+    const isOurs = limits.altDown === SHED_DOWN_BYTES_PER_SEC && limits.altUp === SHED_UP_BYTES_PER_SEC;
+    const isClear = limits.altDown === 0 && limits.altUp === 0;
+    if (!isOurs && !isClear) {
+      return fail(
+        `NOT RESTORED. qBittorrent's alternate limits are down ${limits.altDown}, up ${limits.altUp} B/s, ` +
+          `which are not the values I would have set (down ${SHED_DOWN_BYTES_PER_SEC}, up ` +
+          `${SHED_UP_BYTES_PER_SEC}). Someone else configured this throttle, and removing it is not mine to do.`,
+      );
+    }
+
     const mode = await setSpeedLimitsMode(ctx, 0);
     if (!mode.ok) {
       return fail(`NOT RESTORED. ${mode.detail} qBittorrent may still be throttled.`);
+    }
+
+    // 🔴 GIVE THE BORROWED SETTINGS BACK. Flipping the mode is not enough.
+    //
+    // The shed writes qBittorrent's alternate limits, and leaving them written
+    // makes the fix SINGLE-USE: the next stutter report hits the
+    // "already configured, someone chose these deliberately" refusal — which is
+    // both a dead end and a lie, because Jedd chose them. It also leaves a cap
+    // on the box that nobody set, waiting to surprise whoever enables
+    // qBittorrent's scheduler. Borrowing a setting means putting it back.
+    const zero = await runOnHp(
+      ctx.config.adminSshHost,
+      `curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST --data-urlencode ` +
+        `'json={"alt_dl_limit":0,"alt_up_limit":0}' ` +
+        `${ctx.config.qbittorrent.baseUrl}/api/v2/app/setPreferences`,
+      20_000,
+      ctx.exec,
+    );
+    if (zero.exitCode !== 0 || zero.stdout.trim() !== '200') {
+      return fail(
+        `qBittorrent is back on its normal speed limits, but clearing the borrowed alternate limits ` +
+          `failed (exit=${zero.exitCode}, http=${zero.stdout.trim() || 'none'}). The throttle is OFF, but ` +
+          'those values are still set, so shed_host_load will refuse next time until they are cleared.',
+      );
     }
     // Read the mode back rather than trusting the write's own 200. This is a
     // weaker independence than the fix's symptom check — there is no symptom to
@@ -277,7 +395,10 @@ export const restoreQbitSpeed: Tool = {
           'instead of 0. Whether qBittorrent is back to normal is UNKNOWN.',
       );
     }
-    return ok('qBittorrent is back on its normal speed limits (alternate mode off, verified by reading it back).');
+    return ok(
+      'qBittorrent is back on its normal speed limits: alternate mode off (verified by reading it back) ' +
+        'and the borrowed alternate limits cleared to 0, so the fix can be applied again if needed.',
+    );
   },
 };
 
@@ -316,5 +437,3 @@ export function parseAltLimits(
   }
   return { known: true, altDown: down, altUp: up, detail: 'read' };
 }
-
-export { CONTENTION_MS, MIN_LATENCY_SAMPLES };

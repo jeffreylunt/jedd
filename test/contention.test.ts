@@ -122,9 +122,9 @@ test('🔴 an unreachable qBittorrent API is UNKNOWN, never idle', () => {
 
 // ── the combined verdict ─────────────────────────────────────────────────────
 
-const FAST: LatencyReading = { known: true, medianMs: 1.1, samplesMs: [], detail: 'median 1.1 ms' };
-const SLOW: LatencyReading = { known: true, medianMs: 310, samplesMs: [], detail: 'median 310.0 ms' };
-const BLIND: LatencyReading = { known: false, medianMs: 0, samplesMs: [], detail: 'probe failed' };
+const FAST: LatencyReading = { known: true, medianMs: 1.1, samplesMs: [], stalledSamples: 0, detail: 'median 1.1 ms' };
+const SLOW: LatencyReading = { known: true, medianMs: 310, samplesMs: [], stalledSamples: 7, detail: 'median 310.0 ms' };
+const BLIND: LatencyReading = { known: false, medianMs: 0, samplesMs: [], stalledSamples: 0, detail: 'probe failed' };
 const BUSY = { known: true, downBytesPerSec: 8 * 1024 * 1024, upBytesPerSec: 5 * 1024 * 1024, detail: 'busy' };
 const IDLE = { known: true, downBytesPerSec: 0, upBytesPerSec: 80_581, detail: 'idle' };
 const QBLIND = { known: false, downBytesPerSec: 0, upBytesPerSec: 0, detail: 'api unreachable' };

@@ -86,6 +86,31 @@ Two orthogonal axes, kept apart on purpose:
 Owner authorisation unlocks the restart tool. It does not unlock restarting while someone is
 watching.
 
+## The first safe autonomous fix, and why it is not a restart
+
+`shed_host_load` throttles qBittorrent to free uplink and VPN-encryption CPU. It exists because of an
+inversion that is easy to get backwards: **"I'm watching the game and it's stuttering" comes from an
+ACTIVE VIEWER, so the report is proof that the restart-blocking condition holds.** The intuitive
+response — restart something in the live-TV path — is the worst available action; a mid-game
+Dispatcharr restart cost eight hours of live TV on 2026-04-27. Shedding torrent bandwidth is the one
+documented fix that helps a viewer *without touching the stream*.
+
+- **Precondition is four-state and three of them refuse.** `shed-warranted` is the only one that
+  authorises the write. `clear` says the box was MEASURED and is fine; `qbit-not-the-cause` says the
+  box is loaded but shedding would not help; `unknown` says the instruments were blind. **`unknown`
+  and `clear` are deliberately different verdicts** — "I could not see" must never be reported as
+  "nothing is wrong".
+- **Two ways to be contended**, because one statistic cannot see both shapes: a sustained slowdown
+  moves the median, and an intermittent stall does not move it at all — and intermittent is exactly
+  what a stuttering viewer experiences.
+- **The after-check re-measures the SYMPTOM**, never the mechanism. "The API returned 200" and
+  "qBittorrent says alternate limits are on" are the fix grading its own homework.
+- **It borrows qBittorrent's alternate limits and gives them back**, so qBittorrent itself remains
+  the store of what "normal" means — which matters because Jedd has no persistence yet.
+- ⚠️ The obvious implementation, `toggleSpeedLimitsMode`, would have made things **worse**: measured
+  on this box, the alternate limits are 0 (unlimited) while the normal upload limit is 5 MB/s, so
+  flipping modes would have removed the only cap in force.
+
 ## Safety lives in code, not in the prompt
 
 - `hp_shell` runs on **hp only** — never on this machine. Deny-by-default allowlist; every pipeline

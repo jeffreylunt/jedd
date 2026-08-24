@@ -360,6 +360,22 @@ export function isValidContainerName(name: string): boolean {
 
 /** Median latency at or above this means the host is contended. */
 export const CONTENTION_MS = 50;
+/**
+ * A single probe at or above this is a stall, not jitter.
+ *
+ * 🔴 THE MEDIAN ALONE IS BLIND TO THE SYMPTOM BEING REPORTED. Stutter is
+ * intermittent buffer starvation, and the median is precisely the statistic that
+ * erases it: samples of (1.0, 1.1, 1.1, 1.2, 380, 420, 450) have a median of
+ * 1.2 ms, so a box stalling on three requests in seven would be reported as
+ * "not contended — whatever the problem is, host contention is not it". That is
+ * a well-functioning instrument, the wrong statistic, and a confident wrong
+ * answer, which is worse than a blind one.
+ */
+export const BURST_MS = 250;
+/** How many stalled probes make a burst. Two, so one outlier is still noise. */
+export const BURST_MIN_SAMPLES = 2;
+/** A retained improvement must be at least this large to be called real. */
+export const MATERIAL_IMPROVEMENT = 0.6;
 /** Below this, qBittorrent is not moving enough to be the bottleneck. */
 export const QBIT_ACTIVE_BYTES_PER_SEC = 512 * 1024;
 /** Fewer successful probes than this and the measurement is UNKNOWN, not fast. */
@@ -370,6 +386,8 @@ export interface LatencyReading {
   known: boolean;
   medianMs: number;
   samplesMs: number[];
+  /** Probes at or above BURST_MS. Intermittent stalls the median cannot see. */
+  stalledSamples: number;
   detail: string;
 }
 
@@ -385,9 +403,25 @@ export interface LatencyReading {
  * A non-200 sample contributes NOTHING — it is not a slow response, it is an
  * absent one, and averaging it in would invent a number.
  */
-export function parseLatencySamples(stdout: string, exitCode: number): LatencyReading {
-  const blank = (detail: string): LatencyReading => ({ known: false, medianMs: 0, samplesMs: [], detail });
-  if (exitCode !== 0) return blank(`the latency probe itself failed (exit ${exitCode})`);
+export function parseLatencySamples(stdout: string, exitCode: number, timedOut = false): LatencyReading {
+  const blank = (detail: string): LatencyReading => ({
+    known: false,
+    medianMs: 0,
+    samplesMs: [],
+    stalledSamples: 0,
+    detail,
+  });
+  if (exitCode !== 0) {
+    // `timedOut` is the most diagnostic fact available about a failed probe —
+    // "the box was too slow to answer" and "ssh could not connect" are different
+    // problems, and collapsing them throws away the one that matters here.
+    return blank(
+      timedOut
+        ? 'the latency probe TIMED OUT — which on a contended box is itself a symptom, but it is ' +
+          'still an unmeasured one'
+        : `the latency probe itself failed (exit ${exitCode})`,
+    );
+  }
 
   const samples: number[] = [];
   for (const line of stdout.split('\n')) {
@@ -408,11 +442,16 @@ export function parseLatencySamples(stdout: string, exitCode: number): LatencyRe
   const mid = Math.floor(sorted.length / 2);
   const median =
     sorted.length % 2 === 0 ? ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2 : (sorted[mid] as number);
+  const stalled = sorted.filter((ms) => ms >= BURST_MS).length;
   return {
     known: true,
     medianMs: median,
     samplesMs: sorted,
-    detail: `median ${median.toFixed(1)} ms over ${samples.length} probes (${sorted.map((s) => s.toFixed(1)).join(', ')})`,
+    stalledSamples: stalled,
+    detail:
+      `median ${median.toFixed(1)} ms over ${samples.length} probes ` +
+      `(${sorted.map((s) => s.toFixed(1)).join(', ')})` +
+      (stalled > 0 ? `, of which ${stalled} stalled at or above ${BURST_MS} ms` : ''),
   };
 }
 
@@ -493,21 +532,27 @@ export function hostContentionVerdict(
         'Whether qBittorrent is the contributor is UNKNOWN, so shedding it is not justified.',
     };
   }
-  if (latency.medianMs < CONTENTION_MS) {
+  // TWO ways to be contended, because one statistic cannot see both shapes. A
+  // sustained slowdown moves the median; an intermittent stall does not move it
+  // at all and is the shape a stuttering viewer actually experiences.
+  const sustained = latency.medianMs >= CONTENTION_MS;
+  const bursty = latency.stalledSamples >= BURST_MIN_SAMPLES;
+  if (!sustained && !bursty) {
     return {
       verdict: 'clear',
       detail:
-        `The host is NOT contended: Jellyfin answers in ${latency.detail}, well under the ${CONTENTION_MS} ms ` +
-        `threshold. ${qbit.detail}. This is a measurement, not a failure to measure — whatever the problem is, ` +
-        'host contention is not it.',
+        `The host is NOT contended: Jellyfin answers in ${latency.detail}, under the ${CONTENTION_MS} ms ` +
+        `threshold with fewer than ${BURST_MIN_SAMPLES} stalled probes. ${qbit.detail}. This is a measurement, ` +
+        'not a failure to measure — whatever the problem is, host contention is not it.',
     };
   }
+  const shape = sustained ? 'sustained slowdown' : 'intermittent stalls (the median looks fine)';
   const busiest = Math.max(qbit.downBytesPerSec, qbit.upBytesPerSec);
   if (busiest < QBIT_ACTIVE_BYTES_PER_SEC) {
     return {
       verdict: 'qbit-not-the-cause',
       detail:
-        `The host IS contended (${latency.detail}, over the ${CONTENTION_MS} ms threshold) but ${qbit.detail} — ` +
+        `The host IS contended — ${shape}: ${latency.detail} — but ${qbit.detail} — ` +
         `below the ${(QBIT_ACTIVE_BYTES_PER_SEC / 1024).toFixed(0)} KB/s that would make it the bottleneck. ` +
         'Shedding qBittorrent would not fix this. Something else is loading the host.',
     };
@@ -515,7 +560,7 @@ export function hostContentionVerdict(
   return {
     verdict: 'shed-warranted',
     detail:
-      `The host is contended (${latency.detail}, over the ${CONTENTION_MS} ms threshold) and ${qbit.detail}, ` +
+      `The host is contended — ${shape}: ${latency.detail} — and ${qbit.detail}, ` +
       'which is enough to be the cause. Shedding qBittorrent frees uplink and VPN-encrypt CPU without ' +
       'touching anyone\'s stream.',
   };
@@ -530,8 +575,20 @@ export function hostContentionVerdict(
  * UNKNOWN when either reading is blind — an unverifiable fix is reported as
  * unverified, not as success.
  */
-export type RecoveryVerdict = 'improved' | 'not-improved' | 'unknown';
+export type RecoveryVerdict = 'improved' | 'partially-improved' | 'not-improved' | 'unknown';
 
+/**
+ * ⚠️ Judged on the DELTA as well as the level, because the level alone answers
+ * the wrong question.
+ *
+ * An earlier version returned `improved` iff `after < CONTENTION_MS`, which made
+ * `before` decorative. Two consequences, both wrong in the direction that
+ * matters: 500 ms → 55 ms was reported as *"the load shed did NOT resolve the
+ * symptom"* — a nine-fold improvement described as a failure, which would steer
+ * the next action toward the restart this whole file exists to avoid — while
+ * 51 ms → 49 ms scored a confident `FIXED` off a 2 ms move inside the noise
+ * floor.
+ */
 export function recoveryVerdict(
   before: LatencyReading,
   after: LatencyReading,
@@ -542,18 +599,35 @@ export function recoveryVerdict(
       detail: `Cannot tell whether this helped: ${!before.known ? before.detail : after.detail}.`,
     };
   }
-  if (after.medianMs < CONTENTION_MS) {
+  const from = before.medianMs;
+  const to = after.medianMs;
+  const materially = to <= from * MATERIAL_IMPROVEMENT;
+  const stallsCleared = after.stalledSamples < BURST_MIN_SAMPLES;
+  const move = `Jellyfin latency went from ${from.toFixed(1)} ms to ${to.toFixed(1)} ms`;
+
+  if (to < CONTENTION_MS && stallsCleared) {
+    return materially
+      ? { verdict: 'improved', detail: `${move}, back under the ${CONTENTION_MS} ms threshold.` }
+      : {
+          verdict: 'improved',
+          detail:
+            `${move} — under the ${CONTENTION_MS} ms threshold, though the change is small enough that ` +
+            'some of it may be noise rather than the shed.',
+        };
+  }
+  if (materially || (before.stalledSamples >= BURST_MIN_SAMPLES && stallsCleared)) {
     return {
-      verdict: 'improved',
+      verdict: 'partially-improved',
       detail:
-        `Jellyfin latency went from ${before.medianMs.toFixed(1)} ms to ${after.medianMs.toFixed(1)} ms, ` +
-        `back under the ${CONTENTION_MS} ms threshold.`,
+        `${move} (stalled probes ${before.stalledSamples} → ${after.stalledSamples}). That is a real ` +
+        `improvement but it is still at or over the ${CONTENTION_MS} ms threshold, so the box is better ` +
+        'and not yet well.',
     };
   }
   return {
     verdict: 'not-improved',
     detail:
-      `Jellyfin latency is still ${after.medianMs.toFixed(1)} ms (was ${before.medianMs.toFixed(1)} ms), ` +
-      `at or over the ${CONTENTION_MS} ms threshold. The load shed did NOT resolve the symptom.`,
+      `Jellyfin latency is still ${to.toFixed(1)} ms (was ${from.toFixed(1)} ms), at or over the ` +
+      `${CONTENTION_MS} ms threshold and not materially better. The load shed did NOT resolve the symptom.`,
   };
 }
