@@ -22,7 +22,14 @@
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ProwlarrOptions {
-  /** Base URL including the path prefix, e.g. `http://192.168.1.7:9696/prowlarr/api/v1`. */
+  /**
+   * 🔴 THE BARE ROOT, e.g. `http://192.168.1.7:9696` — no path prefix.
+   *
+   * Unlike Sonarr/Radarr, Prowlarr has none. `/api/v1` is appended HERE rather
+   * than being baked into the base, so the two halves of that fact live in one
+   * place: I changed the config default once without changing this line, and the
+   * result was a URL missing `/api/v1` that failed as UNKNOWN.
+   */
   baseUrl: string;
   apiKey: string;
   fetchImpl?: FetchImpl;
@@ -92,7 +99,7 @@ export class ProwlarrClient {
    */
   async search(term: string, category: number): Promise<SearchResult> {
     const url =
-      `${this.opts.baseUrl}/search?query=${encodeURIComponent(term)}` +
+      `${this.opts.baseUrl}/api/v1/search?query=${encodeURIComponent(term)}` +
       `&categories=${category}&type=search`;
     let res: Response;
     try {

@@ -19,13 +19,22 @@ const OTHER = '+13854346068';
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jedd-se-')), 'f.jsonl');
 
-/** hp replies, in call order: createCategory, add, topPrio, info, stat, base64. */
+/**
+ * hp replies, in call order:
+ *   0 createCategory  1 add  2 topPrio  3 info  4 resolveBookPath  5 stat  6 base64
+ *
+ * ⚠️ Index 4 exists because content_path is a DIRECTORY for a multi-file
+ * torrent, so the book is chosen before anything is read. Adding that step
+ * shifted every later index — the fixture is positional, which is why it broke
+ * loudly rather than silently.
+ */
 function hp(overrides: Partial<Record<number, { stdout: string; code?: number }>> = {}) {
   const seq: { stdout: string; code?: number }[] = [
     { stdout: '' },
     { stdout: 'Ok.\n200' },
     { stdout: '' },
     { stdout: JSON.stringify([{ name: 'book.epub', progress: 1, content_path: '/downloads/ebooks/book.epub' }]) },
+    { stdout: 'FILE' },
     { stdout: `${BOOK.length}\n${SHA}` },
     { stdout: BOOK.toString('base64') },
   ];
@@ -126,7 +135,7 @@ test('🔴 an unmapped container path names the CONFIG problem, not a missing bo
 
 test('🔴 a corrupt transfer is caught BEFORE the send', async () => {
   const { send, sent } = mailer();
-  const exec = hp({ 5: { stdout: BOOK.toString('base64').slice(0, 8) } });
+  const exec = hp({ 6: { stdout: BOOK.toString('base64').slice(0, 8) } });
   const r = await makeSendEbook({ send }).run({ choice: 1 }, { ...ctx(JEFF), exec });
   assert.equal(r.ok, false);
   assert.match(r.content, /CORRUPT/);

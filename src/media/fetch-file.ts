@@ -45,6 +45,82 @@ export function isSafeHostPath(p: string): boolean {
   return true;
 }
 
+/**
+ * Preference order for the thing to actually send.
+ *
+ * 🔴 EXTENSION PREFERENCE, NOT LARGEST-FILE. V1 picked the largest file and sent
+ * the wrong book out of a bundle. Measured on the real download: the folder held
+ * an `.epub` (2.19 MB), a `.mobi` (793 KB), a cover `.jpg`, an `.opf`, and a junk
+ * `pharmakate.txt` — nested one level deeper than `content_path` pointed. Largest
+ * happens to be right here and would be wrong for a bundle with a big PDF scan.
+ */
+const BOOK_EXTENSIONS = ['.epub', '.azw3', '.mobi', '.pdf'] as const;
+
+export type ResolveOutcome =
+  | { state: 'ok'; path: string }
+  | { state: 'none'; detail: string }
+  | { state: 'unknown'; detail: string };
+
+/**
+ * Turn qBittorrent's `content_path` into the path of the file to send.
+ *
+ * ⚠️ `content_path` is a DIRECTORY for a multi-file torrent, which is the common
+ * case for ebooks — they ship with a cover, an `.opf`, sometimes several formats
+ * and sometimes a junk text file. So this recurses and CHOOSES, rather than
+ * assuming the path names a file.
+ */
+export async function resolveBookPath(input: {
+  adminSshHost: string;
+  hostPath: string;
+  exec?: ExecImpl;
+}): Promise<ResolveOutcome> {
+  if (!isSafeHostPath(input.hostPath)) {
+    return { state: 'unknown', detail: `refusing to inspect "${input.hostPath}".` };
+  }
+  const q = shellQuote(input.hostPath);
+  // One command answers both questions: is it a file, and if not what is inside.
+  const out = await runOnHp(
+    input.adminSshHost,
+    `if [ -f ${q} ]; then echo "FILE"; elif [ -d ${q} ]; then find ${q} -type f -printf '%s\t%p\n'; else echo "ABSENT"; fi`,
+    30_000,
+    input.exec,
+  );
+  if (out.exitCode !== 0) {
+    return { state: 'unknown', detail: `could not inspect the path (exit ${out.exitCode}).` };
+  }
+  const text = out.stdout.trim();
+  if (text === 'FILE') return { state: 'ok', path: input.hostPath };
+  if (text === 'ABSENT' || !text) {
+    return {
+      state: 'none',
+      detail:
+        `"${input.hostPath}" is neither a file nor a directory on hp. If the download completed, ` +
+        'this is a path problem rather than a missing book.',
+    };
+  }
+  const files = text
+    .split('\n')
+    .map((line) => {
+      const [size, ...rest] = line.split('\t');
+      return { size: Number(size), path: rest.join('\t') };
+    })
+    .filter((f) => Number.isFinite(f.size) && f.path);
+
+  for (const ext of BOOK_EXTENSIONS) {
+    const matching = files.filter((f) => f.path.toLowerCase().endsWith(ext));
+    if (matching.length === 0) continue;
+    // Within ONE format, the largest is the book rather than a sample.
+    matching.sort((a, b) => b.size - a.size);
+    return { state: 'ok', path: matching[0]!.path };
+  }
+  return {
+    state: 'none',
+    detail:
+      `"${input.hostPath}" contains ${files.length} file(s) but none is a book ` +
+      `(${BOOK_EXTENSIONS.join(', ')}). Nothing to send.`,
+  };
+}
+
 export async function fetchFileFromHp(input: {
   adminSshHost: string;
   hostPath: string;

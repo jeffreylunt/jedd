@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import type { ExecImpl } from '../src/hp.js';
-import { fetchFileFromHp, isSafeHostPath } from '../src/media/fetch-file.js';
+import { fetchFileFromHp, isSafeHostPath, resolveBookPath } from '../src/media/fetch-file.js';
 
 const CONTENT = Buffer.from('a real epub would be here, but bytes are bytes');
 const SHA = createHash('sha256').update(CONTENT).digest('hex');
@@ -110,4 +110,55 @@ test('a path with spaces and quotes survives quoting', async () => {
     exec,
   });
   assert.match(commands[0]!, /'\/downloads\/ebooks\/Jo'\\''s Book \(2024\) EPUB'/);
+});
+
+// ── 🔴 content_path is a DIRECTORY for a multi-file torrent ──────────────────
+
+const listing = [
+  '1309\t/dl/Pride and Prejudice/pharmakate.txt',
+  '793341\t/dl/Pride and Prejudice/Pride and Prejudice/P and P - Austen.mobi',
+  '141160\t/dl/Pride and Prejudice/Pride and Prejudice/P and P - Austen.jpg',
+  '8073\t/dl/Pride and Prejudice/Pride and Prejudice/P and P - Austen.opf',
+  '2186698\t/dl/Pride and Prejudice/Pride and Prejudice/P and P - Austen.epub',
+].join('\n');
+
+test('🔴 the EPUB is chosen from a real multi-format bundle, not the largest file by luck', async () => {
+  // Verbatim from the live download: an epub, a mobi, a cover, an opf and a junk
+  // text file -- nested one level deeper than content_path pointed.
+  const { exec } = ssh(listing, '');
+  const r = await resolveBookPath({ adminSshHost: 'a.invalid', hostPath: '/dl/Pride and Prejudice', exec });
+  assert.equal(r.state, 'ok');
+  if (r.state !== 'ok') throw new Error('unreachable');
+  assert.match(r.path, /\.epub$/);
+});
+
+test('🔴 epub is preferred over a LARGER mobi — extension order, not size', async () => {
+  // The case where largest-file gives the wrong answer, which is V1's bug.
+  const inverted = ['9000000\t/dl/b/x.mobi', '500000\t/dl/b/x.epub'].join('\n');
+  const { exec } = ssh(inverted, '');
+  const r = await resolveBookPath({ adminSshHost: 'a.invalid', hostPath: '/dl/b', exec });
+  if (r.state !== 'ok') throw new Error('unreachable');
+  assert.match(r.path, /\.epub$/, 'a 500KB epub beats a 9MB mobi');
+});
+
+test('within ONE format the largest wins — a sample is smaller than the book', async () => {
+  const two = ['1000\t/dl/b/sample.epub', '900000\t/dl/b/full.epub'].join('\n');
+  const { exec } = ssh(two, '');
+  const r = await resolveBookPath({ adminSshHost: 'a.invalid', hostPath: '/dl/b', exec });
+  if (r.state !== 'ok') throw new Error('unreachable');
+  assert.match(r.path, /full\.epub$/);
+});
+
+test('a directory with no book at all is NONE, not a wrong pick', async () => {
+  const junk = ['1309\t/dl/b/readme.txt', '141160\t/dl/b/cover.jpg'].join('\n');
+  const { exec } = ssh(junk, '');
+  const r = await resolveBookPath({ adminSshHost: 'a.invalid', hostPath: '/dl/b', exec });
+  assert.equal(r.state, 'none');
+});
+
+test('a path that IS a file is returned unchanged', async () => {
+  const { exec } = ssh('FILE', '');
+  const r = await resolveBookPath({ adminSshHost: 'a.invalid', hostPath: '/dl/x.epub', exec });
+  if (r.state !== 'ok') throw new Error('unreachable');
+  assert.equal(r.path, '/dl/x.epub');
 });

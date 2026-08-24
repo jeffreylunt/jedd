@@ -1,4 +1,4 @@
-import { fetchFileFromHp } from '../media/fetch-file.js';
+import { fetchFileFromHp, resolveBookPath } from '../media/fetch-file.js';
 import { grabStatus, grabTorrent, toHostPath, type MountMap } from '../media/grab.js';
 import { sendToKindle, type MailSender } from '../media/kindle-send.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
@@ -121,9 +121,18 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
             'container and maps to no known mount. This is a configuration problem, not a missing book.',
         );
       }
-      const file = await fetchFileFromHp({
+      // content_path is a DIRECTORY for a multi-file torrent, which is the
+      // common case for ebooks. Choose the book before reading anything.
+      const book = await resolveBookPath({
         adminSshHost: ctx.config.adminSshHost,
         hostPath,
+        exec: ctx.exec,
+      });
+      if (book.state !== 'ok') return fail(`${book.state.toUpperCase()} — ${book.detail}`);
+
+      const file = await fetchFileFromHp({
+        adminSshHost: ctx.config.adminSshHost,
+        hostPath: book.path,
         exec: ctx.exec,
       });
       if (file.state !== 'ok') {

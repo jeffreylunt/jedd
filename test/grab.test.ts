@@ -215,3 +215,56 @@ test('🔴 a supplied magnet whose hash does NOT match is ignored, not trusted',
   assert.doesNotMatch(add, /evil/, 'a mismatched magnet must be discarded');
   assert.match(add, /abcdef/i, 'and the validated hash used instead');
 });
+
+// ── 🔴 the live response that broke the first version ────────────────────────
+
+test('🔴 a SUCCESSFUL add whose body contains the word "failure" is not read as failure', async () => {
+  // Verbatim from the live API. The first version tested /fail/i on this body and
+  // matched "failure_count" -- a field whose VALUE says zero failures. The
+  // torrent really was added and the user would have been told it failed.
+  const real = '{"added_torrent_ids":["abc"],"failure_count":0,"pending_count":0,"success_count":1}\n200';
+  const { exec } = ssh([{ stdout: '' }, { stdout: real }, { stdout: '' }]);
+  const r = await grabTorrent({ ...base, exec });
+  assert.equal(r.state, 'started');
+});
+
+test('🔴 accepted-but-PENDING is a failure — the documented silent one', async () => {
+  // V1 saw pending_count:1 forever when qBittorrent was handed a URL it could
+  // not fetch from inside the VPN netns.
+  const pending = '{"added_torrent_ids":[],"failure_count":0,"pending_count":1,"success_count":0}\n200';
+  const { exec } = ssh([{ stdout: '' }, { stdout: pending }]);
+  const r = await grabTorrent({ ...base, exec });
+  assert.equal(r.state, 'failed');
+  assert.match(r.detail, /PENDING and never started/);
+});
+
+test('a genuine zero-success add is still failed', async () => {
+  const none = '{"added_torrent_ids":[],"failure_count":1,"pending_count":0,"success_count":0}\n200';
+  const { exec } = ssh([{ stdout: '' }, { stdout: none }]);
+  assert.equal((await grabTorrent({ ...base, exec })).state, 'failed');
+});
+
+test('the older text protocol still works', async () => {
+  const { exec } = ssh([{ stdout: '' }, { stdout: 'Ok.\n200' }, { stdout: '' }]);
+  assert.equal((await grabTorrent({ ...base, exec })).state, 'started');
+  const { exec: e2 } = ssh([{ stdout: '' }, { stdout: 'Fails.\n200' }]);
+  assert.equal((await grabTorrent({ ...base, exec: e2 })).state, 'failed');
+});
+
+test('🔴 a grab ALWAYS sends an explicit savepath — a category does not place the file', async () => {
+  // Measured live: the ebooks category exists with savePath /downloads/ebooks,
+  // and a torrent added WITH that category still landed in /external/Downloads.
+  // qBittorrent only honours the category path under Automatic Torrent
+  // Management. The download succeeds, the category looks right, and the file is
+  // somewhere the send step will never look.
+  const { exec, commands } = ssh([{ stdout: '' }, ok200, { stdout: '' }]);
+  await grabTorrent({ ...base, exec });
+  const add = commands.find((c) => c.includes('/torrents/add'))!;
+  assert.match(add, /savepath=%2Fdownloads%2Febooks/, 'defaults to /downloads/<category>');
+});
+
+test('an explicit savePath overrides the category default', async () => {
+  const { exec, commands } = ssh([{ stdout: '' }, ok200, { stdout: '' }]);
+  await grabTorrent({ ...base, savePath: '/downloads/elsewhere', exec });
+  assert.match(commands.find((c) => c.includes('/torrents/add'))!, /savepath=%2Fdownloads%2Felsewhere/);
+});

@@ -115,10 +115,23 @@ export async function grabTorrent(input: GrabInput): Promise<GrabOutcome> {
     exec: input.exec,
   });
 
+  /**
+   * 🔴 A CATEGORY DOES NOT PLACE THE FILE. MEASURED THE HARD WAY.
+   *
+   * The `ebooks` category exists with `savePath: /downloads/ebooks`, and a
+   * torrent added WITH that category still landed in `/external/Downloads` —
+   * qBittorrent only applies a category's path when Automatic Torrent Management
+   * is on, and otherwise uses the global default.
+   *
+   * The consequence is the quiet one: the download succeeds, the category looks
+   * right in the UI, and **the file is somewhere the send step will never look.**
+   * So `savepath` is sent EXPLICITLY and is not optional for a grab we intend to
+   * read back.
+   */
   const form =
     `urls=${encodeURIComponent(magnet)}` +
     `&category=${encodeURIComponent(input.category)}` +
-    (input.savePath ? `&savepath=${encodeURIComponent(input.savePath)}` : '');
+    `&savepath=${encodeURIComponent(input.savePath ?? `/downloads/${input.category}`)}`;
 
   const add = await runOnHp(
     input.adminSshHost,
@@ -147,7 +160,45 @@ export async function grabTorrent(input: GrabInput): Promise<GrabOutcome> {
   if (status === 409 || /already in the download list/i.test(bodyText)) {
     return { state: 'already-have', detail: `"${input.title}" is already downloading or downloaded.` };
   }
-  if (status !== 200 || /fail/i.test(bodyText)) {
+  /**
+   * 🔴 PARSE THE RESULT, NEVER SUBSTRING-MATCH THE BODY.
+   *
+   * Measured against the live API: a SUCCESSFUL add returns
+   *   `{"added_torrent_ids":[...],"failure_count":0,"pending_count":0,"success_count":1}`
+   * and my first version tested `/fail/i` on that body — which **matches
+   * `"failure_count"`, a field whose value says there were ZERO failures.**
+   *
+   * So the torrent was really added and the user would have been told it failed:
+   * a false negative on a WRITE, which then invites a retry of something that
+   * already worked. Same shape as a `\bn't\b` guard that misses "isn't", and as
+   * a filter on `mail` matching every `@gmail.com` — **the word appears inside
+   * the thing that says the opposite.**
+   *
+   * Newer qBittorrent answers JSON with counts; older answers `Ok.` / `Fails.`.
+   * Both are handled explicitly, and neither by looking for a word.
+   */
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = JSON.parse(bodyText) as Record<string, unknown>;
+  } catch {
+    parsed = null;
+  }
+  if (parsed && typeof parsed['success_count'] === 'number') {
+    const ok = Number(parsed['success_count']) > 0;
+    const failed = Number(parsed['failure_count'] ?? 0) > 0;
+    const pending = Number(parsed['pending_count'] ?? 0) > 0;
+    if (!ok && !failed && pending) {
+      // The documented silent failure: accepted but never materialises. V1 saw
+      // exactly this when handed a Prowlarr URL qBittorrent could not fetch.
+      return {
+        state: 'failed',
+        detail: `qBittorrent accepted "${input.title}" but left it PENDING and never started it.`,
+      };
+    }
+    if (!ok) {
+      return { state: 'failed', detail: `qBittorrent added nothing (${bodyText.slice(0, 120)}).` };
+    }
+  } else if (status !== 200 || /^Fails\.?$/i.test(bodyText.trim())) {
     return {
       state: 'failed',
       detail: `qBittorrent refused the add (http ${status}${bodyText ? `: ${bodyText.slice(0, 120)}` : ''}).`,

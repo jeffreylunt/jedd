@@ -14,7 +14,7 @@ const json = (b: unknown, status = 200): Response =>
   ({ ok: status < 400, status, json: async () => b }) as Response;
 
 const client = (impl: FetchImpl) =>
-  new ProwlarrClient({ baseUrl: 'http://p.invalid/prowlarr/api/v1', apiKey: 'k', fetchImpl: impl });
+  new ProwlarrClient({ baseUrl: 'http://p.invalid', apiKey: 'k', fetchImpl: impl });
 
 // ── 🔴 the infoHash is the whole point ───────────────────────────────────────
 
@@ -85,6 +85,8 @@ test('the ebook category and the api key are sent, and the call is bounded', asy
     init = i;
     return json([]);
   }).search('the anxious generation', CATEGORY.ebook);
+  // 🔴 Prowlarr has NO path prefix, so /api/v1 is appended by the client.
+  assert.match(url, /^http:\/\/p\.invalid\/api\/v1\/search\?/, 'bare root + /api/v1');
   assert.match(url, /categories=7020/);
   assert.match(url, /query=the%20anxious%20generation/);
   assert.equal((init?.headers as Record<string, string>)['X-Api-Key'], 'k');
