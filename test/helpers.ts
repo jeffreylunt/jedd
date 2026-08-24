@@ -34,6 +34,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       path: '/webhook',
       publicUrl: 'http://127.0.0.1:0/webhook',
     },
+    kindle: { smtpHost: 'smtp.invalid', smtpPort: 587, fromEmail: 'jedd@invalid', smtpPassword: 'test-pw' },
     sonarr: { baseUrl: 'http://sonarr.invalid:8989/sonarr/api/v3', apiKey: 'test-key', rootFolder: '/tv', qualityProfileId: 9 },
     radarr: { baseUrl: 'http://radarr.invalid:7878/radarr/api/v3', apiKey: 'test-key', rootFolder: '/movies', qualityProfileId: 6 },
     dispatcharr: { baseUrl: 'http://dispatcharr.test:9191' },

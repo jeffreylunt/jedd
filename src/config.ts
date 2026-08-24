@@ -64,6 +64,18 @@ export interface Config {
     /** The URL registered WITH BlueBubbles — must be reachable FROM it. */
     publicUrl: string;
   };
+  kindle: {
+    smtpHost: string;
+    smtpPort: number;
+    /**
+     * 🔴 CUTOVER INVARIANT. Amazon matches the sender against each user's
+     * approved list, so a NEW from-address means E014 for every existing ebook
+     * user until they each add it — which looks like nothing from our side.
+     * V2 sends from the SAME address V1 sends from. Do not "tidy" this.
+     */
+    fromEmail: string;
+    smtpPassword: string;
+  };
   dispatcharr: {
     baseUrl: string;
     username?: string;
@@ -152,6 +164,12 @@ export function loadConfig(): Config {
         `http://${process.env.BLUEBUBBLES_WEBHOOK_HOST ?? '127.0.0.1'}:${
           process.env.BLUEBUBBLES_WEBHOOK_PORT ?? 18796
         }${process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook'}`,
+    },
+    kindle: {
+      smtpHost: process.env.KINDLE_SMTP_HOST ?? 'smtp.gmail.com',
+      smtpPort: Number(process.env.KINDLE_SMTP_PORT ?? 587),
+      fromEmail: process.env.KINDLE_FROM_EMAIL ?? 'jeffreylunt@gmail.com',
+      smtpPassword: process.env.KINDLE_SMTP_PASSWORD ?? '',
     },
     dispatcharr: {
       baseUrl: process.env.DISPATCHARR_URL ?? 'http://localhost:9191',
