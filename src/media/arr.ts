@@ -109,12 +109,35 @@ export class ArrClient {
     return { ok: true, status: res.status, body, detail: '' };
   }
 
+  /**
+   * 🔴 THE ID IS SELECTED BY KIND, NEVER BY A `??` CHAIN ACROSS ID SPACES.
+   *
+   * Found against the LIVE api, not by a fixture: a real Sonarr `/series` row for
+   * *The Office (US)* carries **`id: 43` (Sonarr's internal id), `tvdbId: 73244`
+   * AND `tmdbId: 2316`** — all three, all different, all valid-looking integers.
+   *
+   * A precedence chain `tmdbId ?? tvdbId ?? id` therefore returned **2316 for a
+   * SERIES**, and Sonarr's add endpoint wants the **tvdbId**. Nothing would have
+   * errored: 2316 is a perfectly well-formed number that either finds nothing or,
+   * worse, finds a DIFFERENT series. That is the bad-id class in its purest form.
+   *
+   * Worse still, the field is not even consistently present: **59 of 60 rows had
+   * `tmdbId`**, so the chain would have silently changed which id space it
+   * returned for one row in the same list. An identifier that is usually right is
+   * the hardest kind of wrong.
+   *
+   * My fixtures could not catch this because each carried only ONE id field, so
+   * the precedence never had to choose. A fixture that cannot express the
+   * ambiguity cannot test the rule.
+   */
   private toCandidates(rows: unknown): Candidate[] {
     if (!Array.isArray(rows)) return [];
+    const idField = this.kind === 'series' ? 'tvdbId' : 'tmdbId';
     return rows.map((r) => {
       const row = r as Record<string, unknown>;
+      const raw = row[idField];
       return {
-        id: Number(row['tmdbId'] ?? row['tvdbId'] ?? row['id'] ?? 0),
+        id: typeof raw === 'number' && Number.isFinite(raw) ? raw : 0,
         title: String(row['title'] ?? ''),
         year: typeof row['year'] === 'number' ? row['year'] : undefined,
       };

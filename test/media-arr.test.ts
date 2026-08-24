@@ -150,3 +150,47 @@ test('radarr uses the movie endpoints', async () => {
   ).owned('dune', match);
   assert.equal(urls[0], 'http://hp.invalid:8989/radarr/api/v3/movie');
 });
+
+// ── 🔴 the id space, found against the LIVE api ──────────────────────────────
+
+test('🔴 a SERIES row carrying id, tvdbId AND tmdbId yields the tvdbId', async () => {
+  // Real Sonarr row for The Office (US): id 43, tvdbId 73244, tmdbId 2316 — all
+  // three present, all different, all valid-looking. A `tmdbId ?? tvdbId ?? id`
+  // chain returned 2316 for a series, and Sonarr's add wants the tvdbId. Nothing
+  // errors: 2316 is well-formed and either finds nothing or a DIFFERENT series.
+  //
+  // Every earlier fixture carried only ONE id field, so the precedence never had
+  // to choose. A fixture that cannot express the ambiguity cannot test the rule.
+  const r = await client(async () =>
+    json([{ title: 'The Office (US)', year: 2005, id: 43, tvdbId: 73244, tmdbId: 2316 }]),
+  ).owned('the office', match);
+  assert.equal(r.state, 'owned');
+  if (r.state !== 'owned') throw new Error('unreachable');
+  assert.equal(r.matches[0]?.id, 73244, 'a series must be identified by tvdbId');
+});
+
+test('🔴 a MOVIE row carrying both yields the tmdbId', async () => {
+  const r = await new ArrClient(
+    {
+      baseUrl: 'http://radarr.invalid/radarr/api/v3',
+      apiKey: 'k',
+      fetchImpl: async () => json([{ title: 'Dune', year: 2021, id: 12, tvdbId: 999, tmdbId: 438631 }]),
+    },
+    'movie',
+  ).owned('dune', match);
+  assert.equal(r.state, 'owned');
+  if (r.state !== 'owned') throw new Error('unreachable');
+  assert.equal(r.matches[0]?.id, 438631, 'a movie must be identified by tmdbId');
+});
+
+test('a row missing its kind-specific id yields 0 rather than a foreign id', async () => {
+  // 59 of 60 real rows had tmdbId, so a precedence chain would silently change
+  // id space for one row in the same list. 0 is unusable and obviously so.
+  const r = await client(async () => json([{ title: 'Odd Show', year: 2020, id: 7, tmdbId: 555 }])).owned(
+    'odd show',
+    match,
+  );
+  assert.equal(r.state, 'owned');
+  if (r.state !== 'owned') throw new Error('unreachable');
+  assert.equal(r.matches[0]?.id, 0);
+});
