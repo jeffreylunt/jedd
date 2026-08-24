@@ -144,10 +144,21 @@ test('unparseable id output is UNPROVEN, never assumed fine', async () => {
   assert.equal(verdict.safe, false);
 });
 
-test('🔴 an EMPTY shell host is refused rather than silently meaning "different"', async () => {
+test('🔴 an EMPTY shell host is refused, and is never DIALLED', async () => {
+  // ⚠️ The obvious assertion — "safe is false" — passes for the wrong reason:
+  // with the guard removed, `ssh ""` falls through to the admin branch of the
+  // fixture, the uids match, and the uid check refuses it anyway. The property
+  // that actually distinguishes the guard is that an empty host is never
+  // contacted at all.
   const spy = healthyBox();
   const verdict = await proveShellIdentityIsSafe(testConfig({ shellSshHost: '', adminSshHost: ADMIN }), spy.exec);
   assert.equal(verdict.safe, false);
+  assert.equal(
+    spy.calls.some((c) => c.host === ''),
+    false,
+    `an empty ssh host must not be dialled: ${JSON.stringify(spy.calls)}`,
+  );
+  assert.match(verdict.reason, /empty/);
 });
 
 // ── the crossing's own control ───────────────────────────────────────────────

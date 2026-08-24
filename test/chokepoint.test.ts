@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Agent } from '../src/agent.js';
-import { assertShellIdentityIsSafe } from '../src/config.js';
+import { assertShellIdentityIsSafe, loadConfig } from '../src/config.js';
 import type { LlmClient, LlmReply } from '../src/llm.js';
 import { ALL_TOOLS, buildTools, toolsForRole } from '../src/tools/index.js';
 import type { Tool } from '../src/tools/types.js';
@@ -182,5 +182,38 @@ test('every write tool is owner-only', () => {
   assert.ok(writeTools.length >= 2);
   for (const tool of writeTools) {
     assert.equal(tool.minRole, 'owner', `${tool.name} must be owner-only`);
+  }
+});
+
+
+test('🔴 an EMPTY HP_SHELL_SSH_HOST must not read as a different host', () => {
+  // `??` does not fire on an empty string, so an unset-but-present variable used
+  // to sail through the inequality check as a "different" host — a boundary made
+  // of two strings, one of which was nothing at all.
+  const saved = { shell: process.env['HP_SHELL_SSH_HOST'], admin: process.env['HP_ADMIN_SSH_HOST'], owner: process.env['OWNER_HANDLE'] };
+  try {
+    process.env['OWNER_HANDLE'] = '+18015550123';
+    process.env['HP_ADMIN_SSH_HOST'] = 'hp';
+    process.env['HP_SHELL_SSH_HOST'] = '';
+    const empty = loadConfig();
+    assert.equal(empty.shellSshHost, 'hp', 'an empty value must fall back to the admin host');
+    assert.equal(empty.shellIdentityShared, true, 'and therefore register as SHARED, not split');
+    assert.equal(assertShellIdentityIsSafe(empty).safe, false);
+
+    // Whitespace is the same case wearing a hat.
+    process.env['HP_SHELL_SSH_HOST'] = '   ';
+    assert.equal(loadConfig().shellIdentityShared, true);
+
+    // CONTROL: a real value still produces a split, so the check is about
+    // emptiness and not about the fallback swallowing everything.
+    process.env['HP_SHELL_SSH_HOST'] = 'hp-jedd-shell';
+    const split = loadConfig();
+    assert.equal(split.shellSshHost, 'hp-jedd-shell');
+    assert.equal(split.shellIdentityShared, false);
+  } finally {
+    for (const [k, v] of [['HP_SHELL_SSH_HOST', saved.shell], ['HP_ADMIN_SSH_HOST', saved.admin], ['OWNER_HANDLE', saved.owner]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
 });
