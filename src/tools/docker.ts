@@ -203,23 +203,29 @@ export const dockerLogs: Tool = {
   },
 };
 
-/** Which container the tunnel dependents are supposed to share a namespace with. */
-const TUNNEL_CONTAINER = 'gluetun';
-
 /**
  * The netns-inode diagnostic, as its own structured tool.
  *
  * 🔴 THE FAULT THIS EXISTS FOR: after a gluetun restart, a
  * `network_mode: container:gluetun` dependent can keep a stale, dead network
  * namespace. It has zero egress, and `docker ps` reports it **Up** the whole
- * time. `docker inspect` also still shows `NetworkMode: container:gluetun`,
- * because that is the DECLARED configuration and it never changed.
+ * time. `docker inspect` also still shows the same NetworkMode, because that is
+ * the DECLARED configuration and it never changed.
  *
  * The only thing that distinguishes the two states is the kernel's own inode:
  * `readlink /proc/self/ns/net` inside the container, compared against the same
- * read inside gluetun. Equal inodes mean genuinely shared; different inodes on a
- * container that claims `container:gluetun` mean the namespace went stale and the
- * fix is `restart_arr_stack`.
+ * read inside its declared peer. Equal inodes mean genuinely shared; different
+ * inodes mean the namespace went stale, and for sonarr/radarr/prowlarr the
+ * documented fix is `restart_arr_stack`.
+ *
+ * ⚠️ **`HostConfig.NetworkMode` reports `container:<64-hex-id>`, NOT
+ * `container:gluetun`.** An earlier version of this tool compared it against the
+ * literal string `container:gluetun` and therefore said "nothing to compare" for
+ * every container it was written for — it would have been silent on exactly the
+ * fault it exists to detect. Caught by running it against the real homelab; the
+ * unit fixture had invented a shape docker never emits. The peer is now RESOLVED
+ * from that id, which also means the tool never needs to know the tunnel
+ * container's name.
  *
  * Three states, and **`unknown` is never "fine"** — a probe that could not run
  * has shown nothing. `docker exec` needs the container to be running, so a
@@ -228,10 +234,10 @@ const TUNNEL_CONTAINER = 'gluetun';
 export const containerNetns: Tool = {
   name: 'container_netns',
   description:
-    'Check whether a container is REALLY sharing gluetun\'s network namespace, by comparing kernel ' +
-    'netns inodes (readlink /proc/self/ns/net) rather than trusting docker. Use this when arrs are ' +
-    'up but cannot reach anything, or after any gluetun restart: a stale namespace looks perfectly ' +
-    'healthy to docker ps and docker inspect. Takes a container name only.',
+    "Check whether a container is REALLY sharing another container's network namespace (the gluetun " +
+    'tunnel case), by comparing kernel netns inodes (readlink /proc/self/ns/net) rather than trusting ' +
+    'docker. Use this when arrs are up but cannot reach anything, or after any gluetun restart: a ' +
+    'stale namespace looks perfectly healthy to docker ps and docker inspect. Takes a container name only.',
   minRole: 'owner',
   parameters: {
     type: 'object',
@@ -269,38 +275,76 @@ export const containerNetns: Tool = {
       );
     }
 
-    // A container on its own bridge/host network has no gluetun inode to match,
-    // and saying "MISMATCH" there would be a false alarm rather than a finding.
-    if (networkMode !== `container:${TUNNEL_CONTAINER}`) {
+    // A container on its own bridge/host network shares nobody's namespace, so
+    // there is no inode to compare and "MISMATCH" would be a false alarm. A false
+    // alarm here trains the reader to ignore the real one.
+    const peerRef = /^container:(.+)$/.exec(networkMode)?.[1];
+    if (!peerRef) {
       return ok(
-        `${name}: netns inode ${self.inode}, network_mode=${networkMode}. This container does not ` +
-          `share ${TUNNEL_CONTAINER}'s namespace by configuration, so there is nothing to compare.`,
+        `${name}: netns inode ${self.inode}, network_mode=${networkMode}. This container has its own ` +
+          'network namespace by configuration, so there is nothing to compare.',
       );
     }
 
-    const tunnel = await readNetns(ctx, TUNNEL_CONTAINER);
+    const peer = await resolvePeerName(ctx, peerRef);
+    if (!peer.ok) {
+      return fail(
+        `${name} declares network_mode=${networkMode} but the container it points at could NOT be ` +
+          `resolved (${peer.detail}). Whether the namespace is shared is UNKNOWN, which is not fine.`,
+      );
+    }
+
+    const tunnel = await readNetns(ctx, peer.name);
     if (!tunnel.ok) {
       return fail(
-        `${name} has netns inode ${self.inode} and declares network_mode=${networkMode}, but ` +
-          `${TUNNEL_CONTAINER}'s own namespace could NOT be read (${tunnel.detail}). ` +
-          'Whether they match is UNKNOWN, which is not the same as fine.',
+        `${name} has netns inode ${self.inode} and points at ${peer.name}, but ${peer.name}'s own ` +
+          `namespace could NOT be read (${tunnel.detail}). Whether they match is UNKNOWN, which is ` +
+          'not the same as fine.',
       );
     }
 
     if (self.inode === tunnel.inode) {
       return ok(
-        `${name} IS in ${TUNNEL_CONTAINER}'s network namespace — both report inode ${self.inode}. ` +
+        `${name} IS in ${peer.name}'s network namespace — both report inode ${self.inode}. ` +
           'The namespace is healthy; if traffic is still failing, the fault is elsewhere.',
       );
     }
     return fail(
-      `🔴 STALE NAMESPACE: ${name} reports netns inode ${self.inode} but ${TUNNEL_CONTAINER} reports ` +
-        `${tunnel.inode}, while ${name} declares network_mode=${networkMode}. This is the post-gluetun-` +
-        'restart fault: docker ps says Up and the container has no egress. The documented fix for ' +
-        'sonarr/radarr/prowlarr is restart_arr_stack.',
+      `🔴 STALE NAMESPACE: ${name} reports netns inode ${self.inode} but ${peer.name} reports ` +
+        `${tunnel.inode}, while ${name} is configured to share ${peer.name}'s namespace. This is the ` +
+        'post-gluetun-restart fault: docker ps says Up and the container has no egress. The ' +
+        'documented fix for sonarr/radarr/prowlarr is restart_arr_stack.',
     );
   },
 };
+
+/**
+ * Turn the `container:<id>` reference docker actually reports into a name.
+ *
+ * The id comes from docker, not from the model, but it is still validated before
+ * interpolation: "it came from a trusted source" is how an injection sink stops
+ * being reviewed.
+ */
+async function resolvePeerName(
+  ctx: ToolContext,
+  ref: string,
+): Promise<{ ok: true; name: string } | { ok: false; detail: string }> {
+  if (!isValidContainerName(ref)) {
+    return { ok: false, detail: `docker reported an unusable peer reference "${ref}"` };
+  }
+  const out = await runOnHp(
+    ctx.config.adminSshHost,
+    `docker inspect --format '{{.Name}}' ${ref}`,
+    30_000,
+    ctx.exec,
+  );
+  // docker renders names with a leading slash: /gluetun
+  const name = out.stdout.trim().replace(/^\//, '');
+  if (out.exitCode !== 0 || !name || !isValidContainerName(name)) {
+    return { ok: false, detail: `exit=${out.exitCode}, stdout="${out.stdout.trim() || '(empty)'}"` };
+  }
+  return { ok: true, name };
+}
 
 /** Read one container's kernel netns inode. Name must already be validated. */
 async function readNetns(

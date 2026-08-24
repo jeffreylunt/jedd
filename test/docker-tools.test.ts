@@ -209,18 +209,36 @@ test('docker_ps: a failing ssh call never reads as an empty container list', asy
   assert.match(result.content, /UNKNOWN/);
 });
 
-/** Script the two netns reads: the subject container, then gluetun. */
-function netnsSpy(subject: { status?: string; inode?: string }, gluetun: { status?: string; inode?: string }, mode = 'container:gluetun'): SshLog {
+/**
+ * Script a container_netns run against the shapes docker ACTUALLY emits.
+ *
+ * 🔴 `HostConfig.NetworkMode` is `container:<64-hex-id>` — never
+ * `container:gluetun`. An earlier fixture here invented the friendly form, and
+ * the tool passed its tests while being permanently silent on the real homelab:
+ * every container it was written for fell down the "nothing to compare" branch.
+ * The id below is a real one, read off hp.
+ */
+const PEER_ID = '416dbdcb8b98323a2a2bc946f8d43c54901d8180045e0270ba6cd6cc837af4dc';
+
+function netnsSpy(
+  subject: { status?: string; inode?: string },
+  peer: { status?: string; inode?: string; name?: string },
+  mode = `container:${PEER_ID}`,
+): SshLog {
+  const peerName = peer.name ?? 'gluetun';
   return sshSpy((command) => {
     if (command.includes('HostConfig.NetworkMode')) return { stdout: `${mode}\n` };
-    if (command.startsWith('docker ps -a') && command.includes('^gluetun')) {
-      return gluetun.status === undefined ? { error: new Error('boom') } : { stdout: `gluetun|${gluetun.status}\n` };
+    if (command.includes('{{.Name}}')) {
+      return peer.name === null ? { error: new Error('no such container') } : { stdout: `/${peerName}\n` };
+    }
+    if (command.startsWith('docker ps -a') && command.includes(`^${peerName}`)) {
+      return peer.status === undefined ? { error: new Error('boom') } : { stdout: `${peerName}|${peer.status}\n` };
     }
     if (command.startsWith('docker ps -a')) {
       return subject.status === undefined ? { error: new Error('boom') } : { stdout: `sonarr|${subject.status}\n` };
     }
-    if (command.includes('docker exec gluetun')) {
-      return gluetun.inode ? { stdout: `net:[${gluetun.inode}]\n` } : { error: new Error('exec failed') };
+    if (command.includes(`docker exec ${peerName}`)) {
+      return peer.inode ? { stdout: `net:[${peer.inode}]\n` } : { error: new Error('exec failed') };
     }
     if (command.includes('docker exec')) {
       return subject.inode ? { stdout: `net:[${subject.inode}]\n` } : { error: new Error('exec failed') };
@@ -228,6 +246,34 @@ function netnsSpy(subject: { status?: string; inode?: string }, gluetun: { statu
     return {};
   });
 }
+
+test('🔴 container_netns resolves the container:<id> form docker really reports', async () => {
+  // The regression test for the fixture that lied. With the literal
+  // `container:gluetun` comparison this run reported "nothing to compare" while
+  // the namespace was in fact shared, i.e. the diagnostic answered nothing.
+  const spy = netnsSpy(
+    { status: 'Up 10 hours', inode: '4026532519' },
+    { status: 'Up 2 weeks', inode: '4026532519' },
+  );
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, true);
+  assert.match(result.content, /IS in gluetun's network namespace/);
+  assert.doesNotMatch(result.content, /nothing to compare/);
+  assert.ok(
+    spy.calls.some((c) => c.command.includes('{{.Name}}')),
+    'the peer id must be resolved to a name rather than string-matched',
+  );
+});
+
+test('container_netns: an unresolvable peer id is UNKNOWN, not a pass', async () => {
+  const spy = netnsSpy(
+    { status: 'Up 10 hours', inode: '4026532519' },
+    { status: 'Up 2 weeks', inode: '4026532519', name: null as unknown as string },
+  );
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /UNKNOWN/);
+});
 
 test('container_netns: matching inodes report a healthy shared namespace', async () => {
   const spy = netnsSpy({ status: 'Up 2 hours', inode: '4026532519' }, { status: 'Up 3 hours', inode: '4026532519' });
@@ -281,7 +327,8 @@ test('container_netns: a container NOT on the tunnel is reported plainly, not as
 test('container_netns: garbage where an inode should be is UNKNOWN, not a comparison', async () => {
   // `readlink` exiting 0 with unexpected text must not half-parse into a verdict.
   const spy = sshSpy((command) => {
-    if (command.includes('HostConfig.NetworkMode')) return { stdout: 'container:gluetun\n' };
+    if (command.includes('HostConfig.NetworkMode')) return { stdout: `container:${PEER_ID}\n` };
+    if (command.includes('{{.Name}}')) return { stdout: '/gluetun\n' };
     if (command.startsWith('docker ps -a')) return { stdout: 'sonarr|Up 2 hours\n' };
     return { stdout: 'Error response from daemon: something went wrong\n' };
   });
