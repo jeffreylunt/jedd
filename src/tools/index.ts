@@ -10,6 +10,7 @@ import {
   restartArrStack,
   restartContainer,
 } from './homelab.js';
+import { makeCatalogueSearch } from './catalogue.js';
 import { homelabStatus, requestMedia } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
@@ -38,7 +39,7 @@ import type { Tool } from './types.js';
  * identity — see `src/tools/docker.ts`.
  */
 
-const GUEST_TOOLS: Tool[] = [requestMedia, jellyfinSearch, homelabStatus];
+const GUEST_TOOLS: Tool[] = [requestMedia, jellyfinSearch, homelabStatus, makeCatalogueSearch()];
 const OWNER_READ_TOOLS: Tool[] = [
   jellyfinSessions,
   livetvStatus,

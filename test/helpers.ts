@@ -25,6 +25,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     allowSharedSshIdentity: false,
     llm: { provider: 'ollama', baseUrl: 'http://localhost:11434', model: 'test-model' },
     jellyfin: { baseUrl: 'http://jellyfin.test/jellyfin', apiKey: 'test-key' },
+    sonarr: { baseUrl: 'http://sonarr.invalid:8989/sonarr/api/v3', apiKey: 'test-key' },
+    radarr: { baseUrl: 'http://radarr.invalid:7878/radarr/api/v3', apiKey: 'test-key' },
     dispatcharr: { baseUrl: 'http://dispatcharr.test:9191' },
     qbittorrent: { baseUrl: 'http://qbittorrent.invalid:8080' },
     readOnly: true,

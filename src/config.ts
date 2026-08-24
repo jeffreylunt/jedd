@@ -40,6 +40,13 @@ export interface Config {
     baseUrl: string;
     apiKey: string;
   };
+  /**
+   * ⚠️ Base URLs INCLUDE the path prefix: `http://host:8989/sonarr/api/v3`.
+   * The bare host serves a web app, so a wrong URL returns 200 + HTML and reads
+   * as a broken homelab when it is really a config error.
+   */
+  sonarr: { baseUrl: string; apiKey: string };
+  radarr: { baseUrl: string; apiKey: string };
   dispatcharr: {
     baseUrl: string;
     username?: string;
@@ -103,6 +110,14 @@ export function loadConfig(): Config {
     jellyfin: {
       baseUrl: process.env.JELLYFIN_URL ?? 'http://localhost:8096/jellyfin',
       apiKey: process.env.JELLYFIN_API_KEY ?? '',
+    },
+    sonarr: {
+      baseUrl: process.env.SONARR_URL ?? 'http://192.168.1.7:8989/sonarr/api/v3',
+      apiKey: process.env.SONARR_API_KEY ?? '',
+    },
+    radarr: {
+      baseUrl: process.env.RADARR_URL ?? 'http://192.168.1.7:7878/radarr/api/v3',
+      apiKey: process.env.RADARR_API_KEY ?? '',
     },
     dispatcharr: {
       baseUrl: process.env.DISPATCHARR_URL ?? 'http://localhost:9191',
