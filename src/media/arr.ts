@@ -229,12 +229,24 @@ export class ArrClient {
     return { state: 'results', candidates: this.toCandidates(res.body) };
   }
 
-  private async post(path: string, body: unknown): Promise<{ ok: boolean; status: number; body: unknown; detail: string }> {
+  private async post(path: string, body: unknown) {
+    return this.send('POST', path, body);
+  }
+
+  private async put(path: string, body: unknown) {
+    return this.send('PUT', path, body);
+  }
+
+  private async send(
+    method: 'POST' | 'PUT',
+    path: string,
+    body: unknown,
+  ): Promise<{ ok: boolean; status: number; body: unknown; detail: string }> {
     const url = `${this.opts.baseUrl}${path}`;
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
-        method: 'POST',
+        method,
         headers: { 'X-Api-Key': this.opts.apiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(this.timeoutMs),
@@ -302,6 +314,127 @@ export class ArrClient {
       addOptions: { monitor: 'none', searchForMissingEpisodes: true },
     });
     return this.interpretAdd(res, input.seasons, input.title);
+  }
+
+  /**
+   * 🔴 THE MISSING VERB: turn seasons ON for a series ALREADY in the library.
+   *
+   * `addSeries` scopes seasons at CREATE time and that path is unreachable once
+   * Sonarr holds the show — it answers 400 "already exists". Measured live: Jeff
+   * asked for *Seinfeld season 3* on a series Sonarr already had with S2-S9
+   * unmonitored and empty, and V2 had no verb for it at all. V1 does. This is
+   * the regression that closes.
+   *
+   * ── WHAT IS READ BACK, AND WHY IT IS NOT WHAT WE SENT ────────────────────
+   *
+   * `confirmed` comes from **Sonarr's PUT response**, intersected with what was
+   * asked for. Never from the request. A tool that reports the seasons it *sent*
+   * is reporting its own intention, which is true of a write that silently did
+   * nothing as well as one that worked.
+   *
+   * ── ⚠️ IT SENDS THE WHOLE SERIES OBJECT BACK ─────────────────────────────
+   *
+   * Sonarr's `PUT /series/{id}` replaces the resource. A partial body drops
+   * every field it omits — root folder, quality profile, tags. So the object is
+   * read with GET, mutated in exactly two places, and returned intact.
+   *
+   * ⚠️ The second of those two places is the SERIES-level `monitored` flag: a
+   * series toggled off grabs nothing however many seasons are switched on. It is
+   * flipped when it was off, and **reported**, because it is a state change
+   * beyond the seasons that were asked for.
+   */
+  async monitorSeasons(
+    seriesId: number,
+    seasons: number[],
+  ): Promise<
+    | { state: 'updated'; confirmed: number[]; seriesWasUnmonitored: boolean; othersChanged: number[] }
+    | { state: 'failed'; detail: string }
+    | { state: 'unknown'; detail: string }
+  > {
+    if (this.kind !== 'series') {
+      return { state: 'failed', detail: 'monitorSeasons is a Sonarr call; a movie has no seasons.' };
+    }
+    if (!Number.isFinite(seriesId) || seriesId <= 0) {
+      return { state: 'failed', detail: 'no sonarr series id — nothing to update.' };
+    }
+    const got = await this.call(`/series/${seriesId}`);
+    if (!got.ok) {
+      return { state: 'unknown', detail: `could not read series ${seriesId} before updating it: ${got.detail}` };
+    }
+    const series = got.body as Record<string, unknown> | null;
+    if (!series || typeof series !== 'object') {
+      return { state: 'unknown', detail: `series ${seriesId} came back in a shape I do not recognise.` };
+    }
+
+    const wanted = new Set(seasons.filter((n) => Number.isFinite(n) && n >= 0));
+    const rows = Array.isArray(series['seasons']) ? (series['seasons'] as Record<string, unknown>[]) : [];
+    // ⚠️ Recorded BEFORE the write, so "no other season changed" is checkable
+    // against what was actually there rather than against what we assume.
+    const before = new Map<number, boolean>();
+    for (const r of rows) before.set(Number(r['seasonNumber']), r['monitored'] === true);
+
+    const seriesWasUnmonitored = series['monitored'] !== true;
+    const updated = {
+      ...series,
+      monitored: true,
+      seasons: rows.map((r) => (wanted.has(Number(r['seasonNumber'])) ? { ...r, monitored: true } : r)),
+    };
+
+    const res = await this.put(`/series/${seriesId}`, updated);
+    if (res.status === 0) {
+      return {
+        state: 'unknown',
+        detail:
+          `Could not reach Sonarr while updating series ${seriesId}, so I do NOT know whether the ` +
+          `seasons were turned on. This is not a "no". (${res.detail})`,
+      };
+    }
+    if (!res.ok) {
+      return { state: 'failed', detail: `Sonarr refused the update (http ${res.status}): ${res.detail.slice(0, 160)}` };
+    }
+
+    const back = res.body as Record<string, unknown> | null;
+    const backRows = back && Array.isArray(back['seasons']) ? (back['seasons'] as Record<string, unknown>[]) : null;
+    if (!backRows) {
+      // 🔴 An unreadable read-back is UNKNOWN, not success. Sonarr accepted
+      // something; what it accepted is exactly what we cannot say.
+      return {
+        state: 'unknown',
+        detail: `Sonarr accepted the update but its reply carried no season list, so I cannot confirm what changed.`,
+      };
+    }
+    const confirmed: number[] = [];
+    const othersChanged: number[] = [];
+    for (const r of backRows) {
+      const n = Number(r['seasonNumber']);
+      const now = r['monitored'] === true;
+      if (wanted.has(n)) {
+        if (now) confirmed.push(n);
+        continue;
+      }
+      // Anything we did NOT ask about that moved is reported, not ignored.
+      const was = before.get(n);
+      if (was !== undefined && was !== now) othersChanged.push(n);
+    }
+    confirmed.sort((a, b) => a - b);
+    othersChanged.sort((a, b) => a - b);
+    return { state: 'updated', confirmed, seriesWasUnmonitored, othersChanged };
+  }
+
+  /**
+   * 🔴 MONITORING ALONE DOWNLOADS NOTHING.
+   *
+   * Sonarr does not search a season because it was switched on. Without this
+   * command the season sits monitored and empty indefinitely — and "monitored"
+   * reads, to anyone looking at the UI, exactly like "on its way". A season we
+   * monitored but could not search is NOT being downloaded, and the caller must
+   * be able to say so separately.
+   */
+  async seasonSearch(seriesId: number, seasonNumber: number): Promise<{ ok: boolean; detail: string }> {
+    const res = await this.post('/command', { name: 'SeasonSearch', seriesId, seasonNumber });
+    if (res.status === 0) return { ok: false, detail: `could not reach Sonarr: ${res.detail}` };
+    if (!res.ok) return { ok: false, detail: `http ${res.status}: ${res.detail.slice(0, 120)}` };
+    return { ok: true, detail: `SeasonSearch queued for series ${seriesId} season ${seasonNumber}` };
   }
 
   async addMovie(input: {

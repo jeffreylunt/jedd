@@ -42,6 +42,23 @@ export interface SeasonState {
 export interface ShowSeasons {
   title: string;
   year?: number;
+  /**
+   * 🔴 SONARR'S INTERNAL SERIES ID — the one `PUT /series/{id}` needs.
+   *
+   * Absent for a row that is not in the library. It is deliberately NOT
+   * interchangeable with `tvdbId` below: they are different id spaces on the
+   * same object, and every consumer wants exactly one of them.
+   */
+  id?: number;
+  /**
+   * ⚠️ THE TVDB ID, WHICH IS WHAT `ArrClient.progress()` MATCHES ON — not `id`.
+   *
+   * A follow-up records `subject.id` and `progress()` looks up
+   * `rows.find(r => r.tvdbId === id)`. Passing Sonarr's internal id there finds
+   * nothing and reports *"is not in the library listing at all"* — a show that
+   * looks like it vanished, for a follow-up that was scheduled correctly.
+   */
+  tvdbId?: number;
   /** Ascending by season number, INCLUDING season 0 (specials). */
   seasons: SeasonState[];
 }
@@ -70,9 +87,13 @@ export function parseShowSeasons(row: unknown): ShowSeasons | null {
     });
   }
   seasons.sort((a, b) => a.season - b.season);
+  const id = Number(r['id']);
+  const tvdbId = Number(r['tvdbId']);
   return {
     title,
     year: typeof r['year'] === 'number' && r['year'] > 0 ? r['year'] : undefined,
+    id: Number.isFinite(id) && id > 0 ? id : undefined,
+    tvdbId: Number.isFinite(tvdbId) && tvdbId > 0 ? tvdbId : undefined,
     seasons,
   };
 }

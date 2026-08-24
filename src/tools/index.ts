@@ -13,6 +13,7 @@ import {
 } from './homelab.js';
 import { addAudiobook } from './add-audiobook.js';
 import { makeAddMovie, makeAddSeries } from './add-media.js';
+import { makeAddSeason } from './add-season.js';
 import { makeCatalogueSearch } from './catalogue.js';
 import { makeCheckStatus } from './check-status.js';
 import { resolveChoice } from './choice.js';
@@ -66,7 +67,16 @@ const GUEST_TOOLS: Tool[] = [
  * and the reason `registerable()` now quantifies the kill switch over the whole
  * registry instead. This is the first real member of that combination.
  */
-const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries(), saveKindleEmail, addAudiobook];
+const GUEST_WRITE_TOOLS: Tool[] = [
+  makeAddMovie(),
+  makeAddSeries(),
+  // 🔴 `add_season` is the verb V1 had and V2 shipped without: `add_series`
+  // scopes seasons at CREATE time only, so a show Sonarr already holds had no
+  // path at all. Jeff hit it on his first real test, asking for Seinfeld S3.
+  makeAddSeason(),
+  saveKindleEmail,
+  addAudiobook,
+];
 
 /**
  * 🔴 THE INVITE TOOL IS BUILT FROM INJECTED DEPS, WHICH IS WHY IT WAS MISSING.

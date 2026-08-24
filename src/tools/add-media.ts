@@ -17,8 +17,18 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
  * which only detects a wrong claim after it has been made.
  */
 
-/** Schedule the return visit. A turn ends when the user is told the outcome. */
-async function watchIt(
+/**
+ * Schedule the return visit. A turn ends when the user is told the outcome.
+ *
+ * 🔴 EXPORTED, AND `id` IS THE **TVDB** ID FOR A SERIES — never Sonarr's internal
+ * one. `ArrClient.progress()` looks the subject up with
+ * `rows.find(r => r.tvdbId === id)`, so passing the internal id matches nothing
+ * and the follow-up reports *"is not in the library listing at all"* — a show
+ * that reads as having vanished, from a follow-up that was scheduled correctly.
+ * `add_season` holds BOTH ids (it needs the internal one for the PUT), which is
+ * exactly the situation where the wrong one is easy to hand over.
+ */
+export async function watchIt(
   ctx: ToolContext,
   arr: 'series' | 'movie',
   id: number,
