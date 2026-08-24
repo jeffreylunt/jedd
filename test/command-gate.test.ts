@@ -53,6 +53,19 @@ test('a dangerous verb hidden later in a pipeline is still refused', () => {
   assert.equal(allowed('docker ps || docker stop jellyfin'), false);
 });
 
+test('fd duplication is allowed but file redirection is not', () => {
+  // `2>&1` merges stderr into the pipe and writes nothing. Refusing it pushed the
+  // live model into a retry, and it is the documented idiom for stopping a failed
+  // command from reading as an empty result.
+  assert.equal(allowed('docker logs --since 1h jellyfin 2>&1 | grep -i error'), true);
+  assert.equal(allowed('curl -s http://localhost:8096/ 2>&1'), true);
+  // The failing control: a redirect that names a FILE must still be refused,
+  // including the stderr-to-file form that looks superficially similar.
+  assert.equal(allowed('docker logs jellyfin 2> /tmp/err'), false);
+  assert.equal(allowed('docker logs jellyfin > /tmp/out'), false);
+  assert.equal(allowed('docker logs jellyfin 2>&1 > /tmp/out'), false);
+});
+
 test('command substitution and redirection are refused', () => {
   assert.equal(allowed('echo $(docker restart jellyfin)'), false);
   assert.equal(allowed('echo `docker restart jellyfin`'), false);

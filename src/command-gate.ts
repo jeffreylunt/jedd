@@ -71,6 +71,13 @@ export function splitSegments(command: string): string[] | null {
       current += ch;
       continue;
     }
+    // `&` inside a file-descriptor duplication (`2>&1`) is part of the token,
+    // not a separator. Without this, `cmd 2>&1 | grep x` splits into a bogus
+    // segment starting `1`, and a legitimate read is refused.
+    if (ch === '&' && prev === '>') {
+      current += ch;
+      continue;
+    }
     if (ch === '|' || ch === ';' || ch === '&' || ch === '\n') {
       // Consume a doubled operator (&& / ||) as one separator.
       if ((ch === '|' || ch === '&') && command[i + 1] === ch) i++;
@@ -211,9 +218,19 @@ export function commandGate(command: string): GateVerdict {
   if (trimmed.includes('$(') || trimmed.includes('`') || trimmed.includes('<(')) {
     return deny('command substitution ($( ), backticks, <( )) is not allowed');
   }
-  // Redirection writes to the filesystem.
-  if (/[^0-9\s]?>>?/.test(trimmed.replace(/"[^"]*"|'[^']*'/g, ''))) {
-    return deny('output redirection (>, >>) is not allowed on a read-only shell');
+  // Redirection to a FILE writes to the filesystem and is refused.
+  //
+  // File-descriptor duplication (`2>&1`) is not a write — it merges stderr into
+  // stdout so a pipeline can see it, which is the documented idiom for stopping a
+  // failed command from reading as an empty result. It is allowed, so it is
+  // stripped before this check rather than caught by it.
+  const withoutQuotes = trimmed.replace(/"[^"]*"|'[^']*'/g, '');
+  const withoutFdDup = withoutQuotes.replace(/\d*>&\d+/g, '');
+  if (withoutFdDup.includes('>')) {
+    return deny(
+      'output redirection to a file (>, >>) is not allowed on a read-only shell. ' +
+        '`2>&1` is permitted; stderr and the exit code are returned to you separately anyway.',
+    );
   }
 
   const segments = splitSegments(trimmed);
