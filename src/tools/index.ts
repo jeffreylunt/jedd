@@ -10,6 +10,7 @@ import {
   restartContainer,
 } from './homelab.js';
 import { homelabStatus, requestMedia } from './media.js';
+import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import type { Tool } from './types.js';
 
@@ -40,12 +41,19 @@ const GUEST_TOOLS: Tool[] = [requestMedia, jellyfinSearch, homelabStatus];
 const OWNER_READ_TOOLS: Tool[] = [
   jellyfinSessions,
   livetvStatus,
+  diagnoseHostContention,
   dockerPs,
   dockerInspect,
   dockerLogs,
   containerNetns,
 ];
-const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack];
+/**
+ * ⚠️ `shed_host_load` is a WRITE and lives here, so it does not exist at all
+ * unless writes are enabled — even though it is the SAFEST action in the set and
+ * the only one that can be applied while someone is watching. Safe-to-run and
+ * allowed-to-run are different axes, and this file only decides the second.
+ */
+const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLoad, restoreQbitSpeed];
 
 /**
  * Build the tool registry for this process.

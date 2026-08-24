@@ -337,3 +337,223 @@ export function assertSafeToRestart(
 export function isValidContainerName(name: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(name);
 }
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * HOST CONTENTION — the diagnosis side of the safe-fix path (task-10)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * The most common cause of live-TV stutter on this box is NOT a broken stream.
+ * It is host contention: qBittorrent saturating the uplink and the CPU that
+ * gluetun needs for encryption. The homelab knowledge base records the
+ * discriminator: **Jellyfin's LAN response is THE canary — ~1-5 ms healthy,
+ * hundreds of ms under contention.**
+ *
+ * 🔴 AND THE INVERSION THAT MAKES THIS THE RIGHT FIX: a person saying "the game
+ * is stuttering" is a person WATCHING. Their report is proof that the
+ * restart-blocking condition holds, so the intuitive response — restart
+ * something in the live-TV path — is the worst available action (a mid-game
+ * Dispatcharr restart cost eight hours on 2026-04-27). Shedding qBittorrent's
+ * bandwidth is the one documented fix that helps a viewer WITHOUT touching the
+ * stream. The report tightens the gate; it does not license a restart.
+ */
+
+/** Median latency at or above this means the host is contended. */
+export const CONTENTION_MS = 50;
+/** Below this, qBittorrent is not moving enough to be the bottleneck. */
+export const QBIT_ACTIVE_BYTES_PER_SEC = 512 * 1024;
+/** Fewer successful probes than this and the measurement is UNKNOWN, not fast. */
+export const MIN_LATENCY_SAMPLES = 5;
+
+export interface LatencyReading {
+  /** false when too few probes returned a usable timing — UNKNOWN, never "fast". */
+  known: boolean;
+  medianMs: number;
+  samplesMs: number[];
+  detail: string;
+}
+
+/**
+ * Parse repeated `http=<code> total=<seconds>` probe lines into a MEDIAN.
+ *
+ * 🔴 The median is not a stylistic choice. Measured on an idle box, single
+ * samples were 21.5 ms, 17.5 ms and 22.1 ms among readings of ~1.0 ms — a
+ * first-call warm-up artefact. One sample would false-positive contention and
+ * authorise a write. The median of several is stable at ~1.1 ms while remaining
+ * fully sensitive to real contention, which slows EVERY sample rather than one.
+ *
+ * A non-200 sample contributes NOTHING — it is not a slow response, it is an
+ * absent one, and averaging it in would invent a number.
+ */
+export function parseLatencySamples(stdout: string, exitCode: number): LatencyReading {
+  const blank = (detail: string): LatencyReading => ({ known: false, medianMs: 0, samplesMs: [], detail });
+  if (exitCode !== 0) return blank(`the latency probe itself failed (exit ${exitCode})`);
+
+  const samples: number[] = [];
+  for (const line of stdout.split('\n')) {
+    const m = /^http=(\d{3}) total=([0-9.]+)$/.exec(line.trim());
+    if (!m) continue;
+    if (m[1] !== '200') continue;
+    const seconds = Number(m[2]);
+    if (!Number.isFinite(seconds)) continue;
+    samples.push(seconds * 1000);
+  }
+  if (samples.length < MIN_LATENCY_SAMPLES) {
+    return blank(
+      `only ${samples.length} of ${MIN_LATENCY_SAMPLES} required probes returned a usable timing — ` +
+        'latency is UNKNOWN, which is not the same as fast',
+    );
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median =
+    sorted.length % 2 === 0 ? ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2 : (sorted[mid] as number);
+  return {
+    known: true,
+    medianMs: median,
+    samplesMs: sorted,
+    detail: `median ${median.toFixed(1)} ms over ${samples.length} probes (${sorted.map((s) => s.toFixed(1)).join(', ')})`,
+  };
+}
+
+export interface QbitTransfer {
+  /** false when qBittorrent's API could not be read — UNKNOWN, never "idle". */
+  known: boolean;
+  downBytesPerSec: number;
+  upBytesPerSec: number;
+  detail: string;
+}
+
+/**
+ * Read `GET /api/v2/transfer/info`.
+ *
+ * ⚠️ An unreachable qBittorrent API is UNKNOWN, emphatically not "idle". The
+ * inventory records that bridge-local traffic to `172.20.0.1:8080` returns 000
+ * while the tunnel is perfectly healthy when `FIREWALL_OUTBOUND_SUBNETS` is
+ * empty. Reading that silence as "qBittorrent is doing nothing" would conclude
+ * the exact opposite of the truth on a box that is being saturated.
+ */
+export function parseQbitTransfer(stdout: string, exitCode: number): QbitTransfer {
+  const blank = (detail: string): QbitTransfer => ({
+    known: false,
+    downBytesPerSec: 0,
+    upBytesPerSec: 0,
+    detail,
+  });
+  if (exitCode !== 0) return blank(`could not reach qBittorrent's API (exit ${exitCode})`);
+  let body: unknown;
+  try {
+    body = JSON.parse(stdout.trim());
+  } catch {
+    return blank(`qBittorrent returned something that is not JSON: "${stdout.trim().slice(0, 120)}"`);
+  }
+  const rec = body as Record<string, unknown>;
+  const down = rec['dl_info_speed'];
+  const up = rec['up_info_speed'];
+  if (typeof down !== 'number' || typeof up !== 'number') {
+    return blank('qBittorrent\'s transfer/info had no numeric dl_info_speed/up_info_speed');
+  }
+  return {
+    known: true,
+    downBytesPerSec: down,
+    upBytesPerSec: up,
+    detail: `qBittorrent is moving ${(down / 1024).toFixed(0)} KB/s down, ${(up / 1024).toFixed(0)} KB/s up`,
+  };
+}
+
+/**
+ * FOUR outcomes, and three of them refuse.
+ *
+ * `unknown` and `clear` are deliberately DIFFERENT verdicts even though both
+ * refuse: "I measured it and it is fine" and "I could not measure it" are
+ * different facts about the world, and collapsing them is how a blind instrument
+ * starts reporting good news. `qbit-not-the-cause` is the third refusal, and it
+ * is the useful one — most live-TV faults are not fixable by shedding load, and
+ * saying so beats applying a fix that cannot help.
+ */
+export type ContentionVerdict = 'shed-warranted' | 'clear' | 'qbit-not-the-cause' | 'unknown';
+
+export function hostContentionVerdict(
+  latency: LatencyReading,
+  qbit: QbitTransfer,
+): { verdict: ContentionVerdict; detail: string } {
+  // UNKNOWN is checked FIRST and on BOTH instruments. A verdict computed from an
+  // instrument that did not report is not a cautious verdict, it is a guess.
+  if (!latency.known) {
+    return {
+      verdict: 'unknown',
+      detail: `Cannot measure host contention: ${latency.detail}. I am not able to tell whether anything is wrong.`,
+    };
+  }
+  if (!qbit.known) {
+    return {
+      verdict: 'unknown',
+      detail:
+        `Jellyfin latency read fine (${latency.detail}) but ${qbit.detail}. ` +
+        'Whether qBittorrent is the contributor is UNKNOWN, so shedding it is not justified.',
+    };
+  }
+  if (latency.medianMs < CONTENTION_MS) {
+    return {
+      verdict: 'clear',
+      detail:
+        `The host is NOT contended: Jellyfin answers in ${latency.detail}, well under the ${CONTENTION_MS} ms ` +
+        `threshold. ${qbit.detail}. This is a measurement, not a failure to measure — whatever the problem is, ` +
+        'host contention is not it.',
+    };
+  }
+  const busiest = Math.max(qbit.downBytesPerSec, qbit.upBytesPerSec);
+  if (busiest < QBIT_ACTIVE_BYTES_PER_SEC) {
+    return {
+      verdict: 'qbit-not-the-cause',
+      detail:
+        `The host IS contended (${latency.detail}, over the ${CONTENTION_MS} ms threshold) but ${qbit.detail} — ` +
+        `below the ${(QBIT_ACTIVE_BYTES_PER_SEC / 1024).toFixed(0)} KB/s that would make it the bottleneck. ` +
+        'Shedding qBittorrent would not fix this. Something else is loading the host.',
+    };
+  }
+  return {
+    verdict: 'shed-warranted',
+    detail:
+      `The host is contended (${latency.detail}, over the ${CONTENTION_MS} ms threshold) and ${qbit.detail}, ` +
+      'which is enough to be the cause. Shedding qBittorrent frees uplink and VPN-encrypt CPU without ' +
+      'touching anyone\'s stream.',
+  };
+}
+
+/**
+ * Did the symptom actually improve?
+ *
+ * 🔴 Deliberately computed from the SYMPTOM, never from the mechanism. "The API
+ * returned 200" and "qBittorrent reports alternate limits are on" are the fix
+ * reporting on itself; neither is evidence that a viewer's stream got better.
+ * UNKNOWN when either reading is blind — an unverifiable fix is reported as
+ * unverified, not as success.
+ */
+export type RecoveryVerdict = 'improved' | 'not-improved' | 'unknown';
+
+export function recoveryVerdict(
+  before: LatencyReading,
+  after: LatencyReading,
+): { verdict: RecoveryVerdict; detail: string } {
+  if (!before.known || !after.known) {
+    return {
+      verdict: 'unknown',
+      detail: `Cannot tell whether this helped: ${!before.known ? before.detail : after.detail}.`,
+    };
+  }
+  if (after.medianMs < CONTENTION_MS) {
+    return {
+      verdict: 'improved',
+      detail:
+        `Jellyfin latency went from ${before.medianMs.toFixed(1)} ms to ${after.medianMs.toFixed(1)} ms, ` +
+        `back under the ${CONTENTION_MS} ms threshold.`,
+    };
+  }
+  return {
+    verdict: 'not-improved',
+    detail:
+      `Jellyfin latency is still ${after.medianMs.toFixed(1)} ms (was ${before.medianMs.toFixed(1)} ms), ` +
+      `at or over the ${CONTENTION_MS} ms threshold. The load shed did NOT resolve the symptom.`,
+  };
+}

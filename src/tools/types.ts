@@ -16,6 +16,11 @@ export interface ToolContext {
    * seam is here to detect, and it is not observable from the return value.
    */
   exec?: ExecImpl;
+  /**
+   * Test seam ONLY: how a tool waits. Unset in production, where it is a real
+   * timer. Exists so a settle delay does not make the suite take a minute.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**

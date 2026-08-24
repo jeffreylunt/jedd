@@ -45,6 +45,17 @@ export interface Config {
     username?: string;
     password?: string;
   };
+  qbittorrent: {
+    /**
+     * ⚠️ `http://172.20.0.1:8080` — the DOCKER BRIDGE GATEWAY, not
+     * `192.168.1.7:8080`. qBittorrent lives in gluetun-torrents' network
+     * namespace and its API is only reachable on the bridge address, from the
+     * host itself. Auth-bypass is on for that source, which is why no
+     * credentials appear here; a request arriving from anywhere else gets
+     * `Unauthorized`, and that is not a bug.
+     */
+    baseUrl: string;
+  };
   /**
    * Read-only mode: every tool that would mutate the homelab refuses.
    * Defaults to TRUE — a misconfigured deploy is read-only, never write-enabled.
@@ -95,6 +106,9 @@ export function loadConfig(): Config {
       baseUrl: process.env.DISPATCHARR_URL ?? 'http://localhost:9191',
       username: process.env.DISPATCHARR_USER,
       password: process.env.DISPATCHARR_PASSWORD,
+    },
+    qbittorrent: {
+      baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',
     },
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',
