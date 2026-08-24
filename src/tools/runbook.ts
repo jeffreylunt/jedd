@@ -70,6 +70,7 @@ export function makeRunbookTool(runbookPath: string): Tool {
       `Topics: ${Object.keys(TOPICS).join(', ')}. Call this BEFORE guessing at a URL, port, ` +
       'container name or diagnostic command — it is cheaper than a wrong answer.',
     minRole: 'owner',
+    writes: false,
     parameters: {
       type: 'object',
       properties: {

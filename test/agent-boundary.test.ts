@@ -32,6 +32,7 @@ function buildSpyTool() {
     name: 'dangerous_tool',
     description: 'owner-only side effect',
     minRole: 'owner',
+    writes: false,
     parameters: { type: 'object', properties: {}, required: [] },
     async run(args) {
       state.ran = true;
@@ -147,6 +148,7 @@ test('a throwing tool is recorded as failed, not as success', async () => {
     name: 'dangerous_tool',
     description: 'x',
     minRole: 'owner',
+    writes: false,
     parameters: { type: 'object', properties: {}, required: [] },
     async run() {
       throw new Error('ssh died');

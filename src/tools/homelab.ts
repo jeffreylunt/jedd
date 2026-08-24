@@ -26,6 +26,7 @@ export const hpShell: Tool = {
     'denied" — use docker_ps, docker_inspect, docker_logs and container_netns instead. Commands that ' +
     'would change the system are refused by a code gate; restarting a container is a separate tool.',
   minRole: 'owner',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -58,6 +59,7 @@ export const jellyfinSessions: Tool = {
     'List current Jellyfin sessions and what each is playing. Use this to answer "is anyone watching" ' +
     'and before proposing anything disruptive.',
   minRole: 'owner',
+  writes: false,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     const res = await jellyfinGet(ctx.config, '/Sessions');
@@ -78,6 +80,7 @@ export const jellyfinSearch: Tool = {
     'Search the Jellyfin library for a movie, show or episode by title. Returns what is ACTUALLY in the ' +
     'library. Call this before telling anyone whether something is available.',
   minRole: 'guest',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -132,6 +135,7 @@ export const livetvStatus: Tool = {
     'whether gluetun is up, and whether Jellyfin itself is alive. Use this for any "live TV is broken / ' +
     'channel not working" question. Does not touch the tuner, so it is safe to run when live TV is down.',
   minRole: 'owner',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -230,6 +234,7 @@ export const restartContainer: Tool = {
     'ONLY when completely down and only when Jellyfin reports nobody watching. The preconditions are ' +
     'checked in code and cannot be overridden — if this refuses, report the refusal.',
   minRole: 'owner',
+  writes: true,
   parameters: {
     type: 'object',
     properties: {
@@ -312,6 +317,7 @@ export const restartArrStack: Tool = {
     'Jedd cannot search" fault caused by a stale network namespace after a gluetun restart. Safe ' +
     'during playback — these containers serve no video. Owner only.',
   minRole: 'owner',
+  writes: true,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     const containers = ['sonarr', 'radarr', 'prowlarr'];

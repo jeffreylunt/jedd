@@ -51,6 +51,22 @@ export interface Tool {
   description: string;
   /** Minimum role required to CALL this tool. Enforced by the loop, not the prompt. */
   minRole: Role;
+  /**
+   * True if this tool can change the state of the homelab.
+   *
+   * 🔴 REQUIRED, and deliberately not defaulted. Write-ness is a property of the
+   * MEMBER, not of the list it happens to sit in — the registry used to infer it
+   * from which array a tool was in, so the read-only kill switch covered owner
+   * writes and would have silently missed the first guest one.
+   *
+   * Defaulting this to `false` would pick the permissive answer for an author
+   * who forgot; `registerable()` refuses to register a tool that has not said.
+   *
+   * It is a different axis from `minRole`: that decides WHO may call the tool,
+   * this decides whether the tool does anything at all when writes are off.
+   * Neither satisfies the other.
+   */
+  writes: boolean;
   /** JSON Schema for the arguments object. */
   parameters: Record<string, unknown>;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;

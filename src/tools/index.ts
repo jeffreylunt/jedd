@@ -71,11 +71,41 @@ const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLo
  * string comparison. Fail closed by construction, not by remembering to check.
  */
 export function buildTools(config: Config, shellIdentity?: IdentityVerdict): Tool[] {
-  const tools = [...GUEST_TOOLS, ...OWNER_READ_TOOLS];
+  const tools = [...GUEST_TOOLS, ...OWNER_READ_TOOLS, ...OWNER_WRITE_TOOLS];
   if (shellIdentity?.safe) tools.push(hpShell);
   if (config.runbookPath) tools.push(makeRunbookTool(config.runbookPath));
-  if (!config.readOnly) tools.push(...OWNER_WRITE_TOOLS);
-  return tools;
+  return registerable(tools, config);
+}
+
+/**
+ * 🔴 THE READ-ONLY KILL SWITCH, APPLIED OVER THE WHOLE REGISTRY.
+ *
+ * Every candidate tool passes through here, and the rule is quantified rather
+ * than aimed at a named list: **for every tool, `writes` implies absent when
+ * `readOnly`.**
+ *
+ * This replaces gating on the OWNER write array, which made the guest tool list
+ * byte-identical with writes on and off. That was dormant only because no guest
+ * write tool existed — and Jeff has now authorised guests to add media and
+ * provision accounts, so the first one is imminent. A second hand-maintained
+ * GUEST_WRITE_TOOLS array would have fixed this instance and rebuilt the same
+ * trap one list further along: **write-ness is a property of the MEMBER, not of
+ * the list it sits in.**
+ *
+ * An undeclared tool is REFUSED rather than defaulted, because defaulting picks
+ * the permissive answer for an author who simply forgot.
+ */
+export function registerable(tools: Tool[], config: Config): Tool[] {
+  for (const t of tools) {
+    if (typeof t.writes !== 'boolean') {
+      throw new Error(
+        `Tool "${t.name}" does not declare writes. Every tool must declare whether it can change ` +
+          'the homelab, so the read-only kill switch can cover it regardless of which role it is ' +
+          'offered to. This is not defaulted on purpose.',
+      );
+    }
+  }
+  return config.readOnly ? tools.filter((t) => !t.writes) : tools;
 }
 
 /**

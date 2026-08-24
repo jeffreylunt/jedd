@@ -64,6 +64,7 @@ export const dockerPs: Tool = {
     'whether something is up, exited or restarting. The generic shell CANNOT run docker — use this ' +
     'instead. Includes stopped containers, so an absent name really means the container does not exist.',
   minRole: 'owner',
+  writes: false,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     const outcome = await runOnHp(
@@ -105,6 +106,7 @@ export const dockerInspect: Tool = {
     'reports what docker was CONFIGURED with — for whether a container is really sharing gluetun\'s ' +
     'network namespace, use container_netns instead.',
   minRole: 'owner',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -160,6 +162,7 @@ export const dockerLogs: Tool = {
     'name, an optional line count (default 100, max 1000) and an optional age in minutes. The generic ' +
     'shell CANNOT run docker — use this to read any container log.',
   minRole: 'owner',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -248,6 +251,7 @@ export const containerNetns: Tool = {
     'docker. Use this when arrs are up but cannot reach anything, or after any gluetun restart: a ' +
     'stale namespace looks perfectly healthy to docker ps and docker inspect. Takes a container name only.',
   minRole: 'owner',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {

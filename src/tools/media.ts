@@ -20,6 +20,7 @@ export const requestMedia: Tool = {
     'there, nothing is queued and you should just tell the person it is available. Returns the queue ' +
     'position when a request is actually recorded.',
   minRole: 'guest',
+  writes: false,
   parameters: {
     type: 'object',
     properties: {
@@ -82,6 +83,7 @@ export const homelabStatus: Tool = {
     'A short health summary anyone may ask for: is Jellyfin reachable and what version. Does not reveal ' +
     'who is watching.',
   minRole: 'guest',
+  writes: false,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     const info = await jellyfinGet(ctx.config, '/System/Info');

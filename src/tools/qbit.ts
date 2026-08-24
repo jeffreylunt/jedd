@@ -197,6 +197,7 @@ export const diagnoseHostContention: Tool = {
     'of four answers: contended and qBittorrent is the cause, contended but something else is, not ' +
     'contended, or could-not-measure. Use this before proposing any fix, and to answer "is the box ok".',
   minRole: 'owner',
+  writes: false,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     const verdict = await observeContention(ctx);
@@ -225,6 +226,7 @@ export const shedHostLoad: Tool = {
     'qBittorrent is the cause, then re-measures afterwards to say whether it actually helped. Use ' +
     'restore_qbit_speed to undo it.',
   minRole: 'owner',
+  writes: true,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     if (ctx.config.readOnly) {
@@ -393,6 +395,7 @@ export const restoreQbitSpeed: Tool = {
     'Undo shed_host_load: switch qBittorrent back to its normal speed limits. Safe at any time. Use this ' +
     'once live TV is no longer being watched, or if the throttle did not help.',
   minRole: 'owner',
+  writes: true,
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     if (ctx.config.readOnly) {
