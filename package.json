@@ -8,7 +8,8 @@
     "chat": "tsx src/index.ts",
     "test": "tsx --test --test-timeout=30000 test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "history": "tsx scripts/history.mjs"
+    "history": "tsx scripts/history.mjs",
+    "shadow": "tsx src/shadow-main.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7"

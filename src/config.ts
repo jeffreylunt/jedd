@@ -47,6 +47,23 @@ export interface Config {
    */
   sonarr: { baseUrl: string; apiKey: string };
   radarr: { baseUrl: string; apiKey: string };
+  bluebubbles: {
+    /**
+     * 🔴 `:1234` is JEDD (jeffreylunt@outlook.com). `:1235` is Jeff's PERSONAL
+     * Apple ID, used to read 2FA codes. Both accept the same default password
+     * and expose the same API, so a typo connects SUCCESSFULLY to the wrong
+     * identity — which is why `expectedIdentity` is asserted at boot.
+     */
+    baseUrl: string;
+    password: string;
+    expectedIdentity: string;
+    /** Where WE listen. Loopback is correct: BlueBubbles runs on this same Mac. */
+    host: string;
+    port: number;
+    path: string;
+    /** The URL registered WITH BlueBubbles — must be reachable FROM it. */
+    publicUrl: string;
+  };
   dispatcharr: {
     baseUrl: string;
     username?: string;
@@ -118,6 +135,19 @@ export function loadConfig(): Config {
     radarr: {
       baseUrl: process.env.RADARR_URL ?? 'http://192.168.1.7:7878/radarr/api/v3',
       apiKey: process.env.RADARR_API_KEY ?? '',
+    },
+    bluebubbles: {
+      baseUrl: process.env.BLUEBUBBLES_URL ?? 'http://127.0.0.1:1234',
+      password: process.env.BLUEBUBBLES_PASSWORD ?? 'password',
+      expectedIdentity: process.env.BLUEBUBBLES_IDENTITY ?? 'jeffreylunt@outlook.com',
+      host: process.env.BLUEBUBBLES_WEBHOOK_HOST ?? '127.0.0.1',
+      port: Number(process.env.BLUEBUBBLES_WEBHOOK_PORT ?? 18796),
+      path: process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook',
+      publicUrl:
+        process.env.BLUEBUBBLES_WEBHOOK_URL ??
+        `http://${process.env.BLUEBUBBLES_WEBHOOK_HOST ?? '127.0.0.1'}:${
+          process.env.BLUEBUBBLES_WEBHOOK_PORT ?? 18796
+        }${process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook'}`,
     },
     dispatcharr: {
       baseUrl: process.env.DISPATCHARR_URL ?? 'http://localhost:9191',
