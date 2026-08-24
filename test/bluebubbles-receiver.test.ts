@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { BlueBubblesClient, type FetchImpl } from '../src/bluebubbles/client.js';
-import { BlueBubblesReceiver, ShadowConnector, BlueBubblesConnector } from '../src/bluebubbles/receiver.js';
+import {
+  BlueBubblesReceiver,
+  ShadowConnector,
+  BlueBubblesConnector,
+  parseSendAudience,
+} from '../src/bluebubbles/receiver.js';
 import { SeenStore } from '../src/bluebubbles/seen.js';
 import type { IncomingMessage } from '../src/connector.js';
 
@@ -276,6 +281,77 @@ test('the real connector does send, so the shadow refusal is a real difference',
     port: 0,
     path: '/webhook',
   });
-  await new BlueBubblesConnector(receiver, client).send('+18015550123', 'hi');
+  await new BlueBubblesConnector(receiver, client, 'everyone').send('+18015550123', 'hi');
   assert.ok(calls.some((u) => u.includes('/message/text')));
+});
+
+// ── 🔴 the send audience: who V2 may text during a rehearsal ─────────────────
+
+test('🔴 an unset JEDD_SEND_TO is a REFUSAL, never "everyone"', () => {
+  // The rehearsal and the cutover run the same binary against the same server.
+  // If forgetting the variable meant "everyone", the dangerous case would be the
+  // one you get by not thinking about it.
+  assert.throws(() => parseSendAudience(undefined), /I will not guess/);
+  assert.throws(() => parseSendAudience('   '), /I will not guess/);
+  assert.throws(() => parseSendAudience(' , , '), /empty list/);
+});
+
+test('the cutover value has to be typed out in full', () => {
+  assert.equal(parseSendAudience('everyone'), 'everyone');
+  // Nothing else is quietly promoted to it.
+  assert.deepEqual(parseSendAudience('all'), ['all']);
+  assert.deepEqual(parseSendAudience('EVERYONE'), ['EVERYONE']);
+});
+
+test('a rehearsal audience is parsed as a handle list', () => {
+  assert.deepEqual(parseSendAudience(' +15555550100 , jeff@example.com '), ['+15555550100', 'jeff@example.com']);
+});
+
+test('🔴 a reply to a handle outside the audience never reaches sendText', async () => {
+  const sent: string[] = [];
+  const client = {
+    async sendText(to: string) {
+      sent.push(to);
+      return { accepted: true, detail: 'ok' };
+    },
+  } as unknown as BlueBubblesClient;
+  const suppressed: string[] = [];
+  const connector = new BlueBubblesConnector(
+    null as unknown as BlueBubblesReceiver,
+    client,
+    ['+15555550100'],
+    (to) => suppressed.push(to),
+  );
+
+  await connector.send('+15555550100', 'hello Jeff');
+  await connector.send('+15551112222', 'hello somebody else');
+
+  // 🔴 The gate is above the transport. Not a prompt line, not an agent check —
+  // the suppressed reply has no path to the wire even if every layer above it
+  // decided to answer.
+  assert.deepEqual(sent, ['+15555550100']);
+  assert.deepEqual(suppressed, ['+15551112222']);
+});
+
+test('the everyone audience does send to everyone', async () => {
+  const sent: string[] = [];
+  const client = {
+    async sendText(to: string) {
+      sent.push(to);
+      return { accepted: true, detail: 'ok' };
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  await connector.send('+15551112222', 'hi');
+  assert.deepEqual(sent, ['+15551112222'], 'the gate must not be so tight that a real cutover is silent');
+});
+
+test('a suppressed send resolves quietly — it is not an error the loop should log as a failure', async () => {
+  const client = {
+    async sendText() {
+      throw new Error('sendText must not be reached');
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, []);
+  await connector.send('+15551112222', 'hi');
 });

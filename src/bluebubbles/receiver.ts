@@ -173,15 +173,78 @@ export class BlueBubblesReceiver {
 /**
  * The full connector: receives and sends.
  */
+/**
+ * 🔴 WHO THIS CONNECTOR MAY TEXT, STATED OUT LOUD OR NOT AT ALL.
+ *
+ * `'everyone'` is the production cutover value. An array is the rehearsal value:
+ * V2 receives the whole household's traffic — which is the point, that is what
+ * exercises the receive path on real messages — but only *answers* the handles
+ * named here. Everyone else gets silence for the length of the window, and
+ * silence from a bot is recoverable in a way a wrong answer to twelve people is
+ * not.
+ *
+ * There is no default. An author who has not thought about it cannot get the
+ * permissive value by forgetting, which is the same rule `registerable()`
+ * applies to `writes` and `send_ebook` applies to `onlySendTo`. The literal
+ * string has to be typed.
+ */
+export type SendAudience = 'everyone' | string[];
+
+/**
+ * Read the send audience from a raw environment value. Never defaulted.
+ *
+ * 🔴 The failure this prevents is not hypothetical: the rehearsal and the
+ * cutover run the same binary against the same server, and the only thing
+ * distinguishing "answer Jeff" from "answer twelve people" is this value. An
+ * unset variable that meant `everyone` would make the dangerous case the one you
+ * get by forgetting — so an unset variable is a refusal instead.
+ */
+export function parseSendAudience(raw: string | undefined): SendAudience {
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      'JEDD_SEND_TO is not set, so I do not know who I am allowed to text and I will not guess. ' +
+        'Set it to "everyone" for a real cutover, or to a comma-separated list of handles ' +
+        '(e.g. JEDD_SEND_TO="+15555550100") for an attended rehearsal, where everyone else gets ' +
+        'silence rather than an untested answer.',
+    );
+  }
+  const value = raw.trim();
+  if (value === 'everyone') return 'everyone';
+  const handles = value
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean);
+  if (handles.length === 0) {
+    throw new Error(`JEDD_SEND_TO="${raw}" parsed to an empty list. Refusing to start on an ambiguous value.`);
+  }
+  return handles;
+}
+
 export class BlueBubblesConnector implements Connector {
   readonly name = 'bluebubbles';
 
   constructor(
     private readonly receiver: BlueBubblesReceiver,
     private readonly client: BlueBubblesClient,
+    /** Required. See `SendAudience` — there is deliberately no default. */
+    private readonly audience: SendAudience,
+    /** Told about every suppressed reply, so a rehearsal can see what it did not say. */
+    private readonly onSuppressed?: (toHandle: string, text: string) => void,
   ) {}
 
+  /** Is this handle allowed to receive a reply? Exact match; no normalisation, no prefixes. */
+  private allowed(toHandle: string): boolean {
+    return this.audience === 'everyone' || this.audience.includes(toHandle);
+  }
+
   async send(toHandle: string, text: string): Promise<void> {
+    // 🔴 The gate is HERE, above the transport, not in the agent and not in the
+    // prompt. A suppressed reply must be unable to reach `sendText` even if
+    // every layer above it decided to answer.
+    if (!this.allowed(toHandle)) {
+      this.onSuppressed?.(toHandle, text);
+      return;
+    }
     const r = await this.client.sendText(toHandle, text);
     if (!r.accepted) throw new Error(`send failed: ${r.detail}`);
   }

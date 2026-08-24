@@ -173,30 +173,81 @@ export class BlueBubblesClient {
    * changed (loopback → LAN IP) it left an ORPHAN pointing at an unreachable
    * address, and **nothing failed loudly** — BlueBubbles delivered into a black
    * hole for an entire version. Registration has to converge on one row.
+   *
+   * ── 🔴 "OURS" IS PORT + PATH. IT WAS PATH ALONE, AND THAT WAS A LANDMINE. ───
+   *
+   * The staleness rule used to match on PATHNAME only, so any row ending
+   * `/webhook` was fair game to delete. Live registrations on this server right
+   * now:
+   *
+   *     id 5  http://192.168.1.7:18790/webhook    ← V1. Production. Serving a household.
+   *     id 9  http://127.0.0.1:18795/webhook      ← a V2 listener
+   *
+   * Both are `/webhook`, because `/webhook` is what everybody calls it. Under
+   * the old rule, **V2 starting up would have silently deleted V1's
+   * registration** and taken the live Jedd off the air — with no log line saying
+   * so, because from the code's point of view it was tidying up after itself.
+   *
+   * That is the right thing to do at CUTOVER and a catastrophe at every other
+   * moment, and the difference is not something the registration path can see.
+   * So it no longer guesses: a row on a **different port is somebody else's**,
+   * and we do not delete other people's registrations. The original incident is
+   * still covered, because a host change (`127.0.0.1:18790` → `192.168.1.7:18790`)
+   * keeps the port.
+   *
+   * Taking V1 down is a DELIBERATE, SEPARATE step — `deleteWebhook(5)` in the
+   * runbook, recorded before it is done so it can be undone.
+   *
+   * ⚠️ Returns what it did. A removal that nobody logs is the orphan bug wearing
+   * the opposite sign.
    */
-  async ensureWebhook(url: string, events: string[]): Promise<void> {
+  async ensureWebhook(
+    url: string,
+    events: string[],
+  ): Promise<{ outcome: 'already-registered' | 'created'; removed: { id: number; url: string }[] }> {
     const existing = await this.listWebhooks();
-    if (existing.some((w) => w.url === url)) return;
+    if (existing.some((w) => w.url === url)) return { outcome: 'already-registered', removed: [] };
 
-    // Remove rows that are ours by shape (same path) but stale by address.
-    let path = '';
-    try {
-      path = new URL(url).pathname;
-    } catch {
-      path = url;
-    }
+    const mine = BlueBubblesClient.endpointKey(url);
+    const removed: { id: number; url: string }[] = [];
     for (const w of existing) {
-      let wPath = '';
-      try {
-        wPath = new URL(w.url).pathname;
-      } catch {
-        wPath = w.url;
-      }
-      if (wPath === path && w.url !== url) {
+      if (w.url !== url && BlueBubblesClient.endpointKey(w.url) === mine) {
         await this.call(`/webhook/${w.id}`, { method: 'DELETE' });
+        removed.push({ id: w.id, url: w.url });
       }
     }
     await this.call('/webhook', { method: 'POST', body: JSON.stringify({ url, events }) });
+    return { outcome: 'created', removed };
+  }
+
+  /**
+   * `port:path` — what makes a registration OURS across a host change.
+   *
+   * A malformed URL falls back to the whole string, which can only ever match
+   * itself. That is the fail-closed direction: an unparseable row is never
+   * mistaken for one of ours and deleted.
+   */
+  private static endpointKey(url: string): string {
+    try {
+      const u = new URL(url);
+      return `${u.port}:${u.pathname}`;
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Remove one registration by id. The DOWN step of a cutover, and the thing
+   * that undoes an UP step.
+   *
+   * 🔴 Deliberately takes an ID, not a URL. Deleting a webhook is how the live
+   * Jedd is taken off the air, and that is not an action anything should perform
+   * as a side effect of matching a pattern — the caller has to have looked at the
+   * list and named the row.
+   */
+  async deleteWebhook(id: number): Promise<{ ok: boolean; status: number }> {
+    const { status } = await this.call(`/webhook/${id}`, { method: 'DELETE' });
+    return { ok: status >= 200 && status < 300, status };
   }
 
   /**

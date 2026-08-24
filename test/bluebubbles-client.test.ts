@@ -114,6 +114,65 @@ test('🔴 registration updates the existing row instead of adding a second', as
   assert.ok(calls.some((c) => c.method === 'POST'), 'and the new one registered');
 });
 
+test('🔴 registering V2 does NOT delete V1 — a different port is somebody else\'s row', async () => {
+  // The live server carries both of these today. The staleness rule matched on
+  // PATHNAME, and everybody calls it /webhook — so V2 starting up would have
+  // deleted V1's registration and taken the live Jedd off the air, silently,
+  // while believing it was tidying up after itself.
+  const { impl, calls } = scripted((c) => {
+    if (c.method === 'GET') {
+      return {
+        body: {
+          data: [
+            { id: 5, url: 'http://192.168.1.7:18790/webhook', events: ['new-message'] },
+            { id: 9, url: 'http://127.0.0.1:18795/webhook', events: ['*'] },
+          ],
+        },
+      };
+    }
+    if (c.method === 'DELETE') return { body: { message: 'deleted' } };
+    return { body: { data: { id: 11, url: 'http://127.0.0.1:18796/webhook', events: ['new-message'] } } };
+  });
+  const res = await client(impl).ensureWebhook('http://127.0.0.1:18796/webhook', ['new-message']);
+  assert.equal(calls.filter((c) => c.method === 'DELETE').length, 0, 'nothing of anyone else\'s may be deleted');
+  assert.deepEqual(res.removed, []);
+  assert.equal(res.outcome, 'created');
+});
+
+test('🔴 the original orphan is still fixed — a HOST change on our own port is ours', async () => {
+  // The measured V1 incident: 127.0.0.1:18790 -> 192.168.1.7:18790. Same port,
+  // same path, and the old row delivered into a black hole for a whole version.
+  const { impl, calls } = scripted((c) => {
+    if (c.method === 'GET') {
+      return { body: { data: [{ id: 5, url: 'http://127.0.0.1:18790/webhook', events: ['new-message'] }] } };
+    }
+    if (c.method === 'DELETE') return { body: { message: 'deleted' } };
+    return { body: { data: { id: 6 } } };
+  });
+  const res = await client(impl).ensureWebhook('http://192.168.1.7:18790/webhook', ['new-message']);
+  assert.ok(calls.some((c) => c.method === 'DELETE' && c.url.includes('/webhook/5')));
+  assert.deepEqual(res.removed, [{ id: 5, url: 'http://127.0.0.1:18790/webhook' }]);
+});
+
+test('a removal is REPORTED, so it cannot happen without a log line', async () => {
+  const { impl } = scripted((c) => {
+    if (c.method === 'GET') {
+      return { body: { data: [{ id: 5, url: 'http://old.invalid/webhook', events: ['new-message'] }] } };
+    }
+    if (c.method === 'DELETE') return { body: { message: 'deleted' } };
+    return { body: { data: { id: 9 } } };
+  });
+  const res = await client(impl).ensureWebhook('http://new.invalid/webhook', ['new-message']);
+  assert.equal(res.removed.length, 1, 'an unreported removal is the orphan bug with the opposite sign');
+});
+
+test('deleteWebhook takes an ID, because taking Jedd off the air is never a side effect', async () => {
+  const { impl, calls } = scripted(() => ({ body: { message: 'deleted' } }));
+  const res = await client(impl).deleteWebhook(5);
+  assert.equal(res.ok, true);
+  assert.ok(calls.some((c) => c.method === 'DELETE' && c.url.includes('/webhook/5')));
+});
+
 test('registration is a no-op when the exact url is already registered', async () => {
   const { impl, calls } = scripted((c) => {
     if (c.method === 'GET') {
