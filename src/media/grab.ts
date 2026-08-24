@@ -39,6 +39,8 @@ export interface GrabInput {
   adminSshHost: string;
   qbitBaseUrl: string;
   infoHash: string;
+  /** The release's own magnet, when it has one. Carries the indexer's trackers. */
+  magnetUri?: string;
   title: string;
   category: string;
   savePath?: string;
@@ -93,7 +95,17 @@ export async function grabTorrent(input: GrabInput): Promise<GrabOutcome> {
       detail: `Refusing to grab: "${input.infoHash}" is not a valid infoHash. Nothing was sent.`,
     };
   }
-  const magnet = magnetFor(input.infoHash, input.title);
+  /**
+   * Prefer the release's OWN magnet — it carries the indexer's trackers, and a
+   * synthesized `xt=urn:btih:` relies on DHT alone, which is much slower to find
+   * peers. It is still validated: we only accept one whose infoHash matches the
+   * one we validated, so a mismatched or hostile URI cannot ride along.
+   */
+  const supplied = input.magnetUri ?? '';
+  const matchesHash = supplied.toLowerCase().includes(input.infoHash.toLowerCase());
+  const magnet = supplied.startsWith('magnet:') && matchesHash
+    ? supplied
+    : magnetFor(input.infoHash, input.title);
 
   await ensureCategory({
     adminSshHost: input.adminSshHost,

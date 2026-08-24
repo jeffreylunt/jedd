@@ -45,6 +45,19 @@ export interface Config {
    * The bare host serves a web app, so a wrong URL returns 200 + HTML and reads
    * as a broken homelab when it is really a config error.
    */
+  /**
+   * 🔴 PROWLARR HAS NO PATH PREFIX, UNLIKE THE ARRS.
+   *
+   * Sonarr and Radarr live at `/sonarr/api/v3` and `/radarr/api/v3`; Prowlarr is
+   * at the BARE root, `http://host:9696` + `/api/v1/...`. Measured: the prefixed
+   * form returns the SPA's HTML with http 200 for `/search`, while
+   * `/prowlarr/api/v1/system/status` happens to answer — so a control on the
+   * wrong endpoint reports everything is fine.
+   *
+   * Copying the arr pattern here is the obvious mistake and it fails as UNKNOWN,
+   * which reads as "Prowlarr is unreachable" rather than "your URL is wrong".
+   */
+  prowlarr: { baseUrl: string; apiKey: string };
   sonarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   radarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   bluebubbles: {
@@ -148,6 +161,10 @@ export function loadConfig(): Config {
     jellyfin: {
       baseUrl: process.env.JELLYFIN_URL ?? 'http://localhost:8096/jellyfin',
       apiKey: process.env.JELLYFIN_API_KEY ?? '',
+    },
+    prowlarr: {
+      baseUrl: process.env.PROWLARR_URL ?? 'http://192.168.1.7:9696',
+      apiKey: process.env.PROWLARR_API_KEY ?? '',
     },
     sonarr: {
       baseUrl: process.env.SONARR_URL ?? 'http://192.168.1.7:8989/sonarr/api/v3',

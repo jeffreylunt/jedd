@@ -193,3 +193,25 @@ test('an empty content path is null, matching the complete-but-no-path guard', (
   // One live torrent really does report an empty content_path.
   assert.equal(toHostPath('', MOUNTS), null);
 });
+
+// ── the release's own magnet ─────────────────────────────────────────────────
+
+test("🔴 a release's own magnet is used when its hash MATCHES the validated one", async () => {
+  // It carries the indexer's trackers; a synthesized magnet relies on DHT alone.
+  const { exec, commands } = ssh([{ stdout: '' }, ok200, { stdout: '' }]);
+  const own = `magnet:?xt=urn:btih:${HASH.toUpperCase()}&tr=udp%3A%2F%2Ftracker.example%3A80`;
+  await grabTorrent({ ...base, magnetUri: own, exec });
+  const add = commands.find((c) => c.includes('/torrents/add'))!;
+  assert.match(add, /tracker\.example/, 'the trackers must survive');
+});
+
+test('🔴 a supplied magnet whose hash does NOT match is ignored, not trusted', async () => {
+  // A URI from a third-party indexer cannot ride along with a different payload
+  // than the hash we validated.
+  const { exec, commands } = ssh([{ stdout: '' }, ok200, { stdout: '' }]);
+  const hostile = 'magnet:?xt=urn:btih:0000000000000000000000000000000000000000&tr=udp%3A%2F%2Fevil%3A80';
+  await grabTorrent({ ...base, magnetUri: hostile, exec });
+  const add = commands.find((c) => c.includes('/torrents/add'))!;
+  assert.doesNotMatch(add, /evil/, 'a mismatched magnet must be discarded');
+  assert.match(add, /abcdef/i, 'and the validated hash used instead');
+});

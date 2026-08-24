@@ -37,6 +37,15 @@ export interface Release {
   title: string;
   /** 40 hex characters. The ONLY thing that makes a release grabbable. */
   infoHash: string;
+  /**
+   * The release's OWN magnet URI when it has one.
+   *
+   * ⚠️ Prefer it over a synthesized magnet: it carries the indexer's TRACKERS,
+   * and a bare `xt=urn:btih:` relies on DHT alone, which is markedly slower to
+   * find peers. Measured on real Prowlarr output — the `guid` field is itself a
+   * full magnet for these indexers.
+   */
+  magnetUri?: string;
   seeders: number;
   sizeBytes: number;
   indexer: string;
@@ -120,9 +129,11 @@ export class ProwlarrClient {
         discarded += 1;
         continue;
       }
+      const guid = typeof r['guid'] === 'string' ? r['guid'] : '';
       releases.push({
         title: String(r['title'] ?? ''),
         infoHash,
+        ...(guid.startsWith('magnet:') ? { magnetUri: guid } : {}),
         seeders: Number(r['seeders'] ?? 0),
         sizeBytes: Number(r['size'] ?? 0),
         indexer: String(r['indexer'] ?? '?'),
