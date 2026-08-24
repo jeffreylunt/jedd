@@ -74,14 +74,26 @@ export async function sendToKindle(
   }
 
   try {
-    // Amazon reads the ATTACHMENT, not the subject or body. Keeping both nearly
-    // empty is deliberate: "convert" in the subject used to trigger conversion,
-    // and an epub needs none.
+    /**
+     * 🔴 SUBJECT AND BODY MUST BE NON-EMPTY. MEASURED, AFTER GETTING IT WRONG.
+     *
+     * My first version sent an empty subject and empty body on the reasoning
+     * that Amazon reads only the attachment and that "convert" in the subject
+     * triggers conversion an epub does not need. **The second half is true and
+     * the conclusion did not follow — EMPTY is not the same as NOT SAYING
+     * "convert".**
+     *
+     * The live result: Amazon answered
+     * `E009 - No Attachment` for a message that definitely had one. V1's sends,
+     * which bounce zero times, carry `subject = <filename>` and the body
+     * `"Sent from Jedd."` — so this now matches the structure known to work
+     * rather than the one I reasoned my way into.
+     */
     const result = await send({
       from: kindle.fromEmail,
       to: input.toAddress,
-      subject: '',
-      text: '',
+      subject: input.filename,
+      text: 'Sent from Jedd.',
       attachments: [{ filename: input.filename, content: input.bytes }],
     });
     return {

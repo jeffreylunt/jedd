@@ -55,11 +55,14 @@ test('🔴 the from-address comes from config, and the address is NOT a paramete
   assert.equal(sent[0]?.to, 'korbyn96_yo0FhQ@kindle.com');
 });
 
-test('the attachment is what Amazon reads; subject and body stay empty', async () => {
-  // "convert" in the subject used to trigger conversion, and an epub needs none.
+test('🔴 the subject and body are NON-EMPTY — an empty message got E009 No Attachment', async () => {
+  // Measured: an empty subject and body produced "E009 - No Attachment" from
+  // Amazon for a message that definitely had one. V1's sends, which bounce zero
+  // times, carry subject = <filename> and body "Sent from Jedd."
   const { send, sent } = capturing();
   await sendToKindle(base, send);
-  assert.equal(sent[0]?.subject, '');
+  assert.equal(sent[0]?.subject, 'book.epub');
+  assert.ok((sent[0]?.text ?? '').length > 0, 'an empty body is what broke it');
   assert.equal(sent[0]?.attachments[0]?.filename, 'book.epub');
   assert.equal(sent[0]?.attachments[0]?.content.toString(), 'epub bytes');
 });
