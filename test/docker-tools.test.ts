@@ -1,0 +1,291 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import type { ExecImpl } from '../src/hp.js';
+import { isValidContainerName } from '../src/safety.js';
+import { containerNetns, dockerInspect, dockerLogs, dockerPs } from '../src/tools/docker.js';
+import type { Tool, ToolContext } from '../src/tools/types.js';
+import { testConfig } from './helpers.js';
+
+/**
+ * The docker tools run on the PRIVILEGED ssh identity. Everything here exists
+ * because of that one fact.
+ *
+ * `hp_shell` is unprivileged by OS enforcement, so a smuggled interpreter fails
+ * at the kernel. These tools have no such backstop: their command text reaches
+ * hp as the admin account, and the only defence between a model-supplied
+ * container name and a privileged remote shell is `isValidContainerName`.
+ *
+ * So the tests assert the thing that is NOT observable from a return value: that
+ * a refused name produced **no ssh call at all**. A tool that refuses in its
+ * reply while having already run the command would look identical from the
+ * outside, and that is precisely the shape of the bug this file is here to catch.
+ */
+
+/** Every ssh invocation a tool made: the host it used and the command it sent. */
+interface SshLog {
+  calls: { host: string; command: string }[];
+  exec: ExecImpl;
+}
+
+/**
+ * An exec stub that records each ssh call and answers from a script.
+ *
+ * `respond` receives the command string, so a test can answer `docker inspect`
+ * differently from `docker exec … readlink` within one tool run.
+ */
+function sshSpy(
+  respond: (command: string) => { stdout?: string; stderr?: string; error?: unknown } = () => ({}),
+): SshLog {
+  const calls: { host: string; command: string }[] = [];
+  const exec: ExecImpl = (_file, args, _options, callback) => {
+    const host = args[4] ?? '';
+    const command = args[5] ?? '';
+    calls.push({ host, command });
+    const r = respond(command);
+    setImmediate(() => callback(r.error ?? null, r.stdout ?? '', r.stderr ?? ''));
+  };
+  return { calls, exec };
+}
+
+function ctxWith(spy: SshLog, overrides = {}): ToolContext {
+  return {
+    role: 'owner',
+    senderHandle: '+18015550123',
+    config: testConfig(overrides),
+    exec: spy.exec,
+  };
+}
+
+const DOCKER_TOOLS: Tool[] = [dockerPs, dockerInspect, dockerLogs, containerNetns];
+const NAMED_TOOLS: Tool[] = [dockerInspect, dockerLogs, containerNetns];
+
+/**
+ * Names that are not names. Each one, interpolated unescaped into
+ * `docker inspect … ${name}`, executes a second command as the admin account.
+ */
+const INJECTIONS = [
+  'sonarr; docker restart gluetun',
+  'sonarr && docker restart gluetun',
+  'sonarr | docker restart gluetun',
+  'sonarr$(docker restart gluetun)',
+  'sonarr`docker restart gluetun`',
+  "sonarr'; docker restart gluetun; '",
+  'sonarr\ndocker restart gluetun',
+  'sonarr --format {{.Id}}',
+  '$(id)',
+  '../../etc/passwd',
+  '-sonarr',
+  '.sonarr',
+  'sonarr gluetun',
+  '',
+  ' ',
+];
+
+test('🔴 isValidContainerName refuses every shape that would become a second command', () => {
+  for (const bad of INJECTIONS) {
+    assert.equal(isValidContainerName(bad), false, `"${bad}" must be refused`);
+  }
+});
+
+test('CONTROL: real homelab container names are still accepted', () => {
+  // Without this, a validator that returned false for everything would pass the
+  // test above while deleting the capability entirely.
+  for (const good of [
+    'sonarr',
+    'gluetun',
+    'jellyfin',
+    'audiobookshelf-audiobookshelf-1',
+    'qbittorrent',
+    'dispatcharr',
+    'a',
+    'my_app.v2-1',
+  ]) {
+    assert.equal(isValidContainerName(good), true, `"${good}" must be accepted`);
+  }
+});
+
+test('🔴 a refused container name produces NO ssh call — the command is not merely reported as refused', async () => {
+  for (const tool of NAMED_TOOLS) {
+    for (const bad of INJECTIONS) {
+      const spy = sshSpy();
+      const result = await tool.run({ container: bad }, ctxWith(spy));
+      assert.equal(result.ok, false, `${tool.name} must refuse "${bad}"`);
+      assert.equal(
+        spy.calls.length,
+        0,
+        `${tool.name} ran ${spy.calls.length} ssh call(s) for refused input "${bad}": ` +
+          `${spy.calls.map((c) => c.command).join(' ;; ')}`,
+      );
+    }
+  }
+});
+
+test('CONTROL: a VALID name does reach ssh, so the spy above could have seen a leak', async () => {
+  for (const tool of NAMED_TOOLS) {
+    const spy = sshSpy((command) =>
+      command.includes('readlink') ? { stdout: 'net:[4026532519]\n' } : { stdout: 'sonarr|Up 2 hours\n' },
+    );
+    await tool.run({ container: 'sonarr' }, ctxWith(spy));
+    assert.ok(spy.calls.length > 0, `${tool.name} made no ssh call even for a valid name`);
+  }
+});
+
+test('🔴 every docker tool uses the ADMIN identity, never the unprivileged shell one', async () => {
+  // Pointing one of these at the shell account would not fail loudly — it would
+  // return "permission denied" and read as a broken container.
+  const config = { adminSshHost: 'admin-host', shellSshHost: 'shell-host' };
+  for (const tool of DOCKER_TOOLS) {
+    const spy = sshSpy((command) =>
+      command.includes('readlink') ? { stdout: 'net:[4026532519]\n' } : { stdout: 'sonarr|Up 2 hours\n' },
+    );
+    await tool.run({ container: 'sonarr' }, ctxWith(spy, config));
+    assert.ok(spy.calls.length > 0, `${tool.name} made no ssh call`);
+    for (const call of spy.calls) {
+      assert.equal(call.host, 'admin-host', `${tool.name} used "${call.host}" for: ${call.command}`);
+    }
+  }
+});
+
+test('🔴 no docker tool declares a free-form STRING parameter other than the container name', () => {
+  // The whole reason these are safe on the privileged identity is that the only
+  // string that ever reaches the remote shell is a validated container name. A
+  // `grep`/`format`/`args` parameter would quietly reintroduce model-composed
+  // command text with none of the OS backstop hp_shell has.
+  for (const tool of DOCKER_TOOLS) {
+    const props = (tool.parameters as { properties?: Record<string, { type?: string }> }).properties ?? {};
+    for (const [name, schema] of Object.entries(props)) {
+      if (schema.type === 'string') {
+        assert.equal(
+          name,
+          'container',
+          `${tool.name} declares a string parameter "${name}" — that is model-composed command text`,
+        );
+      }
+    }
+  }
+});
+
+test('docker_logs clamps its numbers and emits only digits into the command', async () => {
+  const cases: { tail: unknown; since: unknown; expectTail: number }[] = [
+    { tail: 999_999, since: undefined, expectTail: 1000 },
+    { tail: -5, since: undefined, expectTail: 1 },
+    { tail: undefined, since: undefined, expectTail: 100 },
+    { tail: 12.9, since: undefined, expectTail: 12 },
+  ];
+  for (const c of cases) {
+    const spy = sshSpy(() => ({ stdout: 'a log line\n' }));
+    await dockerLogs.run({ container: 'jellyfin', tail: c.tail }, ctxWith(spy));
+    assert.match(spy.calls[0]?.command ?? '', new RegExp(`^docker logs --tail ${c.expectTail} jellyfin 2>&1$`));
+  }
+
+  // A string in a number field must not be interpolated as text.
+  const spy = sshSpy(() => ({ stdout: 'x\n' }));
+  await dockerLogs.run({ container: 'jellyfin', tail: '5; docker restart gluetun' }, ctxWith(spy));
+  assert.equal(spy.calls[0]?.command, 'docker logs --tail 100 jellyfin 2>&1');
+
+  const spySince = sshSpy(() => ({ stdout: 'x\n' }));
+  await dockerLogs.run({ container: 'jellyfin', since_minutes: 99_999 }, ctxWith(spySince));
+  assert.equal(spySince.calls[0]?.command, 'docker logs --tail 100 --since 1440m jellyfin 2>&1');
+});
+
+test('docker_ps: exit 0 with no rows is UNKNOWN, not "no containers"', async () => {
+  const spy = sshSpy(() => ({ stdout: '   \n' }));
+  const result = await dockerPs.run({}, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /UNKNOWN/);
+
+  // Control: real rows are reported as a success, so the assertion above is
+  // about emptiness rather than about the tool never succeeding.
+  const spyOk = sshSpy(() => ({ stdout: 'sonarr|Up 2 hours|linuxserver/sonarr\n' }));
+  const good = await dockerPs.run({}, ctxWith(spyOk));
+  assert.equal(good.ok, true);
+  assert.match(good.content, /sonarr\|Up 2 hours/);
+});
+
+test('docker_ps: a failing ssh call never reads as an empty container list', async () => {
+  const spy = sshSpy(() => ({ error: new Error('ssh: connect to host hp port 22: No route to host') }));
+  const result = await dockerPs.run({}, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /UNKNOWN/);
+});
+
+/** Script the two netns reads: the subject container, then gluetun. */
+function netnsSpy(subject: { status?: string; inode?: string }, gluetun: { status?: string; inode?: string }, mode = 'container:gluetun'): SshLog {
+  return sshSpy((command) => {
+    if (command.includes('HostConfig.NetworkMode')) return { stdout: `${mode}\n` };
+    if (command.startsWith('docker ps -a') && command.includes('^gluetun')) {
+      return gluetun.status === undefined ? { error: new Error('boom') } : { stdout: `gluetun|${gluetun.status}\n` };
+    }
+    if (command.startsWith('docker ps -a')) {
+      return subject.status === undefined ? { error: new Error('boom') } : { stdout: `sonarr|${subject.status}\n` };
+    }
+    if (command.includes('docker exec gluetun')) {
+      return gluetun.inode ? { stdout: `net:[${gluetun.inode}]\n` } : { error: new Error('exec failed') };
+    }
+    if (command.includes('docker exec')) {
+      return subject.inode ? { stdout: `net:[${subject.inode}]\n` } : { error: new Error('exec failed') };
+    }
+    return {};
+  });
+}
+
+test('container_netns: matching inodes report a healthy shared namespace', async () => {
+  const spy = netnsSpy({ status: 'Up 2 hours', inode: '4026532519' }, { status: 'Up 3 hours', inode: '4026532519' });
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, true);
+  assert.match(result.content, /IS in gluetun's network namespace/);
+  assert.match(result.content, /4026532519/);
+});
+
+test('🔴 container_netns: DIFFERENT inodes on a container:gluetun dependent is the stale-namespace fault', async () => {
+  // docker ps says Up and docker inspect says container:gluetun in BOTH states.
+  // The inode is the only thing that separates them, which is why this tool
+  // exists rather than a `docker inspect` of the network mode.
+  const spy = netnsSpy({ status: 'Up 2 hours', inode: '4026531999' }, { status: 'Up 3 hours', inode: '4026532519' });
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /STALE NAMESPACE/);
+  assert.match(result.content, /restart_arr_stack/);
+});
+
+test('🔴 container_netns: an unreadable probe is UNKNOWN and never reads as healthy', async () => {
+  // Subject running but exec fails.
+  const execFailed = netnsSpy({ status: 'Up 2 hours' }, { status: 'Up 3 hours', inode: '4026532519' });
+  const a = await containerNetns.run({ container: 'sonarr' }, ctxWith(execFailed));
+  assert.equal(a.ok, false);
+  assert.match(a.content, /UNKNOWN/);
+
+  // Subject stopped: docker exec would fail with a message that reads like a
+  // namespace problem and is not one.
+  const stopped = netnsSpy({ status: 'Exited (0) 5 minutes ago' }, { status: 'Up 3 hours', inode: '4026532519' });
+  const b = await containerNetns.run({ container: 'sonarr' }, ctxWith(stopped));
+  assert.equal(b.ok, false);
+  assert.match(b.content, /not running/);
+
+  // Subject fine, gluetun unreadable: the comparison is unknown, not a match.
+  const noTunnel = netnsSpy({ status: 'Up 2 hours', inode: '4026532519' }, { status: 'Up 3 hours' });
+  const c = await containerNetns.run({ container: 'sonarr' }, ctxWith(noTunnel));
+  assert.equal(c.ok, false);
+  assert.match(c.content, /UNKNOWN/);
+});
+
+test('container_netns: a container NOT on the tunnel is reported plainly, not as a mismatch', async () => {
+  // A false alarm here would train the reader to ignore the real one.
+  const spy = netnsSpy({ status: 'Up 2 hours', inode: '4026531840' }, { status: 'Up 3 hours', inode: '4026532519' }, 'bridge');
+  const result = await containerNetns.run({ container: 'jellyfin' }, ctxWith(spy));
+  assert.equal(result.ok, true);
+  assert.match(result.content, /nothing to compare/);
+  assert.doesNotMatch(result.content, /STALE/);
+});
+
+test('container_netns: garbage where an inode should be is UNKNOWN, not a comparison', async () => {
+  // `readlink` exiting 0 with unexpected text must not half-parse into a verdict.
+  const spy = sshSpy((command) => {
+    if (command.includes('HostConfig.NetworkMode')) return { stdout: 'container:gluetun\n' };
+    if (command.startsWith('docker ps -a')) return { stdout: 'sonarr|Up 2 hours\n' };
+    return { stdout: 'Error response from daemon: something went wrong\n' };
+  });
+  const result = await containerNetns.run({ container: 'sonarr' }, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /UNKNOWN is not healthy|could NOT be read/);
+});

@@ -1,10 +1,21 @@
 import type { Config } from '../config.js';
+import type { ExecImpl } from '../hp.js';
 import type { Role } from '../permissions.js';
 
 export interface ToolContext {
   role: Role;
   senderHandle: string;
   config: Config;
+  /**
+   * Test seam ONLY: the exec implementation `runOnHp` should use. Unset in
+   * production, where `runOnHp` falls back to `execFile`.
+   *
+   * It exists so a test can assert on the exact command string a tool would have
+   * sent over ssh — including asserting that a REFUSED argument produced no ssh
+   * call at all. A refusal that still ran the command is the failure mode this
+   * seam is here to detect, and it is not observable from the return value.
+   */
+  exec?: ExecImpl;
 }
 
 /**

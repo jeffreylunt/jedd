@@ -16,12 +16,13 @@ import { fail, ok, type Tool } from './types.js';
 export const hpShell: Tool = {
   name: 'hp_shell',
   description:
-    'Run a READ-ONLY shell command on the homelab host (hp, 192.168.1.7) over ssh. ' +
-    'Use this for anything diagnostic: docker ps/inspect/logs/stats, curl against a local service, ' +
-    'reading files, checking load. Returns exit code, stdout and stderr separately — always read the ' +
-    'exit code, because an empty stdout with a non-zero exit is an ERROR, not an empty result. ' +
-    'Commands that would change the system are refused by a code gate; restarting a container is a ' +
-    'separate tool.',
+    'Run a READ-ONLY shell command on the homelab host (hp, 192.168.1.7) over ssh, as an ' +
+    'UNPRIVILEGED account. Use this for host-level diagnostics: uptime, df, free, ps, ss, reading ' +
+    'files, curl against a local service. Returns exit code, stdout and stderr separately — always ' +
+    'read the exit code, because an empty stdout with a non-zero exit is an ERROR, not an empty ' +
+    'result. This account has NO docker access, so docker commands here fail with "permission ' +
+    'denied" — use docker_ps, docker_inspect, docker_logs and container_netns instead. Commands that ' +
+    'would change the system are refused by a code gate; restarting a container is a separate tool.',
   minRole: 'owner',
   parameters: {
     type: 'object',

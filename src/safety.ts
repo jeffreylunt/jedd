@@ -316,3 +316,24 @@ export function assertSafeToRestart(
     reason: `${container} is completely down and Jellyfin reports no active playback (${opts.playback.detail}).`,
   };
 }
+
+/**
+ * 🔴 The ONLY thing standing between a model-supplied container name and the
+ * PRIVILEGED ssh identity.
+ *
+ * Structured docker tools run as the admin account, and their command strings
+ * are literals in this repo with exactly one hole in them: the container name.
+ * That hole is interpolated into a string the REMOTE shell will parse, so a name
+ * containing `;`, a space, `$(…)`, a backtick or a newline would not be a name —
+ * it would be a second command, running privileged, with the whole point of the
+ * identity split bypassed.
+ *
+ * The pattern is Docker's own (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), so nothing that is
+ * genuinely a container name is rejected. Everything else is refused before it
+ * reaches ssh. **Do not loosen this to "escape it instead" — validation of a
+ * known-narrow shape is checkable; escaping is a shell-quoting argument nobody
+ * wins.**
+ */
+export function isValidContainerName(name: string): boolean {
+  return /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(name);
+}

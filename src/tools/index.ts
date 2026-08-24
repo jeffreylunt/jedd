@@ -1,5 +1,6 @@
 import { assertShellIdentityIsSafe, type Config } from '../config.js';
 import { roleSatisfies, type Role } from '../permissions.js';
+import { containerNetns, dockerInspect, dockerLogs, dockerPs } from './docker.js';
 import {
   hpShell,
   jellyfinSearch,
@@ -25,10 +26,25 @@ import type { Tool } from './types.js';
  *
  * If you add a tool that interpolates model-supplied STRINGS into a shell
  * command, it belongs on the shell identity, not the admin one.
+ *
+ * The docker tools (`docker_ps`, `docker_inspect`, `docker_logs`,
+ * `container_netns`) are the reason the identity split costs no capability. The
+ * shell account has no docker access at all, and none is missing: those reads
+ * were never shell-shaped. Their command strings are literals here with one
+ * hole, a container name, validated by `isValidContainerName` before it is
+ * interpolated. 🔴 That validation is the entire defence on the privileged
+ * identity — see `src/tools/docker.ts`.
  */
 
 const GUEST_TOOLS: Tool[] = [requestMedia, jellyfinSearch, homelabStatus];
-const OWNER_READ_TOOLS: Tool[] = [jellyfinSessions, livetvStatus];
+const OWNER_READ_TOOLS: Tool[] = [
+  jellyfinSessions,
+  livetvStatus,
+  dockerPs,
+  dockerInspect,
+  dockerLogs,
+  containerNetns,
+];
 const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack];
 
 /**
