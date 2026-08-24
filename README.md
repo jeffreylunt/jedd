@@ -56,6 +56,16 @@ So `hp_shell` connects to hp as an **unprivileged ssh identity with no docker gr
 the safety preconditions. A smuggled interpreter then fails at the kernel regardless of what the
 filter believed. **`hp_shell` is not registered at all when the two are equal.**
 
+**The boundary is PROVEN at every boot, by running something.** `proveShellIdentityIsSafe()` reads
+`id` on both ssh identities and requires **different uids**, a non-root shell identity and no
+privileged group; then attempts the docker crossing with the admin identity succeeding as the
+inverting control. `buildTools()` registers `hp_shell` only on a safe verdict, so **forgetting to
+prove the boundary yields no shell** rather than one granted on a string comparison.
+
+⚠️ It replaced a check that compared two ssh **aliases for inequality**, which meant
+`HP_SHELL_SSH_HOST=jeff@hp` against `HP_ADMIN_SSH_HOST=hp` read as a live split while being one
+account — and an empty value passed too. **A string comparison is not a boundary check.**
+
 **The account exists and the boundary is live** (`jedd-shell@hp`, uid 1001, sole group
 `jedd-shell` — no docker, no sudo, key auth only, Unix password locked). Provisioned 2026-08-24;
 `JEDD_ALLOW_SHARED_SSH_IDENTITY` is gone from `.env` and the UNSAFE boot warning with it.
