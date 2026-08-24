@@ -10,6 +10,7 @@ import {
   restartArrStack,
   restartContainer,
 } from './homelab.js';
+import { addAudiobook } from './add-audiobook.js';
 import { makeAddMovie, makeAddSeries } from './add-media.js';
 import { makeCatalogueSearch } from './catalogue.js';
 import { resolveChoice } from './choice.js';
@@ -52,7 +53,7 @@ const GUEST_TOOLS: Tool[] = [jellyfinSearch, homelabStatus, makeCatalogueSearch(
  * and the reason `registerable()` now quantifies the kill switch over the whole
  * registry instead. This is the first real member of that combination.
  */
-const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries(), saveKindleEmail];
+const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries(), saveKindleEmail, addAudiobook];
 const OWNER_READ_TOOLS: Tool[] = [
   jellyfinSessions,
   livetvStatus,

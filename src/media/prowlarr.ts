@@ -175,3 +175,64 @@ export function rankReleases(releases: Release[]): Release[] {
     return b.seeders - a.seeders;
   });
 }
+
+/**
+ * Rank AUDIOBOOK releases.
+ *
+ * ── 🔴 THE PREFERENCE IS A PARAMETER. THE CLASSIFICATION IS NOT. ─────────────
+ *
+ * These are different things and V1 conflated them:
+ *
+ * - **Classifying a RELEASE** as GraphicAudio or abridged reads the indexer's
+ *   own title. That is data, structured by convention, and matching it is the
+ *   same kind of act as reading a file extension.
+ * - **Deciding what the PERSON WANTS** must never be mined from conversation.
+ *   V1 ran `/graphic\s*audio/i` over the WHOLE session **including Jedd's own
+ *   prior turns**, so *"no, NOT the graphic audio version"* turned the
+ *   preference ON by negation-blindness, and Jedd's own listing text then
+ *   **re-asserted it for the rest of the window** — a detector reading its own
+ *   output and latching.
+ *
+ * So `wantGraphicAudio` arrives here as a boolean the MODEL set from what the
+ * person actually said. Nothing in this file reads a conversation.
+ */
+export interface AudiobookPrefs {
+  /** Set by the model from the person's own words. Never inferred here. */
+  wantGraphicAudio: boolean;
+}
+
+const GRAPHIC_AUDIO = /graphic\s*audio/i;
+const ABRIDGED = /\babridged\b/i;
+const UNABRIDGED = /\bunabridged\b/i;
+
+export function classifyAudiobook(title: string): {
+  graphicAudio: boolean;
+  abridged: boolean;
+} {
+  // ⚠️ "unabridged" contains "abridged". Check the negation FIRST, or every
+  // unabridged release is classified as abridged — the \bn't\b trap in a new
+  // costume, and this one is a substring rather than a contraction.
+  const unabridged = UNABRIDGED.test(title);
+  return {
+    graphicAudio: GRAPHIC_AUDIO.test(title),
+    abridged: !unabridged && ABRIDGED.test(title),
+  };
+}
+
+export function rankAudiobooks(releases: Release[], prefs: AudiobookPrefs): Release[] {
+  const score = (r: Release): number[] => {
+    const c = classifyAudiobook(r.title);
+    return [
+      r.seeders > 0 ? 1 : 0, // alive before dead: a 0-seeder release never completes
+      c.graphicAudio === prefs.wantGraphicAudio ? 1 : 0, // matches what they asked for
+      c.abridged ? 0 : 1, // unabridged unless they said otherwise
+      r.seeders, // tiebreak
+    ];
+  };
+  return [...releases].sort((a, b) => {
+    const x = score(a);
+    const y = score(b);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i]! - x[i]!;
+    return 0;
+  });
+}

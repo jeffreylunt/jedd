@@ -113,3 +113,35 @@ test('alive releases outrank dead ones, then by seeders', () => {
   const ranked = rankReleases([mk('dead', 0), mk('few', 3), mk('many', 40)]);
   assert.deepEqual(ranked.map((r) => r.title), ['many', 'few', 'dead']);
 });
+
+// ── 🔴 audiobook ranking: preference is a parameter, classification is not ───
+
+import { classifyAudiobook, rankAudiobooks } from '../src/media/prowlarr.js';
+
+const ab = (title: string, seeders = 10) => ({ title, seeders, infoHash: HASH, sizeBytes: 1, indexer: 'i' });
+
+test('🔴 "unabridged" is NOT classified as abridged — it contains the word', () => {
+  // The \bn't\b trap in a new costume, and worse: a substring rather than a
+  // contraction. Every unabridged release would otherwise be demoted.
+  assert.equal(classifyAudiobook('Dune [Unabridged]').abridged, false);
+  assert.equal(classifyAudiobook('Dune [Abridged]').abridged, true);
+});
+
+test('🔴 the GraphicAudio PREFERENCE is a parameter, never mined from text', () => {
+  // V1 regexed the whole session INCLUDING Jedd's own turns, so "no, NOT the
+  // graphic audio version" turned it ON, and Jedd's own listing then re-asserted
+  // it for the rest of the window.
+  const list = [ab('Dune GraphicAudio'), ab('Dune Unabridged')];
+  assert.match(rankAudiobooks(list, { wantGraphicAudio: false })[0]!.title, /Unabridged/);
+  assert.match(rankAudiobooks(list, { wantGraphicAudio: true })[0]!.title, /GraphicAudio/);
+});
+
+test('a dead release never outranks a live one, whatever else matches', () => {
+  const list = [ab('Dune GraphicAudio', 0), ab('Dune plain', 5)];
+  assert.equal(rankAudiobooks(list, { wantGraphicAudio: true })[0]!.title, 'Dune plain');
+});
+
+test('unabridged beats abridged when neither is preferred by name', () => {
+  const list = [ab('Dune Abridged'), ab('Dune Unabridged')];
+  assert.match(rankAudiobooks(list, { wantGraphicAudio: false })[0]!.title, /Unabridged/);
+});
