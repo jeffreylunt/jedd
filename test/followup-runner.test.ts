@@ -292,3 +292,34 @@ test('nothing due means nothing happens', async () => {
   assert.equal(b.calls.length, 0, 'a follow-up that is not due must not even probe');
   assert.equal(sent.length, 0);
 });
+
+test('🔴 "could not measure the host" and "still contended" are DIFFERENT messages', async () => {
+  // Both hold the throttle, so the authorisation outcome is the same — but the
+  // user is being told two different facts about the world, and collapsing them
+  // is the same defect as reporting a blind probe as good news.
+  const unmeasurable = store();
+  const fu = scheduleDue(unmeasurable);
+  const sentA: { to: string; text: string }[] = [];
+  // Latency probe fails outright => contention verdict is UNKNOWN.
+  const blindBox = box({ latency: 'http=000 total=20.000000' });
+  const dA = deps(blindBox, sessions(NOBODY), sentA);
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    unmeasurable.all().find((x) => x.id === fu.id)!.dueAt = new Date(Date.now() - 1000).toISOString();
+    await runDueFollowups(unmeasurable, dA);
+  }
+  assert.equal(sentA.length, 1);
+  assert.match(sentA[0]!.text, /could not measure/i);
+
+  const contended = store();
+  const fc = scheduleDue(contended);
+  const sentB: { to: string; text: string }[] = [];
+  const busyBox = box({ latency: SLOW, qbitInfo: '{"dl_info_speed":8388608,"up_info_speed":5242880}' });
+  const dB = deps(busyBox, sessions(NOBODY), sentB);
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    contended.all().find((x) => x.id === fc.id)!.dueAt = new Date(Date.now() - 1000).toISOString();
+    await runDueFollowups(contended, dB);
+  }
+  assert.equal(sentB.length, 1);
+  assert.match(sentB[0]!.text, /still loaded/i);
+  assert.doesNotMatch(sentB[0]!.text, /could not measure/i);
+});

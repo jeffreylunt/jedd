@@ -549,3 +549,30 @@ test("🔴 restore refuses to cancel a throttle that is not Jedd's", async () =>
   const okResult = await restoreQbitSpeed.run({}, ctxWith(ours));
   assert.equal(okResult.ok, true, okResult.content);
 });
+
+test('🔴 the shed does not PROMISE a follow-up it could not schedule', async () => {
+  // ctx.followups is optional, so the fix still works without a scheduler — but
+  // a tool that says "I'll check back" when nothing is watching has made a
+  // promise the system cannot keep, and the throttle would sit there forever
+  // with the user believing it was handled.
+  const spy = contendedBox(FAST);
+  const withoutScheduler = await shedHostLoad.run({}, ctxWith(spy));
+  assert.match(withoutScheduler.content, /could NOT schedule/);
+  assert.match(withoutScheduler.content, /stay on until someone removes it/);
+  assert.doesNotMatch(withoutScheduler.content, /I will check back/);
+
+  // CONTROL: with a scheduler it does promise, and it schedules something real.
+  const scheduled: unknown[] = [];
+  const withScheduler = await shedHostLoad.run({}, {
+    ...ctxWith(contendedBox(FAST)),
+    followups: {
+      schedule(input: unknown) {
+        scheduled.push(input);
+        return { id: 'f1' };
+      },
+    } as never,
+  });
+  assert.equal(scheduled.length, 1, 'it must actually schedule the return visit');
+  assert.match(withScheduler.content, /I will check back/);
+  assert.doesNotMatch(withScheduler.content, /could NOT schedule/);
+});

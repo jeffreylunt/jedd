@@ -294,3 +294,34 @@ test('pendingOfKind stops a second follow-up being scheduled for one event', () 
   store.resolve(f.id, 'done', 'lifted');
   assert.equal(store.pendingOfKind('restore-qbit-throttle'), undefined);
 });
+
+test('🔴 the truncation note reaches the MODEL, not just the store\'s return value', async () => {
+  // The store computing a note nobody forwards is the same silent loss V1 had.
+  const path = tempFile('history.jsonl');
+  const store = new HistoryStore(path);
+  for (let i = 0; i < MAX_REPLAY_TURNS + 3; i++) store.record('+18015550123', `q${i}`, `a${i}`);
+
+  let seen: string[] = [];
+  const llm: LlmClient = {
+    label: 'test',
+    async chat(messages): Promise<LlmReply> {
+      seen = messages.map((m) => String(m.content));
+      return { text: 'ok', toolCalls: [] };
+    },
+  };
+  await new Agent(testConfig(), llm, undefined, [], new HistoryStore(path)).handle('+18015550123', 'hi');
+  assert.ok(
+    seen.some((c) => c.includes('no longer in your history')),
+    'the model must be told its history was truncated',
+  );
+
+  // CONTROL: an untruncated conversation carries no such note, so the assertion
+  // above is about truncation and not about some banner that is always present.
+  const short = tempFile('history.jsonl');
+  new HistoryStore(short).record('+18015550123', 'q', 'a');
+  await new Agent(testConfig(), llm, undefined, [], new HistoryStore(short)).handle('+18015550123', 'hi');
+  assert.equal(
+    seen.some((c) => c.includes('no longer in your history')),
+    false,
+  );
+});
