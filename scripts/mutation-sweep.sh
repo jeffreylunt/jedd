@@ -26,6 +26,12 @@
 #   name of the mutation
 #   <<<FROM<<<literal text to replace>>>TO<<<replacement>>>END
 #   CASES
+#
+# ⚠️ FROM and TO are SINGLE-LINE. A multi-line spec is silently truncated by the
+# line reader and then fails to apply -- which the applied-count assertion
+# catches, but only after wasting the run. Use \n in the spec for a newline;
+# it is expanded below. Pick the shortest UNIQUE single line instead where you
+# can: `replace(..., 1)` hits the first occurrence, so uniqueness matters.
 
 set -uo pipefail
 SRC="${1:?usage: mutation-sweep.sh <source-file> <test-file>}"
@@ -48,6 +54,8 @@ while IFS= read -r line; do
   IFS= read -r spec || break
   from="${spec#*<<<FROM<<<}"; from="${from%%>>>TO<<<*}"
   to="${spec#*>>>TO<<<}";     to="${to%%>>>END*}"
+  # Expand \n so a multi-line mutation is expressible on one spec line.
+  from=$(printf '%b' "$from"); to=$(printf '%b' "$to")
   INTENDED=$((INTENDED+1))
 
   if ! FROM="$from" TO="$to" python3 -c '
