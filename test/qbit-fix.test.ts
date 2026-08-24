@@ -512,3 +512,40 @@ test('preferences with the right keys and the wrong types is UNKNOWN, not permis
   assert.equal(wrote(spy.calls), false);
   assert.match(result.content, /UNKNOWN is not permission/);
 });
+
+test('🔴 the recovery boundary is pinned from both sides too', async () => {
+  // `to < CONTENTION_MS` vs `<=` survived a sweep because no fixture landed on
+  // the boundary. Exactly at the threshold, the box is still contended — the
+  // contention check treats `>= CONTENTION_MS` as contended, and the two must
+  // agree or a box can be simultaneously "contended" and "fixed".
+  const at = fakeQbit({ latency: (n) => (n === 1 ? probes(310) : probes(CONTENTION_MS)) });
+  const atResult = await shedHostLoad.run({}, ctxWith(at));
+  assert.equal(atResult.ok, false, 'latency exactly at the threshold is not fixed');
+  assert.doesNotMatch(atResult.content, /^FIXED\./);
+
+  const under = fakeQbit({ latency: (n) => (n === 1 ? probes(310) : probes(CONTENTION_MS - 0.01)) });
+  const underResult = await shedHostLoad.run({}, ctxWith(under));
+  assert.equal(underResult.ok, true, 'a hair under the threshold IS fixed');
+  assert.match(underResult.content, /^FIXED\./);
+});
+
+test("🔴 restore refuses to cancel a throttle that is not Jedd's", async () => {
+  // qBittorrent's own scheduler can put the box into alternate mode. Clearing
+  // someone else's limit is the mirror image of the clobber the shed refuses.
+  const spy = fakeQbit({ latency: () => FAST, altDown: 3_000_000, altUp: 900_000 });
+  const result = await restoreQbitSpeed.run({}, ctxWith(spy));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /not the values I would have set|not mine to do/);
+  assert.equal(
+    spy.calls.some((c) => c.command.includes('setSpeedLimitsMode')),
+    false,
+    "must not flip the mode on someone else's throttle",
+  );
+  assert.equal(spy.state.altDown, 3_000_000, 'and must not clear their values');
+
+  // CONTROL: our own shed values ARE restorable, so the guard is about ownership
+  // and not about refusing everything.
+  const ours = fakeQbit({ latency: () => FAST, altDown: 1_048_576, altUp: 262_144 });
+  const okResult = await restoreQbitSpeed.run({}, ctxWith(ours));
+  assert.equal(okResult.ok, true, okResult.content);
+});
