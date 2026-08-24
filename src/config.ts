@@ -72,6 +72,15 @@ export interface Config {
      * approved list, so a NEW from-address means E014 for every existing ebook
      * user until they each add it — which looks like nothing from our side.
      * V2 sends from the SAME address V1 sends from. Do not "tidy" this.
+     *
+     * ⚠️ **`KINDLE_FROM_EMAIL` IN `.env` IS AUTHORITATIVE. The literal below is
+     * only a fallback for when that variable is absent — editing it alone
+     * CHANGES NOTHING**, because the environment overrides it.
+     *
+     * That is the dangerous direction: `config.ts` is where someone looks for a
+     * value, so a developer who "fixes" it here and not in `.env` gets a silent
+     * no-op and believes the change landed. The warning is duplicated at both
+     * edit sites deliberately; the VALUE has exactly one owner, and it is `.env`.
      */
     fromEmail: string;
     smtpPassword: string;
