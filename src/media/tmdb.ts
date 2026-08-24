@@ -67,7 +67,22 @@ export interface PopularItem {
 }
 
 export type PopularAnswer =
-  | { state: 'results'; kind: PopularKind; items: PopularItem[] }
+  | {
+      state: 'results';
+      kind: PopularKind;
+      items: PopularItem[];
+      /**
+       * How many rows TMDB actually returned, before `normalise` dropped any.
+       *
+       * 🔴 THE CALLER NEEDS BOTH NUMBERS TO TELL TWO ZEROS APART. `items: []`
+       * out of `considered: 0` is an empty list; `items: []` out of
+       * `considered: 20` is a filter that rejected everything, which is a field
+       * rename we have not noticed — not a finding about what is popular.
+       */
+      considered: number;
+      /** Keys of the first row, so a rename is diagnosable from the message alone. */
+      sampleKeys: string[];
+    }
   | { state: 'unknown'; detail: string };
 
 export interface TmdbOptions {
@@ -104,10 +119,18 @@ export class TmdbClient {
       return { state: 'unknown', detail: `could not reach ${url}: ${(e as Error).message}` };
     }
 
-    let raw = '';
-    let body: unknown = null;
+    // ⚠️ Two separate failures, reported separately. Folded into one `try`, a
+    // connection dropped mid-body yields `raw = ''` and the message "the body is
+    // not JSON", which blames TMDB's response shape for a transport fault and
+    // sends whoever debugs it in the wrong direction.
+    let raw: string;
     try {
       raw = await res.text();
+    } catch (e) {
+      return { state: 'unknown', detail: `the response from ${url} could not be read: ${(e as Error).message}` };
+    }
+    let body: unknown = null;
+    try {
       body = JSON.parse(raw);
     } catch {
       body = null;
@@ -138,13 +161,20 @@ export class TmdbClient {
       };
     }
 
+    const rows = results as Record<string, unknown>[];
     const items: PopularItem[] = [];
-    for (const r of results as Record<string, unknown>[]) {
+    for (const r of rows) {
       const item = normalise(r, endpoint.media, items.length + 1);
       if (item) items.push(item);
       if (items.length >= limit) break;
     }
-    return { state: 'results', kind, items };
+    return {
+      state: 'results',
+      kind,
+      items,
+      considered: rows.length,
+      sampleKeys: rows.length ? Object.keys(rows[0] ?? {}) : [],
+    };
   }
 }
 
@@ -175,10 +205,13 @@ function normalise(
   if (!Number.isFinite(tmdbId) || tmdbId <= 0) return null;
 
   // Films carry `title`, shows carry `name`. Same for the date fields.
-  const title = String(r['title'] ?? r['name'] ?? '').trim();
+  // ⚠️ `||`, not `??`: `??` does not fire on an EMPTY STRING, so a row with
+  // `title: ""` would resolve to `''` instead of falling through to `name`. The
+  // same trap has its own 🔴 test in chokepoint.test.ts, for HP_SHELL_SSH_HOST.
+  const title = String(r['title'] || r['name'] || '').trim();
   if (!title) return null;
 
-  const date = String(r['release_date'] ?? r['first_air_date'] ?? '');
+  const date = String(r['release_date'] || r['first_air_date'] || '');
   const year = /^\d{4}/.test(date) ? Number(date.slice(0, 4)) : null;
 
   const voted = Number(r['vote_average']);

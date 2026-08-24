@@ -21,18 +21,28 @@ import { fail, ok, type Tool } from './types.js';
  * recommendation logic anywhere in it. TMDB's own ordering is passed through
  * untouched and the model decides what to say about it.
  *
- * ── 🔴 THE ID IS ONLY DIRECTLY ADDABLE FOR FILMS ─────────────────────────────
+ * ── 🔴 A SHOW'S TMDB ID IS NOT EMITTED AT ALL ────────────────────────────────
  *
  * Radarr keys films by **tmdbId**, which is the same id TMDB returns — so a film
  * option flows straight into `add_movie` with no second lookup, and its stored
  * value is byte-identical to the one `catalogue_search` stores.
  *
- * Sonarr keys shows by **tvdbId**, a DIFFERENT id space. Both are small
- * integers, so a TMDB show id passed to `add_series` would not error — it would
- * quietly add **a different show**. That is the Moneyball defect in a new
- * costume, so a show's stored option deliberately has **no `id` field at all**:
- * the value that would be misused is absent by construction, and the route back
- * to an addable id is named in its place.
+ * A show's id is a different matter, in two ways that compound:
+ *
+ *  - Sonarr keys shows by **tvdbId**, a different id space of similarly small
+ *    integers. A TMDB show id passed to `add_series` would not error; it would
+ *    quietly add **a different show**.
+ *  - Worse, and less obvious: TMDB's movie and tv ids are **separate
+ *    sequences**, so tv id 1396 and movie id 1396 are both real and unrelated.
+ *    A show's tmdbId is therefore a *valid and wrong* argument to `add_movie`,
+ *    which nothing forbids — and calling it "a tmdbId" invites exactly that.
+ *
+ * So the number is **not emitted anywhere** for a show: not in the rendered
+ * line, not in the stored label, not in the option value. An earlier version
+ * kept it under a renamed key with a warning beside it, which is the shape this
+ * codebase refuses everywhere else — a sentence guarding a live footgun. What
+ * remains is the title, which is what `catalogue_search` takes, so nothing an
+ * add actually needs was lost.
  */
 export function makeTrending(fetchImpl?: FetchImpl): Tool {
   return {
@@ -42,8 +52,9 @@ export function makeTrending(fetchImpl?: FetchImpl): Tool {
       'asks what is popular, what is trending, what is new, or what they should watch — anything ' +
       'where they have NOT named a title. It says what the world is watching; it does not say what ' +
       'this library owns (library_search) or what can be added (catalogue_search). Films come back ' +
-      'with a tmdbId that add_movie takes directly. SHOWS DO NOT: a show needs a tvdbId, so run ' +
-      'catalogue_search on its title first and never pass a tmdbId to add_series.',
+      'with a tmdbId that add_movie takes directly. Shows come back with no id at all, because ' +
+      'add_series needs a tvdbId from a different id space — to add a show, call catalogue_search ' +
+      'with its title.',
     minRole: 'guest',
     writes: false,
     parameters: {
@@ -82,8 +93,27 @@ export function makeTrending(fetchImpl?: FetchImpl): Tool {
             `${answer.detail}. Say you could not check.`,
         );
       }
+      /**
+       * 🔴 TWO DIFFERENT ZEROS, AND ONLY ONE OF THEM IS AN ANSWER.
+       *
+       * A filter that rejects 100% of a non-empty input has not found that
+       * nothing is popular — it has failed to recognise anything, which is a
+       * TMDB field rename (`media_type`, `id`, `title`/`name`) we have not
+       * noticed yet. Twenty real titles in and "nothing addable" out is the same
+       * false negative as the missing-`results` case one level up, and it must
+       * be UNKNOWN for the same reason.
+       *
+       * `considered === 0` is the honest empty list, and stays an answer.
+       */
+      if (answer.items.length === 0 && answer.considered > 0) {
+        return fail(
+          `UNKNOWN — TMDB returned ${answer.considered} row(s) for ${popularLabel(kind)} and NONE of ` +
+            `them parsed, which means the response shape has changed rather than that nothing is ` +
+            `popular. First row's fields: ${answer.sampleKeys.join(', ') || '(none)'}. Say you could not check.`,
+        );
+      }
       if (answer.items.length === 0) {
-        return ok(`TMDB answered for ${popularLabel(kind)} but listed nothing addable.`);
+        return ok(`TMDB answered for ${popularLabel(kind)} and its list was empty.`);
       }
 
       /**
@@ -92,7 +122,19 @@ export function makeTrending(fetchImpl?: FetchImpl): Tool {
        * list must survive to the next message so *"add the third one"* resolves
        * through `resolve_choice`, and it survives because the tool that made it
        * stored it, not because the model remembered to.
+       *
+       * ⚠️ A new list REPLACES any pending one for this sender (see
+       * `ChoiceStore.present`). This tool is the one most likely to be called
+       * mid-flow — *"what else is popular?"* — so it is also the one most likely
+       * to invalidate a `catalogue_search` list the person is still deciding on.
+       * That is the intended behaviour (two live lists make a bare "2"
+       * unanswerable), noted here because it is a real consequence.
+       *
+       * 🔴 The hint that a pick can be resolved is emitted ONLY when the list was
+       * actually stored. A tool must never promise a continuation it did not
+       * manage to record — the same rule `watchIt()` follows for follow-ups.
        */
+      let hint = '';
       if (ctx.choices) {
         ctx.choices.present({
           senderHandle: ctx.senderHandle,
@@ -100,38 +142,38 @@ export function makeTrending(fetchImpl?: FetchImpl): Tool {
           kind: 'media-choice',
           options: answer.items.map((i) => ({ n: i.rank, label: describe(i), value: optionValue(i) })),
         });
+        hint =
+          '\n(offer these as a numbered list; resolve_choice maps a later pick back. A film can go ' +
+          'straight to add_movie with its tmdbId; for a show, call catalogue_search with its title.)';
       }
 
       const lines = answer.items.map((i) => `  ${i.rank}. ${describe(i)}`).join('\n');
-      return ok(
-        `${popularLabel(kind).toUpperCase()} — TMDB's order, unchanged:\n${lines}\n` +
-          '(offer these as a numbered list; resolve_choice maps a later pick back. ' +
-          'A film can go straight to add_movie with its tmdbId; a show needs catalogue_search first.)',
-      );
+      const shown =
+        answer.items.length < answer.considered
+          ? ` (${answer.items.length} of the ${answer.considered} rows TMDB returned)`
+          : '';
+      return ok(`${popularLabel(kind).toUpperCase()}${shown} — TMDB's order, unchanged:\n${lines}${hint}`);
     },
   };
 }
 
 function describe(i: PopularItem): string {
   const year = i.year ? ` (${i.year})` : '';
-  const rating = i.rating === null ? '' : `, rated ${i.rating}`;
-  const id = i.media === 'film' ? `tmdbId ${i.tmdbId}` : `tmdbId ${i.tmdbId}, NOT a tvdbId`;
-  return `${i.title}${year} — ${i.media}${rating} [${id}]`;
+  // "/10" so the scale is stated rather than left for the model to supply.
+  const rating = i.rating === null ? '' : `, rated ${i.rating}/10`;
+  // 🔴 Films only. See the header: a show's tmdbId is not printed anywhere.
+  const id = i.media === 'film' ? ` [tmdbId ${i.tmdbId}]` : '';
+  return `${i.title}${year} — ${i.media}${rating}${id}`;
 }
 
 /**
  * What `resolve_choice` hands back when this option is picked.
  *
  * A film's shape matches `catalogue_search`'s exactly, so the add path is
- * identical whichever tool produced the list. A show gets `tmdbId` and no `id`,
- * plus the route to the id it actually needs.
+ * identical whichever tool produced the list. A show carries **no number at
+ * all** — only the title, which is the argument `catalogue_search` takes.
  */
 function optionValue(i: PopularItem): Record<string, unknown> {
   if (i.media === 'film') return { arr: 'movie', id: i.tmdbId, title: i.title };
-  return {
-    arr: 'series',
-    title: i.title,
-    tmdbId: i.tmdbId,
-    needs: 'a tvdbId — call catalogue_search with this title; do NOT pass tmdbId to add_series',
-  };
+  return { arr: 'series', title: i.title, needs: 'a tvdbId — call catalogue_search with this title' };
 }

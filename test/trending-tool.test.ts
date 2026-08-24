@@ -72,6 +72,24 @@ test('🔴 a 200 that is not JSON is UNKNOWN and quotes what came back instead',
   assert.match(r.content, /not JSON/);
 });
 
+test('a body that cannot be READ says so, rather than blaming the JSON', async () => {
+  // Folded into one try/catch, a connection dropped mid-body yields raw = '' and
+  // the message "the body is not JSON", which sends whoever debugs it after a
+  // response-shape change that never happened. Both are UNKNOWN either way, so
+  // only the DETAIL distinguishes them -- which is the whole point of it.
+  const r = await run(async () =>
+    ({
+      ok: true,
+      status: 200,
+      text: async () => {
+        throw new Error('terminated');
+      },
+    }) as unknown as Response);
+  assert.equal(r.ok, false);
+  assert.match(r.content, /could not be read: terminated/);
+  assert.doesNotMatch(r.content, /not JSON/);
+});
+
 test('🔴 an ABSENT TMDB TOKEN is UNKNOWN, and explicitly denies being an empty answer', async () => {
   const r = await makeTrending(dead).run({ kind: 'trending' }, ctx({ config: testConfig({ tmdb: { readToken: '' } }) }));
   assert.equal(r.ok, false);
@@ -86,8 +104,9 @@ test('CONTROL: a healthy TMDB DOES answer, so none of the UNKNOWN checks are vac
     ]),
   );
   assert.equal(r.ok, true);
-  assert.match(r.content, /1\. Toy Story 5 \(2026\) — film, rated 8\.2 \[tmdbId 1084244\]/);
-  assert.match(r.content, /2\. Lanterns \(2026\) — show, rated 8\.2 \[tmdbId 95350, NOT a tvdbId\]/);
+  assert.match(r.content, /1\. Toy Story 5 \(2026\) — film, rated 8\.2\/10 \[tmdbId 1084244\]/);
+  assert.match(r.content, /2\. Lanterns \(2026\) — show, rated 8\.2\/10$/, 'and the show line ends there');
+  assert.doesNotMatch(r.content, /95350/, 'the show carries no id; the film beside it still does');
 });
 
 // ── 🔴 THE ID SPACES. A tmdbId is addable for a FILM and wrong for a SHOW. ───
@@ -105,20 +124,36 @@ test('🔴 a FILM option carries `id`, byte-identical to what catalogue_search s
   assert.deepEqual(value, { arr: 'movie', id: 244786, title: 'Whiplash' });
 });
 
-test('🔴 a SHOW option has NO `id` FIELD AT ALL — a tmdbId is not a tvdbId', async () => {
-  // Sonarr keys shows by tvdbId. Both id spaces are small integers, so passing a
-  // TMDB show id to add_series would not error -- it would add a DIFFERENT show.
-  // The value that could be misused is absent by construction, not warned about.
+test('🔴 a SHOW EMITS ITS TMDB ID NOWHERE — not in the line, the label, or the value', async () => {
+  // Two compounding reasons, and a renamed key guards against neither:
+  //   - Sonarr keys shows by tvdbId, so this integer would add a DIFFERENT show.
+  //   - TMDB's movie and tv ids are SEPARATE SEQUENCES, so tv id 1396 is also a
+  //     real MOVIE id -- making a show's tmdbId a valid, wrong argument to
+  //     add_movie, which nothing forbids.
+  // So the assertion is on the NUMBER, everywhere it could reach the model, not
+  // on the name of a field. An earlier version kept it under `tmdbId` beside a
+  // warning; that test passed while the footgun was loaded.
   const path = tempFile();
-  await run(() => page([{ id: 1396, media_type: 'tv', name: 'Lanterns', first_air_date: '2026-08-16' }]), 'trending', {
-    choices: new ChoiceStore(path),
-  });
+  const shown = await run(
+    () => page([{ id: 1396, media_type: 'tv', name: 'Lanterns', first_air_date: '2026-08-16' }]),
+    'trending',
+    { choices: new ChoiceStore(path) },
+  );
+  assert.doesNotMatch(shown.content, /1396/, 'the rendered line must not carry the number either');
 
   const picked = await resolveChoice.run({ choice: 1 }, ctx({ choices: new ChoiceStore(path) }));
+  assert.doesNotMatch(picked.content, /1396/, 'nor the stored label that resolve_choice reprints');
   const value = JSON.parse(picked.content.slice(picked.content.indexOf('{'))) as Record<string, unknown>;
-  assert.equal('id' in value, false, 'a show option must not carry a field add_series would read as a tvdbId');
-  assert.equal(value['tmdbId'], 1396);
-  assert.match(String(value['needs']), /catalogue_search/);
+  assert.deepEqual(
+    value,
+    { arr: 'series', title: 'Lanterns', needs: 'a tvdbId — call catalogue_search with this title' },
+    'a show option carries a title and no number at all',
+  );
+  assert.equal(
+    Object.values(value).some((v) => typeof v === 'number'),
+    false,
+    'no numeric field may survive, whatever it is called',
+  );
 });
 
 // ── what /trending/all actually returns ─────────────────────────────────────
@@ -138,9 +173,37 @@ test('🔴 PEOPLE are dropped from /trending/all — a person is not addable med
 });
 
 test('an unrecognised media_type is dropped rather than guessed at', async () => {
-  const r = await run(() => page([{ id: 7, media_type: 'collection', title: 'Some Boxset' }]));
+  const r = await run(() =>
+    page([
+      { id: 7, media_type: 'collection', title: 'Some Boxset' },
+      { id: 8, media_type: 'movie', title: 'A Real Film' },
+    ]),
+  );
   assert.equal(r.ok, true);
-  assert.match(r.content, /listed nothing addable/);
+  assert.doesNotMatch(r.content, /Some Boxset/);
+  assert.match(r.content, /1\. A Real Film/);
+  assert.match(r.content, /1 of the 2 rows TMDB returned/, 'a partial drop is reported, not hidden');
+});
+
+test('🔴 ROWS IN AND NOTHING OUT IS UNKNOWN — a 100% filter is a rename, not a finding', async () => {
+  // The false zero one level below the missing-`results` guard: twenty real
+  // trending titles in, zero out, reported as "nothing is popular". Any TMDB
+  // field rename produces exactly this.
+  const r = await run(() =>
+    page(Array.from({ length: 20 }, (_, i) => ({ identifier: i + 1, kind: 'movie', headline: `Film ${i}` }))),
+  );
+  assert.equal(r.ok, false, 'a filter that rejected everything has not answered the question');
+  assert.match(r.content, /UNKNOWN/);
+  assert.match(r.content, /20 row\(s\)/);
+  assert.match(r.content, /identifier, kind, headline/, 'and names the fields, so the rename is diagnosable');
+});
+
+test('CONTROL: a genuinely empty TMDB list is still a real answer, not UNKNOWN', async () => {
+  // considered === 0 is the honest zero. Collapsing it into the UNKNOWN above
+  // would make the guard fire on the one case that IS an answer.
+  const r = await run(() => page([]));
+  assert.equal(r.ok, true);
+  assert.match(r.content, /its list was empty/);
 });
 
 test('a row with no title, or no usable id, is dropped rather than rendered blank', async () => {
@@ -149,14 +212,35 @@ test('a row with no title, or no usable id, is dropped rather than rendered blan
       { id: 0, media_type: 'movie', title: 'Zero Id' },
       { media_type: 'movie', title: 'No Id At All' },
       { id: 12, media_type: 'movie', title: '   ' },
+      { id: 13, media_type: 'movie', title: 'The Survivor' },
     ]),
   );
-  assert.match(r.content, /listed nothing addable/);
+  assert.equal(r.ok, true);
+  assert.match(r.content, /1\. The Survivor — film \[tmdbId 13\]/);
+  assert.doesNotMatch(r.content, /Zero Id|No Id At All/);
+});
+
+test('an EMPTY title falls through to `name` — `??` would not, and this row would vanish', async () => {
+  const r = await run(() => page([{ id: 42, media_type: 'tv', title: '', name: 'Lanterns' }]));
+  assert.match(r.content, /1\. Lanterns — show/);
 });
 
 test('a missing date yields no year rather than a fabricated one', async () => {
   const r = await run(() => page([{ id: 12, media_type: 'movie', title: 'Untitled Thing' }]));
   assert.match(r.content, /1\. Untitled Thing — film \[tmdbId 12\]/);
+});
+
+test('🔴 with NO choice store the tool does not promise a pick can be resolved', async () => {
+  // The same rule watchIt() follows for follow-ups: never promise a
+  // continuation you did not manage to record. catalogue_search omits the hint
+  // when there is nowhere to store the list; so does this.
+  const withStore = await run(() => page([{ id: 9, media_type: 'movie', title: 'Film' }]), 'trending', {
+    choices: new ChoiceStore(tempFile()),
+  });
+  assert.match(withStore.content, /resolve_choice/);
+  const without = await run(() => page([{ id: 9, media_type: 'movie', title: 'Film' }]));
+  assert.doesNotMatch(without.content, /resolve_choice/, 'no store, no promise');
+  assert.match(without.content, /1\. Film — film/, 'CONTROL: the list itself is still returned');
 });
 
 // ── the enum, and that each value REALLY reaches a different endpoint ────────
@@ -207,6 +291,7 @@ test('the list is capped, so a text message does not receive twenty titles', asy
   const r = await run(() => page(many));
   assert.match(r.content, /10\. Film 10/);
   assert.doesNotMatch(r.content, /11\. Film 11/);
+  assert.match(r.content, /10 of the 20 rows TMDB returned/);
 });
 
 // ── registration ────────────────────────────────────────────────────────────
