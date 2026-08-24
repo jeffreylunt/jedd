@@ -19,19 +19,31 @@ export interface ShellOutcome {
  * nothing — that is the single most common false-green in this homelab's
  * history (see knowledge/docker-netns-inspect-lies.md).
  */
+/** The execFile-shaped call runOnHp makes. Injectable so the error path is testable. */
+export type ExecImpl = (
+  file: string,
+  args: string[],
+  options: { timeout: number; maxBuffer: number },
+  callback: (error: unknown, stdout: string, stderr: string) => void,
+) => void;
+
 export function runOnHp(
   host: string,
   command: string,
   timeoutMs = 30_000,
+  exec: ExecImpl = execFile as unknown as ExecImpl,
 ): Promise<ShellOutcome> {
   return new Promise((resolve) => {
-    execFile(
+    exec(
       'ssh',
       ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, command],
       { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
       (error, stdout, stderr) => {
         const err = error as (Error & { code?: number; killed?: boolean }) | null;
         resolve({
+          // An error with no numeric code still means FAILURE. Defaulting to 0
+          // here would turn every ssh transport failure into a clean success
+          // with empty output — the exact false-green this module exists to stop.
           exitCode: typeof err?.code === 'number' ? err.code : err ? 1 : 0,
           stdout: stdout ?? '',
           stderr: stderr ?? '',

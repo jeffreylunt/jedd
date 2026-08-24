@@ -3,19 +3,35 @@ import type { Config } from './config.js';
 export type Role = 'owner' | 'guest';
 
 /**
- * Normalise a messaging handle so that `+1 (801) 839-6586`, `15555550100` and
- * `5555550100` compare equal, without letting an arbitrary string coincidentally
- * match the owner.
+ * Normalise a messaging handle for comparison.
  *
- * Phone-shaped handles collapse to their last 10 digits. Anything else (an
- * email, an iMessage alias) is lowercased and trimmed only.
+ * 🔴 THIS DELIBERATELY DOES NOT COMPARE BY SUFFIX.
+ *
+ * The first version collapsed phone-shaped handles to their **last 10 digits**,
+ * which made `+448015550123`, `008015550123` and `9998015550123` all resolve to
+ * the owner — a complete authentication bypass for anyone who can pick their own
+ * handle. Its unit test used a one-digit-different number, which shares no
+ * suffix, so the test was structurally incapable of detecting the bug.
+ *
+ * The rule now: strip formatting punctuation, normalise a leading `+`, and treat
+ * a bare 10-digit US number as equivalent to the same number with a `1` country
+ * code. Nothing else is equated. Two handles match only if they are the same
+ * handle.
  */
 export function normaliseHandle(handle: string): string {
   const trimmed = handle.trim().toLowerCase();
-  const digits = trimmed.replace(/\D/g, '');
-  // Treat as a phone number only if the handle is essentially all digits.
-  const nonDigits = trimmed.replace(/[\d\s()+.-]/g, '');
-  if (nonDigits === '' && digits.length >= 10) return digits.slice(-10);
+  if (!trimmed) return '';
+
+  // Phone-shaped only if it is digits plus formatting punctuation.
+  if (/^\+?[\d\s()./-]+$/.test(trimmed)) {
+    let digits = trimmed.replace(/\D/g, '');
+    if (!digits) return '';
+    // A bare 10-digit US number is the same number as `1` + those 10 digits.
+    // This is an EXACT widening of one known case, not a suffix match.
+    if (digits.length === 10) digits = `1${digits}`;
+    return `tel:${digits}`;
+  }
+
   return trimmed;
 }
 

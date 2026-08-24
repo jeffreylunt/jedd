@@ -46,14 +46,24 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
 }
 
 /**
- * Ollama-backed client (the homelab's local qwen3.8:27b-mlx).
+ * Ollama client for the pinned local model, `qwen3.8:27b-mlx`.
  *
- * Two measured quirks of this stack are handled here rather than discovered
- * again later:
- *  - `think: false` is required for qwen3.x or the token budget is spent on
- *    hidden reasoning and the reply comes back empty.
- *  - `tool_choice` is silently dropped by Ollama, so there is NO forced tool
- *    calling available. The loop must not depend on forcing.
+ * Every setting below was MEASURED against the live endpoint by
+ * `scripts/probe-ollama.mjs`, not inherited. See
+ * `spaces/jedd-v2/knowledge/qwen3-8-27b-mlx-measured.md`.
+ *
+ *  - `think: true` — Jeff wants thinking and will pay latency for it. Reasoning
+ *    cost 137–320 characters across the probe, so the feared empty-output trap
+ *    is a BUDGET failure, not an argument against thinking.
+ *  - `num_predict: 3000` — ~16× the largest reasoning burst observed, so
+ *    thinking cannot eat the whole allowance before an answer is emitted.
+ *  - `num_ctx: 16384` — keeps the model FULLY resident (`/api/ps` reported
+ *    `size_vram === size`). Do not raise it to buy thinking headroom; that is
+ *    what spills to CPU and produces 110s turns.
+ *  - `keep_alive: '30m'` — an ~18 GB model must not cold-reload mid-conversation.
+ *  - `tool_choice` is NOT sent. It is silently ignored by this stack (verified:
+ *    `tool_choice:"required"` on a message needing no tool returned no call).
+ *    Sending it would imply a guarantee that does not exist.
  */
 export class OllamaClient implements LlmClient {
   readonly label: string;
@@ -63,29 +73,41 @@ export class OllamaClient implements LlmClient {
   }
 
   async chat(messages: LlmMessage[], tools: Tool[]): Promise<LlmReply> {
-    const res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.config.llm.model,
-        messages: toOllamaMessages(messages),
-        tools: tools.map((t) => ({
-          type: 'function',
-          function: { name: t.name, description: t.description, parameters: t.parameters },
-        })),
-        stream: false,
-        think: false,
-        options: { temperature: 0.2, num_ctx: 16384 },
-      }),
-    });
+    // A cold load of ~18 GB plus a slow turn genuinely exceeds shorter timeouts.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 240_000);
+    let res: Response;
+    try {
+      res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: this.config.llm.model,
+          messages: toOllamaMessages(messages),
+          tools: tools.map((t) => ({
+            type: 'function',
+            function: { name: t.name, description: t.description, parameters: t.parameters },
+          })),
+          stream: false,
+          think: true,
+          keep_alive: '30m',
+          options: { temperature: 0.2, num_ctx: 16384, num_predict: 3000 },
+        }),
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       throw new Error(`Ollama HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
     const body = (await res.json()) as {
+      done_reason?: string;
       message?: {
         content?: string;
-        tool_calls?: { function?: { name?: string; arguments?: unknown } }[];
+        thinking?: string;
+        tool_calls?: { id?: string; function?: { name?: string; arguments?: unknown } }[];
       };
     };
 
@@ -104,10 +126,25 @@ export class OllamaClient implements LlmClient {
       } else if (rawArgs && typeof rawArgs === 'object') {
         args = rawArgs as Record<string, unknown>;
       }
-      return [{ id: `call_${Date.now()}_${i}`, name, arguments: args }];
+      // Ollama supplies its own call id; use it rather than inventing one.
+      return [{ id: call.id ?? `call_${Date.now()}_${i}`, name, arguments: args }];
     });
 
-    return { text: body.message?.content ?? '', toolCalls };
+    const text = body.message?.content ?? '';
+
+    // ⚠️ Empty content on a TOOL-CALLING turn is normal — the model returns a
+    // call and no prose. The real budget failure is `done_reason: "length"` with
+    // nothing to show for it, so that is what gets flagged, not emptiness.
+    if (body.done_reason === 'length' && !text.trim() && toolCalls.length === 0) {
+      throw new Error(
+        'Model hit its token budget without producing an answer or a tool call ' +
+          '(done_reason=length). Reasoning consumed the whole num_predict allowance.',
+      );
+    }
+
+    // `message.thinking` is deliberately NOT returned. It is reasoning, not reply,
+    // and must never reach the user or the transcript.
+    return { text, toolCalls };
   }
 }
 

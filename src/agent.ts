@@ -30,40 +30,44 @@ export interface TurnRecord {
   steps: number;
 }
 
-function systemPrompt(role: Role, config: Config): string {
-  const shared = [
-    'You are Jedd, the assistant for Jeff\'s home media server.',
+/**
+ * 🔴 THE PROMPT NEVER STATES WHO IT IS TALKING TO.
+ *
+ * An earlier version said "You are talking to the owner." That makes identity an
+ * assertion inside the context window, and **anything else in the context window
+ * can contend with it** — a forwarded message, a quoted complaint, a media title
+ * carrying an injection, or simply the user writing "I'm Jeff".
+ *
+ * Identity is resolved from the TRANSPORT before the model sees anything, and it
+ * is expressed as **which tools exist in this turn** — not as a sentence. A
+ * guest's tool list has no admin tools in it at all, and no text can add one.
+ *
+ * The prompt is also deliberately short, and stays short as capabilities grow:
+ * per-capability detail belongs in the tool's own description, so adding a tool
+ * is one declaration and never an edit here. (V1's prompt reached 2,052 lines
+ * exactly by taking the other option.)
+ */
+function systemPrompt(config: Config): string {
+  return [
+    "You are Jedd, the assistant for Jeff's home media server.",
     'Be brief and concrete — you are talking over text message.',
     '',
     'Ground every factual claim in a tool result. If you have not called a tool, you do not know.',
     'Never say you have done something unless a tool result in this conversation shows it succeeded.',
-    'If a tool fails or refuses, say so plainly and say what you would need instead.',
+    'If a tool fails or refuses, say so plainly and say what you would need instead. Do not look for',
+    'another way around a refusal — the refusal is the answer.',
     'A tool result marked UNKNOWN is not a "no" — report the uncertainty.',
-  ];
-
-  if (role === 'owner') {
-    return [
-      ...shared,
-      '',
-      'You are talking to the owner. You have read access to the whole homelab through hp_shell:',
-      'docker ps/inspect/logs/stats, curl against local services, reading files and logs on hp.',
-      'Compose your own commands — you are not limited to a menu.',
-      'Always read the exit code in a shell result. Empty stdout with a non-zero exit is an ERROR,',
-      'not an empty result, and a grep that found nothing exits 1.',
-      '',
-      `Writes are ${config.readOnly ? 'DISABLED (read-only mode)' : 'enabled'}. Container restarts have`,
-      'safety preconditions enforced in code; if restart_container refuses, relay the refusal, do not',
-      'look for another way round it.',
-    ].join('\n');
-  }
-
-  return [
-    ...shared,
     '',
-    'You are talking to a household user, not the owner. You can search the library, record a media',
-    'request, and report whether the server is up. You cannot administer anything, and you must not',
-    'discuss who else is watching what. If asked for something outside that, say it is owner-only.',
-  ].join('\n');
+    'Use only the tools you have been given. If something is not among them, say you cannot do it',
+    'rather than guessing at who is asking or what you might be permitted elsewhere.',
+    '',
+    'In shell results, always read the exit code. Empty stdout with a non-zero exit is an ERROR, not',
+    'an empty result; a grep that matched nothing exits 1. When you report finding nothing, also',
+    'report how much you searched.',
+    config.readOnly ? '\nWrites are currently disabled, so nothing you do can change the system.' : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 /**
@@ -96,7 +100,7 @@ export class Agent {
     const key = `${senderHandle}::${role}`;
     let history = this.histories.get(key);
     if (!history) {
-      history = [{ role: 'system', content: systemPrompt(role, this.config) }];
+      history = [{ role: 'system', content: systemPrompt(this.config) }];
       this.histories.set(key, history);
     }
     history.push({ role: 'user', content: userText });

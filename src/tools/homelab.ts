@@ -37,7 +37,7 @@ export const hpShell: Tool = {
       return fail(`REFUSED by the command gate: ${verdict.reason}\nThe command was NOT run.`);
     }
 
-    const outcome = await runOnHp(ctx.config.hpSshHost, command);
+    const outcome = await runOnHp(ctx.config.shellSshHost, command);
     const rendered = `$ ${command}\n\n${renderOutcome(outcome)}`;
     return outcome.exitCode === 0 ? ok(rendered) : fail(rendered);
   },
@@ -154,7 +154,7 @@ export const livetvStatus: Tool = {
 
     // Is the Dispatcharr proxy actually serving? Unauthenticated version endpoint.
     const version = await runOnHp(
-      ctx.config.hpSshHost,
+      ctx.config.adminSshHost,
       `curl -s --max-time 8 -o /dev/null -w "%{http_code}" ${ctx.config.dispatcharr.baseUrl}/api/core/version/`,
     );
     const code = version.stdout.trim();
@@ -169,7 +169,7 @@ export const livetvStatus: Tool = {
     }
 
     const up = await runOnHp(
-      ctx.config.hpSshHost,
+      ctx.config.adminSshHost,
       'docker ps --format "{{.Names}}|{{.Status}}" | grep -E "^(dispatcharr|gluetun)\\|"',
     );
     sections.push(
@@ -180,7 +180,7 @@ export const livetvStatus: Tool = {
     if (up.exitCode !== 0) anyFailure = true;
 
     const logs = await runOnHp(
-      ctx.config.hpSshHost,
+      ctx.config.adminSshHost,
       `docker logs --tail ${logLines} dispatcharr 2>&1 | grep -iE "error|traceback|refused|timeout|failed" | tail -25`,
     );
     // grep exits 1 on "no matches" — that is a clean result, not a failure.
@@ -229,16 +229,12 @@ export const restartContainer: Tool = {
     if (!/^[A-Za-z0-9._-]+$/.test(container)) {
       return fail(`"${container}" is not a valid container name.`);
     }
-    if (container.startsWith('gluetun')) {
-      return fail(
-        'Refusing: gluetun carries the VPN for the whole arr stack and its settings must never be ' +
-          'changed by Jedd. A gluetun restart is a human decision.',
-      );
-    }
+    // The gluetun invariant is NOT checked here. It lives inside
+    // assertSafeToRestart, so it holds for every caller rather than for this one.
 
     // Evidence, gathered here rather than taken on trust.
     const ps = await runOnHp(
-      ctx.config.hpSshHost,
+      ctx.config.adminSshHost,
       `docker ps -a --format "{{.Names}}|{{.Status}}" | grep -E "^${container}\\|"`,
     );
     if (ps.exitCode !== 0 || !ps.stdout.trim()) {
@@ -264,9 +260,65 @@ export const restartContainer: Tool = {
       return fail(`NOT RESTARTED. ${verdict.reason} (observed status: ${status})`);
     }
 
-    const restart = await runOnHp(ctx.config.hpSshHost, `docker restart ${container}`, 90_000);
+    const restart = await runOnHp(ctx.config.adminSshHost, `docker restart ${container}`, 90_000);
     return restart.exitCode === 0
       ? ok(`Restarted ${container}. ${verdict.reason}\n${renderOutcome(restart)}`)
       : fail(`Restart of ${container} FAILED.\n${renderOutcome(restart)}`);
+  },
+};
+
+/**
+ * The most common real fix on this homelab, and a genuinely useful write.
+ *
+ * After any gluetun restart some `network_mode: container:gluetun` dependents
+ * keep a stale, dead network namespace and have zero egress, while `docker ps`
+ * cheerfully reports them Up. Restarting sonarr/radarr/prowlarr is documented as
+ * 🟢 safe mid-match — they serve no playback, so nobody's stream is interrupted.
+ *
+ * The viewer check still runs. It is expected to pass, and that is exactly why
+ * it stays: a precondition that only runs when you expect it to fail is a
+ * precondition nobody has tested.
+ */
+export const restartArrStack: Tool = {
+  name: 'restart_arr_stack',
+  description:
+    'Restart sonarr, radarr and prowlarr together. This is the fix for the common "arrs are down / ' +
+    'Jedd cannot search" fault caused by a stale network namespace after a gluetun restart. Safe ' +
+    'during playback — these containers serve no video. Owner only.',
+  minRole: 'owner',
+  parameters: { type: 'object', properties: {}, required: [] },
+  async run(_args, ctx) {
+    const containers = ['sonarr', 'radarr', 'prowlarr'];
+
+    if (ctx.config.readOnly) {
+      return fail('Jedd is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was restarted.');
+    }
+
+    // Same viewer gate as everything else. Owner authorisation unlocks the tool;
+    // it does not unlock restarting while someone is mid-something.
+    const sessionsRes = await jellyfinGet(ctx.config, '/Sessions');
+    const playback = sessionsRes.ok
+      ? parseSessions(sessionsRes.body)
+      : { known: false, activeSessions: [], detail: `/Sessions unreadable: ${sessionsRes.error}` };
+
+    for (const container of containers) {
+      const verdict = assertSafeToRestart(container, {
+        containerIsUp: true,
+        playback,
+        readOnly: ctx.config.readOnly,
+      });
+      if (!verdict.allowed) {
+        return fail(`NOT RESTARTED (none of them). ${verdict.reason}`);
+      }
+    }
+
+    const restart = await runOnHp(
+      ctx.config.adminSshHost,
+      `docker restart ${containers.join(' ')}`,
+      120_000,
+    );
+    return restart.exitCode === 0
+      ? ok(`Restarted ${containers.join(', ')}. ${playback.detail}\n${renderOutcome(restart)}`)
+      : fail(`Restart FAILED.\n${renderOutcome(restart)}`);
   },
 };

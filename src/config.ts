@@ -9,8 +9,26 @@ import 'dotenv/config';
 export interface Config {
   /** Messaging handle of the single homelab owner. Everyone else is a guest. */
   ownerHandle: string;
-  /** ssh destination for the homelab box. Every shell command runs HERE, never locally. */
-  hpSshHost: string;
+  /**
+   * 🔴 TWO ssh identities, and the separation IS the security boundary.
+   *
+   * `shellSshHost` is used by the free-form `hp_shell` tool and must be an
+   * UNPRIVILEGED account with NO docker group membership. Then an interpreter
+   * smuggled past the string filter — `awk 'BEGIN{system("docker restart …")}'`
+   * — fails at the OS layer regardless of what the filter believed.
+   *
+   * `adminSshHost` is used only by structured tools that genuinely need docker,
+   * and those carry the safety preconditions the shell cannot reach.
+   *
+   * If these are the same account, the boundary does not exist. That case is
+   * refused at startup unless explicitly overridden — see `shellIdentityShared`.
+   */
+  shellSshHost: string;
+  adminSshHost: string;
+  /** True when the two identities are the same account, i.e. no OS-level boundary. */
+  shellIdentityShared: boolean;
+  /** Dev-only escape hatch permitting the shared-identity case. Never set in a deploy. */
+  allowSharedSshIdentity: boolean;
   llm: {
     provider: 'ollama' | 'anthropic';
     baseUrl: string;
@@ -30,6 +48,10 @@ export interface Config {
   /**
    * Read-only mode: every tool that would mutate the homelab refuses.
    * Defaults to TRUE — a misconfigured deploy is read-only, never write-enabled.
+   *
+   * ⚠️ This is the AUTHORISATION-independent kill switch. It is not the same axis
+   * as owner-vs-guest: the owner is authorised to use write tools, and this flag
+   * decides whether write tools do anything at all. Neither satisfies the other.
    */
   readOnly: boolean;
 }
@@ -42,9 +64,16 @@ function required(name: string): string {
 
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
+  const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'hp';
+  // Defaults to the admin host so a missing variable is CONSPICUOUS (it trips the
+  // shared-identity refusal) rather than silently pointing somewhere unexpected.
+  const shellSshHost = process.env.HP_SHELL_SSH_HOST ?? adminSshHost;
   return {
     ownerHandle: required('OWNER_HANDLE'),
-    hpSshHost: process.env.HP_SSH_HOST ?? 'hp',
+    shellSshHost,
+    adminSshHost,
+    shellIdentityShared: shellSshHost === adminSshHost,
+    allowSharedSshIdentity: process.env.JEDD_ALLOW_SHARED_SSH_IDENTITY === 'true',
     llm: {
       provider,
       baseUrl:
@@ -64,5 +93,39 @@ export function loadConfig(): Config {
     },
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',
+  };
+}
+
+/**
+ * Is the free-form shell safe to offer at all?
+ *
+ * Returns a reason when it is not. The caller must then NOT register `hp_shell`
+ * — an absent tool cannot be argued for, and this is the one place where the
+ * string filter is known to be insufficient on its own.
+ */
+export function assertShellIdentityIsSafe(config: Config): { safe: boolean; reason: string } {
+  if (!config.shellIdentityShared) {
+    return {
+      safe: true,
+      reason: `shell runs as "${config.shellSshHost}", docker actions as "${config.adminSshHost}"`,
+    };
+  }
+  if (config.allowSharedSshIdentity) {
+    return {
+      safe: true,
+      reason:
+        `⚠️ UNSAFE: hp_shell and docker actions share the ssh identity "${config.adminSshHost}". ` +
+        'The command filter is the ONLY thing preventing arbitrary container control, and a filter ' +
+        'over command text is known to be defeatable. Permitted only because ' +
+        'JEDD_ALLOW_SHARED_SSH_IDENTITY=true. NEVER set this in a deploy.',
+    };
+  }
+  return {
+    safe: false,
+    reason:
+      `hp_shell is DISABLED: HP_SHELL_SSH_HOST is unset or equal to HP_ADMIN_SSH_HOST ` +
+      `("${config.adminSshHost}"), so the shell would run with docker privileges. Provision an ` +
+      'unprivileged ssh account on hp with no docker group membership and set HP_SHELL_SSH_HOST ' +
+      'to it. To run anyway during development, set JEDD_ALLOW_SHARED_SSH_IDENTITY=true.',
   };
 }

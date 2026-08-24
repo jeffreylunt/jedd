@@ -1,16 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Agent } from '../src/agent.js';
-import type { Config } from '../src/config.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
 import type { Tool } from '../src/tools/types.js';
+import { testConfig } from './helpers.js';
 
-const config = {
-  ownerHandle: '+18015550123',
-  hpSshHost: 'hp',
-  readOnly: true,
-  llm: { provider: 'ollama', baseUrl: '', model: 'test' },
-} as Config;
+const config = testConfig();
 
 /** A model that always asks for `dangerous_tool` first, then answers. */
 class ScriptedLlm implements LlmClient {

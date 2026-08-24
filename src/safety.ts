@@ -82,6 +82,20 @@ export interface RestartVerdict {
 }
 
 /**
+ * gluetun carries the VPN for the whole arr stack, and rolling its exit takes
+ * live TV down for minutes plus a forced dispatcharr restart. Jeff's standing
+ * rule is that this is never Jedd's call.
+ *
+ * 🔴 This lives HERE, inside the pure decision function, and not only in the
+ * calling tool. A review found the invariant guarded by a single untested
+ * `startsWith('gluetun')` line in one call site — delete that line and nothing
+ * went red. An invariant enforced in one caller is enforced nowhere.
+ */
+export function isNeverRestartable(container: string): boolean {
+  return container === 'gluetun' || container.startsWith('gluetun-');
+}
+
+/**
  * The restart precondition, in full.
  *
  * A protected container may be restarted ONLY when it is completely down AND
@@ -97,6 +111,17 @@ export function assertSafeToRestart(
       allowed: false,
       reason:
         'Jedd is running read-only (JEDD_ALLOW_WRITES is not set). No container will be restarted.',
+    };
+  }
+
+  // Checked before anything else, and inside this function rather than in a
+  // caller, so no argument combination can reach a gluetun restart.
+  if (isNeverRestartable(container)) {
+    return {
+      allowed: false,
+      reason:
+        `Refusing: ${container} carries the VPN for the whole arr stack. Rolling it takes live TV ` +
+        'down for minutes and forces a dispatcharr restart. This is never Jedd\'s call — a human does it.',
     };
   }
 
@@ -128,6 +153,25 @@ export function assertSafeToRestart(
   }
 
   if (!opts.playback.known) {
+    // 🔴 The one case where UNKNOWN does not block, and the reasoning is narrow.
+    //
+    // Playback is read FROM Jellyfin. So when the container being restarted IS
+    // Jellyfin and `docker ps` says it is down, /Sessions being unreadable is a
+    // CONSEQUENCE of the outage, not missing information — a Jellyfin that is not
+    // running has no viewers, by definition. Jeff's standing carve-out is exactly
+    // this: "completely down, no viewers possible → fix it autonomously."
+    //
+    // Note the evidence: `containerIsUp` comes from `docker ps`, NOT from the
+    // endpoint served by the dead container. Without that independence this would
+    // be circular. Any other container reaching this branch still refuses.
+    if (container === 'jellyfin' && !opts.containerIsUp) {
+      return {
+        allowed: true,
+        reason:
+          'jellyfin is completely down per docker ps, so /Sessions is unreadable as a consequence ' +
+          'of the outage and no viewer is possible. This is the documented completely-down carve-out.',
+      };
+    }
     return {
       allowed: false,
       reason:

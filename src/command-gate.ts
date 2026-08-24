@@ -1,23 +1,92 @@
 /**
- * Deny-by-default gate for the generic homelab shell.
+ * Defence-in-depth filter for the generic homelab shell.
  *
- * The point is not to out-argue a clever prompt. It is that the dangerous verbs
- * are simply NOT REACHABLE through this tool, so there is nothing to talk
- * around. Restarting a container is not a shell command Jedd can phrase — it is
- * a separate tool with its own preconditions (see safety.ts).
+ * 🔴 READ THIS BEFORE TRUSTING IT: **THIS IS NOT THE SECURITY BOUNDARY.**
  *
- * Every pipeline segment is validated independently, because `docker ps | rm -rf`
- * has a perfectly innocent leading token.
+ * A security review found `awk 'BEGIN{system("docker restart gluetun")}'` sailed
+ * straight through an earlier version of this file. The lesson was not "add awk
+ * to a denylist" — it was that **this whole approach inspects the TEXT of a
+ * command and tries to predict its EFFECT**, which is exactly the prose-policing
+ * that V2 exists to escape. Every allowlisted binary is a potential interpreter:
+ * `awk` has `system()`, `sort` has `-o`, `find` has `-fprintf`, `journalctl` has
+ * `--vacuum-time`. Enumerating them is the same losing game as enumerating
+ * banned phrases, and an incomplete enumeration reads as a green light.
+ *
+ * **The actual boundary is the OS**: the free-form shell connects to hp as an
+ * UNPRIVILEGED ssh identity with no docker group membership, so
+ * `awk 'BEGIN{system("docker restart jellyfin")}'` fails at the kernel no matter
+ * what this file believes. Structured tools that genuinely need docker use a
+ * separate privileged identity and carry the safety preconditions. See
+ * `src/config.ts` and `assertShellIdentityIsSafe`.
+ *
+ * This file remains as a second layer: it catches mistakes early and gives the
+ * model a useful error instead of a permission-denied. **Never let it be the only
+ * thing standing between a string and a side effect.**
  */
 
-/** Leading tokens permitted in read-only mode. Anything absent is refused. */
+/** Leading tokens permitted. Anything absent is refused. */
 const READ_COMMANDS = new Set([
-  'awk', 'basename', 'cat', 'cut', 'date', 'df', 'dirname', 'dig', 'docker', 'du',
+  'basename', 'cat', 'cut', 'df', 'dirname', 'dig', 'docker', 'du',
   'echo', 'egrep', 'fgrep', 'file', 'find', 'free', 'grep', 'head', 'hostname',
   'id', 'jq', 'journalctl', 'ls', 'nproc', 'nslookup', 'printf', 'ps', 'readlink',
   'sort', 'ss', 'stat', 'systemctl', 'tail', 'tr', 'uname', 'uniq', 'uptime',
   'wc', 'which', 'curl',
 ]);
+
+/**
+ * Commands removed after the review, with the reason, so nobody helpfully adds
+ * them back:
+ *   awk  — `system("…")` and `print | "cmd"` execute arbitrary commands, and the
+ *          global quote-stripping means the program body is never even scanned.
+ *   date — `-s` sets the system clock.
+ *   sed  — `-i` edits files in place, `w` writes them, `e` executes.
+ */
+const REMOVED_FOR_CAUSE: Record<string, string> = {
+  awk: 'awk can execute arbitrary commands via system() and `print | "cmd"`',
+  date: 'date -s sets the system clock',
+  sed: 'sed can write files (-i, w) and execute commands (e)',
+  perl: 'perl is a general-purpose interpreter',
+  python3: 'python3 is a general-purpose interpreter',
+  python: 'python is a general-purpose interpreter',
+  xargs: 'xargs runs an arbitrary command per input line',
+  env: 'env runs an arbitrary command',
+  nice: 'nice runs an arbitrary command',
+  timeout: 'timeout runs an arbitrary command',
+  watch: 'watch runs an arbitrary command repeatedly',
+};
+
+/**
+ * Per-command flags that turn a read into a write. Checked against BOTH
+ * space-separated flags and short-flag clusters (`-so out` is `-s -o out`),
+ * because the original curl check only looked at whole tokens and `-sd` sailed
+ * through it.
+ */
+const FLAG_POLICY: Record<string, { long: string[]; short: string[]; reason: string }> = {
+  curl: {
+    long: [
+      '--data', '--data-raw', '--data-binary', '--data-urlencode', '--form', '--form-string',
+      '--upload-file', '--output', '--create-dirs', '--dump-header', '--trace', '--trace-ascii',
+      '--cookie-jar', '--remote-name', '--remote-header-name',
+    ],
+    short: ['d', 'F', 'T', 'o', 'O', 'D', 'c', 'J'],
+    reason: 'sends or writes data',
+  },
+  sort: { long: ['--output'], short: ['o'], reason: 'writes its output to a file' },
+  journalctl: {
+    long: ['--vacuum-time', '--vacuum-size', '--vacuum-files', '--rotate', '--flush', '--sync'],
+    short: [],
+    reason: 'deletes or rotates the journal',
+  },
+  find: {
+    long: ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprintf', '-fprint', '-fprint0', '-fls'],
+    short: [],
+    reason: 'executes commands or writes files',
+  },
+  tee: { long: [], short: [], reason: 'tee always writes' },
+  ss: { long: ['--kill'], short: ['K'], reason: 'kills sockets' },
+  systemctl: { long: [], short: [], reason: '' },
+  docker: { long: [], short: [], reason: '' },
+};
 
 /** `docker` is allowed, but only these subcommands. `exec` and `run` are arbitrary code. */
 const DOCKER_SUBCOMMANDS = new Set([
@@ -31,11 +100,18 @@ const SYSTEMCTL_SUBCOMMANDS = new Set([
   'status', 'show', 'is-active', 'is-enabled', 'is-failed', 'list-units', 'cat',
 ]);
 
-/** curl flags that turn a read into a write. */
-const CURL_WRITE_FLAGS = [
-  '-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '-F', '--form',
-  '-T', '--upload-file', '-o', '--output', '--create-dirs',
-];
+/**
+ * Short flags that CONSUME the rest of their token (or the next token) as a
+ * value. Scanning must stop at these — the characters after them are an
+ * argument, not more flags.
+ */
+const VALUE_TAKING: Record<string, string> = {
+  curl: 'XdFTODcHuAebmwKEUY',
+  sort: 'okStT',
+  journalctl: 'unptS',
+  find: '',
+  ss: 'fF',
+};
 
 export interface GateVerdict {
   allowed: boolean;
@@ -136,9 +212,12 @@ function checkSegment(segment: string): GateVerdict {
     return deny(`commands must be bare names, not paths ("${head}")`);
   }
   if (!READ_COMMANDS.has(head)) {
+    const cause = REMOVED_FOR_CAUSE[head];
     return deny(
-      `"${head}" is not on the read-only command allowlist. ` +
-        'This shell can read the homelab but cannot change it.',
+      cause
+        ? `"${head}" is not permitted: ${cause}. Use a plain read command instead.`
+        : `"${head}" is not on the read-only command allowlist. ` +
+            'This shell can read the homelab but cannot change it.',
     );
   }
 
@@ -173,36 +252,65 @@ function checkSegment(segment: string): GateVerdict {
     return allow;
   }
 
-  if (head === 'curl') {
-    for (const token of tokens.slice(1)) {
-      const flag = token.split('=')[0]!;
-      if (CURL_WRITE_FLAGS.includes(flag)) {
-        return deny(`curl ${flag} sends or writes data; this shell is read-only`);
+  const flagVerdict = checkFlags(head, tokens);
+  if (!flagVerdict.allowed) return flagVerdict;
+
+  return allow;
+}
+
+/**
+ * Check a segment's flags against FLAG_POLICY.
+ *
+ * Short flags are checked CHARACTER BY CHARACTER inside a cluster: `curl -so f`
+ * is `-s -o f` and must be refused exactly as `curl -o f` is. The original
+ * version compared whole tokens, so every clustered form was invisible to it —
+ * and the test only ever exercised the space-separated shape, so it asserted the
+ * bug's absence in the one form its author imagined.
+ */
+function checkFlags(head: string, tokens: string[]): GateVerdict {
+  const policy = FLAG_POLICY[head];
+  if (!policy || (!policy.long.length && !policy.short.length)) return allow;
+  const valueTaking = VALUE_TAKING[head] ?? '';
+
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    const bare = token.split('=')[0]!;
+    if (policy.long.includes(bare)) {
+      return deny(`${head} ${bare} ${policy.reason}; this shell is read-only`);
+    }
+    if (head === 'curl' && (bare === '--request' || bare === '-X')) {
+      const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : (tokens[i + 1] ?? '');
+      const method = value.toUpperCase();
+      if (method !== 'GET' && method !== 'HEAD') {
+        return deny(`curl -X ${method || '<none>'} is not a read; this shell is read-only`);
       }
-      if (flag === '-X' || flag === '--request') {
-        const idx = tokens.indexOf(token);
-        const method = (tokens[idx + 1] ?? '').toUpperCase();
-        if (method !== 'GET' && method !== 'HEAD') {
-          return deny(`curl -X ${method || '<none>'} is not a read; this shell is read-only`);
+      continue;
+    }
+    if (!token.startsWith('-') || token.startsWith('--') || token.length < 2) continue;
+
+    const cluster = token.slice(1);
+    for (let j = 0; j < cluster.length; j++) {
+      const ch = cluster[j]!;
+      if (policy.short.includes(ch)) {
+        return deny(`${head} -${ch} (in "${token}") ${policy.reason}; this shell is read-only`);
+      }
+      if (valueTaking.includes(ch)) {
+        // 🔴 STOP SCANNING. Everything after a value-taking flag is that flag's
+        // VALUE, not more flags. Without this, `curl -XGET` was refused because
+        // the `T` of "GET" looked like curl's upload-file flag — a false refusal
+        // that would have pushed the model into pointless retries.
+        const inline = cluster.slice(j + 1);
+        const value = inline || tokens[i + 1] || '';
+        if (head === 'curl' && ch === 'X') {
+          const method = value.toUpperCase();
+          if (method !== 'GET' && method !== 'HEAD') {
+            return deny(`curl -X ${method || '<none>'} is not a read; this shell is read-only`);
+          }
         }
+        break;
       }
     }
-    return allow;
   }
-
-  if (head === 'find') {
-    if (tokens.includes('-delete') || tokens.includes('-exec') || tokens.includes('-execdir')) {
-      return deny('find -exec/-delete can run arbitrary commands; not permitted');
-    }
-    return allow;
-  }
-
-  if (head === 'awk' || head === 'journalctl' || head === 'ps') {
-    // awk can write files via `> "f"` inside its program text; journalctl and ps
-    // are read-only by nature. Redirection is already rejected globally below.
-    return allow;
-  }
-
   return allow;
 }
 

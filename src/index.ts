@@ -1,8 +1,9 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, type TurnRecord } from './agent.js';
-import { loadConfig } from './config.js';
+import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { StdoutConnector } from './connector.js';
 import { createLlmClient } from './llm.js';
+import { buildTools } from './tools/index.js';
 
 const DATA_DIR = new URL('../data/', import.meta.url).pathname;
 
@@ -18,13 +19,18 @@ function recordTurn(record: TurnRecord): void {
 async function main(): Promise<void> {
   const config = loadConfig();
   const llm = createLlmClient(config);
-  const agent = new Agent(config, llm, recordTurn);
+  const tools = buildTools(config);
+  const agent = new Agent(config, llm, recordTurn, tools);
   const connector = new StdoutConnector(process.argv[2] ?? config.ownerHandle);
 
+  const shellSafety = assertShellIdentityIsSafe(config);
   console.error(
-    `model=${llm.label} owner=${config.ownerHandle} hp=${config.hpSshHost} ` +
+    `model=${llm.label} owner=${config.ownerHandle} ` +
+      `shell-ssh=${config.shellSshHost} admin-ssh=${config.adminSshHost} ` +
       `writes=${config.readOnly ? 'DISABLED' : 'ENABLED'}`,
   );
+  console.error(`tools=${tools.map((t) => t.name).join(', ')}`);
+  console.error(`hp_shell: ${shellSafety.safe ? 'enabled' : 'DISABLED'} — ${shellSafety.reason}`);
 
   await connector.listen(async (message) => {
     const record = await agent.handle(message.senderHandle, message.text);
