@@ -111,6 +111,41 @@ documented fix that helps a viewer *without touching the stream*.
   on this box, the alternate limits are 0 (unlimited) while the normal upload limit is 5 MB/s, so
   flipping modes would have removed the only cap in force.
 
+## Persistence exists to finish a job
+
+History survives a restart, per sender, in an append-only log. Eviction and repair are **appended**,
+so a poisoned turn leaves replay without wiping the conversation or rewriting the audit trail
+(`npm run history -- list <handle>` / `evict <id> "<reason>"`). The V1 trap this closes: a bad reply
+keeps poisoning history after the bug that produced it is fixed.
+
+🔴 **Tool results are NOT persisted and never replayed.** A tool result is an observation with a
+timestamp; replaying one presents yesterday's reading as today's context, and the model has no way to
+tell. The whole architecture rests on *"ground every claim in a tool result"*, so silently ageing
+those results poisons the one thing the model is told to trust. **Jedd remembers what was said and
+re-observes what is true.**
+
+The replay bound (20 turns / 7 days) **announces its truncation** rather than hiding it. V1 replayed
+the last 50 messages and silently lost the rest, so a conversation continuing across an outage came
+back with a hole nobody could see.
+
+## The only path by which Jedd speaks without being spoken to
+
+`shed_host_load` leaves a throttle that nothing else would ever remove, so it schedules its own
+return visit. Every follow-up record carries **why** it was scheduled, **to whom** it must speak, and
+**what was observed** at the time; when it wakes it re-observes and reports both.
+
+- **Refuses rather than guesses** — unreadable qBittorrent, unreadable `/Sessions`, unmeasurable host
+  all defer, and none licenses touching the throttle.
+- **Holds while anyone is watching.** Lifting puts load *back* on the box, so this is the direction
+  that can disturb a viewer.
+- **Deferral is bounded, and it says when it gave up.** A follow-up that quietly stops retrying has
+  left a change on the box that nobody knows about.
+- **No news is not news** — if there is nothing to do it resolves silently.
+- The recipient's authorisation is **re-derived at send time**, never trusted from the record.
+- ⚠️ Only a `clear` verdict lifts the throttle. `qbit-not-the-cause` must not: while the throttle is
+  on, qBittorrent's throughput is capped by definition, so a successful shed is exactly what makes it
+  look innocent. **A measurement taken through your own intervention is not independent of it.**
+
 ## Safety lives in code, not in the prompt
 
 - `hp_shell` runs on **hp only** — never on this machine. Deny-by-default allowlist; every pipeline
