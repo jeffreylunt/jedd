@@ -16,7 +16,10 @@ export interface JellyfinResponse {
 export async function jellyfinGet(
   config: Config,
   path: string,
-  timeoutMs = 15_000,
+  // 20s, matching the homelab's standing rule for Jellyfin calls. Do not tighten
+  // it for consistency: a server-side tuner open of 29.4s is on record, and a cap
+  // that aborts mid-open strands a LiveStreamId.
+  timeoutMs = 20_000,
 ): Promise<JellyfinResponse> {
   if (!config.jellyfin.apiKey) {
     return { ok: false, status: 0, error: 'JELLYFIN_API_KEY is not configured' };

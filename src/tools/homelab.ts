@@ -102,16 +102,27 @@ export const jellyfinSearch: Tool = {
 /**
  * Live TV health, which is the thing that actually breaks.
  *
- * Reads the surface a viewer experiences (Jellyfin's tuner services and channel
- * list) and pairs it with Dispatcharr's own recent errors. Each half is reported
- * with its own success flag — a failure on one side never reads as "fine".
+ * 🔴 THIS TOOL DELIBERATELY NEVER ASKS JELLYFIN ABOUT CHANNELS OR TUNERS.
+ *
+ * `/LiveTv/Channels` (and anything else that enumerates channels or tuners)
+ * iterates the tuner, and against a DEAD tuner that call is what wedged Jellyfin
+ * site-wide for hours on 2026-07-26. A dead tuner is exactly the state someone is
+ * in when they ask "is live TV broken", so the diagnostic would fire precisely
+ * when it does the most damage. An earlier version of this tool called
+ * `/LiveTv/Channels?limit=1`; it was removed rather than commented against.
+ *
+ * What is left still answers the question, from the Dispatcharr side where the
+ * faults actually originate: is the proxy serving, is it erroring, is the tunnel
+ * container up, and is Jellyfin itself alive (via `/System/Info`, which touches
+ * no tuner). Each half carries its own success flag — a failure on one side never
+ * reads as "fine".
  */
 export const livetvStatus: Tool = {
   name: 'livetv_status',
   description:
-    'Check Live TV health end to end: Jellyfin tuner service status, how many channels Jellyfin can see, ' +
-    'whether the Dispatcharr container is up, and its recent error lines. Use this for any "live TV is ' +
-    'broken / channel not working" question.',
+    'Check Live TV health: whether the Dispatcharr proxy is up and serving, its recent error lines, ' +
+    'whether gluetun is up, and whether Jellyfin itself is alive. Use this for any "live TV is broken / ' +
+    'channel not working" question. Does not touch the tuner, so it is safe to run when live TV is down.',
   minRole: 'owner',
   parameters: {
     type: 'object',
@@ -131,36 +142,30 @@ export const livetvStatus: Tool = {
     const sections: string[] = [];
     let anyFailure = false;
 
-    const info = await jellyfinGet(ctx.config, '/LiveTv/Info');
+    // Jellyfin liveness only — /System/Info does not enumerate tuners.
+    const info = await jellyfinGet(ctx.config, '/System/Info');
     if (!info.ok) {
       anyFailure = true;
-      sections.push(`Jellyfin Live TV service: UNKNOWN — ${info.error}`);
+      sections.push(`Jellyfin: NOT reachable — ${info.error}`);
     } else {
-      const body = info.body as { Services?: unknown[]; IsEnabled?: unknown } | undefined;
-      const services = Array.isArray(body?.Services) ? body.Services : [];
-      const rendered = services
-        .map((raw) => {
-          const s = raw as Record<string, unknown>;
-          return `${s['Name'] ?? '?'}=${s['Status'] ?? '?'}`;
-        })
-        .join(', ');
-      sections.push(
-        `Jellyfin Live TV: enabled=${body?.IsEnabled ?? '?'} services: ${rendered || '(none)'}`,
-      );
+      const body = info.body as Record<string, unknown> | undefined;
+      sections.push(`Jellyfin: up (version ${body?.['Version'] ?? 'unknown'})`);
     }
 
-    const channels = await jellyfinGet(ctx.config, '/LiveTv/Channels?limit=1');
-    if (!channels.ok) {
+    // Is the Dispatcharr proxy actually serving? Unauthenticated version endpoint.
+    const version = await runOnHp(
+      ctx.config.hpSshHost,
+      `curl -s --max-time 8 -o /dev/null -w "%{http_code}" ${ctx.config.dispatcharr.baseUrl}/api/core/version/`,
+    );
+    const code = version.stdout.trim();
+    if (version.exitCode !== 0 || code !== '200') {
       anyFailure = true;
-      sections.push(`Jellyfin channel count: UNKNOWN — ${channels.error}`);
+      sections.push(
+        `Dispatcharr proxy: NOT serving (http=${code || 'none'}, exit=${version.exitCode}, ` +
+          `stderr=${version.stderr.trim() || '(empty)'})`,
+      );
     } else {
-      const body = channels.body as { TotalRecordCount?: unknown } | undefined;
-      const total = body?.TotalRecordCount;
-      sections.push(`Jellyfin visible channels: ${total ?? 'unknown'}`);
-      if (typeof total === 'number' && total === 0) {
-        anyFailure = true;
-        sections.push('  ⚠ ZERO channels visible — the tuner is not returning a channel list.');
-      }
+      sections.push('Dispatcharr proxy: serving (HTTP 200 on /api/core/version/)');
     }
 
     const up = await runOnHp(
