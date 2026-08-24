@@ -23,6 +23,7 @@ import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
+import { makeTrending } from './trending.js';
 import type { Tool } from './types.js';
 
 /**
@@ -173,6 +174,10 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   // Same rule: no SMTP credential, no tool. A send_ebook that cannot mail would
   // tell somebody their book is on the way and then fail at the last step.
   if (deps.ebook && config.kindle.smtpPassword) tools.push(makeSendEbook(deps.ebook));
+  // Same rule again: no TMDB token, no tool. A registered whats_popular with no
+  // credential would answer every "what's good right now" with a failure, after
+  // the model has already offered to look.
+  if (config.tmdb.readToken) tools.push(makeTrending());
   return registerable(tools, config);
 }
 
@@ -232,6 +237,10 @@ export const ALL_TOOLS: Tool[] = [
   // writes declaration, the delivery-address rule — silently skipped it.
   // Reachable in production is not the same as covered by the guards.
   makeRunbookTool('/nonexistent/enumeration-only.md'),
+  // ⚠️ Conditionally registered by `buildTools` (needs a TMDB token), so it has
+  // the same shape as `read_runbook` and must be listed here by hand or every
+  // invariant quantified over ALL_TOOLS silently skips it.
+  makeTrending(),
 ];
 
 export type { Tool } from './types.js';

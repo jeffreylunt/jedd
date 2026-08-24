@@ -123,6 +123,20 @@ export interface Config {
     profile: string;
     validityHours: number;
   };
+  /**
+   * The Movie Database — the only source of "what is popular", which no arr has.
+   *
+   * ⚠️ `readToken` is the **v4 read access token** (a ~237-character JWT sent as
+   * `Authorization: Bearer`), NOT the 32-character v3 API key. Both authenticate
+   * against the same v3 endpoints, so either "works" — but they are different
+   * strings of very different lengths, and a value of the wrong length here is
+   * the signature of one having been copied in place of the other.
+   *
+   * ⚠️ Empty means `whats_popular` is **not registered at all**. Same rule as
+   * `runbookPath`, `jfago.password` and `hp_shell`: a tool the model can see is
+   * a capability it will offer, so an absent tool beats one that always fails.
+   */
+  tmdb: { readToken: string };
   qbittorrent: {
     /**
      * ⚠️ `http://172.20.0.1:8080` — the DOCKER BRIDGE GATEWAY, not
@@ -233,6 +247,7 @@ export function loadConfig(): Config {
       profile: process.env.JFAGO_PROFILE ?? 'Default',
       validityHours: Number(process.env.JFAGO_INVITE_HOURS ?? 24),
     },
+    tmdb: { readToken: (process.env.TMDB_READ_TOKEN ?? '').trim() },
     qbittorrent: {
       baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',
     },

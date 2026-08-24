@@ -39,6 +39,10 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     sonarr: { baseUrl: 'http://sonarr.invalid:8989/sonarr/api/v3', apiKey: 'test-key', rootFolder: '/tv', qualityProfileId: 9 },
     radarr: { baseUrl: 'http://radarr.invalid:7878/radarr/api/v3', apiKey: 'test-key', rootFolder: '/movies', qualityProfileId: 6 },
     dispatcharr: { baseUrl: 'http://dispatcharr.test:9191' },
+    // Non-empty so `whats_popular` is REGISTERED in tests. It is never used as a
+    // credential: every test routes a stub fetch, and the client only ever talks
+    // to api.themoviedb.org, which no test is permitted to reach.
+    tmdb: { readToken: 'test-read-token' },
     qbittorrent: { baseUrl: 'http://qbittorrent.invalid:8080' },
     jfago: {
       baseUrl: 'http://jfa-go.invalid:8056',
