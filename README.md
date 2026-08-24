@@ -99,15 +99,16 @@ None of this is phrased as an instruction the model could be argued out of.
 
 ## Known limitations
 
-- **The unprivileged ssh account is not provisioned**, so the OS boundary is not yet real. It does
-  **not** need a docker socket proxy: `docker ps/inspect/logs` are read-only, fixed-shape and
-  parameterized only by a container name, so they belong as structured tools on the admin identity.
-  A boundary that appears to cost a capability usually just relocates the call.
-- Blast-radius **tiers** are missing: the protected-container set is flat, so an unclassified
-  container defaults *permissive*, which is the wrong default.
-- `docker exec` is blocked by the gate, which also blocks legitimate read-only diagnostics that need
-  it (e.g. the netns-inode check, `docker exec <c> readlink /proc/self/ns/net`). Fixing this means
-  gating the nested command with the same allowlist.
+- **The identity split is asserted by string inequality on two ssh aliases**, nothing more.
+  `HP_ADMIN_SSH_HOST=hp` with `HP_SHELL_SSH_HOST=jeff@hp` would read as a live boundary while being
+  one account. The real evidence is a manual crossing (see above) that no longer runs. A boot-time
+  behavioural probe — `id -nG` on the shell identity, refuse if `docker` appears — would close it.
+- **`docker_logs` puts container log lines verbatim into the model's context**, which is a new
+  untrusted-content channel. Bounded by the same tool boundary as everything else (a prompt-injected
+  model still cannot reach a write except through a gated tool), but it is new surface.
+- The command gate blocks `docker exec` for the shell, which is now correct and costs nothing: the
+  shell account cannot reach docker anyway, and the netns-inode diagnostic came back as
+  `container_netns` on the admin identity.
 - Conversation history is in memory; a restart forgets everything.
 - Pinned to `qwen3.8:27b-mlx` via Ollama. `LlmClient` is a seam, not an abstraction to build out.
   There is **no forced tool calling** on this stack (`tool_choice` is silently ignored — verified),

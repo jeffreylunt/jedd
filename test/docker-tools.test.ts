@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import type { ExecImpl } from '../src/hp.js';
 import { isValidContainerName } from '../src/safety.js';
 import { containerNetns, dockerInspect, dockerLogs, dockerPs } from '../src/tools/docker.js';
+import { restartContainer } from '../src/tools/homelab.js';
 import type { Tool, ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
 
@@ -143,6 +144,35 @@ test('🔴 a refused container name produces NO ssh call — the command is not 
       );
     }
   }
+});
+
+test('🔴 restart_container validates its name with the SAME validator — and runs nothing when it refuses', async () => {
+  // The write path had its own weaker inline regex, which accepted `-sonarr` and
+  // `.sonarr`. Two validators guarding one privileged identity means tightening
+  // the one everybody looks at leaves the one that actually restarts things.
+  for (const bad of INJECTIONS) {
+    const spy = sshSpy();
+    const result = await restartContainer.run({ container: bad }, ctxWith(spy, { readOnly: false }));
+    assert.equal(result.ok, false, `restart_container must refuse "${bad}"`);
+    assert.equal(
+      spy.calls.length,
+      0,
+      `restart_container ran ssh for refused input "${bad}": ${spy.calls.map((c) => c.command).join(' ;; ')}`,
+    );
+  }
+
+  // Control: a valid name gets past validation and does reach ssh for its
+  // evidence-gathering read, so the assertion above is about the name.
+  //
+  // The stub fails that read deliberately, which stops the tool right there. A
+  // control that let this tool run to completion would reach Jellyfin over the
+  // real network and then the restart branch — a test that can restart a
+  // container is not a test.
+  const spy = sshSpy(() => ({ error: new Error('ssh: no route to host') }));
+  const control = await restartContainer.run({ container: 'sonarr' }, ctxWith(spy, { readOnly: false }));
+  assert.equal(spy.calls.length, 1, 'restart_container made no ssh call even for a valid name');
+  assert.equal(control.ok, false);
+  assert.match(control.content, /Refusing to restart something I cannot see/);
 });
 
 test('CONTROL: a VALID name does reach ssh, so the spy above could have seen a leak', async () => {
