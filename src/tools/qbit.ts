@@ -7,6 +7,7 @@ import {
   recoveryVerdict,
   type LatencyReading,
 } from '../safety.js';
+import { RESTORE_CHECK_DELAY_MS } from '../followup-runner.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
 
 /**
@@ -51,8 +52,8 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
  */
 
 /** Shed values written into qBittorrent's ALTERNATE limits. Code constants. */
-const SHED_DOWN_BYTES_PER_SEC = 1024 * 1024;
-const SHED_UP_BYTES_PER_SEC = 256 * 1024;
+export const SHED_DOWN_BYTES_PER_SEC = 1024 * 1024;
+export const SHED_UP_BYTES_PER_SEC = 256 * 1024;
 
 /** How long to let the shed take effect before re-measuring the symptom. */
 const SETTLE_MS = 20_000;
@@ -100,7 +101,7 @@ async function settle(ctx: ToolContext, ms: number): Promise<void> {
  * site-wide for hours on 2026-07-26, and a stuttering-live-TV report is exactly
  * when a dead tuner is most likely.
  */
-async function measureLatency(ctx: ToolContext): Promise<LatencyReading> {
+export async function measureLatency(ctx: ToolContext): Promise<LatencyReading> {
   const url = `${ctx.config.jellyfin.baseUrl}/System/Info/Public`;
   const outcome = await runOnHp(
     ctx.config.adminSshHost,
@@ -113,7 +114,7 @@ async function measureLatency(ctx: ToolContext): Promise<LatencyReading> {
 }
 
 /** Read qBittorrent's current throughput. */
-async function measureQbit(ctx: ToolContext) {
+export async function measureQbit(ctx: ToolContext) {
   const outcome = await runOnHp(
     ctx.config.adminSshHost,
     `curl -s --max-time 8 ${ctx.config.qbittorrent.baseUrl}/api/v2/transfer/info`,
@@ -121,6 +122,61 @@ async function measureQbit(ctx: ToolContext) {
     ctx.exec,
   );
   return parseQbitTransfer(outcome.stdout, outcome.exitCode);
+}
+
+/**
+ * The complete contention observation, shared by the diagnosis tool, the fix's
+ * precondition, and the follow-up that decides whether the throttle can come off.
+ *
+ * One function so all three answer the same question the same way. A follow-up
+ * that judged "is the box ok now" by a different rule than the one that judged
+ * "is the box bad now" could take a throttle off a box it would immediately want
+ * to put one back on.
+ */
+export async function observeContention(ctx: ToolContext) {
+  const latency = await measureLatency(ctx);
+  const qbit = await measureQbit(ctx);
+  return { latency, qbit, ...hostContentionVerdict(latency, qbit) };
+}
+
+/**
+ * What throttle, if any, is currently in force — and is it OURS?
+ *
+ * Three states. `unknown` is not "no throttle": an unreadable qBittorrent must
+ * never license the follow-up to conclude there is nothing to clean up, because
+ * concluding that is how a throttle stays on forever with nobody watching it.
+ */
+export async function readThrottleState(
+  ctx: ToolContext,
+): Promise<
+  | { known: true; throttled: boolean; ours: boolean; altDown: number; altUp: number }
+  | { known: false; detail: string }
+> {
+  const mode = await runOnHp(
+    ctx.config.adminSshHost,
+    `curl -s --max-time 8 ${ctx.config.qbittorrent.baseUrl}/api/v2/transfer/speedLimitsMode`,
+    20_000,
+    ctx.exec,
+  );
+  const raw = mode.stdout.trim();
+  if (mode.exitCode !== 0 || (raw !== '0' && raw !== '1')) {
+    return { known: false, detail: `speedLimitsMode read gave "${raw || '(empty)'}" (exit=${mode.exitCode})` };
+  }
+  const prefs = await runOnHp(
+    ctx.config.adminSshHost,
+    `curl -s --max-time 8 ${ctx.config.qbittorrent.baseUrl}/api/v2/app/preferences`,
+    20_000,
+    ctx.exec,
+  );
+  const limits = parseAltLimits(prefs.stdout, prefs.exitCode);
+  if (!limits.known) return { known: false, detail: `preferences unreadable (${limits.detail})` };
+  return {
+    known: true,
+    throttled: raw === '1',
+    ours: limits.altDown === SHED_DOWN_BYTES_PER_SEC && limits.altUp === SHED_UP_BYTES_PER_SEC,
+    altDown: limits.altDown,
+    altUp: limits.altUp,
+  };
 }
 
 /**
@@ -143,9 +199,7 @@ export const diagnoseHostContention: Tool = {
   minRole: 'owner',
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
-    const latency = await measureLatency(ctx);
-    const qbit = await measureQbit(ctx);
-    const verdict = hostContentionVerdict(latency, qbit);
+    const verdict = await observeContention(ctx);
     const body = `${verdict.detail}\n\nverdict: ${verdict.verdict}`;
     // `clear` is a successful measurement; `unknown` is not. The ok flag is the
     // thing the turn record derives from, so it must not call a blind probe fine.
@@ -178,9 +232,9 @@ export const shedHostLoad: Tool = {
     }
 
     // ── PRECONDITION ────────────────────────────────────────────────────────
-    const before = await measureLatency(ctx);
-    const qbit = await measureQbit(ctx);
-    const verdict = hostContentionVerdict(before, qbit);
+    const observation = await observeContention(ctx);
+    const before = observation.latency;
+    const verdict = { verdict: observation.verdict, detail: observation.detail };
     if (verdict.verdict !== 'shed-warranted') {
       return fail(`NOT APPLIED. ${verdict.detail}`);
     }
@@ -273,10 +327,32 @@ export const shedHostLoad: Tool = {
     await settle(ctx, SETTLE_MS);
     const after = await measureLatency(ctx);
     const recovery = recoveryVerdict(before, after);
+    // 🔴 NOTHING WILL EVER TAKE THIS THROTTLE OFF ON ITS OWN.
+    //
+    // The shed is a change to the box that outlives the conversation, and the
+    // person who asked for help is not going to remember to ask for it back. So
+    // the tool schedules its own return visit, and the promise it makes in the
+    // reply is conditional on that scheduling having actually succeeded — a tool
+    // that says "I'll check back" when nothing is watching is worse than one
+    // that admits it cannot.
+    const scheduled = ctx.followups?.schedule({
+      kind: 'restore-qbit-throttle',
+      senderHandle: ctx.senderHandle,
+      dueAt: new Date(Date.now() + RESTORE_CHECK_DELAY_MS),
+      reason: 'throttled qBittorrent because the host was contended and it was the cause',
+      observed: verdict.detail,
+    });
+
+    const promise = scheduled
+      ? ` I will check back in about ${Math.round(RESTORE_CHECK_DELAY_MS / 60_000)} minutes and take it ` +
+        'off if the box is quiet and nobody is watching.'
+      : ' ⚠️ I could NOT schedule a follow-up, so this throttle will stay on until someone removes it — ' +
+        'run restore_qbit_speed when live TV is done.';
+
     const applied =
       `qBittorrent throttled to ${(SHED_DOWN_BYTES_PER_SEC / 1024).toFixed(0)} KB/s down / ` +
       `${(SHED_UP_BYTES_PER_SEC / 1024).toFixed(0)} KB/s up (alternate speed limits). ` +
-      'Nothing in the playback path was touched. Undo with restore_qbit_speed.';
+      `Nothing in the playback path was touched.${promise}`;
 
     if (recovery.verdict === 'improved') {
       return ok(`FIXED. ${recovery.detail}\n\n${applied}`);

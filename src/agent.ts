@@ -1,5 +1,7 @@
 import type { Config } from './config.js';
+import type { FollowupStore } from './followups.js';
 import type { LlmClient, LlmMessage } from './llm.js';
+import type { HistoryStore } from './store.js';
 import { roleFor, roleSatisfies, type Role } from './permissions.js';
 import { ALL_TOOLS } from './tools/index.js';
 import type { Tool, ToolContext } from './tools/types.js';
@@ -93,6 +95,8 @@ export class Agent {
     private readonly llm: LlmClient,
     private readonly onTurn?: (record: TurnRecord) => void,
     registry: Tool[] = ALL_TOOLS,
+    private readonly store?: HistoryStore,
+    private readonly followups?: FollowupStore,
   ) {
     this.registry = registry;
   }
@@ -100,7 +104,12 @@ export class Agent {
   async handle(senderHandle: string, userText: string): Promise<TurnRecord> {
     const role = roleFor(senderHandle, this.config);
     const tools = this.registry.filter((t) => roleSatisfies(role, t.minRole));
-    const ctx: ToolContext = { role, senderHandle, config: this.config };
+    const ctx: ToolContext = {
+      role,
+      senderHandle,
+      config: this.config,
+      followups: this.followups,
+    };
 
     // History is keyed by sender, so one process serves many conversations and
     // no history can leak from one identity to another.
@@ -108,6 +117,14 @@ export class Agent {
     let history = this.histories.get(key);
     if (!history) {
       history = [{ role: 'system', content: systemPrompt(this.config) }];
+      // Replay what was SAID, never what was OBSERVED — see src/store.ts. Tool
+      // results are timestamped readings, and replaying one presents a stale
+      // measurement as current context with nothing to mark it as old.
+      if (this.store) {
+        const replayed = this.store.replay(senderHandle);
+        if (replayed.note) history.push({ role: 'system', content: replayed.note });
+        history.push(...replayed.messages);
+      }
       this.histories.set(key, history);
     }
     history.push({ role: 'user', content: userText });
@@ -192,6 +209,9 @@ export class Agent {
       replyText,
       steps: steps + 1,
     };
+    // Persisted AFTER the turn completes, so a crash mid-turn leaves no record
+    // of a reply that was never delivered.
+    this.store?.record(senderHandle, userText, replyText);
     this.onTurn?.(record);
     return record;
   }

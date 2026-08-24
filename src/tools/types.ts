@@ -1,4 +1,5 @@
 import type { Config } from '../config.js';
+import type { FollowupStore } from '../followups.js';
 import type { ExecImpl } from '../hp.js';
 import type { Role } from '../permissions.js';
 
@@ -21,6 +22,14 @@ export interface ToolContext {
    * timer. Exists so a settle delay does not make the suite take a minute.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Where a tool records work that is not finished when it returns.
+   *
+   * Optional so a tool that cannot schedule still WORKS — it just cannot promise
+   * to come back. A tool must therefore never claim a follow-up it did not
+   * manage to schedule.
+   */
+  followups?: FollowupStore;
 }
 
 /**

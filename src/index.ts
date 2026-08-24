@@ -2,7 +2,10 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, type TurnRecord } from './agent.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { StdoutConnector } from './connector.js';
+import { FollowupStore } from './followups.js';
+import { runDueFollowups } from './followup-runner.js';
 import { createLlmClient } from './llm.js';
+import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
 const DATA_DIR = new URL('../data/', import.meta.url).pathname;
@@ -16,11 +19,16 @@ function recordTurn(record: TurnRecord): void {
   console.error(`  [audit] ${record.role} · ${summary} · ${record.steps} step(s)`);
 }
 
+/** How often to look for follow-ups that have come due. */
+const TICK_MS = 60_000;
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const llm = createLlmClient(config);
   const tools = buildTools(config);
-  const agent = new Agent(config, llm, recordTurn, tools);
+  const history = new HistoryStore(`${DATA_DIR}history.jsonl`);
+  const followups = new FollowupStore(`${DATA_DIR}followups.jsonl`);
+  const agent = new Agent(config, llm, recordTurn, tools, history, followups);
   const connector = new StdoutConnector(process.argv[2] ?? config.ownerHandle);
 
   const shellSafety = assertShellIdentityIsSafe(config);
@@ -31,6 +39,26 @@ async function main(): Promise<void> {
   );
   console.error(`tools=${tools.map((t) => t.name).join(', ')}`);
   console.error(`hp_shell: ${shellSafety.safe ? 'enabled' : 'DISABLED'} — ${shellSafety.reason}`);
+
+  // The thing that wakes up. A follow-up whose work is not done when the turn
+  // ends is not finished until the user has been told the outcome, and this is
+  // the only path by which Jedd speaks without being spoken to.
+  const pending = followups.due(new Date()).length;
+  console.error(
+    `followups: ${followups.all().filter((f) => f.status === 'pending').length} pending` +
+      `${pending ? ` (${pending} already due)` : ''}, checked every ${TICK_MS / 1000}s`,
+  );
+  const timer = setInterval(() => {
+    void runDueFollowups(followups, {
+      config,
+      send: (to, text) => connector.send(to, text),
+    }).then((outcomes) => {
+      for (const o of outcomes) {
+        console.error(`  [followup] ${o.id} ${o.action}${o.sent ? ' (sent)' : ''} — ${o.detail}`);
+      }
+    });
+  }, TICK_MS);
+  timer.unref();
 
   await connector.listen(async (message) => {
     const record = await agent.handle(message.senderHandle, message.text);
