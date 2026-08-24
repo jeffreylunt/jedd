@@ -254,6 +254,14 @@ export function parseSendAudience(raw: string | undefined): SendAudience {
   return handles;
 }
 
+/** What a send actually did. See `BlueBubblesConnector.sendReporting`. */
+export interface SendOutcome {
+  state: 'suppressed' | 'accepted' | 'failed';
+  /** 🔴 `null` means no verdict yet. It is NEVER a synonym for `false`. */
+  delivered: boolean | null;
+  detail: string;
+}
+
 export class BlueBubblesConnector implements Connector {
   readonly name = 'bluebubbles';
 
@@ -271,16 +279,57 @@ export class BlueBubblesConnector implements Connector {
     return this.audience === 'everyone' || this.audience.includes(toHandle);
   }
 
-  async send(toHandle: string, text: string): Promise<void> {
+  /**
+   * Send, and REPORT what happened rather than throwing it away.
+   *
+   * ── 🔴 A SUPPRESSED SEND IS A FAILED SEND, TO ANY CALLER THAT OWNS A ────────
+   * ── CREDENTIAL ─────────────────────────────────────────────────────────────
+   *
+   * `send()` below can afford to return quietly on a suppression: a reply that
+   * was not sent costs a reply. `invite_to_jellyfin` cannot, because by the time
+   * it calls this **a live single-use Jellyfin invite already exists** — the link
+   * IS the message, so the credential must be minted before the risky operation.
+   * If a suppression came back looking like a success, the invite would stay live
+   * for 24 hours for a message that nobody ever received. That is V1's exact
+   * defect, reintroduced by the rehearsal gate rather than by the tool.
+   *
+   * So the three outcomes stay distinct all the way up:
+   *
+   *   `suppressed` → `delivered: false`  — did not go out. Revoke.
+   *   `failed`     → `delivered: false`  — went out and was refused. Revoke.
+   *   `accepted`   → `delivered: null`   — 🔴 **NO VERDICT YET, NOT SUCCESS.**
+   *
+   * `null` is never `false`. iMessage acquires delivery on ACK, so treating the
+   * first few hundred milliseconds as failure would revoke every working invite.
+   */
+  async sendReporting(toHandle: string, text: string): Promise<SendOutcome> {
     // 🔴 The gate is HERE, above the transport, not in the agent and not in the
     // prompt. A suppressed reply must be unable to reach `sendText` even if
     // every layer above it decided to answer.
     if (!this.allowed(toHandle)) {
       this.onSuppressed?.(toHandle, text);
-      return;
+      return {
+        state: 'suppressed',
+        delivered: false,
+        detail: `SUPPRESSED — ${toHandle} is outside the send audience, so nothing was sent.`,
+      };
     }
     const r = await this.client.sendText(toHandle, text);
-    if (!r.accepted) throw new Error(`send failed: ${r.detail}`);
+    return r.accepted
+      ? { state: 'accepted', delivered: null, detail: r.detail }
+      : { state: 'failed', delivered: false, detail: r.detail };
+  }
+
+  /**
+   * Fire-and-forget send, for replies.
+   *
+   * ⚠️ Delegates to `sendReporting` rather than reimplementing the gate. Two send
+   * paths would be two places for the audience check to drift, and the drift
+   * would be invisible: each path is individually plausible.
+   */
+  async send(toHandle: string, text: string): Promise<void> {
+    const r = await this.sendReporting(toHandle, text);
+    if (r.state === 'failed') throw new Error(`send failed: ${r.detail}`);
   }
 
   async listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void> {

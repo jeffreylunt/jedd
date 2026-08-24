@@ -29,12 +29,38 @@ export interface JfagoOptions {
   baseUrl: string;
   username: string;
   password: string;
-  /** Public Jellyfin URL the signup link is built from. */
-  publicUrl: string;
+  /**
+   * 🔴 jfa-go's OWN public base, INCLUDING its `url_base` — the signup page is
+   * served at `<base>/invite/<code>`.
+   *
+   * **This is NOT the Jellyfin URL, and the two are one path segment apart on
+   * the same host:** `https://jeffreylunt.com/accounts` (jfa-go, correct) versus
+   * `https://jeffreylunt.com/jellyfin` (Jellyfin, wrong). A link built from the
+   * second is a 404 — and it is a 404 handed to a guest inside a message that
+   * says "set up your account here", after a real invite has been minted and
+   * charged against their quota. Nothing in this process could detect it: the
+   * mint succeeded, the send succeeded, and the only thing that failed happened
+   * in somebody else's browser.
+   *
+   * The field used to be called `publicUrl` and documented as the Jellyfin URL.
+   * Renamed rather than re-commented, because the name is what a caller reads
+   * when deciding which of two adjacent values to pass.
+   */
+  inviteBaseUrl: string;
   profile: string;
   validityHours: number;
   fetchImpl?: FetchImpl;
   timeoutMs?: number;
+  /**
+   * How long to wait between read-back attempts. Injectable so the retry is a
+   * real wait in production and free in tests.
+   *
+   * ⚠️ Zero here makes the retry loop decorative: three back-to-back requests
+   * against a service that lags by even 50 ms all miss, and the outcome is an
+   * `orphaned` — a live credential nobody can name — reported for a race that
+   * would have resolved itself.
+   */
+  readBackDelayMs?: number;
 }
 
 export interface Invite {
@@ -103,7 +129,7 @@ export class JfagoClient {
   }
 
   private link(code: string): string {
-    return `${this.opts.publicUrl.replace(/\/$/, '')}/invite/${code}`;
+    return `${this.opts.inviteBaseUrl.replace(/\/$/, '')}/invite/${code}`;
   }
 
   /** Mint a single-use invite and read its code back. */
@@ -133,7 +159,9 @@ export class JfagoClient {
 
     // The code is not in the create response. Read it back by label; GET can lag
     // the POST, so this retries rather than concluding on the first miss.
+    const delay = this.opts.readBackDelayMs ?? 300;
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0 && delay > 0) await new Promise((r) => setTimeout(r, delay));
       const listed = await this.call('GET', '/invites', { token });
       const invites = (listed.body as { invites?: { code?: string; label?: string }[] } | undefined)?.invites;
       const match = Array.isArray(invites)

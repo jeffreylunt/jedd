@@ -40,6 +40,14 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     radarr: { baseUrl: 'http://radarr.invalid:7878/radarr/api/v3', apiKey: 'test-key', rootFolder: '/movies', qualityProfileId: 6 },
     dispatcharr: { baseUrl: 'http://dispatcharr.test:9191' },
     qbittorrent: { baseUrl: 'http://qbittorrent.invalid:8080' },
+    jfago: {
+      baseUrl: 'http://jfa-go.invalid:8056',
+      inviteBaseUrl: 'https://jf.invalid/accounts',
+      username: 'u',
+      password: 'test-pw',
+      profile: 'Default',
+      validityHours: 24,
+    },
     readOnly: true,
     ...overrides,
   };

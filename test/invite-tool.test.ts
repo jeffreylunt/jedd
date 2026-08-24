@@ -5,8 +5,16 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { InviteLedger, QUOTA_MAX } from '../src/invite-ledger.js';
 import { JfagoClient, type FetchImpl } from '../src/jfago.js';
-import { makeInviteTool, type InviteSender } from '../src/tools/invite.js';
+import { buildTools } from '../src/tools/index.js';
+import { makeInviteTool, type InviteDeps, type InviteSender } from '../src/tools/invite.js';
 import { testConfig } from './helpers.js';
+
+/** Deps good enough to REGISTER with. Registration must not require a live jfa-go. */
+const inertDeps = (): InviteDeps => ({
+  jfago: jfago().client,
+  ledger: new InviteLedger(tmp()),
+  send: async () => ({ delivered: null, detail: 'not sent in this test' }),
+});
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jedd-it-')), 'l.jsonl');
 const GUEST = '+13854346068';
@@ -30,7 +38,7 @@ function jfago(opts: { revokeOk?: boolean; mintFails?: boolean; unreadable?: boo
   let lastLabel = '';
   const client = new JfagoClient({
     baseUrl: 'https://jf.invalid/accounts', username: 'u', password: 'p',
-    publicUrl: 'https://jf.invalid/jellyfin', profile: 'Default', validityHours: 24, fetchImpl: impl,
+    inviteBaseUrl: 'https://jf.invalid/accounts', profile: 'Default', validityHours: 24, fetchImpl: impl, readBackDelayMs: 0,
   });
   // capture the label the tool generates so the read-back matches
   const origMint = client.mint.bind(client);
@@ -145,4 +153,35 @@ test('an orphaned mint is surfaced and nothing is sent', async () => {
   assert.equal(r.ok, false);
   assert.match(r.content, /ORPHANED/);
   assert.equal(s.sent.length, 0, 'we cannot send a link we could not read back');
+});
+
+// ── 🔴 REGISTRATION: the tool was built, tested, swept — and unreachable ─────
+
+test('🔴 invite_to_jellyfin IS REGISTERED when jfa-go is configured and writes are on', () => {
+  const names = buildTools(testConfig({ readOnly: false }), undefined, { invite: inertDeps() }).map((t) => t.name);
+  assert.ok(names.includes('invite_to_jellyfin'), `absent from: ${names.join(', ')}`);
+});
+
+test('🔴 it is absent when writes are DISABLED — it is a guest write tool', () => {
+  const names = buildTools(testConfig({ readOnly: true }), undefined, { invite: inertDeps() }).map((t) => t.name);
+  assert.ok(!names.includes('invite_to_jellyfin'));
+});
+
+test('it is absent when jfa-go is NOT configured — an absent tool beats one that always fails', () => {
+  const config = testConfig({ readOnly: false });
+  const names = buildTools(
+    { ...config, jfago: { ...config.jfago, password: '' } },
+    undefined,
+    { invite: inertDeps() },
+  ).map((t) => t.name);
+  assert.ok(!names.includes('invite_to_jellyfin'));
+});
+
+test('it is absent when no send path was injected — it cannot deliver what it mints', () => {
+  const names = buildTools(testConfig({ readOnly: false }), undefined, {}).map((t) => t.name);
+  assert.ok(!names.includes('invite_to_jellyfin'));
+});
+
+test('CONTROL: the registry is not empty in any of those cases', () => {
+  assert.ok(buildTools(testConfig({ readOnly: true }), undefined, {}).length > 3);
 });

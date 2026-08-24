@@ -6,6 +6,8 @@ import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
+import { InviteLedger } from './invite-ledger.js';
+import { JfagoClient } from './jfago.js';
 import { runDueFollowups } from './followup-runner.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { KindleRegistry } from './kindle.js';
@@ -75,14 +77,12 @@ async function main(): Promise<void> {
     ? await proveShellIdentityIsSafe(config)
     : { safe: false, reason: preflight.reason, evidence: ['pre-flight refused; probe not attempted'] };
 
-  const tools = buildTools(config, shellIdentity);
   const history = new HistoryStore(`${DATA_DIR}history.jsonl`);
   const followups = new FollowupStore(`${DATA_DIR}followups.jsonl`);
   const choices = new ChoiceStore(`${DATA_DIR}choices.jsonl`);
   const kindle = new KindleRegistry(`${DATA_DIR}kindle.jsonl`);
   const seen = new SeenStore(`${DATA_DIR}seen.jsonl`);
-
-  const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, kindle);
+  const invites = new InviteLedger(`${DATA_DIR}invites.jsonl`);
 
   const receiver = new BlueBubblesReceiver({
     client,
@@ -98,6 +98,36 @@ async function main(): Promise<void> {
   const connector = new BlueBubblesConnector(receiver, client, audience, (to, text) =>
     console.error(`[jedd] SUPPRESSED ${text.length} chars to ${to} — not in the send audience.`),
   );
+
+  /**
+   * 🔴 THE INVITE SENDS THROUGH THE SAME GATED CONNECTOR AS EVERY OTHER MESSAGE.
+   *
+   * Two things follow, and both are load-bearing:
+   *
+   *  1. A rehearsal cannot leak a real invite link to somebody outside
+   *     `JEDD_SEND_TO`. The audience gate is not re-implemented here; there is
+   *     one send path.
+   *  2. **A SUPPRESSED SEND MUST READ AS A FAILED SEND**, so the invite is
+   *     revoked. `connector.send` reports what happened; anything that is not a
+   *     confirmed non-failure destroys the credential. Silently swallowing a
+   *     suppression would leave a live single-use invite behind for a message
+   *     nobody ever received — the exact V1 defect this tool was built to not
+   *     have, reintroduced by the test harness rather than by the tool.
+   */
+  const invite = {
+    jfago: new JfagoClient({
+      baseUrl: config.jfago.baseUrl,
+      inviteBaseUrl: config.jfago.inviteBaseUrl,
+      username: config.jfago.username,
+      password: config.jfago.password,
+      profile: config.jfago.profile,
+      validityHours: config.jfago.validityHours,
+    }),
+    ledger: invites,
+    send: (to: string, text: string) => connector.sendReporting(to, text),
+  };
+  const tools = buildTools(config, shellIdentity, { invite });
+  const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, kindle);
 
   console.error(
     `[jedd] model=${llm.label} owner=${config.ownerHandle} ` +

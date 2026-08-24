@@ -103,6 +103,26 @@ export interface Config {
     username?: string;
     password?: string;
   };
+  /**
+   * jfa-go — Jellyfin account provisioning.
+   *
+   * 🔴 `baseUrl` is the ADMIN api and `inviteBaseUrl` is what a guest clicks.
+   * They are usually the same host and they are not interchangeable — see
+   * `src/jfago.ts`.
+   *
+   * ⚠️ `password` empty means jfa-go is NOT configured, and `invite_to_jellyfin`
+   * is then **not registered at all**. Same rule as `runbookPath` and `hp_shell`:
+   * an absent tool beats one that always fails, because a tool the model can see
+   * is a capability it will offer.
+   */
+  jfago: {
+    baseUrl: string;
+    inviteBaseUrl: string;
+    username: string;
+    password: string;
+    profile: string;
+    validityHours: number;
+  };
   qbittorrent: {
     /**
      * ⚠️ `http://172.20.0.1:8080` — the DOCKER BRIDGE GATEWAY, not
@@ -201,6 +221,17 @@ export function loadConfig(): Config {
       baseUrl: process.env.DISPATCHARR_URL ?? 'http://localhost:9191',
       username: process.env.DISPATCHARR_USER,
       password: process.env.DISPATCHARR_PASSWORD,
+    },
+    jfago: {
+      baseUrl: process.env.JFAGO_URL ?? '',
+      // Defaults to the admin base, which is correct for jfa-go: the same
+      // url_base serves both surfaces. It is a separate variable so a deploy
+      // that fronts them differently does not have to lie about one of them.
+      inviteBaseUrl: process.env.JFAGO_PUBLIC_URL ?? process.env.JFAGO_URL ?? '',
+      username: process.env.JFAGO_USER ?? '',
+      password: process.env.JFAGO_PASSWORD ?? '',
+      profile: process.env.JFAGO_PROFILE ?? 'Default',
+      validityHours: Number(process.env.JFAGO_INVITE_HOURS ?? 24),
     },
     qbittorrent: {
       baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',

@@ -356,6 +356,48 @@ test('a suppressed send resolves quietly — it is not an error the loop should 
   await connector.send('+15551112222', 'hi');
 });
 
+// ── 🔴 what a send REPORTS, for a caller holding a live credential ──────────
+
+test('🔴 a SUPPRESSED send reports delivered:false — an invite behind it must be revoked', async () => {
+  // `send()` may resolve quietly on a suppression: an unsent reply costs a
+  // reply. `invite_to_jellyfin` cannot, because a live single-use Jellyfin
+  // invite already exists by the time it calls. A suppression that looked like
+  // a success would leave that credential live for 24h for a message nobody
+  // received — V1's defect, reintroduced by the rehearsal gate.
+  const client = {
+    async sendText() {
+      throw new Error('sendText must not be reached');
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, []);
+  const r = await connector.sendReporting('+15551112222', 'here is your invite');
+  assert.equal(r.state, 'suppressed');
+  assert.equal(r.delivered, false, 'false, not null: this one is KNOWN not to have gone out');
+});
+
+test('🔴 an ACCEPTED send reports delivered:null — acceptance is not delivery', async () => {
+  const client = {
+    async sendText() {
+      return { accepted: true, guid: 'g1', delivery: 'unknown', detail: 'accepted' };
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  const r = await connector.sendReporting('+15551112222', 'hi');
+  assert.equal(r.state, 'accepted');
+  assert.equal(r.delivered, null, 'null is NOT false — revoking here kills every working invite');
+});
+
+test('a REFUSED send reports delivered:false, and send() still throws for the reply path', async () => {
+  const client = {
+    async sendText() {
+      return { accepted: false, guid: null, delivery: 'failed', detail: 'http 500' };
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  assert.equal((await connector.sendReporting('+1555', 'hi')).delivered, false);
+  await assert.rejects(() => connector.send('+1555', 'hi'), /send failed/);
+});
+
 // ── 🔴 the first boot must not answer history ────────────────────────────────
 
 /** A server holding `history` messages, newest rowid 2601. */

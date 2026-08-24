@@ -1,5 +1,7 @@
 import { type Config } from '../config.js';
 import type { IdentityVerdict } from '../identity-probe.js';
+import { InviteLedger } from '../invite-ledger.js';
+import { JfagoClient } from '../jfago.js';
 import { roleSatisfies, type Role } from '../permissions.js';
 import { containerNetns, dockerInspect, dockerLogs, dockerPs } from './docker.js';
 import {
@@ -16,6 +18,7 @@ import { makeCheckStatus } from './check-status.js';
 import { resolveChoice } from './choice.js';
 import { kindleStatus, saveKindleEmail } from './kindle.js';
 import { librarySearch } from './library.js';
+import { makeInviteTool, type InviteDeps } from './invite.js';
 import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
@@ -62,6 +65,55 @@ const GUEST_TOOLS: Tool[] = [
  * registry instead. This is the first real member of that combination.
  */
 const GUEST_WRITE_TOOLS: Tool[] = [makeAddMovie(), makeAddSeries(), saveKindleEmail, addAudiobook];
+
+/**
+ * 🔴 THE INVITE TOOL IS BUILT FROM INJECTED DEPS, WHICH IS WHY IT WAS MISSING.
+ *
+ * `invite_to_jellyfin` was written, tested and mutation-swept — and then not
+ * registered, because it is the only tool that cannot be a module-level const:
+ * it needs a jfa-go client, a persistent ledger and **a way to send a text**,
+ * and the send path belongs to the connector, not to a tool file. Every other
+ * tool could be added by appending to an array in this file; this one needed a
+ * parameter, so adding it was a two-file change and the second file was never
+ * edited. **It was absent by omission, in a registry whose whole design is that
+ * absence should be by construction.**
+ *
+ * That is the reason `buildTools` now takes deps rather than the invite tool
+ * reaching for a module-level singleton: the thing that decides whether a
+ * credential can be minted is now visible in the call that builds the registry.
+ */
+export interface ToolDeps {
+  /** Absent → `invite_to_jellyfin` is not registered at all. */
+  invite?: InviteDeps;
+}
+
+/**
+ * ⚠️ An INERT invite tool, for enumeration only — `ALL_TOOLS`, and nothing else.
+ *
+ * It is pointed at `jfa-go.invalid` (RFC 2606, can never resolve) with a sender
+ * that throws, so the worst a mistaken use can do is fail to mint. The
+ * enumeration invariants — every tool declares `writes`, every tool is gated by
+ * role, no tool takes an unvouched delivery address — must see this tool, and
+ * they can only see what is in a list.
+ *
+ * ⚠️ `ALL_TOOLS` already carries `hpShell` regardless of the identity proof, so
+ * it is a documentation surface rather than a runnable registry. Do not start
+ * treating it as one.
+ */
+const INERT_INVITE: InviteDeps = {
+  jfago: new JfagoClient({
+    baseUrl: 'http://jfa-go.invalid:8056',
+    inviteBaseUrl: 'http://jfa-go.invalid',
+    username: '',
+    password: '',
+    profile: 'Default',
+    validityHours: 24,
+  }),
+  ledger: new InviteLedger('/nonexistent/jedd-inert-invites.jsonl'),
+  send: async () => {
+    throw new Error('ALL_TOOLS carries an INERT invite tool; it cannot send. Use buildTools(deps).');
+  },
+};
 const OWNER_READ_TOOLS: Tool[] = [
   jellyfinSessions,
   livetvStatus,
@@ -93,10 +145,14 @@ const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLo
  * boundary gets no free-form shell, rather than getting one on the strength of a
  * string comparison. Fail closed by construction, not by remembering to check.
  */
-export function buildTools(config: Config, shellIdentity?: IdentityVerdict): Tool[] {
+export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps: ToolDeps = {}): Tool[] {
   const tools = [...GUEST_TOOLS, ...GUEST_WRITE_TOOLS, ...OWNER_READ_TOOLS, ...OWNER_WRITE_TOOLS];
   if (shellIdentity?.safe) tools.push(hpShell);
   if (config.runbookPath) tools.push(makeRunbookTool(config.runbookPath));
+  // Same rule as hp_shell and read_runbook: no jfa-go, no tool. A registered
+  // invite tool that cannot reach jfa-go would offer a capability that fails
+  // AFTER the model has promised it to someone.
+  if (deps.invite && config.jfago.password) tools.push(makeInviteTool(deps.invite));
   return registerable(tools, config);
 }
 
@@ -149,6 +205,7 @@ export const ALL_TOOLS: Tool[] = [
   ...OWNER_READ_TOOLS,
   ...OWNER_WRITE_TOOLS,
   hpShell,
+  makeInviteTool(INERT_INVITE),
 ];
 
 export type { Tool } from './types.js';

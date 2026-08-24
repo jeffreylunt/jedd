@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { KindleRegistry, normaliseKindleAddress } from '../src/kindle.js';
+import { testConfig } from './helpers.js';
 
 function tempFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'jedd-kindle-')), 'kindle.jsonl');
@@ -135,19 +136,59 @@ test('CONTROL: the tool stores an address the person did type', async () => {
   assert.match(r.content, /approved-senders/i, 'and it owes them the Amazon reminder');
 });
 
-test('🔴 there is NO send tool that takes an address', async () => {
-  // The delivery pipeline does not exist yet, and a send tool that cannot send
-  // would be the request_media mistake. When it lands it will take a choice
-  // number, never an address -- the model cannot supply what the schema will not
-  // accept.
+test('🔴 EVERY tool that accepts a delivery address REFUSES one nobody typed', async () => {
+  /**
+   * This used to be a NAME check with a hardcoded exception:
+   *
+   *   `!/mail|address|recipient|send_to/i.test(key) || t.name === 'save_kindle_email'`
+   *
+   * — i.e. "no tool may take an address, except the one that does". That is an
+   * allowlist, and an allowlist grows: `invite_to_jellyfin` takes a `recipient`
+   * for the same reason `save_kindle_email` takes an `address` — the person is
+   * telling us where to send something — and adding a second name to the
+   * exception would have turned the guard into a list of tools somebody
+   * remembered to think about.
+   *
+   * 🔴 The rule the two tools actually share is PROVENANCE, and provenance is a
+   * BEHAVIOUR, so it is checked by CALLING them: given a well-formed address
+   * that does not appear in this person's own messages, the tool must refuse.
+   * That is strictly stronger than the name check it replaces — it now also
+   * holds `save_kindle_email` to the rule instead of exempting it by name.
+   */
   const { ALL_TOOLS } = await import('../src/tools/index.js');
+  const ADDRESSISH = /mail|address|recipient|send_to/i;
+  let exercised = 0;
+
   for (const t of ALL_TOOLS) {
     const props = (t.parameters as { properties?: Record<string, unknown> }).properties ?? {};
     for (const key of Object.keys(props)) {
-      assert.ok(
-        !/mail|address|recipient|send_to/i.test(key) || t.name === 'save_kindle_email',
-        `${t.name} takes "${key}" — a delivery address must never be a model-supplied parameter`,
+      if (!ADDRESSISH.test(key)) continue;
+      exercised += 1;
+      const r = await t.run(
+        // Well-formed, plausible, and never typed by this person. A validator
+        // passes it; only provenance rejects it.
+        { [key]: key === 'recipient' ? '+18015559999' : 'korbyn96_yo0FhQ@kindle.com' },
+        {
+          role: 'owner',
+          senderHandle: OTHER,
+          // 🔴 Writes ENABLED. With writes off every tool here refuses for the
+          // wrong reason, and a refusal that is not about provenance would let
+          // this test pass on a tool that has no provenance check at all.
+          config: testConfig({ readOnly: false }),
+          kindle: new KindleRegistry(tempFile()),
+          userTurns: ['hey', 'can you get me a book'],
+        },
+      );
+      assert.equal(r.ok, false, `${t.name} accepted a "${key}" nobody typed`);
+      assert.match(
+        r.content,
+        /does not appear in anything this person typed/i,
+        `${t.name} refused "${key}", but not because of provenance`,
       );
     }
   }
+
+  // 🔴 FAILING CONTROL. A loop over zero matches passes silently, and this
+  // invariant is only worth anything if it ran.
+  assert.ok(exercised >= 2, `only ${exercised} address-shaped parameter(s) were exercised`);
 });

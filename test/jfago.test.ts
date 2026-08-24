@@ -25,10 +25,13 @@ function scripted(handler: (c: Call, n: number) => { status?: number; body: unkn
 
 const client = (impl: FetchImpl) =>
   new JfagoClient({
-    baseUrl: 'https://jf.invalid/accounts',
+    // 🔴 The admin API and the public signup base are DIFFERENT URLs, and this
+    // fixture keeps them different on purpose: when they agree, nothing can
+    // detect a link built from the wrong one.
+    baseUrl: 'http://jfa-go.invalid:8056',
     username: 'u', password: 'p',
-    publicUrl: 'https://jf.invalid/jellyfin',
-    profile: 'Default', validityHours: 24, fetchImpl: impl,
+    inviteBaseUrl: 'https://jf.invalid/accounts',
+    profile: 'Default', validityHours: 24, fetchImpl: impl, readBackDelayMs: 0,
   });
 
 const TOKEN = { token: 'tok' };
@@ -118,12 +121,17 @@ test('a create that jfa-go refuses is FAILED — no credential exists to worry a
   assert.equal(r.state, 'failed');
 });
 
-test('the signup link is built from the PUBLIC url, not the admin one', async () => {
+test("🔴 the signup link is built from JFA-GO's public base, not the admin API and not Jellyfin", async () => {
+  // This assertion used to read `.../jellyfin/invite/ZZ`, matching a field
+  // called `publicUrl` documented as "the public Jellyfin URL". That is a 404:
+  // jfa-go serves the signup page under ITS OWN url_base. The test agreed with
+  // the code, and both were wrong — measured against V1, which has been minting
+  // working links from `config.jfago.url` in production.
   const { impl } = scripted((c) =>
     c.url.endsWith('/token/login') ? { body: TOKEN }
       : c.method === 'POST' ? { body: { success: true } }
       : { body: { invites: [{ code: 'ZZ', label: 'l' }] } });
   const r = await client(impl).mint('l');
   if (r.state !== 'minted') throw new Error('unreachable');
-  assert.equal(r.invite.link, 'https://jf.invalid/jellyfin/invite/ZZ');
+  assert.equal(r.invite.link, 'https://jf.invalid/accounts/invite/ZZ');
 });
