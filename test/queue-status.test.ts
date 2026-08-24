@@ -328,3 +328,25 @@ test('many groups are capped and the answer says how many it left out', async ()
   const res = await makeCheckStatus(stub.fetchImpl, () => NOW).run({}, ctx());
   assert.match(res.content, /and 8 more group\(s\) not shown/);
 });
+
+test('🔴 a STOPPED release never states how long it has been stopped', async () => {
+  // This read "0% after 49h" and a human read it — correctly, from the words —
+  // as "stopped for 49 hours". It had been stopped 27 MINUTES earlier, by
+  // someone reclaiming download slots. 49h was the age of the QUEUE ITEM, and
+  // the stop has no timestamp anywhere: qBittorrent's last_activity equals
+  // added_on for a torrent that never moved a byte.
+  const rows = [record({ status: 'paused', size: 1_000, sizeleft: 1_000, added: hoursAgo(49) })];
+  const stub = arrStub({ sonarr: { records: rows, totalRecords: 1 } });
+  const res = await makeCheckStatus(stub.fetchImpl, () => NOW).run({}, ctx());
+
+  assert.match(res.content, /since it was queued/, 'the age must be labelled with what it measures');
+  assert.match(res.content, /cannot tell you WHEN it was stopped/);
+  // 🔴 The failing control: the old wording, which relabelled an age as a duration.
+  assert.doesNotMatch(res.content, /0% after 49h/);
+});
+
+test('a STOPPED release warns that the stop may have been deliberate', () => {
+  const a = classify(releases([record({ status: 'paused', sizeleft: 1_000, added: hoursAgo(48) })])[0]!, NOW);
+  // Restarting something a person switched off on purpose is its own defect.
+  assert.match(a.response.wouldResolve, /ask before restarting/i);
+});

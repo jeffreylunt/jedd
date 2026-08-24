@@ -258,7 +258,8 @@ export function classify(release: Release, now: Date): Assessment {
         jeddCanFix: false,
         wouldResolve:
           'It was STOPPED in the download client, so it is not going to restart on its own and ' +
-          'nothing is wrong with the release. Someone has to start it again in qBittorrent.',
+          'nothing is wrong with the release. Someone has to start it again in qBittorrent — and ' +
+          'somebody may have stopped it deliberately, so ask before restarting it.',
       },
       ageHours: age,
     };

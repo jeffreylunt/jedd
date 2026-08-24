@@ -137,7 +137,24 @@ function line(g: Group): string {
     case 'import-blocked':
       return `IMPORT BLOCKED — ${head}. The download FINISHED ${age(g.oldestHours)} ago; the import did not.${msgs}${fix}`;
     case 'stopped':
-      return `STOPPED in the download client — ${head}, 0% after ${age(g.oldestHours)} and it will not restart by itself (${g.observed})${fix}`;
+      /**
+       * 🔴 THE AGE IS SINCE IT WAS QUEUED. IT IS NOT HOW LONG IT HAS BEEN STOPPED.
+       *
+       * This read "0% after 49h" and a human read it — correctly, from the
+       * words — as "stopped for 49 hours". It had in fact been stopped **27
+       * minutes** earlier, deliberately, by someone reclaiming download slots.
+       * 49h was the age of the QUEUE ITEM.
+       *
+       * The stop carries **no timestamp anywhere**. qBittorrent's `last_activity`
+       * equals `added_on` for a torrent that never transferred a byte, so even
+       * that field reads as "last did something on the 22nd" when it means "was
+       * added on the 22nd and has done nothing since". There is no field to ask.
+       *
+       * So the sentence says what the number IS, and says the unknown out loud.
+       * An age silently relabelled as a duration is how a reader reconstructs a
+       * two-day-old outage out of a decision somebody made this afternoon.
+       */
+      return `STOPPED in the download client — ${head}. 0% in the ${age(g.oldestHours)} since it was queued; I cannot tell you WHEN it was stopped, because nothing records that (${g.observed})${fix}`;
     case 'starting':
       return `JUST STARTED — ${head}, ${age(g.oldestHours)} ago, nothing downloaded yet (normal at this age)`;
     case 'no-peers':
