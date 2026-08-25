@@ -23,7 +23,6 @@ import { kindleStatus, saveKindleEmail } from './kindle.js';
 import { librarySearch } from './library.js';
 import { makeFindGaps, makeGrabRelease, makeSearchEpisode } from './fill-gaps.js';
 import { makeInviteTool, type InviteDeps } from './invite.js';
-import { homelabStatus } from './media.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import { makeSearchAudiobook, makeSearchEbook } from './search-release.js';
@@ -57,7 +56,27 @@ import type { Tool } from './types.js';
 
 const GUEST_TOOLS: Tool[] = [
   librarySearch,
-  homelabStatus,
+  /**
+   * 🔴 THE GENERIC READ IS GUEST-LEVEL, AND THE GATE IS THE DATA, NOT THE ROLE.
+   *
+   * Jeff overruled an earlier owner-only reading: *"All users should have read
+   * access to everything in the library, etc, but not other users information or
+   * server secrets."* So the boundary moved from *who is asking* to *what the
+   * data is about* — CONTENT for everyone, PERSON for the owner, SECRET for
+   * nobody. All three live in `src/homelab-read.ts`.
+   *
+   * ⚠️ THE CONSEQUENCE FOR WHOEVER EDITS THAT DENYLIST NEXT: it is no longer
+   * backstopped by a role gate. While this tool was owner-only, a path someone
+   * forgot to classify was contained to Jeff. Now a missed PERSON path is
+   * visible to every guest in the house. Deny the borderline case; un-denying is
+   * one line and a leak is not.
+   *
+   * ⚠️ This is what let `homelab_status` retire — a guest can now ask whether
+   * the server is up. It was safe to remove ONLY because nothing NAMED it;
+   * `assertNamedProducersExist` would have thrown for `catalogue_search` or any
+   * of the four docker tools. Absence of a guard is not permission.
+   */
+  makeHomelabRead(),
   makeCatalogueSearch(),
   makeCheckStatus(),
   resolveChoice,
@@ -165,24 +184,6 @@ const OWNER_READ_TOOLS: Tool[] = [
   dockerInspect,
   dockerLogs,
   containerNetns,
-  /**
-   * 🔴 THE GENERIC READ IS OWNER-ONLY, AND IT RETIRES NOTHING.
-   *
-   * Guests are real other people in this household. A generic GET across the
-   * whole media stack is materially more surface than the twenty curated tools
-   * they have, and none of it is shaped to their questions — so it sits here,
-   * which is the conservative and reversible answer to the survey's open
-   * `minRole` question.
-   *
-   * ⚠️ Which is exactly why `homelab_status` STAYS in `GUEST_TOOLS`: it is the
-   * only health tool a guest can reach, so retiring it "because the generic read
-   * covers it" would be a capability loss for everybody who is not Jeff.
-   * `assertNamedProducersExist` would turn most other retirements into a BOOT
-   * FAILURE — `hp_shell` names all four docker tools, `catalogue_search` is named
-   * by five — but this one it would not catch, because nothing names
-   * `homelab_status`. Absence of a guard is not permission.
-   */
-  makeHomelabRead(),
   /**
    * Not replaceable by the generic read at any path: the results are a FILE on
    * hp and the roster is Dispatcharr's Postgres behind `docker exec`. Neither is

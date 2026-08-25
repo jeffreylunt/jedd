@@ -1,4 +1,5 @@
 import type { Config } from './config.js';
+import type { Role } from './permissions.js';
 
 /**
  * THE GENERIC READ — the gate and the bound, as pure functions.
@@ -58,7 +59,12 @@ interface ServiceSpec {
   auth(config: Config): Record<string, string>;
   /** Present when the service cannot be read at all, e.g. no API key configured. */
   unconfigured(config: Config): string | null;
-  denied: DeniedPath[];
+  /** SECRET — denied to EVERYONE. No role is consulted. */
+  secret: DeniedPath[];
+  /** PERSON — denied to guests, allowed to the owner. */
+  person: DeniedPath[];
+  /** Operationally harmful regardless of what it returns. Denied to everyone. */
+  operational: DeniedPath[];
 }
 
 interface DeniedPath {
@@ -103,6 +109,44 @@ interface DeniedPath {
  * lines, and `/Search/Hints` returns `ChannelId` itself so the channel join
  * needs no enumeration at all.
  */
+/**
+ * 🔴 THREE CLASSES OF DATA, IMPLEMENTED THREE DIFFERENT WAYS ON PURPOSE.
+ *
+ * Jeff, 2026-08-25: *"All users should have read access to everything in the
+ * library, etc, but not other users information or server secrets"*, then:
+ * *"Owner can ask about all information, but not secrets or keys since we don't
+ * want them in message logs."*
+ *
+ * | class   | guest | owner |
+ * |---------|-------|-------|
+ * | CONTENT | ✅    | ✅    |
+ * | PERSON  | ❌    | ✅    |
+ * | SECRET  | ❌    | ❌ nobody |
+ *
+ * The boundary is a RULE about **what the data is about**, not about who is
+ * asking — which is what makes it extensible by someone who was not here:
+ *
+ *   ⚠️ **ALLOW anything about the CONTENT. DENY anything about a PERSON or a
+ *   SECRET.**
+ *
+ * ── 🔴 WHY SECRET TAKES NO ROLE ARGUMENT, AND WHY THAT MATTERS ───────────────
+ *
+ * The owner is denied secrets too, and the reason is **not** trust — it is that
+ * a secret in a Jedd reply does not stop at the screen. It lands in the iMessage
+ * thread, in the replayed history, and in `data/jedd.log`. **Reading it once
+ * persists it in three places, none of which anyone will remember to clean.**
+ *
+ * So `secretVerdict` **does not take a role parameter at all**. It cannot
+ * consult one, cannot be widened by a role bug, a spoofed handle, or a future
+ * refactor of who counts as owner — there is no code path to get it wrong. That
+ * is the same principle as `method: 'GET'` being a literal: the strongest guard
+ * on the highest-consequence class is enforced by construction, not by a check.
+ *
+ * `personVerdict` IS role-gated, and that is the weakest guard here. It is
+ * acceptable only because the consequence is a privacy slip between household
+ * members rather than a credential leak. Do not move anything from SECRET to
+ * PERSON to make it convenient for the owner.
+ */
 const TUNER_WHY =
   'it enumerates Jellyfin channels/tuners. That call wedged Jellyfin site-wide for hours on ' +
   '2026-07-26 against a dead tuner — and a dead tuner is exactly the state someone is in when they ' +
@@ -115,13 +159,127 @@ const INDEXER_WHY =
   'rate limits that Sonarr and Radarr are already reporting as unhealthy. It looks like a cheap read ' +
   'and is not. Use search_episode, which is the curated verb for finding a release.';
 
+/**
+ * SECRET paths, denied to EVERYONE. Every arr entry below was MEASURED on
+ * 2026-08-25 — none of it is precautionary.
+ *
+ * ⚠️ `/config/host` on **both** Sonarr and Radarr returns a populated
+ * `password` (44 chars) and `apiKey` (32 chars) on a plain GET. Nothing about
+ * the path suggests danger; it reads like "server settings".
+ */
+const ARR_SECRET_PATHS: DeniedPath[] = [
+  {
+    prefix: '/config',
+    why:
+      'the arr config surface returns credentials on a plain GET — MEASURED: /config/host on both ' +
+      'Sonarr and Radarr hands back a 44-character password and a 32-character apiKey. Nothing about ' +
+      'the path warns you.',
+  },
+  {
+    prefix: '/downloadclient',
+    why: 'it carries the download client password inside its `fields` array (MEASURED on Sonarr).',
+  },
+  {
+    /**
+     * 🔴 DENIED ON ALL THREE, INCLUDING PROWLARR, AND THIS IS A DELIBERATE STEP
+     * BEYOND WHAT THE MEASUREMENT ALONE SHOWED.
+     *
+     * Measured: Sonarr `/indexer` carries **4** populated `apiKey` values and
+     * Radarr **3**, all inside `fields[]` as `{name, value}` pairs. Prowlarr's
+     * `/api/v1/indexer` came back **clean** — but only because all six of its
+     * indexers happen to be PUBLIC trackers today. **That is a fact about the
+     * current tracker list, not a property of the endpoint**, and it becomes
+     * false the moment one private tracker is added, silently.
+     *
+     * ⚠️ It costs nothing, and that is why it is worth doing: indexer HEALTH is
+     * `/indexerstatus` and `/indexerstats`, which are DIFFERENT path segments
+     * and stay allowed. Segment matching is what makes over-denying cheap here
+     * — the same property that keeps `/releaseprofile` readable.
+     */
+    prefix: '/indexer',
+    why:
+      'indexer definitions carry tracker credentials in their `fields` array — MEASURED: 4 populated ' +
+      'apiKey values on Sonarr, 3 on Radarr. Indexer HEALTH is a different path and is allowed: use ' +
+      '/indexerstatus (which lists only the broken ones) or /indexerstats.',
+  },
+  { prefix: '/notification', why: 'notification connections carry webhook URLs, tokens and passwords.' },
+  { prefix: '/importlist', why: 'import lists carry credentials for the services they pull from.' },
+  {
+    prefix: '/applications',
+    why:
+      "Prowlarr's application links carry the API keys of the apps they sync to — MEASURED: 2 " +
+      'populated apiKey values, which are Sonarr’s and Radarr’s own keys.',
+  },
+  { prefix: '/settings', why: 'the settings surface is where credentials live.' },
+  { prefix: '/system/backup', why: 'a backup contains the whole configuration database, credentials included.' },
+];
+
+/**
+ * 🔴 `/Auth/Keys` IS THE ONE TO KNOW ABOUT, and it was not on anyone's list.
+ *
+ * MEASURED 2026-08-25: `GET /Auth/Keys` returns **four live 32-character
+ * `AccessToken` values** — Jellyfin API keys, in plaintext, from a read that
+ * looks like administrative housekeeping. This is the single most dangerous
+ * endpoint found on any of the four services.
+ */
+const JELLYFIN_SECRET_PATHS: DeniedPath[] = [
+  {
+    prefix: '/auth',
+    why:
+      'it hands back live API keys — MEASURED: /Auth/Keys returns four 32-character AccessToken ' +
+      'values in plaintext. The whole /Auth subtree is denied rather than just that one path.',
+  },
+  { prefix: '/quickconnect', why: 'it is an authentication flow and deals in tokens.' },
+  { prefix: '/system/configuration', why: 'the server configuration surface is where credentials live.' },
+  {
+    prefix: '/plugins',
+    why:
+      'plugin configuration holds the credentials each plugin uses — the Xtream plugin in particular ' +
+      'holds the IPTV provider login. The plugin LIST is denied with the rest of the subtree rather ' +
+      'than carved out.',
+  },
+  { prefix: '/startup', why: 'the setup wizard creates accounts and sets passwords.' },
+  { prefix: '/system/logs', why: 'log files quote request URLs, which carry tokens and API keys.' },
+  {
+    prefix: '/livetv/listingproviders',
+    why: 'listing providers store the IPTV provider username and password.',
+  },
+];
+
+/**
+ * PERSON paths — who watched what, who logged in, from where, and who has an
+ * account. Denied to guests, allowed to the owner.
+ *
+ * ⚠️ NOT `/Persons`. That is Jellyfin's endpoint for CAST MEMBERS — actors in
+ * the library — and it is CONTENT. Matching is by segment, so `/users` does not
+ * touch it; do not "tidy" these into a `/person*` pattern.
+ */
+const JELLYFIN_PERSON_PATHS: DeniedPath[] = [
+  { prefix: '/sessions', why: 'it shows who is watching what, right now, and on which device.' },
+  {
+    prefix: '/users',
+    why:
+      'it lists every account with their last login and last activity — MEASURED: 19 real people, by ' +
+      'name. This also covers /Users/{id}/Items, which carries that user’s own watch state; search ' +
+      'the library with /Items instead, which is not scoped to a person.',
+  },
+  { prefix: '/devices', why: 'it maps devices to the people who last used them.' },
+  { prefix: '/system/activitylog', why: 'it is a log of who did what and when, by name.' },
+  {
+    prefix: '/user_usage_stats',
+    why: 'the Playback Reporting plugin reports per-user viewing history.',
+  },
+];
+
 const SERVICES: Record<ReadService, ServiceSpec> = {
   jellyfin: {
     label: 'Jellyfin',
     baseUrl: (c) => c.jellyfin.baseUrl,
     auth: (c) => ({ 'X-Emby-Token': c.jellyfin.apiKey }),
     unconfigured: (c) => (c.jellyfin.apiKey ? null : 'JELLYFIN_API_KEY is not configured'),
-    denied: [
+    secret: JELLYFIN_SECRET_PATHS,
+    person: JELLYFIN_PERSON_PATHS,
+    operational: [
       { prefix: '/livetv/channels', why: TUNER_WHY },
       { prefix: '/livetv/tuners', why: TUNER_WHY },
       { prefix: '/livetv/tunerhosts', why: TUNER_WHY },
@@ -146,21 +304,32 @@ const SERVICES: Record<ReadService, ServiceSpec> = {
     baseUrl: (c) => c.sonarr.baseUrl,
     auth: (c) => ({ 'X-Api-Key': c.sonarr.apiKey }),
     unconfigured: (c) => (c.sonarr.apiKey ? null : 'SONARR_API_KEY is not configured'),
-    denied: [{ prefix: '/release', why: INDEXER_WHY }],
+    secret: ARR_SECRET_PATHS,
+    // ⚠️ An arr has no PERSON surface: /history records what was grabbed and
+    // when, with NO requester field — verified over 30 real rows. It is content.
+    person: [],
+    operational: [{ prefix: '/release', why: INDEXER_WHY }],
   },
   radarr: {
     label: 'Radarr',
     baseUrl: (c) => c.radarr.baseUrl,
     auth: (c) => ({ 'X-Api-Key': c.radarr.apiKey }),
     unconfigured: (c) => (c.radarr.apiKey ? null : 'RADARR_API_KEY is not configured'),
-    denied: [{ prefix: '/release', why: INDEXER_WHY }],
+    secret: ARR_SECRET_PATHS,
+    // ⚠️ An arr has no PERSON surface: /history records what was grabbed and
+    // when, with NO requester field — verified over 30 real rows. It is content.
+    person: [],
+    operational: [{ prefix: '/release', why: INDEXER_WHY }],
   },
   prowlarr: {
     label: 'Prowlarr',
     baseUrl: (c) => c.prowlarr.baseUrl,
     auth: (c) => ({ 'X-Api-Key': c.prowlarr.apiKey }),
     unconfigured: (c) => (c.prowlarr.apiKey ? null : 'PROWLARR_API_KEY is not configured'),
-    denied: [{ prefix: '/api/v1/search', why: INDEXER_WHY }],
+    // Prowlarr has no path prefix, so its SECRET paths sit under /api/v1.
+    secret: ARR_SECRET_PATHS.map((d) => ({ ...d, prefix: `/api/v1${d.prefix}` })),
+    person: [],
+    operational: [{ prefix: '/api/v1/search', why: INDEXER_WHY }],
   },
 };
 
@@ -200,11 +369,52 @@ const PATH_CHARS = /^[A-Za-z0-9/._~()@:,+-]+$/;
  * test can assert on the URL a refused call would have produced — and, more
  * importantly, that a refused call produced no URL at all.
  */
+/** Does `routed` fall under any of these prefixes? Returns the reason, or null. */
+function matchDeny(rules: DeniedPath[], routed: string): string | null {
+  for (const rule of rules) {
+    if (routed === rule.prefix || routed.startsWith(`${rule.prefix}/`)) return rule.why;
+  }
+  return null;
+}
+
+/**
+ * 🔴 SECRET. TAKES NO ROLE, BY DESIGN — DO NOT ADD ONE.
+ *
+ * Nobody reads a credential through this tool, owner included, because a secret
+ * in a reply lands in the iMessage thread, the replayed history and the log
+ * file. This signature is the guarantee: there is no role here to make an
+ * exception for, so no refactor of who counts as owner can widen it.
+ *
+ * ⚠️ A test asserts this function's ARITY. If you find yourself adding a third
+ * parameter, that test is telling you the answer is no.
+ */
+export function secretVerdict(service: ReadService, routed: string): string | null {
+  const why = matchDeny(SERVICES[service].secret, routed);
+  return why
+    ? `REFUSED — SECRET: ${SERVICES[service].label} ${routed} is denied to EVERYONE, including the ` +
+        `owner, because ${why}\nThis is not about permission. A credential in a reply is copied into ` +
+        'the message thread, the conversation history and the log file, and nobody cleans those. ' +
+        'There is no role that can read it and no flag that turns this off.'
+    : null;
+}
+
+/** PERSON. Role-gated by the CALLER — this function reports the class, not the verdict. */
+export function personVerdict(service: ReadService, routed: string): string | null {
+  const why = matchDeny(SERVICES[service].person, routed);
+  return why
+    ? `REFUSED — PERSONAL: ${SERVICES[service].label} ${routed} is about PEOPLE rather than about ` +
+        `the library, because ${why}\nEveryone here can read anything about the content — what exists, ` +
+        'what is missing, what is downloading, what is on TV. Information about other users is ' +
+        "Jeff's to see, not everyone's. Say that plainly rather than implying the data is unavailable."
+    : null;
+}
+
 export function planRead(
   service: unknown,
   path: unknown,
   query: unknown,
   config: Config,
+  role: Role,
 ): ReadPlan {
   if (typeof service !== 'string' || !(service in SERVICES)) {
     return {
@@ -308,16 +518,36 @@ export function planRead(
     };
   }
 
-  // The path RELATIVE to the API prefix, normalised — the form the denylist is
+  // The path RELATIVE to the API prefix, normalised — the form the denylists are
   // written in, and the form the service's own router sees.
   const routed = target.pathname.slice(basePath.length).toLowerCase();
-  for (const rule of spec.denied) {
-    if (routed === rule.prefix || routed.startsWith(`${rule.prefix}/`)) {
-      return {
-        allowed: false,
-        reason: `REFUSED: ${spec.label} ${target.pathname} is not readable through this tool, because ${rule.why}`,
-      };
-    }
+
+  /**
+   * 🔴 SECRET FIRST, AND WITHOUT THE ROLE.
+   *
+   * `role` is in scope here, and `secretVerdict` still does not receive it —
+   * it takes `(service, routed)` and nothing else, so no future edit inside it
+   * can accidentally make an exception for the owner. Denying the highest-
+   * consequence class is the one decision that must not depend on getting
+   * identity right.
+   */
+  const secret = secretVerdict(service as ReadService, routed);
+  if (secret) return { allowed: false, reason: secret };
+
+  const operational = matchDeny(spec.operational, routed);
+  if (operational) {
+    return {
+      allowed: false,
+      reason: `REFUSED: ${spec.label} ${target.pathname} is not readable through this tool, because ${operational}`,
+    };
+  }
+
+  // PERSON — the only tier that consults who is asking, and the weakest guard
+  // here. Acceptable because the consequence is a privacy slip between household
+  // members, not a credential leak.
+  if (role !== 'owner') {
+    const person = personVerdict(service as ReadService, routed);
+    if (person) return { allowed: false, reason: person };
   }
 
   const qs = buildQuery(query);
@@ -387,6 +617,147 @@ function buildQuery(query: unknown): { value: string } | { error: string } {
 
 function isScalar(v: unknown): boolean {
   return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SECOND GUARD — strip credentials from every response, whatever the path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 🔴 THE BRACES TO THE DENYLIST'S BELT, AND NEITHER IS SUFFICIENT ALONE.
+ *
+ * **A path denylist only blocks what somebody thought to block.** A credential
+ * can surface from an endpoint nobody anticipated — and one nearly did here:
+ * `/history` looks like pure content, and for private trackers the `downloadUrl`
+ * it records carries a passkey in its querystring.
+ *
+ * **A field-name stripper only catches what it recognises.** This system has had
+ * five redactors fail on five unrelated shapes — a field called `raw`, a
+ * free-text `notes`, a settings table. So this is a NET, not a guarantee, and
+ * the paths that are known to hand back credentials are denied outright as well.
+ *
+ * ── ⚠️ WHY THE NAMES ARE MATCHED EXACTLY AND NOT BY SUBSTRING ────────────────
+ *
+ * My first probe of the live servers matched `key|pass|token|auth` as
+ * substrings, and on real responses that flagged **`packageAuthor`** (a person's
+ * name), **`authenticationMethod`** (`"forms"`), **`proxyBypassLocalAddresses`**,
+ * **`HasPassword`** and **`HasConfiguredPassword`** (booleans) — every one of
+ * them a useful, harmless field. A substring stripper redacts the diagnostics
+ * and teaches everyone to ignore `[REDACTED]`. Exact names, plus the `{name,
+ * value}` shape below.
+ */
+const CREDENTIAL_FIELD_NAMES = new Set([
+  'apikey',
+  'api_key',
+  'apisecret',
+  'accesstoken',
+  'refreshtoken',
+  'authtoken',
+  'bearertoken',
+  'clientsecret',
+  'cookie',
+  'cookies',
+  'passkey',
+  'rsspasskey',
+  'password',
+  'passwd',
+  'passphrase',
+  'privatekey',
+  'secret',
+  'secretkey',
+  'sessionid',
+  'token',
+  'userpasskey',
+  'vipkey',
+]);
+
+/** Querystring parameters that carry a credential inside a URL-shaped VALUE. */
+const CREDENTIAL_QUERY_KEYS = ['passkey', 'apikey', 'api_key', 'token', 'secret', 'rsskey', 'authkey'];
+
+const REDACTED = '[REDACTED — credentials are never quoted into a reply]';
+
+/** Deep structures are bounded rather than trusted; JSON.parse output cannot cycle. */
+const MAX_STRIP_DEPTH = 40;
+
+export interface StripResult {
+  value: unknown;
+  /** Which field names were redacted, so the output can SAY so. */
+  redacted: string[];
+}
+
+/**
+ * Remove credential-shaped values from a parsed response, recursively.
+ *
+ * 🔴 It REPLACES rather than deletes, and the caller reports what it replaced.
+ * A silently removed field is indistinguishable from a field that was empty —
+ * which would quietly turn "I am hiding this from you" into "there is nothing
+ * there", the false-zero shape this repo refuses everywhere else.
+ */
+export function stripCredentials(input: unknown): StripResult {
+  const redacted = new Set<string>();
+
+  const walk = (value: unknown, depth: number): unknown => {
+    if (depth > MAX_STRIP_DEPTH) return value;
+    if (Array.isArray(value)) return value.map((v) => walk(v, depth + 1));
+    if (!value || typeof value !== 'object') {
+      return typeof value === 'string' ? scrubUrl(value, redacted) : value;
+    }
+
+    const obj = value as Record<string, unknown>;
+    /**
+     * 🔴 THE `{name, value}` PAIR — the shape a key-name walker cannot see.
+     *
+     * Sonarr, Radarr and Prowlarr store connection settings as
+     * `fields: [{ name: "password", value: "…" }]`. The KEY is `value`; the
+     * credential's name is DATA. My own first probe of the live servers reported
+     * `/downloadclient` as clean for exactly this reason, and it is not: it
+     * carries a populated password. Measured, same day, once the walker was
+     * taught this shape.
+     */
+    if ('name' in obj && 'value' in obj && isCredentialName(obj['name'])) {
+      const hasValue = obj['value'] !== null && obj['value'] !== undefined && obj['value'] !== '';
+      if (hasValue) {
+        redacted.add(String(obj['name']));
+        return { ...obj, value: REDACTED };
+      }
+    }
+
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (CREDENTIAL_FIELD_NAMES.has(k.toLowerCase()) && v !== null && v !== undefined && v !== '') {
+        redacted.add(k);
+        out[k] = REDACTED;
+        continue;
+      }
+      out[k] = walk(v, depth + 1);
+    }
+    return out;
+  };
+
+  return { value: walk(input, 0), redacted: [...redacted].sort() };
+}
+
+function isCredentialName(name: unknown): boolean {
+  return typeof name === 'string' && CREDENTIAL_FIELD_NAMES.has(name.toLowerCase());
+}
+
+/**
+ * A credential can hide in a VALUE rather than a field name: a private tracker's
+ * `downloadUrl` is `https://tracker/rss?passkey=…`, and the field is called
+ * `downloadUrl`, which no name list will ever flag. Rewrites the querystring
+ * parameter, keeping the rest of the URL, which is the useful part.
+ */
+function scrubUrl(value: string, redacted: Set<string>): string {
+  if (!/[?&]/.test(value) || !/^https?:\/\//i.test(value)) return value;
+  let out = value;
+  for (const key of CREDENTIAL_QUERY_KEYS) {
+    const re = new RegExp(`([?&]${key}=)[^&#\\s]+`, 'gi');
+    if (re.test(out)) {
+      redacted.add(`${key} (in a URL)`);
+      out = out.replace(re, `$1[REDACTED]`);
+    }
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

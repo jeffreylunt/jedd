@@ -1,4 +1,4 @@
-import { planRead, renderRead, READ_SERVICES } from '../homelab-read.js';
+import { planRead, renderRead, stripCredentials, READ_SERVICES } from '../homelab-read.js';
 import type { FetchImpl } from '../media/arr.js';
 import { fail, ok, type Tool } from './types.js';
 
@@ -24,17 +24,28 @@ import { fail, ok, type Tool } from './types.js';
  * that one is not recoverable. Here the method is a literal in the fetch call
  * below, so no write endpoint is reachable at all — see `src/homelab-read.ts`.
  *
- * ── 🔴 OWNER ONLY, AND `homelab_status` STAYS ────────────────────────────────
+ * ── 🔴 GUEST-LEVEL, GATED BY WHAT THE DATA IS ABOUT ──────────────────────────
  *
- * Guests are real other people in Jeff's household. A generic GET across the
- * whole media stack is materially more surface than the curated set they have,
- * and nothing about it is shaped to their questions. So `minRole: 'owner'`.
+ * Jeff, 2026-08-25: *"All users should have read access to everything in the
+ * library, etc, but not other users information or server secrets"*, then:
+ * *"Owner can ask about all information, but not secrets or keys since we don't
+ * want them in message logs."*
  *
- * That makes `homelab_status` the ONLY health tool a guest can reach, so it is
- * NOT superseded by this and must not be retired. "The generic read replaces X"
- * is the sentence to distrust: `assertNamedProducersExist` turns most such
- * retirements into a boot failure, and this one would simply be a capability
- * loss for everybody who is not Jeff.
+ * So the gate is **not a role**, it is a rule about the DATA — the three tiers
+ * live in `src/homelab-read.ts`. CONTENT is everyone's; PERSON is the owner's;
+ * SECRET is nobody's, enforced with no role logic at all.
+ *
+ * ⚠️ An earlier version was `minRole: 'owner'`, which left the path denylist
+ * backstopped by a role gate: a missed path was contained to Jeff. **It is not
+ * backstopped any more.** A path that should be PERSON and is not listed is
+ * visible to every guest in the house. When in doubt, deny — un-denying is one
+ * line, and a leak is not.
+ *
+ * ⚠️ This is what retired `homelab_status`. That tool existed because a guest
+ * had no way to ask "is the server up"; now they do, and `/System/Info/Public`
+ * is the cheap form of it. The retirement was safe ONLY because nothing named
+ * it — `assertNamedProducersExist` would have thrown for `catalogue_search` or
+ * any of the four docker tools. Absence of a guard is not permission.
  */
 
 /** Records shown when the caller does not say. */
@@ -103,12 +114,21 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       'returns ChannelName as null unless you ask for fields=ChannelInfo. An arr /queue defaults to ' +
       'pageSize=10 and will hand you 10 of 15 without saying so. Sonarr /history/since is unpaged and ' +
       'huge; use /history with pageSize.\n' +
-      'Some paths are refused, and the refusal explains itself: anything that enumerates Jellyfin ' +
-      'channels or tuners, and the release-search endpoints on the arrs and Prowlarr. For per-channel ' +
-      'Live TV health use channel_health.\n' +
+      'WHAT IS REFUSED, and every refusal says which of these it is. Everything about the CONTENT is ' +
+      'open to everyone: the library, what is missing, the queue, the guide, channel line-ups, ' +
+      'indexer health, and an arr /history (what was grabbed and when). PERSONAL data — who is ' +
+      'watching what, who logged in, the user list — is Jeff\'s only; for anyone else say so plainly ' +
+      'rather than implying it is broken. SECRETS — API keys, passwords, tokens, the config and ' +
+      'download-client and indexer endpoints — are refused to EVERYONE INCLUDING JEFF, because a ' +
+      'credential quoted into a reply is copied into the message thread and the logs. If he asks, say ' +
+      'that; do not look for another route, there is not one. Also refused: anything enumerating ' +
+      'Jellyfin channels or tuners, and the release-search endpoints. For per-channel Live TV health ' +
+      'use channel_health. For "is the server up", /System/Info/Public is the cheap read.\n' +
+      'Any credential that slips through on an allowed path is stripped from the response before you ' +
+      'see it, and the result says what was removed. Report that it was withheld; never guess at it.\n' +
       'Output is bounded by RECORD COUNT and field projection, never by bytes, and the first line ' +
       'always says how many of how many you got. "showing 25 of 1744" means 1,719 you have not seen.',
-    minRole: 'owner',
+    minRole: 'guest',
     writes: false,
     parameters: {
       type: 'object',
@@ -150,7 +170,7 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
     },
 
     async run(args, ctx) {
-      const plan = planRead(args['service'], args['path'], args['query'], ctx.config);
+      const plan = planRead(args['service'], args['path'], args['query'], ctx.config, ctx.role);
       if (!plan.allowed) return fail(`${plan.reason}\nNothing was requested.`);
 
       const limit = clamp(args['limit'], DEFAULT_LIMIT, 1, MAX_LIMIT);
@@ -267,11 +287,29 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
        * dates need comparing, at the moment they were read — not stamped once
        * into a system prompt that a long-lived pm2 conversation would outlive.
        */
+      /**
+       * 🔴 THE SECOND GUARD, RUN ON EVERY RESPONSE FROM EVERY PATH FOR EVERY
+       * CALLER — including the owner, and including paths nobody thought were
+       * dangerous. There is no role check here and there must never be one.
+       *
+       * The path denylist is the belt; this is the braces. Neither is sufficient:
+       * a denylist only blocks what somebody thought of, and a stripper only
+       * catches what it recognises.
+       */
+      const stripped = stripCredentials(body);
+      const redactionNote = stripped.redacted.length
+        ? `\n🔴 REDACTED before you saw it: ${stripped.redacted.join(', ')}. These are credentials, ` +
+          'and they are removed for everyone including Jeff — a secret quoted into a reply is copied ' +
+          'into the message thread, the history and the log file. Do not ask for them another way; ' +
+          'there is no other way. Tell the user the field exists and was withheld.'
+        : '';
+
       return ok(
         `GET ${plan.url}\n` +
           `(read at ${new Date().toISOString()} — compare any StartDate against THIS, not against a guess)\n` +
-          renderRead(body, { limit, fields: fields.value, maxChars: MAX_OUTPUT_CHARS }) +
-          missingOverviewNote(body),
+          renderRead(stripped.value, { limit, fields: fields.value, maxChars: MAX_OUTPUT_CHARS }) +
+          missingOverviewNote(stripped.value) +
+          redactionNote,
       );
     },
   };

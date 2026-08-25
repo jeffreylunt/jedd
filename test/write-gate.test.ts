@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { ALL_TOOLS, buildTools, registerable } from '../src/tools/index.js';
 import { ok, type Tool } from '../src/tools/types.js';
@@ -99,7 +100,11 @@ test('CONTROL: owner write tools are still gated exactly as before', () => {
 
 test('CONTROL: read tools are unaffected by the kill switch', () => {
   const off = buildTools(testConfig({ readOnly: true })).map((t) => t.name);
-  for (const name of ['library_search', 'homelab_status', 'docker_ps']) {
+  // ⚠️ `homelab_status` used to be in this list. It was RETIRED on 2026-08-25
+  // once `homelab_read` became guest-level — a guest can now ask whether the
+  // server is up. `homelab_read` takes its place here so the control still
+  // exercises a GUEST read.
+  for (const name of ['library_search', 'homelab_read', 'docker_ps']) {
     assert.ok(off.includes(name), `${name} is a read and must survive read-only mode`);
   }
 });
@@ -137,16 +142,55 @@ test('the request_media stub is gone — it reported a queue position for work n
   const on = buildTools(testConfig({ readOnly: false })).map((t) => t.name);
   assert.ok(!on.includes('request_media'), 'the stub must not ship alongside a real add path');
 
-  // 🔴 THE ASSERTION ABOVE WAS TRUE FOR A MONTH WHILE THE TRAP WAS STILL LIVE.
-  // Un-registering the tool left `requestMedia` exported from tools/media.ts,
-  // appending to `data/requests.jsonl` — a second store of what is being
-  // fetched, one import away from shipping beside the arr queue, and looking for
-  // all the world like something left out by mistake. A registry-absence test
-  // cannot see a tool that is not registered YET. Assert the SYMBOL is gone.
-  const media = await import('../src/tools/media.js');
-  assert.ok(
-    !('requestMedia' in media),
-    'requestMedia must not exist at all — a dormant second source of download state is the ' +
-      'exact defect check_status was built to make unrepresentable.',
+  /**
+   * 🔴 THE ASSERTION ABOVE WAS TRUE FOR A MONTH WHILE THE TRAP WAS STILL LIVE.
+   *
+   * Un-registering the tool left `requestMedia` exported from `tools/media.ts`,
+   * appending to `data/requests.jsonl` — a second store of what is being
+   * fetched, one import away from shipping beside the arr queue, and looking for
+   * all the world like something left out by mistake. A registry-absence test
+   * cannot see a tool that is not registered YET. Assert the SYMBOL is gone.
+   *
+   * ⚠️ It used to import `tools/media.js` and check that one module. That file
+   * was DELETED on 2026-08-25 when `homelab_status` retired, which would have
+   * made the check throw — and the obvious repair, deleting the assertion with
+   * the file, would have quietly removed the only thing standing between this
+   * repo and a reintroduced `requestMedia`. So it is quantified over the
+   * DIRECTORY instead: the symbol must not exist anywhere in src/, in any file,
+   * including one nobody has created yet.
+   */
+  const srcDir = new URL('../src/', import.meta.url).pathname;
+  const offenders: string[] = [];
+  const scan = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = `${dir}${entry.name}`;
+      if (entry.isDirectory()) scan(`${full}/`);
+      else if (entry.name.endsWith('.ts') && /\brequestMedia\b/.test(readFileSync(full, 'utf8'))) {
+        offenders.push(full);
+      }
+    }
+  };
+  scan(srcDir);
+  assert.deepEqual(
+    offenders,
+    [],
+    'requestMedia must not exist anywhere in src/ — a dormant second source of download state is ' +
+      'the exact defect check_status was built to make unrepresentable. Found in: ' + offenders.join(', '),
   );
+});
+
+test('CONTROL: that directory scan really can find a symbol in src/', () => {
+  // Without this, a broken walker (wrong path, wrong extension filter) reports
+  // an empty offender list and reads as "requestMedia is gone".
+  const srcDir = new URL('../src/', import.meta.url).pathname;
+  const found: string[] = [];
+  const scan = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = `${dir}${entry.name}`;
+      if (entry.isDirectory()) scan(`${full}/`);
+      else if (entry.name.endsWith('.ts') && /\bbuildTools\b/.test(readFileSync(full, 'utf8'))) found.push(full);
+    }
+  };
+  scan(srcDir);
+  assert.ok(found.length >= 2, `the scan found ${found.length} files naming buildTools; it is not working`);
 });
