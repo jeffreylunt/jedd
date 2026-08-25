@@ -13,6 +13,8 @@ import {
 } from './homelab.js';
 import { addAudiobook } from './add-audiobook.js';
 import { makeAddMovie, makeAddSeries } from './add-media.js';
+import { channelHealth } from './channel-health.js';
+import { makeHomelabRead } from './homelab-read.js';
 import { makeAddSeason } from './add-season.js';
 import { makeCatalogueSearch } from './catalogue.js';
 import { makeCheckStatus } from './check-status.js';
@@ -163,6 +165,30 @@ const OWNER_READ_TOOLS: Tool[] = [
   dockerInspect,
   dockerLogs,
   containerNetns,
+  /**
+   * 🔴 THE GENERIC READ IS OWNER-ONLY, AND IT RETIRES NOTHING.
+   *
+   * Guests are real other people in this household. A generic GET across the
+   * whole media stack is materially more surface than the twenty curated tools
+   * they have, and none of it is shaped to their questions — so it sits here,
+   * which is the conservative and reversible answer to the survey's open
+   * `minRole` question.
+   *
+   * ⚠️ Which is exactly why `homelab_status` STAYS in `GUEST_TOOLS`: it is the
+   * only health tool a guest can reach, so retiring it "because the generic read
+   * covers it" would be a capability loss for everybody who is not Jeff.
+   * `assertNamedProducersExist` would turn most other retirements into a BOOT
+   * FAILURE — `hp_shell` names all four docker tools, `catalogue_search` is named
+   * by five — but this one it would not catch, because nothing names
+   * `homelab_status`. Absence of a guard is not permission.
+   */
+  makeHomelabRead(),
+  /**
+   * Not replaceable by the generic read at any path: the results are a FILE on
+   * hp and the roster is Dispatcharr's Postgres behind `docker exec`. Neither is
+   * HTTP-reachable.
+   */
+  channelHealth,
 ];
 /**
  * ⚠️ `shed_host_load` is a WRITE and lives here, so it does not exist at all
