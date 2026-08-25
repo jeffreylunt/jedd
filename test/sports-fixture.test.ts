@@ -589,6 +589,37 @@ test("🔴 the venue is ATTRIBUTED to ESPN, because ESPN gets it wrong on cup ti
   assert.match(r.content, /venue \(per ESPN, UNVERIFIED/);
 });
 
+test('🔴 the EpisodeTitle is rendered — often the ONLY place the teams appear', async () => {
+  /**
+   * 🔴 MEASURED ON THE LIVE GUIDE, 2026-08-26.
+   *
+   * `FAN DUEL SPORTS WEST HD` carried Guardians/Angels as
+   *   Name:         "Live: MLB Baseball"
+   *   Overview:     "From Angel Stadium of Anaheim in Anaheim, Calif."
+   *   EpisodeTitle: "Cleveland Guardians at Los Angeles Angels"
+   *
+   * The matcher already read EpisodeTitle, so the match was correct — but
+   * `GuideProgramme` did not STORE it, so the rendered reply named a programme
+   * whose visible title and description mention neither team. The evidence for
+   * the claim was invisible in the claim.
+   */
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () =>
+      res(
+        guideBody([
+          programme({
+            Name: 'Live: Premier League',
+            EpisodeTitle: 'Crystal Palace at Manchester City',
+            Overview: 'From Selhurst Park.',
+          }),
+        ]),
+      ),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /"Live: Premier League" — Crystal Palace at Manchester City/);
+});
+
 test('🔴 a slug that returns the WRONG COMPETITION is flagged, not silently answered from', async () => {
   /**
    * 🔴 THE CASE HTTP STATUS CANNOT CATCH.
@@ -969,6 +1000,7 @@ test('rankChannelOptions and qualityOf, as units', () => {
     channelName,
     channelId: null,
     name: 'x',
+    episodeTitle: '',
     startDate: '',
     overview: '',
     replayMarkers: [],
@@ -1385,6 +1417,39 @@ test('🔴 a three-letter ABBREVIATION is never a matchable variant', async () =
   assert.doesNotMatch(r.content, /CHANNEL: UK/);
 });
 
+test('🔴 LOCATION is never a variant — the Real Housewives near-miss', async () => {
+  /**
+   * 🔴 LIVE ON BRAVO WEST HD INSIDE TONIGHT'S KICKOFF WINDOW (2026-08-25).
+   *
+   * ESPN gives Real Salt Lake `location: "Salt Lake"`. As a match token that
+   * made `The Real Housewives of Salt Lake City` satisfy the RSL half of the
+   * both-teams rule; only the absence of "león" kept it out of a reply. A
+   * scheduled job matching on EITHER token would have reported it to Jeff as
+   * his match 45 minutes before kickoff.
+   *
+   * Measured before removing: 21 real guide matches with location variants,
+   * 21 without. It discriminated nothing and collided with a place.
+   */
+  const rsl = teamVariants({
+    displayName: 'Real Salt Lake',
+    shortDisplayName: 'Real Salt Lake',
+    name: 'Real Salt Lake',
+    location: 'Salt Lake',
+    abbreviation: 'RSL',
+  });
+  assert.ok(!rsl.includes('salt lake'), 'a CITY is not a team identity');
+  assert.ok(rsl.includes('real salt lake'));
+
+  // And the asking side still works, because the query token-matches the name.
+  const f = fixtureOf([['real salt lake'], ['leon']]);
+  assert.equal(matchQuality(f, 'salt lake'), 2, '"salt lake" must still find RSL');
+  assert.equal(
+    programmeNamesAllTeams('The Real Housewives of Salt Lake City', f),
+    false,
+    'a programme about the PLACE is not the fixture',
+  );
+});
+
 test('🔴 the ABBREVIATION field is never read, and no variant is short enough to match by accident', () => {
   /**
    * ⚠️ BOTH HALVES ARE PINNED SEPARATELY BECAUSE EACH IS SAFE WHILE THE OTHER
@@ -1409,22 +1474,25 @@ test('🔴 the ABBREVIATION field is never read, and no variant is short enough 
   assert.ok(!sentinel.includes('sentinelabbr'), 'a team code substring-matches guide prose by accident');
   assert.ok(sentinel.includes('utah jazz') && sentinel.includes('jazz'));
 
-  // Real ESPN row. "la" is inside thousands of words; as a variant it would let
-  // almost any programme satisfy one half of the both-teams rule.
-  const clippers = teamVariants({
-    displayName: 'LA Clippers',
-    shortDisplayName: 'Clippers',
-    name: 'Clippers',
-    location: 'LA',
-    abbreviation: 'LAC',
-  });
-  assert.ok(!clippers.includes('la'), 'a two-character variant matches by accident');
-  assert.ok(!clippers.includes('lac'));
-  assert.ok(clippers.includes('clippers'));
-  assert.ok(
-    clippers.every((v) => v.length >= 4),
-    'every variant must clear the accidental-match floor',
-  );
+  /**
+   * The floor now has to be tested on an IDENTITY field, because `location` is
+   * no longer read at all — the old case used `LA Clippers`' two-character
+   * location, so dropping the floor stopped changing anything and the mutation
+   * survived. A guard whose only test goes through a removed input is untested.
+   *
+   * ⚠️ Every short identity in the leagues we carry is exactly four characters
+   * (`Nets`, `Hull`, `LAFC`, `León`, `Heat`, `Suns`, `UNAM` — measured), so the
+   * floor admits all of them, which is correct. What it exists to reject is
+   * shorter: AZ Alkmaar's `shortDisplayName` really is "AZ", and PSG's is
+   * "PSG". `teamVariants` is general, so it is tested against that shape
+   * directly.
+   */
+  const az = teamVariants({ displayName: 'AZ Alkmaar', shortDisplayName: 'AZ', name: 'AZ', nickname: 'AZ' });
+  assert.ok(!az.includes('az'), '"az" is inside "jazz", "amazing", "Kazakhstan"…');
+  assert.ok(az.includes('az alkmaar'));
+
+  const leon = teamVariants({ displayName: 'León', shortDisplayName: 'León', name: 'León' });
+  assert.deepEqual(leon, ['leon'], 'a real four-character identity must survive the floor');
 });
 
 test('a two-character query never matches a team', () => {

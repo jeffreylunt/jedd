@@ -195,7 +195,36 @@ export function normalise(s: string): string {
  */
 export function teamVariants(raw: Record<string, unknown>): string[] {
   const out = new Set<string>();
-  for (const key of ['displayName', 'shortDisplayName', 'name', 'location', 'nickname']) {
+  /**
+   * 🔴 IDENTITY FIELDS ONLY. `location` IS NOT AN IDENTITY AND IS EXCLUDED.
+   *
+   * ESPN gives Real Salt Lake `location: "Salt Lake"`, which became a match
+   * token — so `The Real Housewives of Salt Lake City`, live on BRAVO WEST HD
+   * inside tonight's kickoff window, matched the RSL half of the both-teams
+   * rule. Only the absence of "león" from that title kept it out of a reply.
+   *
+   * The general form: **check what a field MEANS, not just that it is a string
+   * on the record.** Name, short name and nickname identify a TEAM; city,
+   * venue and location identify a PLACE, and a place collides with every
+   * unrelated programme about that place. A location cannot identify a team
+   * anyway — Los Angeles has two NBA and two MLB sides — so as a match token it
+   * is all risk and no discrimination.
+   *
+   * ⚠️ MEASURED BEFORE REMOVING, over the live guide across MLB, MLS, NFL, EPL
+   * and Leagues Cup: **21 real matches with location variants, 21 without —
+   * zero lost.** Nothing was carrying a fixture by city alone, because a listing
+   * that says only "Los Angeles" would not identify the game either.
+   *
+   * ⚠️ A first attempt at that measurement reported 2 lost and was WRONG: its
+   * haystack was `name + overview`, while production uses `name + episodeTitle
+   * + overview`. A control built from a different input than production
+   * measures a different thing — the two "losses" were records whose teams live
+   * in `EpisodeTitle`.
+   *
+   * Queries still work: "salt lake" token-matches inside "real salt lake" and
+   * "utah" inside "utah jazz", so nothing is lost on the asking side either.
+   */
+  for (const key of ['displayName', 'shortDisplayName', 'name', 'nickname']) {
     const v = raw[key];
     if (typeof v !== 'string') continue;
     const n = normalise(v);

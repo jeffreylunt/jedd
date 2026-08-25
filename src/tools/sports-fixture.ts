@@ -162,7 +162,9 @@ const HEALTH_LABEL: Record<ChannelOption['health'], string> = {
 function renderOption(o: ChannelOption): string[] {
   const lines = [`  CHANNEL: ${o.channelName}  [${HEALTH_LABEL[o.health]} — ${o.healthDetail}]`];
   for (const p of o.programmes) {
-    lines.push(`    "${p.name}" starts ${p.startDate.slice(0, 16)}Z`);
+    // The episode title carries the fixture on many sports listings, and
+    // without it the reply names a programme that mentions neither team.
+    lines.push(`    "${p.name}"${p.episodeTitle ? ` — ${p.episodeTitle}` : ''} starts ${p.startDate.slice(0, 16)}Z`);
     if (p.overview) lines.push(`    ${p.overview.slice(0, 200)}`);
     if (p.replayMarkers.length) {
       lines.push(

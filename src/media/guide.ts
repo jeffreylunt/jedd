@@ -81,6 +81,16 @@ export interface GuideProgramme {
   channelName: string;
   channelId: string | null;
   name: string;
+  /**
+   * 🔴 OFTEN THE ONLY PLACE THE TEAMS APPEAR. Measured 2026-08-26:
+   * `FAN DUEL SPORTS WEST HD` carried the Guardians/Angels game as
+   * `Name: "Live: MLB Baseball"`, `Overview: "From Angel Stadium of Anaheim in
+   * Anaheim, Calif."` and `EpisodeTitle: "Cleveland Guardians at Los Angeles
+   * Angels"`. The matcher already read it; the RENDERED result did not carry
+   * it, so the reply showed a programme whose visible title and description
+   * name neither team — the evidence for the match was invisible.
+   */
+  episodeTitle: string;
   startDate: string;
   overview: string;
   /** Replay-ish words found in the title or description, if any. */
@@ -255,6 +265,7 @@ export async function findFixtureInGuide(
       channelName: channelName || '(the guide did not name a channel for this programme)',
       channelId: typeof p['ChannelId'] === 'string' ? p['ChannelId'] : null,
       name,
+      episodeTitle: episode,
       startDate: typeof p['StartDate'] === 'string' ? p['StartDate'] : '',
       overview,
       replayMarkers: findReplayMarkers(haystack),
