@@ -131,6 +131,8 @@ function espnEvent(
   };
 }
 
+// ⚠️ The league name is the one ESPN really returns for `soccer/eng.1`,
+// measured 2026-08-25 — the slug-identity check compares against it.
 const espnBody = (events: unknown[]) => ({ leagues: [{ name: 'English Premier League' }], events });
 
 /** A Jellyfin `/LiveTv/Programs` page. */
@@ -585,6 +587,44 @@ test("🔴 the venue is ATTRIBUTED to ESPN, because ESPN gets it wrong on cup ti
     ctx(),
   );
   assert.match(r.content, /venue \(per ESPN, UNVERIFIED/);
+});
+
+test('🔴 a slug that returns the WRONG COMPETITION is flagged, not silently answered from', async () => {
+  /**
+   * 🔴 THE CASE HTTP STATUS CANNOT CATCH.
+   *
+   * A malformed slug is HTTP 400 — measured against five near-misses, all
+   * rejected — so a typo does NOT look like a quiet competition. But a slug
+   * that is valid for a DIFFERENT competition (`usa.1` mistyped to `mex.1`)
+   * returns a healthy 200 full of the wrong fixtures. Nothing about the
+   * response is anomalous; only the name disagrees.
+   */
+  const s = spy({
+    espn: (url: string) =>
+      url.includes('usa.1')
+        ? res({ leagues: [{ name: 'Mexican Liga BBVA MX' }], events: [espnEvent({ home: 'León', away: 'Toluca' })] })
+        : res(espnBody([])),
+  });
+  const r = await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: 'mls', team: 'León' }, ctx());
+  assert.match(r.content, /UNEXPECTED NAME/);
+  assert.match(r.content, /MLS → ESPN returned "Mexican Liga BBVA MX"/);
+  assert.match(r.content, /may be from the wrong competition/);
+});
+
+test('CONTROL: a competition returning its EXPECTED name carries no warning', async () => {
+  // Without this the warning could be unconditional and the test above would
+  // still pass. `espnBody` returns "English Premier League", which is what the
+  // epl slug was measured to return.
+  const s = spy({ espn: () => res(espnBody([])) });
+  const r = await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: 'epl' }, ctx());
+  assert.doesNotMatch(r.content, /UNEXPECTED NAME/);
+});
+
+test('🔴 a 200 with NO leagues[0].name is UNKNOWN, not a quiet competition', async () => {
+  const s = spy({ espn: () => res({ events: [] }) });
+  const r = await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: 'epl' }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /no leagues\[0\]\.name/);
 });
 
 test('🔴 an EMPTY fixture search names every competition it searched', async () => {

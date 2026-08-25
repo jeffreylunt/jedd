@@ -432,11 +432,29 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
        * game. Naming the competitions searched is what makes the difference
        * between a finding and a fact about one list.
        */
+      /**
+       * 🔴 A COMPETITION THAT CAME BACK UNDER THE WRONG NAME IS NOT TRUSTWORTHY.
+       *
+       * HTTP 400 catches a malformed slug. It cannot catch a slug that is valid
+       * for a DIFFERENT competition — `usa.1` mistyped to `mex.1` returns a
+       * healthy 200 full of Liga MX fixtures. Only the name disagrees, so the
+       * name is what is checked, and the mismatch is surfaced rather than
+       * silently answering from the wrong competition.
+       */
+      const misnamed = okAnswers.flatMap(({ key, a }) =>
+        a.state === 'results' && !a.nameMatches
+          ? [`${leagueLabel(key)} → ESPN returned "${a.espnName}"`]
+          : [],
+      );
       const scopeLine =
         `SEARCHED ${searched.length} competition(s): ${scopeLabel}. ` +
         'Anything NOT in that list was not checked — do not report on it.' +
         (failures.length
           ? `\n🔴 ${failures.length} could NOT be read, so they are UNKNOWN rather than empty: ${failures.join('; ')}`
+          : '') +
+        (misnamed.length
+          ? `\n🔴 ${misnamed.length} came back under an UNEXPECTED NAME, so its fixtures may be from the ` +
+            `wrong competition entirely — treat them as suspect: ${misnamed.join('; ')}`
           : '');
       const sourceLine =
         `${asOf}\n${scopeLine}\nFIXTURE SOURCE (ESPN): ${considered} events across those ` +

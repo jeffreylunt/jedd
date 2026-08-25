@@ -77,23 +77,23 @@ import type { FetchImpl } from './arr.js';
  */
 export const LEAGUES = {
   // ── England ────────────────────────────────────────────────────────────
-  epl: { path: 'soccer/eng.1', label: 'Premier League' },
-  efl_cup: { path: 'soccer/eng.league_cup', label: 'Carabao Cup' },
-  fa_cup: { path: 'soccer/eng.fa', label: 'FA Cup' },
+  epl: { path: 'soccer/eng.1', label: 'Premier League', espnName: 'English Premier League' },
+  efl_cup: { path: 'soccer/eng.league_cup', label: 'Carabao Cup', espnName: 'English Carabao Cup' },
+  fa_cup: { path: 'soccer/eng.fa', label: 'FA Cup', espnName: 'English FA Cup' },
   // ── Europe ─────────────────────────────────────────────────────────────
-  ucl: { path: 'soccer/uefa.champions', label: 'UEFA Champions League' },
-  uel: { path: 'soccer/uefa.europa', label: 'UEFA Europa League' },
-  uecl: { path: 'soccer/uefa.europa.conf', label: 'UEFA Conference League' },
+  ucl: { path: 'soccer/uefa.champions', label: 'UEFA Champions League', espnName: 'UEFA Champions League' },
+  uel: { path: 'soccer/uefa.europa', label: 'UEFA Europa League', espnName: 'UEFA Europa League' },
+  uecl: { path: 'soccer/uefa.europa.conf', label: 'UEFA Conference League', espnName: 'UEFA Conference League' },
   // ── North America ──────────────────────────────────────────────────────
-  mls: { path: 'soccer/usa.1', label: 'MLS' },
-  leagues_cup: { path: 'soccer/concacaf.leagues.cup', label: 'Leagues Cup' },
-  us_open_cup: { path: 'soccer/usa.open', label: 'U.S. Open Cup' },
-  concacaf_cc: { path: 'soccer/concacaf.champions', label: 'CONCACAF Champions Cup' },
+  mls: { path: 'soccer/usa.1', label: 'MLS', espnName: 'MLS' },
+  leagues_cup: { path: 'soccer/concacaf.leagues.cup', label: 'Leagues Cup', espnName: 'Leagues Cup' },
+  us_open_cup: { path: 'soccer/usa.open', label: 'U.S. Open Cup', espnName: 'U.S. Open Cup' },
+  concacaf_cc: { path: 'soccer/concacaf.champions', label: 'CONCACAF Champions Cup', espnName: 'Concacaf Champions Cup' },
   // ── US leagues ─────────────────────────────────────────────────────────
-  nfl: { path: 'football/nfl', label: 'NFL' },
-  nba: { path: 'basketball/nba', label: 'NBA' },
-  mlb: { path: 'baseball/mlb', label: 'MLB' },
-} as const satisfies Record<string, { path: string; label: string }>;
+  nfl: { path: 'football/nfl', label: 'NFL', espnName: 'National Football League' },
+  nba: { path: 'basketball/nba', label: 'NBA', espnName: 'National Basketball Association' },
+  mlb: { path: 'baseball/mlb', label: 'MLB', espnName: 'Major League Baseball' },
+} as const satisfies Record<string, { path: string; label: string; espnName: string }>;
 
 export type LeagueKey = keyof typeof LEAGUES;
 
@@ -156,6 +156,10 @@ export type FixtureAnswer =
       sampleKeys: string[];
       windowFrom: string;
       windowTo: string;
+      /** What ESPN itself calls this competition. */
+      espnName: string;
+      /** False when ESPN's name differs from the one measured when the slug was added. */
+      nameMatches: boolean;
     }
   | { state: 'unknown'; detail: string };
 
@@ -355,6 +359,15 @@ export class EspnClient {
       };
     }
 
+    const leagues = (body as { leagues?: unknown }).leagues;
+    const leagueRow = (Array.isArray(leagues) ? leagues[0] : undefined) as Record<string, unknown> | undefined;
+    const name = typeof leagueRow?.['name'] === 'string' ? leagueRow['name'] : '';
+    if (!name) {
+      // A 200 with no competition identity is a shape we do not recognise, and
+      // `events: []` under it would read as "this competition is quiet".
+      return { state: 'unknown', detail: `${url} returned ${res.status} with no leagues[0].name, so the competition it describes is UNKNOWN` };
+    }
+
     const rows = events as Record<string, unknown>[];
     const fixtures: Fixture[] = [];
     for (const r of rows) {
@@ -383,6 +396,24 @@ export class EspnClient {
       sampleKeys: rows.length ? Object.keys(rows[0] ?? {}) : [],
       windowFrom: new Date(fromMs).toISOString(),
       windowTo: new Date(toMs).toISOString(),
+      /**
+       * 🔴 A SLUG CAN BE VALID AND POINT AT THE WRONG COMPETITION.
+       *
+       * A MALFORMED slug is HTTP 400 — measured against five near-misses
+       * (`uefa.conf`, `usa.opencup`, `concacaf.leaguescup`, `eng.facup`,
+       * `usa.2`), all rejected. So a typo does NOT look like a quiet
+       * competition, and the "0 events could be a typo" worry is unfounded for
+       * ESPN.
+       *
+       * What HTTP status cannot catch is a slug that is valid for a DIFFERENT
+       * competition — `usa.1` mistyped to `mex.1` returns a healthy 200 full of
+       * Liga MX fixtures under a label saying MLS. Nothing about that response
+       * is anomalous; only the NAME disagrees. So the name ESPN returns is
+       * compared against the one measured when the slug was added, and any
+       * drift is reported rather than assumed benign.
+       */
+      espnName: name,
+      nameMatches: name === entry.espnName,
     };
   }
 }
