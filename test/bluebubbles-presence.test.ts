@@ -39,7 +39,12 @@ const HELPER_ABSENT_BODY = {
   error: { type: 'iMessage Error', message: 'iMessage Private API Helper is not connected!' },
 };
 
-const JEFF = '+18018396586';
+/**
+ * ⚠️ Reserved-for-fiction, deliberately. The real owner handle is configuration,
+ * not source — `owner-config-fail-closed.test.ts` scans the tracked tree for it
+ * and fails. The percent-encoded literals below are this number, not Jeff's.
+ */
+const OWNER = '+18015550123';
 
 /** Let the fire-and-forget chain drain. Presence never gives the caller a promise. */
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
@@ -128,10 +133,10 @@ function stubClient(behaviour: 'ok' | 'helper-absent' | 'throw' = 'ok') {
 test('startTyping POSTs to the chat typing route, stopTyping DELETEs the same one', async () => {
   const { impl, calls } = scripted(() => ({ body: { status: 200, message: 'Success' } }));
   const c = client(impl);
-  await c.startTyping(chatGuidFor(JEFF));
-  await c.stopTyping(chatGuidFor(JEFF));
+  await c.startTyping(chatGuidFor(OWNER));
+  await c.stopTyping(chatGuidFor(OWNER));
 
-  const path = '/api/v1/chat/iMessage%3B-%3B%2B18018396586/typing';
+  const path = '/api/v1/chat/iMessage%3B-%3B%2B18015550123/typing';
   assert.equal(calls[0]?.method, 'POST');
   assert.ok(calls[0]?.url.startsWith(`http://bb.invalid:1234${path}?`), calls[0]?.url);
   assert.equal(calls[1]?.method, 'DELETE');
@@ -143,17 +148,17 @@ test('startTyping POSTs to the chat typing route, stopTyping DELETEs the same on
 
 test('markChatRead POSTs to the chat read route', async () => {
   const { impl, calls } = scripted(() => ({ body: { status: 200, message: 'Success' } }));
-  await client(impl).markChatRead(chatGuidFor(JEFF));
+  await client(impl).markChatRead(chatGuidFor(OWNER));
   assert.equal(calls[0]?.method, 'POST');
-  assert.ok(calls[0]?.url.includes('/api/v1/chat/iMessage%3B-%3B%2B18018396586/read?'), calls[0]?.url);
+  assert.ok(calls[0]?.url.includes('/api/v1/chat/iMessage%3B-%3B%2B18015550123/read?'), calls[0]?.url);
 });
 
 test('every presence call is bounded — a hung BlueBubbles cannot hold a socket open', async () => {
   const { impl, calls } = scripted(() => ({ body: { status: 200 } }));
   const c = client(impl);
-  await c.startTyping(chatGuidFor(JEFF));
-  await c.stopTyping(chatGuidFor(JEFF));
-  await c.markChatRead(chatGuidFor(JEFF));
+  await c.startTyping(chatGuidFor(OWNER));
+  await c.stopTyping(chatGuidFor(OWNER));
+  await c.markChatRead(chatGuidFor(OWNER));
   assert.equal(calls.length, 3);
   assert.ok(
     calls.every((k) => k.hasSignal),
@@ -164,21 +169,21 @@ test('every presence call is bounded — a hung BlueBubbles cannot hold a socket
 test('🔴 typing addresses the SAME chat guid that a send addresses — not a second scheme', async () => {
   const { impl, calls } = scripted(() => ({ body: { status: 200, data: { guid: 'g' } } }));
   const c = client(impl);
-  await c.sendText(JEFF, 'hello');
-  await c.startTyping(chatGuidFor(JEFF));
+  await c.sendText(OWNER, 'hello');
+  await c.startTyping(chatGuidFor(OWNER));
 
   // 🔴 Read the guid the SEND actually put on the wire, rather than restating
   // the literal in the assertion. Restating it is exactly what lets the two
   // drift: each would still look right on its own, and only the PAIRING would
   // be wrong — a typing indicator on one thread, the reply on another.
   const sentGuid = (calls[0]?.body as { chatGuid?: string } | undefined)?.chatGuid;
-  assert.equal(sentGuid, chatGuidFor(JEFF));
+  assert.equal(sentGuid, chatGuidFor(OWNER));
   assert.ok(calls[1]?.url.includes(encodeURIComponent(String(sentGuid))), calls[1]?.url);
 });
 
 test('🔴 the LIVE helper-absent 500 is recognised as expected, not as a fault', async () => {
   const { impl } = scripted(() => ({ status: 500, body: HELPER_ABSENT_BODY }));
-  const r = await client(impl).startTyping(chatGuidFor(JEFF));
+  const r = await client(impl).startTyping(chatGuidFor(OWNER));
   assert.equal(r.ok, false);
   assert.equal(r.status, 500);
   assert.equal(r.helperAbsent, true);
@@ -190,7 +195,7 @@ test('a 500 that is NOT the helper is not laundered into the expected case', asy
     status: 500,
     body: { status: 500, message: 'Something went wrong', error: { message: 'unexpected' } },
   }));
-  const r = await client(impl).startTyping(chatGuidFor(JEFF));
+  const r = await client(impl).startTyping(chatGuidFor(OWNER));
   assert.equal(r.helperAbsent, false);
   assert.match(r.detail, /Something went wrong/);
 });
@@ -201,7 +206,7 @@ test('🔴 CONTROL: the client itself still THROWS on transport failure', async 
   const impl: FetchImpl = async () => {
     throw new Error('ECONNREFUSED');
   };
-  await assert.rejects(() => client(impl).startTyping(chatGuidFor(JEFF)), /ECONNREFUSED/);
+  await assert.rejects(() => client(impl).startTyping(chatGuidFor(OWNER)), /ECONNREFUSED/);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,9 +223,9 @@ test('🔴 with the helper ABSENT, a turn returns its reply exactly as it would 
   const lines: string[] = [];
   const presence = new Presence({ client: bb, log: (l) => lines.push(l) });
 
-  presence.markRead(JEFF);
-  const reply = await presence.withTyping(JEFF, async () => {
-    await bb.sendText(JEFF, 'Dune is ready to watch.');
+  presence.markRead(OWNER);
+  const reply = await presence.withTyping(OWNER, async () => {
+    await bb.sendText(OWNER, 'Dune is ready to watch.');
     return 'Dune is ready to watch.';
   });
   await flush();
@@ -240,8 +245,8 @@ test('🔴 with the transport THROWING, a turn still returns its reply', async (
   const lines: string[] = [];
   const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
 
-  presence.markRead(JEFF);
-  const reply = await presence.withTyping(JEFF, async () => 'the answer');
+  presence.markRead(OWNER);
+  const reply = await presence.withTyping(OWNER, async () => 'the answer');
   await flush();
 
   assert.equal(reply, 'the answer');
@@ -251,7 +256,7 @@ test('🔴 with the transport THROWING, a turn still returns its reply', async (
 test('markRead hands the caller no promise at all, so it cannot be awaited by accident', async () => {
   const { impl } = stubClient('throw');
   const presence = new Presence({ client: impl, log: () => {} });
-  assert.equal(presence.markRead(JEFF), undefined);
+  assert.equal(presence.markRead(OWNER), undefined);
   await flush(); // an unhandled rejection here would fail the run
 });
 
@@ -260,8 +265,8 @@ test('the helper-absent notice is said ONCE, not on every turn for the rest of t
   const lines: string[] = [];
   const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
   for (let i = 0; i < 5; i += 1) {
-    presence.markRead(JEFF);
-    await presence.withTyping(JEFF, async () => 'ok');
+    presence.markRead(OWNER);
+    await presence.withTyping(OWNER, async () => 'ok');
     await flush();
   }
   assert.equal(lines.length, 1, `expected one notice across five turns, got:\n${lines.join('\n')}`);
@@ -274,9 +279,9 @@ test('the helper-absent notice is said ONCE, not on every turn for the rest of t
 test('typing stops when the turn succeeds', async () => {
   const { impl, calls } = stubClient();
   const presence = new Presence({ client: impl, log: () => {} });
-  await presence.withTyping(JEFF, async () => 'done');
+  await presence.withTyping(OWNER, async () => 'done');
   await flush();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`, `stop ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
 });
 
 test('🔴 typing stops when the turn THROWS — and the error reaches the caller unchanged', async () => {
@@ -285,13 +290,13 @@ test('🔴 typing stops when the turn THROWS — and the error reaches the calle
   const boom = new Error('the model timed out after 240000ms');
   await assert.rejects(
     () =>
-      presence.withTyping(JEFF, async () => {
+      presence.withTyping(OWNER, async () => {
         throw boom;
       }),
     (e) => e === boom, // identity, not shape: a wrapper here would hide the real fault
   );
   await flush();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`, `stop ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
 });
 
 test('🔴 stop can never overtake start, even on an instantaneous turn', async () => {
@@ -315,7 +320,7 @@ test('🔴 stop can never overtake start, even on an instantaneous turn', async 
     markChatRead: async () => ({ ok: true, status: 200, helperAbsent: false, detail: '' }),
   };
   const presence = new Presence({ client: impl, log: () => {} });
-  await presence.withTyping(JEFF, async () => 'instant');
+  await presence.withTyping(OWNER, async () => 'instant');
   await flush();
   // The turn is over and `stopTyping` is already queued, but `startTyping` has
   // not come back yet — so nothing has been sent in either direction.
@@ -331,15 +336,15 @@ test('🔴 two concurrent turns from one sender share ONE indicator, stopped by 
   const { impl, calls } = stubClient();
   const presence = new Presence({ client: impl, log: () => {} });
   let finishFirst = (): void => {};
-  const first = presence.withTyping(JEFF, () => new Promise<string>((r) => (finishFirst = () => r('a'))));
-  const second = presence.withTyping(JEFF, async () => 'b');
+  const first = presence.withTyping(OWNER, () => new Promise<string>((r) => (finishFirst = () => r('a'))));
+  const second = presence.withTyping(OWNER, async () => 'b');
   await second;
   await flush();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`], 'the first turn is still thinking');
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`], 'the first turn is still thinking');
   finishFirst();
   await first;
   await flush();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`, `stop ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
 });
 
 test('the indicator is refreshed while a long turn runs, and refreshes stop when it does', async () => {
@@ -353,7 +358,7 @@ test('the indicator is refreshed while a long turn runs, and refreshes stop when
     refreshMs: 30_000,
   });
   let finish = (): void => {};
-  const turn = presence.withTyping(JEFF, () => new Promise<string>((r) => (finish = () => r('ok'))));
+  const turn = presence.withTyping(OWNER, () => new Promise<string>((r) => (finish = () => r('ok'))));
   await flush();
   clock.advance(30_000);
   clock.advance(30_000);
@@ -385,12 +390,12 @@ test('🔴 the ceiling stops the indicator even if the turn never ends', async (
     refreshMs: 30_000,
     ceilingMs: 120_000,
   });
-  presence.withTyping(JEFF, () => new Promise<string>(() => {})).catch(() => {});
+  presence.withTyping(OWNER, () => new Promise<string>(() => {})).catch(() => {});
   await flush();
   for (let i = 0; i < 5; i += 1) clock.advance(30_000);
   await flush();
 
-  assert.ok(calls.includes(`stop ${chatGuidFor(JEFF)}`), calls.join(', '));
+  assert.ok(calls.includes(`stop ${chatGuidFor(OWNER)}`), calls.join(', '));
   assert.equal(clock.pending(), 0, 'the refresh loop survived the ceiling');
   assert.ok(lines.some((l) => l.includes('ceiling')), lines.join('\n'));
 });
@@ -398,11 +403,11 @@ test('🔴 the ceiling stops the indicator even if the turn never ends', async (
 test('🔴 shutdown stops a live indicator — a pm2 restart lands mid-turn sooner or later', async () => {
   const { impl, calls } = stubClient();
   const presence = new Presence({ client: impl, log: () => {} });
-  presence.withTyping(JEFF, () => new Promise<string>(() => {})).catch(() => {});
+  presence.withTyping(OWNER, () => new Promise<string>(() => {})).catch(() => {});
   await flush();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`]);
   await presence.stopAll();
-  assert.deepEqual(calls, [`start ${chatGuidFor(JEFF)}`, `stop ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
 });
 
 test('stopAll is bounded — an unreachable BlueBubbles cannot stop the process dying', async () => {
@@ -412,7 +417,7 @@ test('stopAll is bounded — an unreachable BlueBubbles cannot stop the process 
     markChatRead: async () => ({ ok: true, status: 200, helperAbsent: false, detail: '' }),
   };
   const presence = new Presence({ client: impl, log: () => {} });
-  presence.withTyping(JEFF, () => new Promise<string>(() => {})).catch(() => {});
+  presence.withTyping(OWNER, () => new Promise<string>(() => {})).catch(() => {});
   await flush();
   await presence.stopAll(20); // resolves via the bound, not via the hung call
 });
@@ -447,19 +452,19 @@ test('🔴 a handle outside JEDD_SEND_TO gets NO read receipt and NO typing bubb
 test('CONTROL: a handle INSIDE the audience gets both', async () => {
   const { impl, calls } = stubClient();
   const presence = new Presence({ client: impl, log: () => {} });
-  const connector = connectorWith([JEFF], presence);
+  const connector = connectorWith([OWNER], presence);
 
-  connector.markRead(JEFF);
-  await connector.withTyping(JEFF, async () => 'ok');
+  connector.markRead(OWNER);
+  await connector.withTyping(OWNER, async () => 'ok');
   await flush();
 
-  assert.deepEqual(calls, [`read ${chatGuidFor(JEFF)}`, `start ${chatGuidFor(JEFF)}`, `stop ${chatGuidFor(JEFF)}`]);
+  assert.deepEqual(calls, [`read ${chatGuidFor(OWNER)}`, `start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
 });
 
 test('a connector built with NO Presence still runs the turn', async () => {
   const connector = connectorWith('everyone');
-  connector.markRead(JEFF);
-  assert.equal(await connector.withTyping(JEFF, async () => 'ok'), 'ok');
+  connector.markRead(OWNER);
+  assert.equal(await connector.withTyping(OWNER, async () => 'ok'), 'ok');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -485,7 +490,7 @@ test('🔴 a message arriving over the real webhook marks read, types, and stops
   const connector = new BlueBubblesConnector(
     receiver,
     null as unknown as BlueBubblesClient,
-    [JEFF],
+    [OWNER],
     undefined,
     presence,
   );
@@ -511,8 +516,8 @@ test('🔴 a message arriving over the real webhook marks read, types, and stops
         guid: 'p:0/ABC',
         text: 'is dune downloaded yet',
         isFromMe: false,
-        handle: { address: JEFF, service: 'iMessage' },
-        chats: [{ chatIdentifier: JEFF, originalROWID: 1 }],
+        handle: { address: OWNER, service: 'iMessage' },
+        chats: [{ chatIdentifier: OWNER, originalROWID: 1 }],
       },
     }),
   });
@@ -522,9 +527,9 @@ test('🔴 a message arriving over the real webhook marks read, types, and stops
 
   assert.deepEqual(order, ['turn:is dune downloaded yet'], 'the turn never ran');
   assert.deepEqual(calls, [
-    `read ${chatGuidFor(JEFF)}`,
-    `start ${chatGuidFor(JEFF)}`,
-    `stop ${chatGuidFor(JEFF)}`,
+    `read ${chatGuidFor(OWNER)}`,
+    `start ${chatGuidFor(OWNER)}`,
+    `stop ${chatGuidFor(OWNER)}`,
   ]);
 });
 
@@ -532,8 +537,8 @@ test('🔴 ShadowConnector cannot signal presence, and holds nothing that could'
   // A shadow is supposed to be invisible. A read receipt is the one outward
   // sign it could produce, appearing beside V1's real replies.
   const shadow = new ShadowConnector(null as unknown as BlueBubblesReceiver);
-  shadow.markRead(JEFF);
-  assert.equal(await shadow.withTyping(JEFF, async () => 'ok'), 'ok');
+  shadow.markRead(OWNER);
+  assert.equal(await shadow.withTyping(OWNER, async () => 'ok'), 'ok');
   assert.equal(
     Object.values(shadow).filter((v) => v && typeof v === 'object' && 'startTyping' in v).length,
     0,
