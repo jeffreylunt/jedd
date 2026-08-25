@@ -355,6 +355,28 @@ test('both teams in the OVERVIEW alone still match — the Search/Hints blind sp
   assert.match(r.content, /CHANNEL: UK: SKY SPORTS MAIN EVENT/);
 });
 
+test('🔴 the result says what it did NOT search, in both guide branches', async () => {
+  /**
+   * 🔴 CAUGHT ON A REAL TURN, NOT IN A TEST.
+   *
+   * Asked "is Crystal Palace on TV tonight?" the model answered correctly about
+   * Friday's fixture and then added "Nothing involving Palace in the guide for
+   * tonight" — a claim the tool never made, and a false one: the guide really
+   * does list `PL: Everton v Crystal Palace` tonight at 22:00, a rebroadcast.
+   *
+   * A zero over one 105-minute window reads as a zero over the whole day unless
+   * the result says otherwise. Both branches must say otherwise, because the
+   * over-read is available from either.
+   */
+  for (const guide of [() => res(guideBody([filler(1)])), () => res(guideBody([programme()]))]) {
+    const s = spy({ espn: () => res(espnBody([espnEvent()])), guide });
+    const r = await run(s);
+    assert.match(r.content, /ONLY that window was searched/);
+    assert.match(r.content, /says NOTHING about the rest of the guide/);
+    assert.match(r.content, /rebroadcast of an OLDER match/);
+  }
+});
+
 // ── REPLAY DISAMBIGUATION ───────────────────────────────────────────────────
 
 test('🔴 a COMPLETED match is never offered as the next fixture', async () => {
@@ -457,6 +479,75 @@ test('"Match Week" alone is NOT treated as a replay marker', async () => {
   const r = await run(s);
   assert.match(r.content, /CHANNEL: UK: SKY SPORTS MAIN EVENT/);
   assert.doesNotMatch(r.content, /POSSIBLE REPLAY/);
+});
+
+// ── LATER FIXTURES: "NOT LOOKED UP" IS NOT "NOT LISTED" ────────────────────
+
+test('🔴 a later fixture INSIDE the guide reach is actually looked up, not written off', async () => {
+  /**
+   * 🔴 CAUGHT ON A REAL TURN. The later-fixtures line used to read "the guide
+   * does not reach these, so no channel was sought", and the model reported
+   * that the later Dodgers games "have no channel listed yet". Both halves were
+   * wrong: those games are well inside a four-day guide and both really do have
+   * channels. A gap in what we LOOKED AT had rendered as a finding about the
+   * world.
+   */
+  const soon = '2026-08-27T19:00Z'; // 2 days out — inside the guide
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
+    guide: () => res(guideBody([programme()])),
+  });
+  const r = await run(s);
+  const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
+  assert.match(laterBlock, /channel: UK: SKY SPORTS MAIN EVENT/);
+  assert.doesNotMatch(laterBlock, /not looked up/);
+});
+
+test('🔴 a later fixture BEYOND the guide reach is UNCHECKED, never "no channel"', async () => {
+  const far = '2026-09-19T14:00Z'; // 25 days out
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: far })])),
+    guide: () => res(guideBody([])),
+  });
+  const r = await run(s);
+  const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
+  assert.match(laterBlock, /not looked up/);
+  assert.match(laterBlock, /says NOTHING about whether a channel exists/);
+  assert.doesNotMatch(laterBlock, /no channel listed/);
+});
+
+test('🔴 a TRUNCATED scan on a LATER fixture is UNKNOWN there too, not a clean zero', async () => {
+  // The same rule as the next fixture, and it needed its own test: a mutation
+  // that deleted this branch left the suite green, because every assertion
+  // about truncation was aimed at the NEXT fixture only.
+  const soon = '2026-08-27T19:00Z';
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
+    guide: () => res(guideBody([filler(1)], 900)),
+  });
+  const r = await run(s);
+  const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
+  assert.match(laterBlock, /channel UNKNOWN — the scan was truncated \(1 of 900/);
+  assert.doesNotMatch(laterBlock, /no channel listed/);
+});
+
+test('the guide is queried at most once per reported fixture', async () => {
+  // Each lookup is a request. Five in-reach fixtures must not become five
+  // requests plus however many the lookahead grows to next.
+  const dates = ['2026-08-26T12:00Z', '2026-08-27T12:00Z', '2026-08-28T12:00Z', '2026-08-29T12:00Z', '2026-08-29T18:00Z'];
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), ...dates.map((d, i) => espnEvent({ id: `x${i}`, date: d }))])),
+    guide: () => res(guideBody([])),
+  });
+  await run(s);
+  assert.ok(s.guideCalls.length <= 4, `expected at most 4 guide calls, got ${s.guideCalls.length}`);
+  assert.ok(s.guideCalls.length >= 2, 'later fixtures inside the guide must actually be looked up');
+});
+
+test('a single day reads as "1 day", not "1 days"', () => {
+  assert.match(renderKickoff(NOW + 40 * 3_600_000, NOW), /in 2 days/);
+  assert.match(renderKickoff(NOW + 30 * 3_600_000, NOW), /in 30 h/);
+  assert.doesNotMatch(renderKickoff(NOW + 40 * 3_600_000, NOW), /1 days/);
 });
 
 // ── NO FIXTURE AT ALL, BOUNDED HONESTLY ─────────────────────────────────────

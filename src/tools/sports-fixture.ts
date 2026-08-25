@@ -86,6 +86,17 @@ const MAX_DAYS = 120;
 const LOOKAHEAD = 3;
 
 /**
+ * How far ahead a guide lookup is worth attempting.
+ *
+ * The guide runs about four days deep (measured: 5,614 programmes on
+ * 2026-08-26, 296 by 2026-08-29). Five days is that plus a margin, so a fixture
+ * inside it gets a real answer and one outside it is honestly labelled
+ * unchecked rather than searched-and-empty. Bounded because each lookup is a
+ * request: at most `LOOKAHEAD + 1` of them per call.
+ */
+const GUIDE_HORIZON_MS = 5 * 86_400_000;
+
+/**
  * Kickoff in three forms, because the model has no clock.
  *
  * 🔴 There is no current time in the system prompt. A bare ISO timestamp leaves
@@ -126,7 +137,8 @@ export function renderKickoff(kickoffMs: number, nowMs: number): string {
   } else if (hours < 36) {
     relative = `in ${Math.round(hours)} h`;
   } else {
-    relative = `in ${Math.round(hours / 24)} days`;
+    const d = Math.round(hours / 24);
+    relative = `in ${d} ${d === 1 ? 'day' : 'days'}`;
   }
   return `${iso} — ${local} (${relative})`;
 }
@@ -265,6 +277,25 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
         .toISOString()
         .slice(0, 16)}Z`;
 
+      /**
+       * 🔴 WHAT THIS RESULT DOES NOT COVER, SAID OUT LOUD.
+       *
+       * Caught on a real turn, not in a test. Asked *"is Crystal Palace on TV
+       * tonight?"* the model answered correctly about Friday's fixture and then
+       * added **"Nothing involving Palace in the guide for tonight"** — a claim
+       * the tool never made and that is FALSE: the guide really does list `PL:
+       * Everton v Crystal Palace` tonight at 22:00, a rebroadcast.
+       *
+       * The tool searched one 105-minute window and reported a zero. A zero
+       * over a stated window reads as a zero over the day unless the result
+       * says otherwise, so it says otherwise — and the sentence that closes the
+       * over-read is the same sentence that explains the replay.
+       */
+      const scopeNote =
+        '  ⚠️ ONLY that window was searched, so this says NOTHING about the rest of the guide. ' +
+        'A rebroadcast of an OLDER match involving these teams may well be listed at another time ' +
+        'today; it would not be this fixture. Do not report on any time this window does not cover.';
+
       if (guide.state !== 'searched') {
         // 🔴 The guide failing NEVER suppresses the fixture. The kickoff above
         // is already established by a source that answered; only the channel
@@ -299,6 +330,7 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
             'fixture source; only the channel is unknown. Say when the match is on and that no ' +
             'channel is listed for it yet.',
         );
+        parts.push(scopeNote);
       } else {
         parts.push(
           `TV GUIDE: searched ${winText} — ${guide.scanned} programmes on ${guide.channels} channels, ` +
@@ -315,13 +347,49 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
             );
           }
         }
+        parts.push(scopeNote);
       }
 
       const later = wanted.slice(1, 1 + LOOKAHEAD);
       if (later.length) {
         parts.push('');
-        parts.push('LATER FIXTURES (kickoff only — the guide does not reach these, so no channel was sought):');
-        for (const f of later) parts.push(`  ${renderKickoff(f.kickoffMs, nowMs)} — ${teamLine(f)}`);
+        parts.push('LATER FIXTURES:');
+        for (const f of later) {
+          parts.push(`  ${renderKickoff(f.kickoffMs, nowMs)} — ${teamLine(f)}`);
+          /**
+           * 🔴 "NOT LOOKED UP" AND "NOT LISTED" ARE DIFFERENT, AND CONFLATING
+           * THEM PRODUCED A FALSE STATEMENT ON A REAL TURN.
+           *
+           * This block used to render one line — *"LATER FIXTURES (kickoff only
+           * — the guide does not reach these, so no channel was sought)"* — and
+           * the model duly reported that the later Dodgers games "have no
+           * channel listed yet". Both halves were wrong. The 26th and 27th are
+           * WELL inside a guide that runs about four days, and both really do
+           * have channels (MLB NETWORK, TNT SPORTS 1), so the parenthetical was
+           * false and the conclusion drawn from it was false.
+           *
+           * So a fixture inside the guide's reach is now actually looked up,
+           * and one beyond it is labelled as UNCHECKED rather than as empty. A
+           * gap in what we looked at must never render as a finding about the
+           * world.
+           */
+          if (f.kickoffMs > nowMs + GUIDE_HORIZON_MS) {
+            parts.push('      not looked up — beyond the few days the guide reaches. This says NOTHING about whether a channel exists.');
+            continue;
+          }
+          const g = await findFixtureInGuide(ctx.config, f, fetchImpl);
+          if (g.state !== 'searched') {
+            parts.push(`      channel UNKNOWN — the guide could not be searched (${g.detail})`);
+          } else if (g.matches.length) {
+            parts.push(`      channel: ${g.matches.map((m) => m.channelName).join(' | ')}`);
+          } else if (g.scanned < g.total) {
+            parts.push(`      channel UNKNOWN — the scan was truncated (${g.scanned} of ${g.total} programmes read)`);
+          } else if (g.scanned === 0) {
+            parts.push('      no channel listed — the guide holds nothing at all for that window yet');
+          } else {
+            parts.push(`      no channel listed — ${g.scanned} programmes in that window, none naming both teams`);
+          }
+        }
       }
 
       return ok(parts.join('\n'));
