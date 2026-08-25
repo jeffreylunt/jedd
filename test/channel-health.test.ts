@@ -68,8 +68,8 @@ function execStub(now: number, opts: { results?: string; resultsExit?: number; r
   return { commands, impl };
 }
 
-function ctx(exec: ExecImpl): ToolContext {
-  return { role: 'owner', senderHandle: '+18015550123', config: testConfig(), exec };
+function ctx(exec: ExecImpl, role: 'owner' | 'guest' = 'owner'): ToolContext {
+  return { role, senderHandle: '+18015550123', config: testConfig(), exec };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +288,75 @@ test('parseRoster reads the psql tuple format', () => {
   assert.deepEqual(rows[4], { number: '90', name: 'NEWLY ADDED CHANNEL', hasEpg: false, hidden: false });
 });
 
-test('the tool declares itself a read and is owner-only', () => {
+test('the tool declares itself a read, and CONTENT means guests get it', () => {
   assert.equal(channelHealth.writes, false);
-  assert.equal(channelHealth.minRole, 'owner');
+  // ⚠️ Was 'owner'. Which channel works is not about a person and is not a
+  // secret, so by Jeff's rule it is everyone's. The PRIVILEGED half is gated
+  // inside run(), not by the tool's minRole.
+  assert.equal(channelHealth.minRole, 'guest');
+});
+
+test('🔴 a GUEST never causes the privileged docker exec — the call is not made at all', async () => {
+  const { commands, impl } = execStub(MTIME + HOUR);
+  const res = await channelHealth.run({}, ctx(impl, 'guest'));
+
+  assert.equal(res.ok, true, 'a guest is entitled to the content answer');
+  assert.match(res.content, /243 channels checked|4 channels checked/, 'the guest got the real data');
+  assert.deepEqual(
+    commands.filter((c) => c.command.includes('psql')),
+    [],
+    'a guest triggered docker exec on the PRIVILEGED identity',
+  );
+  assert.deepEqual(
+    commands.map((c) => c.host),
+    [testConfig().shellSshHost],
+    'a guest reached an identity other than the unprivileged one',
+  );
+
+  // 🔴 CONTROL: the owner DOES cause it, so the assertion above is about the
+  // role and not about a stub that never answers psql.
+  const asOwner = execStub(MTIME + HOUR);
+  await channelHealth.run({}, ctx(asOwner.impl, 'owner'));
+  assert.equal(
+    asOwner.commands.filter((c) => c.command.includes('psql')).length,
+    1,
+    'the owner path did not run the roster query, so the guest check proves nothing',
+  );
+});
+
+test('🔴 "I did not look" is not rendered as "I looked and it failed"', async () => {
+  const { impl } = execStub(MTIME + HOUR);
+  const guest = await channelHealth.run({}, ctx(impl, 'guest'));
+  assert.match(guest.content, /I did not look up the full Dispatcharr channel list/);
+  assert.match(guest.content, /NOT a report that anything is wrong/);
+  assert.doesNotMatch(guest.content, /could NOT be read/, 'a guest was told a read failed that never ran');
+
+  // CONTROL: when the owner's roster read really does fail, it says so.
+  const broken = execStub(MTIME + HOUR, { rosterExit: 1 });
+  const owner = await channelHealth.run({}, ctx(broken.impl, 'owner'));
+  assert.match(owner.content, /could NOT be read/);
+  assert.match(owner.content, /Coverage is UNKNOWN/);
+});
+
+test('a guest asking about one channel gets it, without the roster commentary', async () => {
+  const { impl } = execStub(MTIME + HOUR);
+  const res = await channelHealth.run({ channel: 'cooking' }, ctx(impl, 'guest'));
+  assert.match(res.content, /OK {3}1 COOKING CHANNEL HD/);
+  assert.match(res.content, /Stream check last ran/);
+});
+
+test('🔴 a guest never sees the privileged command‘s stderr', async () => {
+  // On failure the owner path quotes docker's stderr, which names containers and
+  // paths. A guest must not reach that text by any route.
+  const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
+  const res = await channelHealth.run({}, ctx(impl, 'guest'));
+  assert.doesNotMatch(res.content, /No such container/, "docker's stderr reached a guest");
+  assert.doesNotMatch(res.content, /exit=|stderr=/, 'raw command diagnostics reached a guest');
+
+  // 🔴 CONTROL: the owner DOES see that stderr, so the assertions above are
+  // about the role rather than about a stub that never produced any.
+  const asOwner = execStub(MTIME + HOUR, { rosterExit: 1 });
+  const owner = await channelHealth.run({}, ctx(asOwner.impl, 'owner'));
+  assert.match(owner.content, /No such container/);
+  assert.match(owner.content, /stderr=/);
 });

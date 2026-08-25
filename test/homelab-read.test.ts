@@ -520,7 +520,13 @@ test('🔴 homelab_read reaches GUESTS; channel_health stays owner-only', () => 
   assert.ok(guest.includes('homelab_read'));
   assert.ok(owner.includes('homelab_read'));
   assert.ok(owner.includes('channel_health'));
-  assert.ok(!guest.includes('channel_health'), 'channel_health shells into hp; that is not a guest capability');
+  /**
+   * ⚠️ `channel_health` is guest-level TOO, as of the tier ruling: which channel
+   * works is CONTENT. What is owner-only is the PRIVILEGED half inside it — the
+   * `docker exec` roster read — and that is gated in `run()`, not by `minRole`.
+   * See channel-health.test.ts, which asserts a guest never causes that command.
+   */
+  assert.ok(guest.includes('channel_health'), 'which channel works is content, so it is everyone\'s');
 });
 
 test('🔴 ONLY homelab_status retired — nothing else went with it', () => {
@@ -700,7 +706,7 @@ test('the tool is GUEST-level now, and homelab_status is gone', () => {
   const tools = buildTools(testConfig({ readOnly: false }), { safe: true, reason: 't', evidence: [] });
   const guest = toolsForRole(tools, 'guest').map((t) => t.name);
   assert.ok(guest.includes('homelab_read'), 'Jeff overruled owner-only: everyone reads the library');
-  assert.ok(!guest.includes('channel_health'), 'channel_health stays owner-only');
+  assert.ok(guest.includes('channel_health'), 'which channel works is CONTENT');
   assert.ok(
     !tools.map((t) => t.name).includes('homelab_status'),
     'homelab_status retired once a guest could ask whether the server is up',

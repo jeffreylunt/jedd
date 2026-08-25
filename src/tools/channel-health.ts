@@ -195,8 +195,11 @@ export const channelHealth: Tool = {
     'It NEVER opens a stream — probing costs about 10 seconds per channel and has wedged the whole ' +
     '242-channel run for three hours — so this is a SNAPSHOT and the first line always says how old ' +
     'it is. Report that age with the answer; if it is stale, say so instead of presenting it as ' +
-    'current. Pass `channel` to ask about one channel by name or number.',
-  minRole: 'owner',
+    'current. Pass `channel` to ask about one channel by name or number. For Jeff it also reports ' +
+    'which channels Dispatcharr knows about that the check never covered.',
+  // CONTENT: which channel works is not about a person and is not a secret, so
+  // it is everyone's. The privileged half of it is gated inside `run`.
+  minRole: 'guest',
   writes: false,
   parameters: {
     type: 'object',
@@ -278,11 +281,35 @@ export const channelHealth: Tool = {
 
     const sections: string[] = [`Stream check last ran ${when} UTC — ${describeAge(ageSeconds)}. ${freshness}${garbage}`];
 
-    // The roster half. Its own success flag — a failure here must never read as
-    // "every channel is covered".
-    const roster = await runOnHp(ctx.config.adminSshHost, ROSTER_CMD, 30_000, ctx.exec);
-    const rosterRows = roster.exitCode === 0 ? parseRoster(roster.stdout) : [];
-    const rosterKnown = roster.exitCode === 0 && rosterRows.length > 0;
+    /**
+     * ── 🔴 THE ROSTER HALF IS OWNER-ONLY, AND THE REASON IS THE MECHANISM ────
+     *
+     * *Which channel works* is CONTENT by Jeff's rule — it is not about a person
+     * and not a secret — so a guest gets the answer above, from a world-readable
+     * file on the unprivileged ssh identity.
+     *
+     * The roster is a different thing. It is `docker exec` on the **privileged**
+     * identity, and that is a capability rather than a data class. The three
+     * tiers classify what data is ABOUT; they say nothing about what a call
+     * CAUSES, and this is the one tool where those two answers differ. Every
+     * other guest-visible tool is HTTP-only.
+     *
+     * ⚠️ So a guest does not reach it **by construction — the call is not made**
+     * — rather than by filtering its output afterwards. That also means a
+     * guest never sees this command's stderr, which on failure quotes container
+     * names and paths.
+     *
+     * 🔴 AND "I DID NOT ASK" IS NOT "I ASKED AND IT FAILED". Those render
+     * differently below. Collapsing them would tell a guest the homelab is
+     * broken when nothing was even attempted — a false failure, which is the
+     * false zero pointing the other way.
+     */
+    const rosterEligible = ctx.role === 'owner';
+    const roster = rosterEligible
+      ? await runOnHp(ctx.config.adminSshHost, ROSTER_CMD, 30_000, ctx.exec)
+      : null;
+    const rosterRows = roster && roster.exitCode === 0 ? parseRoster(roster.stdout) : [];
+    const rosterKnown = !!roster && roster.exitCode === 0 && rosterRows.length > 0;
 
     if (needle.trim()) {
       const hits = rows.filter((r) => matches(needle, r.number, r.name));
@@ -291,7 +318,11 @@ export const channelHealth: Tool = {
         sections.push(
           `No channel matching "${needle}" in the ${rows.length} checked` +
             (rosterKnown ? ` or in Dispatcharr's ${rosterRows.length}-channel roster.` : '.') +
-            (rosterKnown ? '' : ' ⚠️ The Dispatcharr roster could not be read, so a channel that exists but was never checked would be invisible here.'),
+            (rosterKnown
+              ? ''
+              : rosterEligible
+                ? ' ⚠️ The Dispatcharr roster could not be read, so a channel that exists but was never checked would be invisible here.'
+                : ' (I only checked the stream-check results, not the full Dispatcharr channel list.)'),
         );
         return ok(sections.join('\n'));
       }
@@ -333,9 +364,13 @@ export const channelHealth: Tool = {
 
     if (!rosterKnown) {
       sections.push(
-        "⚠️ Dispatcharr's channel roster could NOT be read " +
-          `(exit=${roster.exitCode}, stderr=${roster.stderr.trim() || '(empty)'}), so I cannot say ` +
-          'whether the check covered every channel that exists. Coverage is UNKNOWN.',
+        roster
+          ? "⚠️ Dispatcharr's channel roster could NOT be read " +
+            `(exit=${roster.exitCode}, stderr=${roster.stderr.trim() || '(empty)'}), so I cannot say ` +
+            'whether the check covered every channel that exists. Coverage is UNKNOWN.'
+          : 'This is the stream-check results file only. I did not look up the full Dispatcharr ' +
+            'channel list, so a channel that exists but was never checked would not appear above — ' +
+            'that is a limit of what I looked at, NOT a report that anything is wrong.',
       );
       return ok(sections.join('\n'));
     }
