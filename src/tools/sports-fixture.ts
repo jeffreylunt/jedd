@@ -2,8 +2,8 @@ import type { FetchImpl } from '../media/arr.js';
 import {
   EspnClient,
   LEAGUE_KEYS,
-  fixtureInvolves,
   leagueLabel,
+  matchQuality,
   type Fixture,
   type LeagueKey,
 } from '../media/espn.js';
@@ -245,17 +245,25 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
     name: 'sports_fixture',
     description:
       'When is a team playing next, and which channels are carrying it? Combines a live fixture ' +
-      'list (ESPN) with the TV guide. Use this for "when do Crystal Palace play", "are the Jazz on ' +
-      'tonight", "what channel is the game on" — prefer it over a raw guide read for anything ' +
-      'sport-and-schedule shaped, because a raw guide read cannot see past about four days and ' +
-      'cannot tell a live fixture from a rebroadcast. ' +
+      'list (ESPN) across every competition it knows with the TV guide. Use this for "when do ' +
+      'Crystal Palace play", "are the Jazz on tonight", "is there a game today", "what channel is ' +
+      'the game on". ' +
+      '🔴 PASS THE TEAM NAME AS THE PERSON SAID IT and LEAVE OUT league — it searches all ' +
+      'competitions and works out which one the team is in. Do not translate a city into a team ' +
+      'you know: "real salt lake" is Real Salt Lake, not the Utah Jazz. Only set league when they ' +
+      'named a competition, or when they want its fixture list rather than a team. ' +
+      '🔴 CALL IT AGAIN FOR ANY FOLLOW-UP THAT CHANGES THE TIME — "today", "tonight", "this ' +
+      'week", "what about tomorrow" are NEW questions, and an earlier answer covered a different ' +
+      'window. Never answer them from what you already said. ' +
       'It lists EVERY channel it found, not the first, with what the last stream check said about ' +
       'each and how old that check is — report that age, and do not present it as live. ' +
       'It reports the KICKOFF even when no channel is listed: the guide runs about four days deep ' +
       'despite claiming seven, so most fixtures come back with no channels yet, and that is an ' +
       'answer — never say they are not playing. A channel is named only when a guide entry was ' +
-      'actually found. If the fixture list cannot be reached it FAILS rather than answering from ' +
-      'the guide alone. The result carries the current time; compare start times against THAT.',
+      'actually found. Every result names the competitions it searched: report that when you say ' +
+      'no game was found, because "no game" is a claim about the world and what it checked is a ' +
+      'list. If no competition can be reached it FAILS rather than answering from the guide alone. ' +
+      'The result carries the current time; compare start times against THAT.',
     minRole: 'guest',
     /**
      * 🔴 CONTENT, not PERSON. What is on television is not about anybody, so
@@ -272,33 +280,57 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
           type: 'string',
           enum: LEAGUE_KEYS,
           description:
-            'Which competition to look in. "epl" is the English Premier League. Pick from the ' +
-            "person's wording; if they named a team but not a competition, pick the one that team " +
-            'plays in.',
+            'OPTIONAL and usually WRONG to set. Leave it out and every competition is searched. ' +
+            'Set it only when the person named a competition ("who is in the Premier League ' +
+            'tonight"), never to narrow down a team you think you recognise.',
         },
         team: {
           type: 'string',
           description:
-            'The team asked about, e.g. "Crystal Palace" or "Utah Jazz". Partial names work. Leave ' +
-            'this out to list the next fixtures in the whole competition.',
+            'The team, WORDED AS THE PERSON WORDED IT — "real salt lake", "palace", "the jazz". ' +
+            'Partial names work and an exact name always beats a loose one, so do not "helpfully" ' +
+            'resolve it to a team you know first. Leave out only to list a competition.',
         },
         days_ahead: {
           type: 'number',
           description: `How far ahead to look for fixtures, in days (default ${DEFAULT_DAYS}, max ${MAX_DAYS}).`,
         },
       },
-      required: ['league'],
+      required: [],
     },
 
     async run(args, ctx) {
+      /**
+       * 🔴 `league` IS OPTIONAL, AND THAT IS THE FIX FOR THE WORST DEFECT.
+       *
+       * It used to be REQUIRED, so the model had to choose a competition before
+       * it could ask anything. Asked *"When is the next real salt lake game?"*
+       * it chose `{league: 'nba', team: 'Utah Jazz'}` — it resolved a city to a
+       * basketball team to satisfy a required argument, and this tool never saw
+       * the words "real salt lake" at all.
+       *
+       * ⚠️ So the cross-sport error was NOT in the matcher; no amount of
+       * ranking would have caught it, because the wrong team name arrived
+       * already resolved. The repair is to stop demanding the answer as input:
+       * with a name and no league, the tool searches every competition itself
+       * and ranks by how well the name matches.
+       */
       const rawLeague = typeof args['league'] === 'string' ? args['league'].trim().toLowerCase() : '';
-      if (!(LEAGUE_KEYS as string[]).includes(rawLeague)) {
+      if (rawLeague && !(LEAGUE_KEYS as string[]).includes(rawLeague)) {
         return fail(
-          `"${rawLeague}" is not a competition I can look up. Choose one of: ${LEAGUE_KEYS.join(', ')}.`,
+          `"${rawLeague}" is not a competition I can look up. Choose one of: ${LEAGUE_KEYS.join(', ')} ` +
+            '— or leave it out entirely and I will search all of them.',
         );
       }
-      const league = rawLeague as LeagueKey;
-      const label = leagueLabel(league);
+      const team = typeof args['team'] === 'string' ? args['team'].trim() : '';
+      if (!rawLeague && !team) {
+        return fail(
+          'Tell me a team, a competition, or both. With a team name I search every competition I ' +
+            `know (${LEAGUE_KEYS.length}); with a competition I list its next fixtures.`,
+        );
+      }
+      const searched: LeagueKey[] = rawLeague ? [rawLeague as LeagueKey] : LEAGUE_KEYS;
+      const scopeLabel = searched.map(leagueLabel).join(', ');
 
       // Finiteness matters: NaN survives Math.min/Math.max and would render as
       // the text "NaN" in a date and in the message.
@@ -310,34 +342,74 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
         ),
         MAX_DAYS,
       );
-      const team = typeof args['team'] === 'string' ? args['team'].trim() : '';
 
       const nowMs = now();
       const espn = new EspnClient({ fetchImpl });
-      const answer = await espn.fixtures(league, nowMs, nowMs + days * 86_400_000);
+      // Measured: 13 competitions in parallel is 612 ms / 3.87 MB, and the
+      // dormant ones are ~1 KB each. Breadth is cheap; the gap was not.
+      const answers = await Promise.all(
+        searched.map((k) => espn.fixtures(k, nowMs, nowMs + days * 86_400_000)),
+      );
 
-      // ─────────────────────────────────────────────────────────────────────
-      // 🔴 THE EARLY RETURN THAT IS THE WHOLE GUARANTEE.
-      //
-      // Nothing below this line runs when the fixture source did not answer, so
-      // there is no code path from "ESPN is unreachable" to a guide-only reply.
-      // Do not turn this into a warning-and-continue: continuing would answer
-      // "nothing found" from a four-day guide and call it a schedule.
-      // ─────────────────────────────────────────────────────────────────────
-      if (answer.state !== 'results') {
+      /**
+       * 🔴 ONE UNREACHABLE COMPETITION DOES NOT SINK THE ANSWER, BUT SILENCE WOULD.
+       *
+       * The original rule — no fixture source, no answer — was written when
+       * there was ONE source. With thirteen, failing the whole call because a
+       * dormant cup endpoint blipped would be worse than useless. But a
+       * competition that could not be read is a competition we cannot say
+       * anything about, so the failures are NAMED and travel with the result.
+       * If EVERY one failed we are back to the original case exactly, and it
+       * still fails.
+       */
+      const okAnswers = answers.flatMap((a, i) =>
+        a.state === 'results' ? [{ key: searched[i] as LeagueKey, a }] : [],
+      );
+      const failures = answers.flatMap((a, i) =>
+        a.state === 'unknown' ? [`${leagueLabel(searched[i] as LeagueKey)} (${a.detail})`] : [],
+      );
+      if (okAnswers.length === 0) {
         return fail(
-          `THE FIXTURE SOURCE IS UNREACHABLE, so I do not know when ${team || `any ${label} team`} ` +
-            `plays next: ${answer.detail}\n` +
-            'I did NOT fall back to searching the TV guide. The guide only reaches about four days ' +
+          `THE FIXTURE SOURCE IS UNREACHABLE, so I do not know when ${team || 'any team'} plays ` +
+            `next. All ${searched.length} competition(s) failed:\n` +
+            failures.map((f) => `  - ${f}`).join('\n') +
+            '\nI did NOT fall back to searching the TV guide. The guide only reaches about four days ' +
             'ahead and holds no fixture list, so a guide-only answer would report a match as ABSENT ' +
             'merely because it is further out than that — the mistake this tool exists to avoid. ' +
             'Say the schedule could not be checked; do not guess at one.',
         );
       }
 
-      const all = answer.fixtures;
-      const wanted = team ? all.filter((f) => fixtureInvolves(f, team)) : all;
-      const who = team ? `"${team}"` : `any ${label} team`;
+      /**
+       * 🔴 THE COMPETITION EACH FIXTURE CAME FROM TRAVELS WITH IT.
+       *
+       * Without it the union is unattributable, and "Real Salt Lake at León"
+       * with no "Leagues Cup" beside it is exactly the answer that reads as MLS
+       * and sends someone looking in the wrong place.
+       */
+      const considered = okAnswers.reduce((n, { a }) => n + (a.state === 'results' ? a.considered : 0), 0);
+      const all = okAnswers.flatMap(({ key, a }) =>
+        a.state === 'results' ? a.fixtures.map((f) => ({ f, key })) : [],
+      );
+
+      /**
+       * 🔴 BEST MATCH WINS OUTRIGHT — A LOOSE HIT NEVER SHOWS BESIDE AN EXACT ONE.
+       *
+       * Rank 3 exact, 2 whole-word, 1 bare substring. Taking everything above
+       * zero is what lets an accident sit next to a real answer; taking only
+       * the best tier means a literal team name cannot lose to a city token.
+       */
+      let wanted = all;
+      if (team) {
+        const scored = all
+          .map((row) => ({ ...row, q: matchQuality(row.f, team) }))
+          .filter((row) => row.q > 0);
+        const best = scored.reduce((m, row) => Math.max(m, row.q), 0);
+        wanted = scored.filter((row) => row.q === best);
+      }
+      wanted.sort((a, b) => a.f.kickoffMs - b.f.kickoffMs);
+
+      const who = team ? `"${team}"` : `any team in ${scopeLabel}`;
       /**
        * 🔴 THE CURRENT TIME SHIPS WITH THE DATA, EVERY CALL.
        *
@@ -352,31 +424,62 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
        * outlives a prompt stamp, and a stale "now" is worse than none.
        */
       const asOf = `AS OF ${new Date(nowMs).toISOString().slice(0, 16)}Z — compare every time below against THIS, not a guess.`;
+      /**
+       * 🔴 THE SCOPE IS ON EVERY ANSWER, NOT ONLY THE EMPTY ONES.
+       *
+       * Jedd told Jeff "nothing in the MLS fixture list for RSL today" — true,
+       * and an answer to a question he did not ask. He asked whether there is a
+       * game. Naming the competitions searched is what makes the difference
+       * between a finding and a fact about one list.
+       */
+      const scopeLine =
+        `SEARCHED ${searched.length} competition(s): ${scopeLabel}. ` +
+        'Anything NOT in that list was not checked — do not report on it.' +
+        (failures.length
+          ? `\n🔴 ${failures.length} could NOT be read, so they are UNKNOWN rather than empty: ${failures.join('; ')}`
+          : '');
       const sourceLine =
-        `${asOf}\nFIXTURE SOURCE (ESPN ${label} scoreboard): ${answer.considered} events in ` +
-        `${answer.windowFrom.slice(0, 10)} → ${answer.windowTo.slice(0, 10)}, ` +
+        `${asOf}\n${scopeLine}\nFIXTURE SOURCE (ESPN): ${considered} events across those ` +
+        `competitions in ${new Date(nowMs).toISOString().slice(0, 10)} → ` +
+        `${new Date(nowMs + days * 86_400_000).toISOString().slice(0, 10)}, ` +
         `${all.length} still upcoming or in progress, ${wanted.length} involving ${who}.`;
 
       if (!wanted.length) {
         // A real zero, and bounded as one. `considered` is reported so that "the
         // schedule is empty" and "the name did not match" are different
         // sentences rather than the same blank.
-        const why = answer.considered
-          ? `ESPN listed ${answer.considered} ${label} events in that window and none involve ${who}.`
-          : `ESPN listed NO ${label} events at all in that window.`;
+        const why = considered
+          ? `ESPN listed ${considered} events across those competitions and none involve ${who}.`
+          : 'ESPN listed NO events at all in any of them for that window.';
         return ok(
           `${sourceLine}\n\nNO FIXTURE FOUND for ${who} in the next ${days} days. ${why}\n` +
-            'This is bounded by the window, not by the TV guide — a fixture further out than ' +
-            `${days} days would not appear here. Widen days_ahead, or check the team name.`,
+            '🔴 This is bounded by the WINDOW and by the COMPETITION LIST above, not by the TV ' +
+            'guide. Say which competitions were searched when you report this — "no game" is a ' +
+            'claim about the world, and what I checked is a list. A fixture further out than ' +
+            `${days} days, or in a competition not named above, would not appear here.`,
         );
       }
 
-      const next = wanted[0] as Fixture;
+      const nextRow = wanted[0] as { f: Fixture; key: LeagueKey };
+      const next = nextRow.f;
       const parts: string[] = [sourceLine, ''];
       const stateNote = next.state === 'in' ? ' 🔴 IN PROGRESS NOW' : '';
-      parts.push(`NEXT: ${teamLine(next)}${stateNote}`);
+      parts.push(`NEXT: ${teamLine(next)}${stateNote}  [${leagueLabel(nextRow.key)}]`);
       parts.push(`  kickoff ${renderKickoff(next.kickoffMs, nowMs)}`);
-      if (next.venue) parts.push(`  venue ${next.venue}`);
+      /**
+       * 🔴 ATTRIBUTED, BECAUSE ESPN GETS THIS WRONG ON CUP TIES.
+       *
+       * Measured 2026-08-25: `Real Salt Lake at León` in the Leagues Cup came
+       * back with `venue: Dick's Sporting Goods Park, Commerce City, Colorado`
+       * — Colorado Rapids' ground, in the wrong country, for a match in Mexico.
+       * ESPN's venue field is evidently stale or team-derived for neutral and
+       * cup fixtures.
+       *
+       * We cannot check it, so we do not launder it. Naming the source turns a
+       * confident wrong fact into a legible wrong claim, which is the whole
+       * distinction this tool is built around.
+       */
+      if (next.venue) parts.push(`  venue (per ESPN, UNVERIFIED — it is often wrong for cup ties): ${next.venue}`);
       parts.push('');
 
       const guide = await findFixtureInGuide(ctx.config, next, fetchImpl);
@@ -403,10 +506,11 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
        * unrepresentable rather than remembered.
        */
       const later = wanted.slice(1, 1 + LOOKAHEAD);
-      const laterGuides: Array<{ fixture: Fixture; guide: GuideAnswer | null }> = [];
-      for (const f of later) {
+      const laterGuides: Array<{ fixture: Fixture; key: LeagueKey; guide: GuideAnswer | null }> = [];
+      for (const { f, key } of later) {
         laterGuides.push({
           fixture: f,
+          key,
           // `null` means NOT LOOKED UP, which is a different fact from an empty
           // search and is rendered differently below.
           guide: f.kickoffMs > nowMs + GUIDE_HORIZON_MS ? null : await findFixtureInGuide(ctx.config, f, fetchImpl),
@@ -533,8 +637,10 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
       if (laterGuides.length) {
         parts.push('');
         parts.push('LATER FIXTURES:');
-        for (const { fixture: f, guide: g } of laterGuides) {
-          parts.push(`  ${renderKickoff(f.kickoffMs, nowMs)} — ${teamLine(f)}`);
+        for (const { fixture: f, key, guide: g } of laterGuides) {
+          // The competition travels with every fixture, not just the first — a
+          // union whose rows are unattributable reads as one league.
+          parts.push(`  ${renderKickoff(f.kickoffMs, nowMs)} — ${teamLine(f)}  [${leagueLabel(key)}]`);
           /**
            * 🔴 "NOT LOOKED UP" AND "NOT LISTED" ARE DIFFERENT, AND CONFLATING
            * THEM PRODUCED A FALSE STATEMENT ON A REAL TURN.

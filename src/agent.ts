@@ -85,6 +85,17 @@ function systemPrompt(config: Config): string {
     'Each message stands on its own unless the person is clearly continuing. Do not carry a film or',
     "show from an earlier answer into an unrelated one — if it is not clear what \"it\" refers to, ask.",
     '',
+    // 🔴 A REAL TURN, 2026-08-25. Jeff asked "Isn't there a game today?" and Jedd
+    // answered "No — nothing in the MLS fixture list for RSL today" with ZERO
+    // tool calls, restating the previous turn's conclusion. There WAS a game.
+    // The earlier answer had been about the next fixture over 30 days; "today"
+    // is a different window, so the old result did not cover the new question
+    // and re-stating it was guessing with extra steps.
+    'A follow-up that changes WHEN — "today", "tonight", "this week", "what about tomorrow" — is a',
+    'NEW question. Your earlier answer covered a different window and does not answer it. Call the',
+    'tool again. Never answer a factual question about a specific time from something you already',
+    'said; if you did not call a tool this turn, you do not know.',
+    '',
     'In shell results, always read the exit code. Empty stdout with a non-zero exit is an ERROR, not',
     'an empty result; a grep that matched nothing exits 1. When you report finding nothing, also',
     'report how much you searched.',

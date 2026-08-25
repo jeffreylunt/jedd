@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LEAGUE_KEYS, fixtureInvolves, teamVariants, type Fixture } from '../src/media/espn.js';
+import { LEAGUE_KEYS, fixtureInvolves, matchQuality, teamVariants, type Fixture } from '../src/media/espn.js';
 import { discriminatingVariants, kickoffWindow, programmeNamesAllTeams } from '../src/media/guide.js';
 import { qualityOf, rankChannelOptions, type HealthRow } from '../src/media/channel-options.js';
 import type { FetchImpl } from '../src/media/arr.js';
@@ -172,19 +172,22 @@ interface Spy {
  * default. A stub that quietly answers an unexpected host would let a third
  * source appear without any test noticing.
  */
-function spy(opts: { espn?: () => Response | Promise<Response>; guide?: () => Response | Promise<Response> }): Spy {
+function spy(opts: {
+  espn?: (url: string) => Response | Promise<Response>;
+  guide?: (url: string) => Response | Promise<Response>;
+}): Spy {
   const espnCalls: string[] = [];
   const guideCalls: string[] = [];
   const fetchImpl: FetchImpl = async (url) => {
     if (url.includes('site.api.espn.com')) {
       espnCalls.push(url);
       if (!opts.espn) throw new Error('the test did not expect an ESPN call');
-      return opts.espn();
+      return opts.espn(url);
     }
     if (url.includes('jellyfin.test')) {
       guideCalls.push(url);
       if (!opts.guide) throw new Error('the test did not expect a guide call');
-      return opts.guide();
+      return opts.guide(url);
     }
     throw new Error(`unexpected host in ${url}`);
   };
@@ -520,6 +523,149 @@ test('"Match Week" alone is NOT treated as a replay marker', async () => {
   const r = await run(s);
   assert.match(r.content, /CHANNEL: UK: SKY SPORTS MAIN EVENT/);
   assert.doesNotMatch(r.content, /POSSIBLE REPLAY/);
+});
+
+// ── 🔴 THE RSL MISS: A FIXTURE IN A COMPETITION WE NEVER ASKED ABOUT ───────
+
+/**
+ * 🔴 THE DISCRIMINATING CASE, FROM A REAL FAILED CONVERSATION (2026-08-25).
+ *
+ * Jeff asked *"Isn't there a game today?"* and Jedd answered **"No — nothing in
+ * the MLS fixture list for RSL today."** True, and wrong: `Real Salt Lake at
+ * León` kicked off that night at 02:30Z in the **Leagues Cup**, which the tool
+ * never queried. `soccer/usa.1` really does return zero events that day, so
+ * every MLS-scoped answer was true and irrelevant.
+ *
+ * ⚠️ A TEST SET BUILT FROM MLS FIXTURES ALONE IS STRUCTURALLY INCAPABLE OF
+ * FAILING ON THIS. The whole point is a competition the old code could not see,
+ * so the stub serves the fixture from `soccer/concacaf.leagues.cup` and NOTHING
+ * from `soccer/usa.1` — exactly what ESPN returned.
+ */
+const RSL_KICKOFF = '2026-08-26T02:30Z';
+
+function espnByPath(): (url: string) => Response {
+  return (url: string) => {
+    if (url.includes('concacaf.leagues.cup')) {
+      return res(
+        espnBody([
+          espnEvent({ id: 'rsl-leon', date: RSL_KICKOFF, home: 'León', away: 'Real Salt Lake' }),
+        ]),
+      );
+    }
+    // 🔴 Every other competition is genuinely EMPTY, including MLS. If this
+    // returned the Colorado fixture the test would pass for the wrong reason.
+    return res(espnBody([]));
+  };
+}
+
+test('🔴 RSL at León resolves WITHOUT a league argument — the competition we never asked about', async () => {
+  const s = spy({ espn: espnByPath(), guide: () => res(guideBody([])) });
+  const r = await makeSportsFixture(s.fetchImpl, () => Date.parse('2026-08-25T20:40:00Z')).run(
+    // 🔴 NO `league`. Jeff said "real salt lake"; nothing in that names a
+    // competition, and requiring one is what let the model pick `nba`.
+    { team: 'Real Salt Lake' },
+    ctx(),
+  );
+  assert.equal(r.ok, true);
+  // 🔴 On the NEXT line itself. Asserting /Leagues Cup/ anywhere would also be
+  // satisfied by the SEARCHED scope line, which names every competition — so
+  // dropping the per-fixture tag would leave the test green.
+  assert.match(r.content, /NEXT: Real Salt Lake at León.*\[Leagues Cup\]/);
+  assert.match(r.content, /2026-08-26T02:30Z/);
+  assert.doesNotMatch(r.content, /NO FIXTURE FOUND/);
+});
+
+test("🔴 the venue is ATTRIBUTED to ESPN, because ESPN gets it wrong on cup ties", async () => {
+  // Measured: ESPN returned `Real Salt Lake at León` with venue "Dick's
+  // Sporting Goods Park, Commerce City, Colorado" — Colorado's ground, wrong
+  // country. We cannot check it, so we must not launder it as our own fact.
+  const s = spy({ espn: espnByPath(), guide: () => res(guideBody([])) });
+  const r = await makeSportsFixture(s.fetchImpl, () => Date.parse('2026-08-25T20:40:00Z')).run(
+    { team: 'Real Salt Lake' },
+    ctx(),
+  );
+  assert.match(r.content, /venue \(per ESPN, UNVERIFIED/);
+});
+
+test('🔴 an EMPTY fixture search names every competition it searched', async () => {
+  // "Nothing in the MLS fixture list" answers a question nobody asked. An empty
+  // result without its scope is uninterpretable — the same rule as coverageNote.
+  const s = spy({ espn: () => res(espnBody([])) });
+  const r = await makeSportsFixture(s.fetchImpl, () => NOW).run({ team: 'Nobody United' }, ctx());
+  assert.equal(r.ok, true);
+  assert.match(r.content, /NO FIXTURE FOUND/);
+  assert.match(r.content, /searched/i);
+  for (const label of ['MLS', 'Leagues Cup', 'Premier League']) {
+    assert.ok(r.content.includes(label), `the empty answer must name ${label} as searched`);
+  }
+});
+
+test('🔴 an EXACT team name beats a LOOSE one, and the loose one is not shown beside it', async () => {
+  /**
+   * 🔴 THE CASE THE CROSS-SPORT TEST DOES NOT REACH, AND A MUTATION FOUND IT.
+   *
+   * "Utah Jazz" scores ZERO against "real salt lake" — no substring either way
+   * — so that test never exercised ranking at all, and collapsing the rank to a
+   * boolean left the suite green. Ranking only matters when candidates actually
+   * compete, which needs a name that CONTAINS the query without equalling it.
+   * `Real Salt Lake II` is that, and is a real kind of thing: senior sides and
+   * their reserve teams share a name stem.
+   */
+  const s = spy({
+    espn: (url: string) => {
+      if (url.includes('concacaf.leagues.cup')) {
+        return res(espnBody([espnEvent({ id: 'rsl', date: RSL_KICKOFF, home: 'León', away: 'Real Salt Lake' })]));
+      }
+      if (url.includes('usa.open')) {
+        return res(
+          espnBody([
+            espnEvent({ id: 'rsl2', date: '2026-08-26T01:00Z', home: 'Real Salt Lake II', away: 'Colorado Rapids 2' }),
+          ]),
+        );
+      }
+      return res(espnBody([]));
+    },
+    guide: () => res(guideBody([])),
+  });
+  const r = await makeSportsFixture(s.fetchImpl, () => Date.parse('2026-08-25T20:40:00Z')).run(
+    { team: 'Real Salt Lake' },
+    ctx(),
+  );
+  // The reserve fixture kicks off EARLIER, so sorting alone would surface it.
+  assert.match(r.content, /NEXT: Real Salt Lake at León/);
+  assert.doesNotMatch(r.content, /Real Salt Lake II/, 'a loose match must not appear while an exact one exists');
+});
+
+test('matchQuality ranks exact above whole-word above substring', () => {
+  const f = (variants: string[]): Fixture => fixtureOf([variants, ['other team']]);
+  assert.equal(matchQuality(f(['real salt lake']), 'real salt lake'), 3, 'exact');
+  assert.equal(matchQuality(f(['real salt lake ii']), 'real salt lake'), 2, 'whole-word');
+  assert.equal(matchQuality(f(['realsaltlakers']), 'real salt lake'), 0, 'not a token run');
+  assert.equal(matchQuality(f(['crystal palace']), 'palace'), 2);
+  assert.equal(matchQuality(f(['utah jazz']), 'real salt lake'), 0, 'no overlap at all');
+  assert.equal(matchQuality(f(['programs united']), 'rams'), 1, 'bare substring is the lowest tier');
+});
+
+test('🔴 "real salt lake" NEVER resolves to a basketball team', async () => {
+  // Turn 1 of the failed conversation. Cross-sport resolution on a city token.
+  const s = spy({
+    espn: (url: string) => {
+      if (url.includes('basketball/nba')) {
+        return res(espnBody([espnEvent({ id: 'jazz', date: '2026-10-13T01:00Z', home: 'Utah Jazz', away: 'San Antonio Spurs' })]));
+      }
+      if (url.includes('concacaf.leagues.cup')) {
+        return res(espnBody([espnEvent({ id: 'rsl', date: RSL_KICKOFF, home: 'León', away: 'Real Salt Lake' })]));
+      }
+      return res(espnBody([]));
+    },
+    guide: () => res(guideBody([])),
+  });
+  const r = await makeSportsFixture(s.fetchImpl, () => Date.parse('2026-08-25T20:30:00Z')).run(
+    { team: 'real salt lake' },
+    ctx(),
+  );
+  assert.match(r.content, /Real Salt Lake/);
+  assert.doesNotMatch(r.content, /Utah Jazz/, 'a city token must never outrank a literal team name');
 });
 
 // ── 🔴 ALL THE CHANNELS, RANKED, WITH HEALTH JOINED ON ─────────────────────
@@ -997,14 +1143,16 @@ test('no matching team is a WINDOW-bounded zero, and says which window', async (
   assert.equal(s.guideCalls.length, 0, 'there is no fixture to look up a channel for');
   assert.match(r.content, /NO FIXTURE FOUND/);
   assert.match(r.content, /next 7 days/);
-  assert.match(r.content, /1 .*events in that window and none involve/);
-  assert.match(r.content, /bounded by the window, not by the TV guide/);
+  assert.match(r.content, /1 events across those competitions and none involve/);
+  assert.match(r.content, /bounded by the WINDOW and by the COMPETITION LIST above/);
+  // 🔴 The scope must be on the answer, not implied by the caller's argument.
+  assert.match(r.content, /SEARCHED 1 competition\(s\): Premier League/);
 });
 
 test('an EMPTY schedule and an UNMATCHED name are different sentences', async () => {
   const s = spy({ espn: () => res(espnBody([])) });
   const r = await run(s);
-  assert.match(r.content, /NO .* events at all in that window/);
+  assert.match(r.content, /NO events at all in any of them for that window/);
 });
 
 // ── THE CLOCK. The model has none. ──────────────────────────────────────────

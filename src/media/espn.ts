@@ -41,31 +41,55 @@ import type { FetchImpl } from './arr.js';
 /**
  * Which competitions we ask about.
  *
- * ── WHY THESE FIVE ───────────────────────────────────────────────────────────
+ * ── 🔴 THE LEAGUE LIST IS THE TOOL'S COVERAGE, NOT THE WORLD ────────────────
  *
- *  - `epl`  — Jeff asked for it by name; Crystal Palace is the worked example.
- *  - `mls`  — there is an `mls-matchday-lineup-sync` job in the homelab, so it
- *             is already a thing this house tracks.
- *  - `nfl`, `nba`, `mlb` — the three US leagues whose games appear in the
- *             channel lineup (`NBA: UTAH JAZZ ᴴᴰ` is a channel here).
+ * This shipped with five — `epl mls nfl nba mlb` — and that gap produced a
+ * confident wrong answer to Jeff on 2026-08-25. He asked *"Isn't there a game
+ * today?"* about Real Salt Lake and was told **"nothing in the MLS fixture list
+ * for RSL today"**. True: `soccer/usa.1` really did return zero events that day.
+ * Also irrelevant: `Real Salt Lake at León` kicked off that night at 02:30Z in
+ * the **Leagues Cup**, a competition we simply never asked about.
  *
- * ── ADDING ONE IS ONE LINE ───────────────────────────────────────────────────
+ * **An absence in the competitions we query is not an absence of fixtures.**
+ * That is the same substitution as answering a question about the channel
+ * lineup with a measurement of the guide — evidence about store A presented as
+ * a finding about store B — and it reached a user as a flat "no".
  *
- * ESPN's pattern is `/sports/{sport}/{league}/scoreboard`, so a new competition
- * is a new row here and nothing else — the enum in the tool schema is derived
- * from `Object.keys`, so the model sees it immediately.
+ * So the list now covers the competitions the supported teams actually play in,
+ * and every caller reports WHICH of them it searched. A zero without its scope
+ * is uninterpretable.
  *
- * ⚠️ Verify a candidate slug before adding it. A WRONG slug is HTTP 400 (checked:
- * `soccer/zzz.999` and `zzzball/nfl` both 400), which this client reports as
- * unknown — but a slug that is merely EMPTY this season returns HTTP 200 with
- * `events: []`, which is indistinguishable from "no fixtures". `uefa.champions`
- * is currently in that state (valid slug, ESPN still on the 2025-26 season, zero
- * future events), which is why it is not in this table: it would answer every
- * question with a true-but-useless zero.
+ * ── COST, MEASURED ──────────────────────────────────────────────────────────
+ *
+ * All 13 fetched in parallel: **612 ms, 3.87 MB**. The dormant ones are ~1 KB
+ * each, so breadth is nearly free — which is why the "true-but-useless zero"
+ * argument that once kept `uefa.champions` OUT no longer holds. That reasoning
+ * was written when `league` was REQUIRED and a caller could ask for a dead
+ * competition and get nothing. As one branch of a union whose scope is
+ * reported, a dormant competition contributes an honest zero.
+ *
+ * ⚠️ Slugs verified live 2026-08-25 — a WRONG slug is HTTP 400
+ * (`soccer/zzz.999`, `zzzball/nfl`), so these are all real. Four are valid but
+ * currently empty (`eng.fa`, the three UEFA): ESPN has not published their
+ * 2026-27 fixtures. `eng.league_cup` returned 60 events, `concacaf.leagues.cup`
+ * 58, `usa.open` 2. Adding one is a single row; the tool's enum is derived from
+ * `Object.keys`.
  */
 export const LEAGUES = {
+  // ── England ────────────────────────────────────────────────────────────
   epl: { path: 'soccer/eng.1', label: 'Premier League' },
+  efl_cup: { path: 'soccer/eng.league_cup', label: 'Carabao Cup' },
+  fa_cup: { path: 'soccer/eng.fa', label: 'FA Cup' },
+  // ── Europe ─────────────────────────────────────────────────────────────
+  ucl: { path: 'soccer/uefa.champions', label: 'UEFA Champions League' },
+  uel: { path: 'soccer/uefa.europa', label: 'UEFA Europa League' },
+  uecl: { path: 'soccer/uefa.europa.conf', label: 'UEFA Conference League' },
+  // ── North America ──────────────────────────────────────────────────────
   mls: { path: 'soccer/usa.1', label: 'MLS' },
+  leagues_cup: { path: 'soccer/concacaf.leagues.cup', label: 'Leagues Cup' },
+  us_open_cup: { path: 'soccer/usa.open', label: 'U.S. Open Cup' },
+  concacaf_cc: { path: 'soccer/concacaf.champions', label: 'CONCACAF Champions Cup' },
+  // ── US leagues ─────────────────────────────────────────────────────────
   nfl: { path: 'football/nfl', label: 'NFL' },
   nba: { path: 'basketball/nba', label: 'NBA' },
   mlb: { path: 'baseball/mlb', label: 'MLB' },
@@ -364,13 +388,47 @@ export class EspnClient {
 }
 
 /**
+ * How well does this fixture match the team the person named?
+ *
+ * 🔴 A RANK, NOT A BOOLEAN, BECAUSE A LOOSE MATCH MUST LOSE TO AN EXACT ONE.
+ *
+ * `3` exact — a variant equals the query outright.
+ * `2` whole-word — the query's words appear as a token run inside a variant,
+ *     or vice versa: "palace" → "crystal palace".
+ * `1` loose — a bare substring match, which is where accidents live.
+ * `0` no match.
+ *
+ * A boolean cannot express *"Real Salt Lake is a literal team name, so it beats
+ * anything that merely contains one of its words"*, and that distinction is the
+ * one that failed live: asked for the next **Real Salt Lake** game, Jedd
+ * answered about the **Utah Jazz**.
+ *
+ * ⚠️ The tool picks the BEST score across every competition and discards
+ * everything below it, so a rank-1 accident can never be shown while a rank-2
+ * or rank-3 real match exists anywhere in the union.
+ */
+export function matchQuality(f: Fixture, query: string): number {
+  const q = normalise(query);
+  if (q.length < 3) return 0;
+  let best = 0;
+  for (const t of f.teams) {
+    for (const v of t.variants) {
+      if (v === q) return 3;
+      // Token-bounded either way — ` rams ` is not inside ` programs `.
+      if (` ${v} `.includes(` ${q} `) || ` ${q} `.includes(` ${v} `)) best = Math.max(best, 2);
+      else if (v.includes(q) || q.includes(v)) best = Math.max(best, 1);
+    }
+  }
+  return best;
+}
+
+/**
  * Does this fixture involve a team the person named?
  *
- * Matched against the normalised variants, in both directions, so "palace"
- * finds "Crystal Palace" and "Crystal Palace" finds "palace".
+ * ⚠️ Kept as the loose predicate for a SINGLE-competition search, where there
+ * is no other candidate to outrank. Cross-competition callers must use
+ * `matchQuality` — see the note above.
  */
 export function fixtureInvolves(f: Fixture, query: string): boolean {
-  const q = normalise(query);
-  if (q.length < 3) return false;
-  return f.teams.some((t) => t.variants.some((v) => v.includes(q) || q.includes(v)));
+  return matchQuality(f, query) > 0;
 }
