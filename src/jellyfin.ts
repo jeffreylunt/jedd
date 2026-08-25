@@ -1,4 +1,5 @@
 import type { Config } from './config.js';
+import type { FetchImpl } from './media/arr.js';
 
 export interface JellyfinResponse {
   ok: boolean;
@@ -20,6 +21,16 @@ export async function jellyfinGet(
   // it for consistency: a server-side tuner open of 29.4s is on record, and a cap
   // that aborts mid-open strands a LiveStreamId.
   timeoutMs = 20_000,
+  /**
+   * Test seam ONLY. Unset in production, where this is the global `fetch`.
+   *
+   * It exists so a test can assert that Jellyfin was **not called at all** —
+   * which is the shape of the guarantee `sports_fixture` has to make: when the
+   * fixture source is unreachable it must NOT fall through to a guide-only
+   * answer, and "it did not fall through" is not observable from the return
+   * value, only from the absence of the call.
+   */
+  fetchImpl?: FetchImpl,
 ): Promise<JellyfinResponse> {
   if (!config.jellyfin.apiKey) {
     return { ok: false, status: 0, error: 'JELLYFIN_API_KEY is not configured' };
@@ -28,7 +39,8 @@ export async function jellyfinGet(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const doFetch: FetchImpl = fetchImpl ?? ((u, i) => fetch(u, i));
+    const res = await doFetch(url, {
       headers: { 'X-Emby-Token': config.jellyfin.apiKey, Accept: 'application/json' },
       signal: controller.signal,
     });

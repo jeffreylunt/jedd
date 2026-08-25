@@ -27,6 +27,7 @@ import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.j
 import { makeRunbookTool } from './runbook.js';
 import { makeSearchAudiobook, makeSearchEbook } from './search-release.js';
 import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
+import { makeSportsFixture } from './sports-fixture.js';
 import { makeTitleDetails } from './title-details.js';
 import { makeTrending } from './trending.js';
 import type { Tool } from './types.js';
@@ -90,6 +91,16 @@ const GUEST_TOOLS: Tool[] = [
   // this touches a quality profile.
   makeFindGaps(),
   makeSearchEpisode(),
+  /**
+   * 🔴 GUEST BECAUSE IT IS CONTENT, NOT BECAUSE IT IS HARMLESS.
+   *
+   * Jeff's rule is about WHAT THE DATA IS ABOUT, not who is asking: *"All users
+   * should have read access to everything in the library, etc, but not other
+   * users information or server secrets."* What is on television is not about a
+   * person, so it sits with `library_search` on the guest side. It reads a
+   * public sports schedule and the shared TV guide, and names nobody.
+   */
+  makeSportsFixture(),
 ];
 
 /**
