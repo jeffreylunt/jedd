@@ -71,6 +71,24 @@ interface DeniedPath {
   /** Lower-cased path prefix. Matched against the lower-cased request path. */
   prefix: string;
   why: string;
+  /**
+   * Match this path EXACTLY rather than its whole subtree.
+   *
+   * ⚠️ Exists for `/System/Info`, whose narrower sibling `/System/Info/Public` is
+   * the endpoint we actually want people using. A subtree deny would take both
+   * and leave no way to ask "is the server up".
+   */
+  exact?: boolean;
+  /**
+   * What KIND of thing this is, for the refusal the user reads. Defaults to
+   * PERSONAL.
+   *
+   * 🔴 The refusal text is user-visible, so it has to be TRUE. `/System/Info` is
+   * denied to guests and is not about a person at all — labelling it PERSONAL
+   * would have the model relay a false reason, and a denylist whose stated
+   * reasons drift from its actual rule stops being extensible by anyone.
+   */
+  headline?: string;
 }
 
 /**
@@ -269,6 +287,29 @@ const JELLYFIN_PERSON_PATHS: DeniedPath[] = [
     prefix: '/user_usage_stats',
     why: 'the Playback Reporting plugin reports per-user viewing history.',
   },
+  /**
+   * 🔴 SERVER TOPOLOGY — the class the CONTENT/PERSON/SECRET rule does not
+   * obviously catch, which is exactly why it needed deciding rather than
+   * inferring.
+   *
+   * `/System/Info` carries `CachePath`, `LogPath`, `ProgramDataPath`,
+   * `InternalMetadataPath`, `TranscodingTempPath`, `WebPath`, `LocalAddress` and
+   * the server `Id`. None of that is a credential and none of it is about a
+   * person, so the rule allows it — and it is still strictly more than the
+   * retired `homelab_status` ever showed, which was version and server name.
+   *
+   * ⚠️ **The replacement must not show more than the thing it replaced.**
+   * `/System/Info/Public` is seven keys and answers "is the server up" exactly,
+   * so `exact: true` keeps that sibling open while closing this one.
+   */
+  {
+    prefix: '/system/info',
+    exact: true,
+    headline: 'SERVER INTERNALS: it is about the server\'s own layout, not about the library',
+    why:
+      'it lists filesystem paths, the LAN address and the server id. Use /System/Info/Public instead ' +
+      '— it answers "is the server up and what version" and nothing else.',
+  },
 ];
 
 const SERVICES: Record<ReadService, ServiceSpec> = {
@@ -370,9 +411,10 @@ const PATH_CHARS = /^[A-Za-z0-9/._~()@:,+-]+$/;
  * importantly, that a refused call produced no URL at all.
  */
 /** Does `routed` fall under any of these prefixes? Returns the reason, or null. */
-function matchDeny(rules: DeniedPath[], routed: string): string | null {
+function matchDeny(rules: DeniedPath[], routed: string): DeniedPath | null {
   for (const rule of rules) {
-    if (routed === rule.prefix || routed.startsWith(`${rule.prefix}/`)) return rule.why;
+    if (routed === rule.prefix) return rule;
+    if (!rule.exact && routed.startsWith(`${rule.prefix}/`)) return rule;
   }
   return null;
 }
@@ -389,10 +431,10 @@ function matchDeny(rules: DeniedPath[], routed: string): string | null {
  * parameter, that test is telling you the answer is no.
  */
 export function secretVerdict(service: ReadService, routed: string): string | null {
-  const why = matchDeny(SERVICES[service].secret, routed);
-  return why
+  const rule = matchDeny(SERVICES[service].secret, routed);
+  return rule
     ? `REFUSED — SECRET: ${SERVICES[service].label} ${routed} is denied to EVERYONE, including the ` +
-        `owner, because ${why}\nThis is not about permission. A credential in a reply is copied into ` +
+        `owner, because ${rule.why}\nThis is not about permission. A credential in a reply is copied into ` +
         'the message thread, the conversation history and the log file, and nobody cleans those. ' +
         'There is no role that can read it and no flag that turns this off.'
     : null;
@@ -400,12 +442,13 @@ export function secretVerdict(service: ReadService, routed: string): string | nu
 
 /** PERSON. Role-gated by the CALLER — this function reports the class, not the verdict. */
 export function personVerdict(service: ReadService, routed: string): string | null {
-  const why = matchDeny(SERVICES[service].person, routed);
-  return why
-    ? `REFUSED — PERSONAL: ${SERVICES[service].label} ${routed} is about PEOPLE rather than about ` +
-        `the library, because ${why}\nEveryone here can read anything about the content — what exists, ` +
-        'what is missing, what is downloading, what is on TV. Information about other users is ' +
-        "Jeff's to see, not everyone's. Say that plainly rather than implying the data is unavailable.\n" +
+  const rule = matchDeny(SERVICES[service].person, routed);
+  return rule
+    ? `REFUSED — ${rule.headline ?? 'PERSONAL: it is about PEOPLE rather than about the library'}. ` +
+        `${SERVICES[service].label} ${routed} is refused because ${rule.why}\n` +
+        'Everyone here can read anything about the CONTENT — what exists, what is missing, what is ' +
+        "downloading, what is on TV. This particular read is Jeff's, not everyone's. Say that plainly " +
+        'rather than implying the data is unavailable.\n' +
         /**
          * ⚠️ Found on a live guest turn: the model refused correctly and then
          * added *"If you're Jeff, say so and I'll pull the live sessions."*
@@ -550,7 +593,7 @@ export function planRead(
   if (operational) {
     return {
       allowed: false,
-      reason: `REFUSED: ${spec.label} ${target.pathname} is not readable through this tool, because ${operational}`,
+      reason: `REFUSED: ${spec.label} ${target.pathname} is not readable through this tool, because ${operational.why}`,
     };
   }
 

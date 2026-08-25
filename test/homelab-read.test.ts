@@ -832,3 +832,56 @@ test('🔴 the PERSON refusal does not invite the guest to claim to be Jeff', ()
   assert.match(reason, /Do NOT invite them to identify themselves/);
   assert.match(reason, /decided by the number they texted from/);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVER TOPOLOGY — the class the CONTENT/PERSON/SECRET rule does not catch
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 /System/Info is denied to a guest, /System/Info/Public is not', () => {
+  /**
+   * The retired homelab_status showed version and server name. /System/Info adds
+   * CachePath, LogPath, ProgramDataPath, LocalAddress and the server id — a real
+   * widening of the guest surface, and the replacement must not show more than
+   * the thing it replaced. /System/Info/Public is the seven keys that answer the
+   * actual question.
+   */
+  const denied = planRead('jellyfin', '/System/Info', {}, config, 'guest');
+  assert.equal(denied.allowed, false, '/System/Info leaked server topology to a guest');
+
+  const open = planRead('jellyfin', '/System/Info/Public', {}, config, 'guest');
+  assert.equal(open.allowed, true, 'the guest lost the ability to ask whether the server is up');
+});
+
+test('🔴 the topology refusal does NOT claim to be about people — the reason must be true', () => {
+  // A denylist whose stated reasons drift from its actual rule stops being
+  // extensible by anyone, and the model relays this text to the user verbatim.
+  const reason = personVerdict('jellyfin', '/system/info') ?? '';
+  assert.match(reason, /SERVER INTERNALS/);
+  assert.doesNotMatch(reason, /about PEOPLE/, 'a topology read was explained as a privacy matter');
+  assert.match(reason, /Use \/System\/Info\/Public instead/, 'the refusal must name the endpoint that works');
+
+  // CONTROL: a genuine PERSON path still says so, so the headline really varies.
+  const person = personVerdict('jellyfin', '/sessions') ?? '';
+  assert.match(person, /about PEOPLE/);
+  assert.doesNotMatch(person, /SERVER INTERNALS/);
+});
+
+test('the OWNER still reads /System/Info — this is a guest-surface decision', () => {
+  assert.equal(planRead('jellyfin', '/System/Info', {}, config, 'owner').allowed, true);
+});
+
+test('🔴 `exact` really is exact — it must not silently become a subtree deny', () => {
+  // If `exact` were ignored, /System/Info/Public would be swallowed and the
+  // guest would have no liveness read at all. That is the failure this flag
+  // exists to prevent, so assert both directions.
+  assert.equal(planRead('jellyfin', '/System/Info', {}, config, 'guest').allowed, false);
+  assert.equal(planRead('jellyfin', '/System/Info/Public', {}, config, 'guest').allowed, true);
+  // And a NON-exact neighbour still takes its whole subtree.
+  assert.equal(planRead('jellyfin', '/Users/abc/Items', {}, config, 'guest').allowed, false);
+});
+
+test('🔴 the topology deny is not reachable by dot-segment either', () => {
+  for (const p of ['/./System/Info', '/System/./Info', '/System/Info/../Info']) {
+    assert.equal(planRead('jellyfin', p, {}, config, 'guest').allowed, false, `${p} reached /System/Info`);
+  }
+});
