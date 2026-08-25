@@ -7,7 +7,15 @@ import {
   type Fixture,
   type LeagueKey,
 } from '../media/espn.js';
-import { findFixtureInGuide, kickoffWindow } from '../media/guide.js';
+import {
+  ORDER_EXPLANATION,
+  rankChannelOptions,
+  summariseHealth,
+  type ChannelOption,
+  type HealthRow,
+} from '../media/channel-options.js';
+import { findFixtureInGuide, kickoffWindow, type GuideAnswer } from '../media/guide.js';
+import { describeAge, describeFreshness, readStreamCheck } from './channel-health.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -143,6 +151,58 @@ export function renderKickoff(kickoffMs: number, nowMs: number): string {
   return `${iso} — ${local} (${relative})`;
 }
 
+const HEALTH_LABEL: Record<ChannelOption['health'], string> = {
+  ok: 'WORKING at the last check',
+  failed: '🔴 FAILED the last check',
+  'not-covered': 'NOT COVERED by the last check',
+  unknown: 'health UNKNOWN',
+};
+
+/** One channel, its health, and every programme on it that named both teams. */
+function renderOption(o: ChannelOption): string[] {
+  const lines = [`  CHANNEL: ${o.channelName}  [${HEALTH_LABEL[o.health]} — ${o.healthDetail}]`];
+  for (const p of o.programmes) {
+    lines.push(`    "${p.name}" starts ${p.startDate.slice(0, 16)}Z`);
+    if (p.overview) lines.push(`    ${p.overview.slice(0, 200)}`);
+    if (p.replayMarkers.length) {
+      lines.push(
+        `    ⚠️ POSSIBLE REPLAY — the listing says "${p.replayMarkers.join('", "')}". Check the ` +
+          'description before telling anyone this is the live match.',
+      );
+    }
+  }
+  return lines;
+}
+
+/**
+ * 🔴 SAY THAT THE DECIDING FIELD IS ABSENT, AT THE MOMENT IT IS ABSENT.
+ *
+ * The replay marker lives only in `Overview`, and `fields=Overview,ChannelInfo`
+ * is the one parameter that makes Jellyfin return it. If that stops working —
+ * a server change, or an edit dropping the parameter — matching silently
+ * degrades to title-only, every fixture whose teams live in the description
+ * reports "no channels", and nothing anywhere says why.
+ *
+ * Keyed on the DATA rather than on the endpoint or the parameter string, so it
+ * fires for any route into the same defect. Same shape and same reason as
+ * `homelab_read`'s note; this verb needed its own because a new verb inherits
+ * nothing from another tool's description.
+ */
+function overviewNote(guide: Extract<GuideAnswer, { state: 'searched' }>): string {
+  if (guide.scanned === 0 || guide.withOverview > 0) return '';
+  return (
+    `  ⚠️ NONE of the ${guide.scanned} programmes in that window carried a description, so ` +
+    'fields=Overview is not doing anything and matching fell back to titles alone. A fixture whose ' +
+    'teams appear only in the description would be INVISIBLE here, and a replay could not be told ' +
+    'from the live match. Treat a "no channels" result as UNRELIABLE until that is fixed.'
+  );
+}
+
+/** Append a line only when it has content, so an inapplicable note is absent rather than blank. */
+function pushIf(parts: string[], line: string): void {
+  if (line) parts.push(line);
+}
+
 function teamLine(f: Fixture): string {
   if (f.teams.length < 2) return f.name;
   const home = f.teams.find((t) => t.homeAway === 'home');
@@ -155,13 +215,18 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
   return {
     name: 'sports_fixture',
     description:
-      'When is a team playing next, and is a channel listed for it? Combines a live fixture list ' +
-      '(ESPN) with the TV guide. Use this for "when do Crystal Palace play", "are the Jazz on ' +
-      'tonight", "what channel is the game on". It reports the KICKOFF even when no channel is ' +
-      'listed — the guide only reaches about four days ahead, so most fixtures are found with no ' +
-      'channel yet, and that is an answer, not a "no game". A channel is only ever named when a ' +
-      'guide entry was actually found. If the fixture list cannot be reached it FAILS rather than ' +
-      'answering from the guide alone.',
+      'When is a team playing next, and which channels are carrying it? Combines a live fixture ' +
+      'list (ESPN) with the TV guide. Use this for "when do Crystal Palace play", "are the Jazz on ' +
+      'tonight", "what channel is the game on" — prefer it over a raw guide read for anything ' +
+      'sport-and-schedule shaped, because a raw guide read cannot see past about four days and ' +
+      'cannot tell a live fixture from a rebroadcast. ' +
+      'It lists EVERY channel it found, not the first, with what the last stream check said about ' +
+      'each and how old that check is — report that age, and do not present it as live. ' +
+      'It reports the KICKOFF even when no channel is listed: the guide runs about four days deep ' +
+      'despite claiming seven, so most fixtures come back with no channels yet, and that is an ' +
+      'answer — never say they are not playing. A channel is named only when a guide entry was ' +
+      'actually found. If the fixture list cannot be reached it FAILS rather than answering from ' +
+      'the guide alone. The result carries the current time; compare start times against THAT.',
     minRole: 'guest',
     /**
      * 🔴 CONTENT, not PERSON. What is on television is not about anybody, so
@@ -244,8 +309,22 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
       const all = answer.fixtures;
       const wanted = team ? all.filter((f) => fixtureInvolves(f, team)) : all;
       const who = team ? `"${team}"` : `any ${label} team`;
+      /**
+       * 🔴 THE CURRENT TIME SHIPS WITH THE DATA, EVERY CALL.
+       *
+       * The model has no clock: the system prompt carries no date, `hp_shell
+       * date` is refused by the command gate, and an outbound time API is
+       * unreachable. On `homelab_read`'s first live turn it burned four tool
+       * calls hunting for the date and then labelled an Aug 22 broadcast as
+       * live. This verb's whole job is past-versus-future discrimination, so
+       * the stamp matters more here, not less.
+       *
+       * Per call, not once into a system prompt — a long-lived pm2 conversation
+       * outlives a prompt stamp, and a stale "now" is worse than none.
+       */
+      const asOf = `AS OF ${new Date(nowMs).toISOString().slice(0, 16)}Z — compare every time below against THIS, not a guess.`;
       const sourceLine =
-        `FIXTURE SOURCE (ESPN ${label} scoreboard): ${answer.considered} events in ` +
+        `${asOf}\nFIXTURE SOURCE (ESPN ${label} scoreboard): ${answer.considered} events in ` +
         `${answer.windowFrom.slice(0, 10)} → ${answer.windowTo.slice(0, 10)}, ` +
         `${all.length} still upcoming or in progress, ${wanted.length} involving ${who}.`;
 
@@ -273,6 +352,58 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
 
       const guide = await findFixtureInGuide(ctx.config, next, fetchImpl);
       const win = kickoffWindow(next);
+      /**
+       * Read at most ONCE per call, and only if some channel was actually
+       * found. It is an ssh round trip, and a call that turns up no channels
+       * has nothing to annotate.
+       *
+       * 🔴 A health read that FAILS never removes a channel from the list. The
+       * channel was found in the guide, and that fact does not depend on a
+       * second source — `rankChannelOptions(matches, null)` marks every option
+       * `unknown` and the list still prints.
+       */
+      /**
+       * 🔴 EVERY GUIDE LOOKUP HAPPENS BEFORE THE HEALTH READ.
+       *
+       * The health read is one ssh round trip, and it has to be one — reading
+       * it per fixture would multiply it by the lookahead. It also has to
+       * happen when ANY fixture found a channel, not only the next one: an
+       * earlier arrangement read health from the next fixture alone, so a
+       * fixture tonight with no listing and one tomorrow on three channels
+       * annotated none of them. Collecting the lookups first makes that
+       * unrepresentable rather than remembered.
+       */
+      const later = wanted.slice(1, 1 + LOOKAHEAD);
+      const laterGuides: Array<{ fixture: Fixture; guide: GuideAnswer | null }> = [];
+      for (const f of later) {
+        laterGuides.push({
+          fixture: f,
+          // `null` means NOT LOOKED UP, which is a different fact from an empty
+          // search and is rendered differently below.
+          guide: f.kickoffMs > nowMs + GUIDE_HORIZON_MS ? null : await findFixtureInGuide(ctx.config, f, fetchImpl),
+        });
+      }
+
+      let healthRows: HealthRow[] | null = null;
+      let healthNote = '';
+      const anyChannelFound =
+        (guide.state === 'searched' && guide.matches.length > 0) ||
+        laterGuides.some((l) => l.guide?.state === 'searched' && l.guide.matches.length > 0);
+      if (anyChannelFound) {
+        const read = await readStreamCheck(ctx.config, ctx.exec);
+        if (read.ok) {
+          healthRows = read.snapshot.rows;
+          healthNote =
+            `Channel health is from the stream check that ran ${read.snapshot.when} UTC — ` +
+            `${describeAge(read.snapshot.ageSeconds)}. ${describeFreshness(read.snapshot.ageSeconds)}` +
+            (read.snapshot.unparsed
+              ? ` ⚠️ ${read.snapshot.unparsed} line(s) of it did not parse, so the check itself may be malfunctioning.`
+              : '');
+        } else {
+          // 🔴 UNKNOWN, never "the channels are broken". Two different answers.
+          healthNote = `⚠️ Channel health is UNKNOWN — ${read.detail}. That is NOT a report that these channels are broken.`;
+        }
+      }
       const winText = `${new Date(win.fromMs).toISOString().slice(0, 16)}Z → ${new Date(win.toMs)
         .toISOString()
         .slice(0, 16)}Z`;
@@ -315,46 +446,57 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
               '"not listed" here is NOT conclusive.',
           );
         } else if (guide.scanned === 0) {
+          /**
+           * 🔴 PLURAL. The reason there is no channel is that the guide has not
+           * filled in ANY of them yet, not that there is one and we could not
+           * find it. Same false-zero discipline as everywhere else in this
+           * file, one word different — and the singular quietly implies a
+           * search that came within one of succeeding.
+           */
           parts.push(
-            '  NO CHANNEL LISTED YET — the guide holds NOTHING at all for that window, i.e. it does ' +
-              'not reach that far ahead (it runs about four days deep).',
+            '  NO CHANNELS LISTED YET — the guide holds NOTHING at all for that window, i.e. it does ' +
+              'not reach that far ahead (it runs about four days deep despite GuideInfo claiming seven).',
           );
         } else {
           parts.push(
-            '  NO CHANNEL LISTED YET — the guide does cover that window, but no programme in it ' +
+            '  NO CHANNELS LISTED YET — the guide does cover that window, but no programme in it ' +
               'names both teams.',
           );
         }
+        pushIf(parts, overviewNote(guide));
         parts.push(
           '  🔴 A MISSING CHANNEL IS NOT A MISSING FIXTURE. The kickoff above is confirmed by the ' +
-            'fixture source; only the channel is unknown. Say when the match is on and that no ' +
-            'channel is listed for it yet.',
+            'fixture source; only the channels are unknown. Say when the match is on and that no ' +
+            'channels are listed for it yet.',
         );
         parts.push(scopeNote);
       } else {
+        const { options, collapsed } = rankChannelOptions(guide.matches, healthRows);
         parts.push(
-          `TV GUIDE: searched ${winText} — ${guide.scanned} programmes on ${guide.channels} channels, ` +
-            `${guide.matches.length} naming both teams:`,
+          `TV GUIDE: searched ${winText} — ${guide.scanned} programmes on ${guide.channels} channels. ` +
+            `${options.length} CHANNEL(S) carrying this fixture — ALL of them are listed below, ` +
+            `not just the first.`,
         );
-        for (const m of guide.matches) {
-          parts.push(`  CHANNEL: ${m.channelName}`);
-          parts.push(`    "${m.name}" starts ${m.startDate.slice(0, 16)}Z`);
-          if (m.overview) parts.push(`    ${m.overview.slice(0, 200)}`);
-          if (m.replayMarkers.length) {
-            parts.push(
-              `    ⚠️ POSSIBLE REPLAY — the listing says "${m.replayMarkers.join('", "')}". Check the ` +
-                'description before telling anyone this is the live match.',
-            );
-          }
+        parts.push(`  ${summariseHealth(options)}.`);
+        parts.push(`  ${ORDER_EXPLANATION}`);
+        if (healthNote) parts.push(`  ${healthNote}`);
+        if (collapsed) {
+          // 🔴 Never a silent collapse. Two feeds of the same match are two real
+          // options; only a listing returned twice is merged, and it is counted.
+          parts.push(
+            `  (${collapsed} byte-identical duplicate listing(s) merged — same channel, same ` +
+              'programme, same start time. No distinct feed was removed.)',
+          );
         }
+        for (const o of options) parts.push(...renderOption(o));
+        pushIf(parts, overviewNote(guide));
         parts.push(scopeNote);
       }
 
-      const later = wanted.slice(1, 1 + LOOKAHEAD);
-      if (later.length) {
+      if (laterGuides.length) {
         parts.push('');
         parts.push('LATER FIXTURES:');
-        for (const f of later) {
+        for (const { fixture: f, guide: g } of laterGuides) {
           parts.push(`  ${renderKickoff(f.kickoffMs, nowMs)} — ${teamLine(f)}`);
           /**
            * 🔴 "NOT LOOKED UP" AND "NOT LISTED" ARE DIFFERENT, AND CONFLATING
@@ -373,21 +515,28 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
            * gap in what we looked at must never render as a finding about the
            * world.
            */
-          if (f.kickoffMs > nowMs + GUIDE_HORIZON_MS) {
+          if (g === null) {
             parts.push('      not looked up — beyond the few days the guide reaches. This says NOTHING about whether a channel exists.');
             continue;
           }
-          const g = await findFixtureInGuide(ctx.config, f, fetchImpl);
           if (g.state !== 'searched') {
-            parts.push(`      channel UNKNOWN — the guide could not be searched (${g.detail})`);
+            parts.push(`      channels UNKNOWN — the guide could not be searched (${g.detail})`);
           } else if (g.matches.length) {
-            parts.push(`      channel: ${g.matches.map((m) => m.channelName).join(' | ')}`);
+            // 🔴 ALL of them here too, health and all. A later fixture is not a
+            // second-class answer — the ranking and the annotation are the same
+            // ones the next fixture gets, from the same single health read.
+            const { options, collapsed } = rankChannelOptions(g.matches, healthRows);
+            parts.push(`      ${options.length} channel(s), ${summariseHealth(options)}:`);
+            for (const o of options) {
+              parts.push(`        ${o.channelName}  [${HEALTH_LABEL[o.health]} — ${o.healthDetail}]`);
+            }
+            if (collapsed) parts.push(`        (${collapsed} identical duplicate listing(s) merged)`);
           } else if (g.scanned < g.total) {
-            parts.push(`      channel UNKNOWN — the scan was truncated (${g.scanned} of ${g.total} programmes read)`);
+            parts.push(`      channels UNKNOWN — the scan was truncated (${g.scanned} of ${g.total} programmes read)`);
           } else if (g.scanned === 0) {
-            parts.push('      no channel listed — the guide holds nothing at all for that window yet');
+            parts.push('      no channels listed — the guide holds nothing at all for that window yet');
           } else {
-            parts.push(`      no channel listed — ${g.scanned} programmes in that window, none naming both teams`);
+            parts.push(`      no channels listed — ${g.scanned} programmes in that window, none naming both teams`);
           }
         }
       }

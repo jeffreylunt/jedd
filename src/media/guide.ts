@@ -97,6 +97,22 @@ export type GuideAnswer =
       /** How many programmes were actually read in this window. */
       scanned: number;
       /**
+       * How many of those carried a non-empty `Overview`.
+       *
+       * 🔴 KEYED ON THE DATA, NOT ON THE ENDPOINT NAME. The replay marker lives
+       * only in the description, and `fields=Overview,ChannelInfo` is the one
+       * parameter that makes Jellyfin return it — `ChannelName` is `null` and
+       * `Overview` absent without it. If that parameter ever stops working, or
+       * a future edit drops it, matching silently degrades to title-only and
+       * every fixture whose teams live in the description reports as "no
+       * channel". `scanned > 0 && withOverview === 0` is that failure, visible.
+       *
+       * The same shape as `homelab_read`'s missing-Overview note, and keyed the
+       * same way for the same reason: naming the endpoint would not fire for
+       * the other route into the identical defect.
+       */
+      withOverview: number;
+      /**
        * What Jellyfin said the window really holds.
        *
        * 🔴 `scanned < total` means the scan was cut short, and a "no match"
@@ -219,6 +235,7 @@ export async function findFixtureInGuide(
 
   const matches: GuideProgramme[] = [];
   const channelNames = new Set<string>();
+  let withOverview = 0;
   for (const raw of items) {
     if (!raw || typeof raw !== 'object') continue;
     const p = raw as Record<string, unknown>;
@@ -227,6 +244,7 @@ export async function findFixtureInGuide(
     const episode = typeof p['EpisodeTitle'] === 'string' ? p['EpisodeTitle'] : '';
     const channelName = typeof p['ChannelName'] === 'string' ? p['ChannelName'] : '';
     if (channelName) channelNames.add(channelName);
+    if (overview.trim()) withOverview++;
 
     const haystack = `${name} ${episode} ${overview}`;
     if (!programmeNamesAllTeams(haystack, fixture)) continue;
@@ -243,5 +261,14 @@ export async function findFixtureInGuide(
     });
   }
 
-  return { state: 'searched', from, to, matches, scanned: items.length, total, channels: channelNames.size };
+  return {
+    state: 'searched',
+    from,
+    to,
+    matches,
+    scanned: items.length,
+    withOverview,
+    total,
+    channels: channelNames.size,
+  };
 }

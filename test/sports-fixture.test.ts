@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { LEAGUE_KEYS, fixtureInvolves, teamVariants, type Fixture } from '../src/media/espn.js';
 import { discriminatingVariants, kickoffWindow, programmeNamesAllTeams } from '../src/media/guide.js';
+import { qualityOf, rankChannelOptions, type HealthRow } from '../src/media/channel-options.js';
 import type { FetchImpl } from '../src/media/arr.js';
 import { buildTools, toolsForRole } from '../src/tools/index.js';
 import { makeSportsFixture, renderKickoff } from '../src/tools/sports-fixture.js';
+import type { ExecImpl } from '../src/hp.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
 
@@ -25,10 +27,46 @@ import { testConfig } from './helpers.js';
 const NOW = Date.parse('2026-08-25T18:00:00Z');
 const KICKOFF = '2026-08-28T19:00Z';
 
+/**
+ * The stream-check file, in its real shape.
+ *
+ * 🔴 The FAIL row is the real one from hp, reason column and all — column 4
+ * holds the REASON on a fail row, not a codec, and rendering it as a codec
+ * prints an HTTP error where a codec should be.
+ */
+const HEALTH_MTIME = 1_787_498_113; // 2026-08-23 15:15:13Z
+const HEALTH_ROWS = [
+  '1|UK: SKY SPORTS MAIN EVENT|OK|h264|1920x1080|60000/1001',
+  '2|US: TRUTV 4K|OK|hevc|3840x2160|60000/1001',
+  '3|TBS HD|OK|h264|1280x720|30000/1001',
+  '7705|ESPN DEPORTES 4K|FAIL|http://znq234.live/live/x/1537742.ts: Server returned 4XX Client Error|?|?',
+].join('\n');
+
+/** An exec stub for the stream-check read. Records every command it was handed. */
+function healthStub(opts: { rows?: string; exit?: number; nowEpoch?: number; noClock?: boolean } = {}) {
+  const commands: { host: string; command: string }[] = [];
+  const impl: ExecImpl = (_file, args, _options, callback) => {
+    const host = args[args.length - 2] ?? '';
+    const command = args[args.length - 1] ?? '';
+    commands.push({ host, command });
+    if (opts.exit) return callback({ code: opts.exit }, '', 'cat: No such file or directory');
+    // Answer what was ASKED, not what the tool hoped for — a stub that prepends
+    // the clock regardless would keep passing after the command lost `date +%s`.
+    const head = command.includes('stat -c %Y') ? `${HEALTH_MTIME}\n` : '';
+    const clock = opts.noClock ? '' : command.includes('date +%s') ? `${opts.nowEpoch ?? HEALTH_MTIME + 3600}\n` : '';
+    return callback(null, `${head}${clock}${opts.rows ?? HEALTH_ROWS}\n`, '');
+  };
+  return { commands, impl };
+}
+
 const ctx = (over: Partial<ToolContext> = {}): ToolContext => ({
   role: 'guest',
   senderHandle: '+18015550123',
   config: testConfig(),
+  // Default: the stream check cannot be read. Tests that care about health pass
+  // their own stub. This keeps every other test off the network — an unstubbed
+  // exec would ssh to shell-host.invalid for real.
+  exec: healthStub({ exit: 1 }).impl,
   ...over,
 });
 
@@ -163,8 +201,11 @@ const fixtureOf = (teams: string[][]): Fixture => ({
   state: 'pre',
 });
 
-const run = (s: Spy, args: Record<string, unknown> = { league: 'epl', team: 'Crystal Palace' }) =>
-  makeSportsFixture(s.fetchImpl, () => NOW).run(args, ctx());
+const run = (
+  s: Spy,
+  args: Record<string, unknown> = { league: 'epl', team: 'Crystal Palace' },
+  over: Partial<ToolContext> = {},
+) => makeSportsFixture(s.fetchImpl, () => NOW).run(args, ctx(over));
 
 // ── 🔴 CRITERION 2. NO FIXTURE SOURCE, NO ANSWER. ───────────────────────────
 
@@ -235,7 +276,7 @@ test('🔴 a fixture BEYOND the guide reports the KICKOFF and says the channel i
   assert.equal(r.ok, true, 'this is an ANSWER — the kickoff is known');
   assert.match(r.content, /NEXT: Manchester City at Crystal Palace/);
   assert.match(r.content, /2026-08-28T19:00Z/, 'the kickoff must be in the reply');
-  assert.match(r.content, /NO CHANNEL LISTED YET/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.match(r.content, /does not reach that far ahead/);
   assert.match(r.content, /A MISSING CHANNEL IS NOT A MISSING FIXTURE/);
   // 🔴 The false zero, as the words the model must not be handed.
@@ -334,7 +375,7 @@ test('a programme naming only ONE of the two teams is not a match', async () => 
     guide: () => res(guideBody([programme({ Name: 'PL Tonight: Crystal Palace preview', Overview: 'Panel chat.' })])),
   });
   const r = await run(s);
-  assert.match(r.content, /NO CHANNEL LISTED YET/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.doesNotMatch(r.content, /CHANNEL: UK/);
 });
 
@@ -481,6 +522,279 @@ test('"Match Week" alone is NOT treated as a replay marker', async () => {
   assert.doesNotMatch(r.content, /POSSIBLE REPLAY/);
 });
 
+// ── 🔴 ALL THE CHANNELS, RANKED, WITH HEALTH JOINED ON ─────────────────────
+
+/** Four channels carrying the same fixture, exactly the shape this lineup produces. */
+const multiChannel = () => {
+  // ⚠️ The generic TITLE with the teams in the DESCRIPTION — the real shape,
+  // and the one `/Search/Hints` cannot see. If these named the teams in the
+  // title, the fixture would not exercise the path it is meant to.
+  const carrying = (ChannelName: string, over: Record<string, unknown> = {}) =>
+    programme({
+      ChannelName,
+      Name: 'Live: Premier League',
+      Overview: 'Crystal Palace host Manchester City at Selhurst Park.',
+      ...over,
+    });
+  return res(
+    guideBody([
+      carrying('ESPN DEPORTES 4K'),
+      carrying('TBS HD'),
+      carrying('US: TRUTV 4K'),
+      carrying('UK: SKY SPORTS MAIN EVENT'),
+      // A second programme on a channel already listed — a pre-show. NOT a
+      // duplicate: different name, different start.
+      carrying('TBS HD', { Name: 'Match Build-Up', StartDate: '2026-08-28T18:00:00.0000000Z' }),
+    ]),
+  );
+};
+
+test('🔴 EVERY carrying channel is listed, not the first', async () => {
+  // Jeff: "if there is more than one channel a game or event is on, the bot
+  // should be able to list all of them." The naive shape is `.find()`, and on
+  // this lineup that is wrong far more often than right — measured live, the
+  // Dodgers/Braves window carried SEVEN distinct channels.
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  for (const c of ['ESPN DEPORTES 4K', 'TBS HD', 'US: TRUTV 4K', 'UK: SKY SPORTS MAIN EVENT']) {
+    assert.match(r.content, new RegExp(`CHANNEL: ${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), `${c} is missing`);
+  }
+  assert.match(r.content, /4 CHANNEL\(S\)/);
+  assert.match(r.content, /ALL of them are listed below, not just the first/);
+});
+
+test('🔴 a channel that FAILED the last check is listed LAST and marked, not hidden', async () => {
+  // A list of options is worse than useless if the first one is broken. The
+  // failing channel is 4K, so quality alone would have ranked it top.
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  const order = [...r.content.matchAll(/^  CHANNEL: (.+?)  \[/gm)].map((m) => m[1]);
+  assert.equal(order[order.length - 1], 'ESPN DEPORTES 4K', `ranked: ${order.join(' → ')}`);
+  assert.match(r.content, /ESPN DEPORTES 4K {2}\[🔴 FAILED the last check/);
+  // 🔴 The reason, not a codec. Column 4 means something different on a fail row.
+  assert.match(r.content, /reason: http:\/\/znq234\.live/);
+});
+
+test('🔴 a WORKING HD feed outranks a 4K feed that failed — health before quality', async () => {
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  const order = [...r.content.matchAll(/^  CHANNEL: (.+?)  \[/gm)].map((m) => m[1]);
+  assert.ok(
+    order.indexOf('TBS HD') < order.indexOf('ESPN DEPORTES 4K'),
+    `a working HD feed must beat a failed 4K feed; got ${order.join(' → ')}`,
+  );
+  // Among the working ones, 4K first.
+  assert.ok(order.indexOf('US: TRUTV 4K') < order.indexOf('TBS HD'), `4K first among working; got ${order.join(' → ')}`);
+});
+
+test('🔴 the ordering is STATED, not left to be inferred from iteration order', async () => {
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /Ordered by HEALTH first/);
+  assert.match(r.content, /A working HD feed is listed above a 4K feed that failed/);
+  assert.match(r.content, /3 working at the last check, 1 FAILED the last check/);
+});
+
+test('🔴 the health snapshot AGE is reported, and a stale one is called stale', async () => {
+  // Measured on the live file: mtime was 2.2 days behind the host clock, so
+  // "working at the last check" is a different claim from "working now".
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub({ nowEpoch: HEALTH_MTIME + 3 * 86400 }).impl });
+  assert.match(r.content, /stream check that ran 2026-08-23 15:15 UTC/);
+  assert.match(r.content, /3d ago/);
+  assert.match(r.content, /STALE: this is more than a day old/);
+});
+
+test('🔴 an UNKNOWN snapshot age is treated as STALE, not as fresh', async () => {
+  /**
+   * 🔴 THE UNKNOWN BRANCH MUST BE AT LEAST AS CAUTIOUS AS THE STALE ONE.
+   *
+   * An earlier version of this rule tested `isFinite(age) && age > threshold`,
+   * so an unreadable clock — NaN, or a negative age from skew — fell through to
+   * the sentence written for a FRESH result. The whole contract of this data is
+   * that its age gates whether it may be quoted as current.
+   *
+   * Reached here by a results file whose clock line is missing, which is what a
+   * malfunctioning checker actually produces.
+   */
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub({ noClock: true }).impl });
+  assert.match(r.content, /could NOT work out how old this is, so treat it as stale/);
+  assert.doesNotMatch(r.content, /snapshot, not a live probe/, 'the reassuring branch is for a FRESH result only');
+});
+
+test('🔴 health is joined by EXACT channel name — a near-miss is NOT COVERED, never borrowed', async () => {
+  /**
+   * 🔴 A WRONG JOIN IS A CONFIDENT WRONG ANSWER ABOUT THE THING BEING ASKED.
+   *
+   * Guide names carry country prefixes (`NZ: SKY SPORTS 7 4K`, `CA: SPORTSNET
+   * ONTARIO HD`). A substring or prefix join would attach the health of one
+   * channel to a different one — and the measurement says it is not needed:
+   * 207 of 213 live guide channel names matched a stream-check row byte for
+   * byte. The six that did not are ephemeral per-event channels the sweep never
+   * covered, which is exactly what NOT COVERED means.
+   */
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () => res(guideBody([programme({ ChannelName: 'NZ: SKY SPORTS MAIN EVENT' })])),
+  });
+  // The stub's health rows contain `UK: SKY SPORTS MAIN EVENT`, WORKING. A
+  // fuzzy join would report this NZ channel as working on that row's evidence.
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /CHANNEL: NZ: SKY SPORTS MAIN EVENT {2}\[NOT COVERED by the last check/);
+  assert.doesNotMatch(r.content, /NZ: SKY SPORTS MAIN EVENT {2}\[WORKING/);
+});
+
+test('a FRESH snapshot is not described as stale', async () => {
+  // CONTROL for the test above: the staleness wording must depend on the age.
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub({ nowEpoch: HEALTH_MTIME + 600 }).impl });
+  assert.match(r.content, /10m ago/);
+  assert.doesNotMatch(r.content, /STALE/);
+  assert.match(r.content, /snapshot, not a live probe/);
+});
+
+test('🔴 an unreadable stream check leaves every channel UNKNOWN and REMOVES NONE of them', async () => {
+  // The channels were found in the guide; that fact does not depend on a second
+  // source. And "unknown" is not "these channels are broken".
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub({ exit: 1 }).impl });
+  assert.match(r.content, /4 CHANNEL\(S\)/);
+  assert.match(r.content, /CHANNEL: TBS HD {2}\[health UNKNOWN/);
+  assert.match(r.content, /Channel health is UNKNOWN/);
+  assert.match(r.content, /NOT a report that these channels are broken/);
+});
+
+test('a channel the sweep never covered is NOT COVERED, not broken and not fine', async () => {
+  // Measured: 207 of 213 live guide channel names matched a stream-check row
+  // exactly; the six that did not are ephemeral per-event MLS channels.
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () => res(guideBody([programme({ ChannelName: 'MLS: LAFC vs Portland (8:30 PM)' })])),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /NOT COVERED by the last check/);
+  assert.doesNotMatch(r.content, /FAILED the last check/);
+});
+
+test('🔴 the stream check is read ONCE per call, on the UNPRIVILEGED identity, and never probes', async () => {
+  const h = healthStub();
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  await run(s, undefined, { exec: h.impl });
+  assert.equal(h.commands.length, 1, 'one ssh round trip, not one per channel');
+  assert.equal(h.commands[0]?.host, 'shell-host.invalid', 'health needs no docker, so it takes the smaller capability');
+  for (const c of h.commands) {
+    assert.doesNotMatch(c.command, /ffprobe|ffmpeg/, 'probing is ~10s/channel and has wedged the 242-channel loop for 3h');
+  }
+});
+
+test('the stream check is NOT read when no channel was found — it has nothing to annotate', async () => {
+  const h = healthStub();
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res(guideBody([filler(1)])) });
+  await run(s, undefined, { exec: h.impl });
+  assert.equal(h.commands.length, 0);
+});
+
+test('🔴 duplicate listings are collapsed only when IDENTICAL, and the collapse is REPORTED', async () => {
+  // Jeff: two feeds of the same match are two real options, not noise. Only a
+  // listing returned twice is merged — and never silently.
+  const dup = programme({ ChannelName: 'TBS HD' });
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () => res(guideBody([dup, { ...dup }, programme({ ChannelName: 'US: TRUTV 4K' })])),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /1 byte-identical duplicate listing\(s\) merged/);
+  assert.match(r.content, /No distinct feed was removed/);
+  assert.match(r.content, /2 CHANNEL\(S\)/);
+});
+
+test('two programmes on the SAME channel are grouped under it, and neither is dropped', async () => {
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /"Live: Premier League"/);
+  assert.match(r.content, /"Match Build-Up"/);
+  // One CHANNEL heading for TBS HD, carrying both programmes.
+  assert.equal((r.content.match(/CHANNEL: TBS HD/g) ?? []).length, 1);
+});
+
+test('rankChannelOptions and qualityOf, as units', () => {
+  const health: HealthRow[] = [
+    { number: '1', name: 'GOOD HD', ok: true, codec: 'h264', resolution: '1280x720' },
+    { number: '2', name: 'BAD 4K', ok: false, codec: 'Server returned 4XX', resolution: '?' },
+  ];
+  const p = (ChannelName: string) => ({ channelName: ChannelName, programmes: [], health: 'ok' as const });
+  void p;
+  const mk = (channelName: string) => ({
+    channelName,
+    channelId: null,
+    name: 'x',
+    startDate: '',
+    overview: '',
+    replayMarkers: [],
+  });
+  const { options } = rankChannelOptions([mk('BAD 4K'), mk('GOOD HD'), mk('NEVER SEEN')], health);
+  assert.deepEqual(options.map((o) => o.channelName), ['GOOD HD', 'NEVER SEEN', 'BAD 4K']);
+  assert.deepEqual(options.map((o) => o.health), ['ok', 'not-covered', 'failed']);
+
+  assert.equal(qualityOf('US: TRUTV 4K'), '4K');
+  assert.equal(qualityOf('NZ: SKY SPORTS 7 4K'), '4K');
+  assert.equal(qualityOf('TBS HD'), 'HD');
+  assert.equal(qualityOf('NBA: UTAH JAZZ ᴴᴰ'), 'HD', 'the superscript form is real in this lineup');
+  assert.equal(qualityOf('POKERGO'), 'unstated');
+});
+
+// ── 🔴 THE MODEL HAS NO CLOCK ──────────────────────────────────────────────
+
+test('🔴 the current time ships WITH the data, on every call', async () => {
+  /**
+   * The system prompt carries no date, `hp_shell date` is refused by the
+   * command gate, and an outbound time API is unreachable. On homelab_read's
+   * first live turn the model burned four tool calls hunting for the date and
+   * then labelled an Aug 22 broadcast as live. This verb's whole job is
+   * past-versus-future discrimination, so it must not depend on the model
+   * having a clock it does not have.
+   */
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res(guideBody([])) });
+  const r = await run(s);
+  assert.match(r.content, /AS OF 2026-08-25T18:00Z/);
+  assert.match(r.content, /compare every time below against THIS/);
+});
+
+test('the clock stamp is present even when there is no fixture at all', async () => {
+  const s = spy({ espn: () => res(espnBody([])) });
+  const r = await run(s);
+  assert.match(r.content, /AS OF 2026-08-25T18:00Z/);
+});
+
+// ── 🔴 THE DECIDING FIELD, KEYED ON THE DATA ───────────────────────────────
+
+test('🔴 a window whose records carry NO Overview says the match is unreliable', async () => {
+  /**
+   * `fields=Overview,ChannelInfo` is the one parameter that makes Jellyfin
+   * return the description, and the replay marker lives nowhere else. If it
+   * stops working, matching silently degrades to titles alone and every fixture
+   * whose teams live in the description reports "no channels".
+   *
+   * Keyed on the DATA, not the endpoint name or the parameter string, so it
+   * fires for any route into the same defect.
+   */
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () => res(guideBody([{ ...filler(1), Overview: '' }, { ...filler(2), Overview: '' }])),
+  });
+  const r = await run(s);
+  assert.match(r.content, /NONE of the 2 programmes in that window carried a description/);
+  assert.match(r.content, /fields=Overview is not doing anything/);
+  assert.match(r.content, /Treat a "no channels" result as UNRELIABLE/);
+});
+
+test('CONTROL: a window WITH descriptions carries no such warning', async () => {
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res(guideBody([filler(1)])) });
+  const r = await run(s);
+  assert.doesNotMatch(r.content, /fields=Overview is not doing anything/);
+});
+
 // ── LATER FIXTURES: "NOT LOOKED UP" IS NOT "NOT LISTED" ────────────────────
 
 test('🔴 a later fixture INSIDE the guide reach is actually looked up, not written off', async () => {
@@ -497,10 +811,54 @@ test('🔴 a later fixture INSIDE the guide reach is actually looked up, not wri
     espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
     guide: () => res(guideBody([programme()])),
   });
-  const r = await run(s);
+  const h = healthStub();
+  const r = await run(s, undefined, { exec: h.impl });
   const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
-  assert.match(laterBlock, /channel: UK: SKY SPORTS MAIN EVENT/);
+  assert.match(laterBlock, /UK: SKY SPORTS MAIN EVENT/);
   assert.doesNotMatch(laterBlock, /not looked up/);
+  // 🔴 A later fixture is not a second-class answer: it gets the same health
+  // annotation the next fixture gets, from the SAME single read.
+  assert.match(laterBlock, /1 channel\(s\), 1 working at the last check/);
+  assert.match(laterBlock, /UK: SKY SPORTS MAIN EVENT {2}\[WORKING at the last check/);
+  assert.equal(h.commands.length, 1, 'one health read for the whole call, not one per fixture');
+});
+
+test('🔴 health is read when only a LATER fixture found a channel, not just the next one', async () => {
+  /**
+   * An earlier arrangement decided whether to read health from the NEXT fixture
+   * alone. A fixture tonight with no listing and one tomorrow on three channels
+   * then annotated none of them. Collecting every guide lookup before the read
+   * makes that unrepresentable rather than something to remember.
+   */
+  const soon = '2026-08-27T19:00Z';
+  let call = 0;
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
+    // The NEXT fixture finds nothing; the LATER one finds a channel.
+    guide: () => (call++ === 0 ? res(guideBody([filler(1)])) : res(guideBody([programme()]))),
+  });
+  const h = healthStub();
+  const r = await run(s, undefined, { exec: h.impl });
+  assert.equal(h.commands.length, 1, 'the later fixture found a channel, so health must be read');
+  assert.match(r.content, /UK: SKY SPORTS MAIN EVENT {2}\[WORKING at the last check/);
+});
+
+test('🔴 a later fixture lists ALL its channels too, not just the first', async () => {
+  // The same rule as the next fixture, and it needed its own test: a mutation
+  // that sliced the later list to one left the suite green, because every
+  // "all of them" assertion was aimed at the NEXT fixture.
+  const soon = '2026-08-27T19:00Z';
+  let call = 0;
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
+    guide: () => (call++ === 0 ? res(guideBody([filler(1)])) : multiChannel()),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
+  for (const c of ['ESPN DEPORTES 4K', 'TBS HD', 'US: TRUTV 4K', 'UK: SKY SPORTS MAIN EVENT']) {
+    assert.ok(laterBlock.includes(c), `${c} is missing from the later fixture`);
+  }
+  assert.match(laterBlock, /4 channel\(s\), 3 working at the last check, 1 FAILED the last check/);
 });
 
 test('🔴 a later fixture BEYOND the guide reach is UNCHECKED, never "no channel"', async () => {
@@ -513,7 +871,7 @@ test('🔴 a later fixture BEYOND the guide reach is UNCHECKED, never "no channe
   const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
   assert.match(laterBlock, /not looked up/);
   assert.match(laterBlock, /says NOTHING about whether a channel exists/);
-  assert.doesNotMatch(laterBlock, /no channel listed/);
+  assert.doesNotMatch(laterBlock, /no channels listed/);
 });
 
 test('🔴 a TRUNCATED scan on a LATER fixture is UNKNOWN there too, not a clean zero', async () => {
@@ -527,8 +885,8 @@ test('🔴 a TRUNCATED scan on a LATER fixture is UNKNOWN there too, not a clean
   });
   const r = await run(s);
   const laterBlock = r.content.slice(r.content.indexOf('LATER FIXTURES'));
-  assert.match(laterBlock, /channel UNKNOWN — the scan was truncated \(1 of 900/);
-  assert.doesNotMatch(laterBlock, /no channel listed/);
+  assert.match(laterBlock, /channels UNKNOWN — the scan was truncated \(1 of 900/);
+  assert.doesNotMatch(laterBlock, /no channels listed/);
 });
 
 test('the guide is queried at most once per reported fixture', async () => {
@@ -663,7 +1021,7 @@ test('🔴 a name BOTH teams share cannot satisfy both halves — the EPIX HD fa
       ),
   });
   const r = await run(s, { league: 'nfl', team: 'Chargers' });
-  assert.match(r.content, /NO CHANNEL LISTED YET/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.doesNotMatch(r.content, /EPIX/, 'a shared city name is not evidence that a channel is carrying the game');
 });
 
@@ -705,7 +1063,7 @@ test('🔴 a team name inside a LONGER WORD is not a match', async () => {
       ),
   });
   const r = await run(s, { league: 'nfl', team: 'Jets' });
-  assert.match(r.content, /NO CHANNEL LISTED YET/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.doesNotMatch(r.content, /FILLER TV/);
 });
 
@@ -755,7 +1113,7 @@ test('🔴 a three-letter ABBREVIATION is never a matchable variant', async () =
     guide: () => res(guideBody([programme({ Name: 'CRY v MNC', Overview: 'Scrying and financing.' })])),
   });
   const r = await run(s);
-  assert.match(r.content, /NO CHANNEL LISTED YET/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.doesNotMatch(r.content, /CHANNEL: UK/);
 });
 

@@ -1,4 +1,5 @@
-import { renderOutcome, runOnHp } from '../hp.js';
+import type { Config } from '../config.js';
+import { renderOutcome, runOnHp, type ExecImpl } from '../hp.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -179,6 +180,82 @@ function epoch(line: string | undefined): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * 🔴 ONE READER, TWO TOOLS. `sports_fixture` JOINS HEALTH ONTO ITS CHANNELS.
+ *
+ * Jeff: *"if there is more than one channel a game or event is on, the bot should
+ * be able to list all of them."* A list of options is worse than useless if the
+ * first one is known-broken, and the health data is already sitting in this file
+ * — so `sports_fixture` annotates every channel it found with what the last
+ * sweep said about it.
+ *
+ * It calls THIS rather than re-reading the file, because everything that makes
+ * the read honest is here and none of it is obvious: the mtime and the clock
+ * come from the SAME machine (comparing hp's mtime against the Mac's would fold
+ * clock skew into the age), `Number('')` is 0 rather than NaN so an empty first
+ * line would silently become 1970, and an unparseable line is COUNTED rather
+ * than dropped. A second implementation would get at least one of those wrong.
+ *
+ * ⚠️ Unprivileged identity, literal command, no argument. It cannot be made to
+ * open a stream — probing is ~10 s per channel and has wedged the 242-channel
+ * loop for three hours.
+ */
+export interface StreamCheckSnapshot {
+  rows: StreamCheckRow[];
+  unparsed: number;
+  /** NaN when the clock could not be read. Never treat that as fresh. */
+  ageSeconds: number;
+  /** When the check ran, `YYYY-MM-DD HH:MM` UTC, or 'unknown'. */
+  when: string;
+}
+
+export type StreamCheckRead = { ok: true; snapshot: StreamCheckSnapshot } | { ok: false; detail: string };
+
+export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<StreamCheckRead> {
+  const results = await runOnHp(config.shellSshHost, RESULTS_CMD, 30_000, exec);
+  if (results.exitCode !== 0) {
+    // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
+    return { ok: false, detail: `could not read ${RESULTS_PATH} on hp: ${renderOutcome(results)}` };
+  }
+  const lines = results.stdout.split('\n');
+  const mtime = epoch(lines[0]);
+  const now = epoch(lines[1]);
+  const { rows, unparsed } = parseStreamCheck(lines.slice(2).join('\n'));
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      detail: `${RESULTS_PATH} was read but holds no parseable channel rows (${unparsed} unparseable line(s))`,
+    };
+  }
+  return {
+    ok: true,
+    snapshot: {
+      rows,
+      unparsed,
+      ageSeconds: mtime !== null && now !== null ? now - mtime : NaN,
+      when: mtime !== null ? new Date(mtime * 1000).toISOString().replace('T', ' ').slice(0, 16) : 'unknown',
+    },
+  };
+}
+
+/**
+ * 🔴 THREE AGE STATES, AND AN UNKNOWN ONE MUST NOT TAKE THE REASSURING BRANCH.
+ *
+ * The first version tested `isFinite(age) && age > threshold`, so an unreadable
+ * clock — NaN, or a negative age from skew — fell through to the sentence
+ * written for a FRESH result. The whole contract of this data is that the age
+ * gates whether it may be quoted as current, so an unknown age has to be at
+ * least as cautious as a stale one, never less.
+ */
+export function describeFreshness(ageSeconds: number): string {
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
+    return '⚠️ I could NOT work out how old this is, so treat it as stale: it may describe how things were at any point in the past.';
+  }
+  return ageSeconds > STALE_AFTER_SECONDS
+    ? '⚠️ STALE: this is more than a day old, so it describes how things WERE, not how they are.'
+    : 'This is a snapshot, not a live probe.';
+}
+
 /** Does this row match what the caller asked about? Exact number, or name substring. */
 function matches(needle: string, number: string, name: string): boolean {
   const n = needle.trim().toLowerCase();
@@ -218,9 +295,10 @@ export const channelHealth: Tool = {
     const needle = typeof args['channel'] === 'string' ? args['channel'] : '';
 
     // 🔴 The results file first, on the UNPRIVILEGED identity: it is a plain
-    // world-readable file and needs no docker, so it takes the smaller capability.
-    const results = await runOnHp(ctx.config.shellSshHost, RESULTS_CMD, 30_000, ctx.exec);
-    if (results.exitCode !== 0) {
+    // world-readable file and needs no docker, so it takes the smaller
+    // capability. Shared with `sports_fixture` — see `readStreamCheck`.
+    const read = await readStreamCheck(ctx.config, ctx.exec);
+    if (!read.ok) {
       /**
        * 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
        *
@@ -229,44 +307,12 @@ export const channelHealth: Tool = {
        * reads as a total Live TV outage.
        */
       return fail(
-        `Could not read ${RESULTS_PATH} on hp, so per-channel health is UNKNOWN — this is NOT ` +
-          `"no channels are working". The stream checker may not have run.\n${renderOutcome(results)}`,
+        `Per-channel health is UNKNOWN — this is NOT "no channels are working". The stream checker ` +
+          `may not have run. ${read.detail}`,
       );
     }
-
-    const lines = results.stdout.split('\n');
-    // ⚠️ `Number('')` is 0, not NaN — an empty first line would silently become
-    // 1970 and render as a very old but perfectly confident timestamp.
-    const mtime = epoch(lines[0]);
-    const now = epoch(lines[1]);
-    const { rows, unparsed } = parseStreamCheck(lines.slice(2).join('\n'));
-    if (rows.length === 0) {
-      return fail(
-        `${RESULTS_PATH} was read but contains no parseable channel rows (${unparsed} unparseable ` +
-          'line(s)). Per-channel health is UNKNOWN.',
-      );
-    }
-
-    const ageSeconds = mtime !== null && now !== null ? now - mtime : NaN;
-    const when = mtime !== null ? new Date(mtime * 1000).toISOString().replace('T', ' ').slice(0, 16) : 'unknown';
-
-    /**
-     * 🔴 THREE AGE STATES, AND AN UNKNOWN ONE MUST NOT TAKE THE REASSURING BRANCH.
-     *
-     * The first version tested `isFinite(age) && age > threshold`, so an
-     * unreadable clock — NaN, or a negative age from skew — fell through to
-     * *"This is a snapshot, not a live probe"*, the sentence written for a FRESH
-     * result. The whole contract of this tool is that the age gates whether its
-     * numbers may be quoted as current, so an unknown age has to be at least as
-     * cautious as a stale one, never less.
-     */
-    const freshness =
-      !Number.isFinite(ageSeconds) || ageSeconds < 0
-        ? '⚠️ I could NOT work out how old this is, so treat it as stale: it may describe how things ' +
-          'were at any point in the past.'
-        : ageSeconds > STALE_AFTER_SECONDS
-          ? '⚠️ STALE: this is more than a day old, so it describes how things WERE, not how they are.'
-          : 'This is a snapshot, not a live probe.';
+    const { rows, unparsed, ageSeconds, when } = read.snapshot;
+    const freshness = describeFreshness(ageSeconds);
 
     /**
      * ⚠️ Carried on EVERY path, not just the whole-picture one. When it appeared
