@@ -346,6 +346,64 @@ test('a happy read reports the URL it issued and the bound', async () => {
   assert.equal(calls[0]?.init?.method, 'GET');
 });
 
+test('🔴 every result states the time it was read — the model has no other clock', async () => {
+  /**
+   * On the first live turn the model spent FOUR tool calls hunting for the
+   * current time (`date` is refused by the command gate, an outbound time API is
+   * unreachable), then hedged its answer and called an already-aired broadcast
+   * "live". Two of the four traps in the description say "compare StartDate
+   * against now yourself", so an instruction it cannot execute is a trap we
+   * built.
+   */
+  const { impl } = recordingFetch(() => json({ SearchHints: [{ Name: 'x' }], TotalRecordCount: 1 }));
+  const before = Date.now();
+  const res = await makeHomelabRead(impl).run({ service: 'jellyfin', path: '/Search/Hints' }, ctx());
+  const stamped = /read at (\S+) —/.exec(res.content)?.[1];
+  assert.ok(stamped, `no read-time in: ${res.content.slice(0, 200)}`);
+  const t = Date.parse(stamped);
+  assert.ok(t >= before - 1000 && t <= Date.now() + 1000, `read-time ${stamped} is not now`);
+  // And the description must point at it, or the model will still go hunting.
+  assert.match(makeHomelabRead().description, /states the time it was read/);
+});
+
+test('🔴 records with a StartDate and no Overview say the replay question is unanswered', async () => {
+  const { impl } = recordingFetch(() =>
+    json({
+      SearchHints: [
+        { Name: 'PL: Everton v Crystal Palace', ChannelId: 'abc', StartDate: '2026-08-25T22:00:00Z' },
+      ],
+      TotalRecordCount: 1,
+    }),
+  );
+  const res = await makeHomelabRead(impl).run({ service: 'jellyfin', path: '/Search/Hints' }, ctx());
+  assert.equal(res.ok, true);
+  assert.match(res.content, /NO Overview, so you cannot yet tell a live fixture from a replay/);
+  assert.match(res.content, /fields=Overview,ChannelInfo/);
+});
+
+test('CONTROL: once Overview IS present the note is gone, so it is not printed unconditionally', async () => {
+  const { impl } = recordingFetch(() =>
+    json({
+      Items: [
+        {
+          Name: 'PL: Everton v Crystal Palace',
+          StartDate: '2026-08-25T22:00:00Z',
+          Overview: 'Coverage from Match Week 1 of the Premier League.',
+        },
+      ],
+      TotalRecordCount: 1,
+    }),
+  );
+  const res = await makeHomelabRead(impl).run({ service: 'jellyfin', path: '/LiveTv/Programs' }, ctx());
+  assert.doesNotMatch(res.content, /cannot yet tell a live fixture/);
+});
+
+test('CONTROL: records with no StartDate at all are not live TV and get no note', async () => {
+  const { impl } = recordingFetch(() => json([{ title: 'Fringe', id: 1 }]));
+  const res = await makeHomelabRead(impl).run({ service: 'sonarr', path: '/series' }, ctx());
+  assert.doesNotMatch(res.content, /cannot yet tell a live fixture/);
+});
+
 test('🔴 HTTP 200 with HTML is reported as a WRONG BASE URL, not as data and not as an outage', async () => {
   const { impl } = recordingFetch(
     () => new Response('<!doctype html><html><body>app</body></html>', { status: 200, headers: { 'content-type': 'text/html' } }),

@@ -88,7 +88,8 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       'teams in its sub-title is invisible to it.\n' +
       '2. /Search/Hints ALSO ignores minStartDate. Most hits it returns have ALREADY AIRED (11 of 13 ' +
       'measured). Compare StartDate against the current time yourself before saying anything about ' +
-      '"tonight".\n' +
+      '"tonight" — every result from this tool states the time it was read, so use THAT as now; do ' +
+      'not go looking for a clock elsewhere and do not guess.\n' +
       '3. A HIT IS USUALLY A REPLAY, and NO structured flag detects it: IsRepeat is absent on exactly ' +
       'the ones that matter and the category is often Show rather than Sport. The marker is in the ' +
       'PROSE. Read Overview via /LiveTv/Programs with channelIds set to the ChannelId that ' +
@@ -249,12 +250,69 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
         );
       }
 
+      /**
+       * 🔴 THE CURRENT TIME SHIPS WITH THE DATA. FOUND BY THE FIRST LIVE TURN.
+       *
+       * Two of the four traps are *"compare StartDate against now yourself"*, and
+       * on the first real run the model could not. It has no clock: the system
+       * prompt carries no date, `hp_shell date` is refused by the command gate,
+       * and an outbound time API is unreachable. So it spent **four tool calls**
+       * hunting — `date`, `/proc/uptime`, worldtimeapi, `stat /proc/1` — then
+       * hedged its whole answer on not knowing, and labelled an Aug 22 broadcast
+       * as the LIVE one.
+       *
+       * An instruction to filter by date that the model cannot execute is not a
+       * cheatsheet, it is a trap of our own making. The time is a fact this
+       * process has and the model does not, so it travels WITH the records whose
+       * dates need comparing, at the moment they were read — not stamped once
+       * into a system prompt that a long-lived pm2 conversation would outlive.
+       */
       return ok(
         `GET ${plan.url}\n` +
-          renderRead(body, { limit, fields: fields.value, maxChars: MAX_OUTPUT_CHARS }),
+          `(read at ${new Date().toISOString()} — compare any StartDate against THIS, not against a guess)\n` +
+          renderRead(body, { limit, fields: fields.value, maxChars: MAX_OUTPUT_CHARS }) +
+          missingOverviewNote(body),
       );
     },
   };
+}
+
+/**
+ * 🔴 SAY THAT THE DECIDING FIELD IS ABSENT, AT THE MOMENT IT IS ABSENT.
+ *
+ * Measured over three live turns on the Crystal Palace question: two answered
+ * correctly, and the third stopped after `/Search/Hints`, led with *"next one is
+ * tonight, 22:00"* and merely OFFERED to check whether it was a replay. It had
+ * been told, in the description, that a hit is usually a replay and that the
+ * marker is in `Overview` — and `/Search/Hints` does not return `Overview`, so at
+ * the moment it decided it was finished, nothing in front of it said otherwise.
+ *
+ * This is not prose-policing and it is not a guard over the reply: the tool is
+ * reporting a **property of the records it just returned** — these have a start
+ * time and no description, so the live-or-replay question is not yet answerable
+ * from them. That is the repo's own rule (return the fact, do not make a guard
+ * guess it back out of English), and it is keyed on the DATA rather than on the
+ * endpoint name, so it fires equally for `/LiveTv/Programs` fetched without
+ * `fields=Overview` — the same defect by the other route.
+ */
+function missingOverviewNote(body: unknown): string {
+  const rows = Array.isArray(body)
+    ? body
+    : ((body as Record<string, unknown> | null)?.['Items'] ??
+        (body as Record<string, unknown> | null)?.['SearchHints']);
+  if (!Array.isArray(rows) || rows.length === 0) return '';
+  const scheduled = rows.filter(
+    (r): r is Record<string, unknown> => !!r && typeof r === 'object' && 'StartDate' in r,
+  );
+  if (scheduled.length === 0) return '';
+  if (scheduled.some((r) => typeof r['Overview'] === 'string' && r['Overview'].trim())) return '';
+  return (
+    '\n⚠️ These records have a StartDate but NO Overview, so you cannot yet tell a live fixture from ' +
+    'a replay or a highlights package — and most guide hits are replays. Before you answer, read the ' +
+    'description: GET /LiveTv/Programs with channelIds set to the ChannelId above, a ' +
+    'minStartDate/maxStartDate window around the slot, and fields=Overview,ChannelInfo. "Coverage ' +
+    'from Match Week N", "Highlights from", "Final:" and a title ending "Hls" all mean a rebroadcast.'
+  );
 }
 
 /**
