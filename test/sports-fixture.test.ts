@@ -295,7 +295,7 @@ test('🔴 a guide that COVERS the window but lists no match says so DIFFERENTLY
   const r = await run(s);
   assert.equal(r.ok, true);
   assert.match(r.content, /3 programmes on 1 channels/);
-  assert.match(r.content, /does cover that window/);
+  assert.match(r.content, /has some data for that window/);
   assert.doesNotMatch(r.content, /does not reach that far ahead/);
   assert.match(r.content, /2026-08-28T19:00Z/);
 });
@@ -688,11 +688,65 @@ test('🔴 the stream check is read ONCE per call, on the UNPRIVILEGED identity,
   }
 });
 
-test('the stream check is NOT read when no channel was found — it has nothing to annotate', async () => {
-  const h = healthStub();
+test('🔴 "the guide covers that window" carries a DENOMINATOR, or it overstates', async () => {
+  /**
+   * 🔴 THE SAME MISTAKE THIS FILE'S AUTHOR MADE IN PROSE, THEN IN CODE.
+   *
+   * I reported that the lineup holds no UK sports channels, from a Friday
+   * window that returned Australian beIN only. Jeff said "I swear we do, go
+   * look" — and he was right: `UK: SKY SPORTS PREMIER LEAGUE HEVC 4K` and
+   * `TNT SPORTS 1-4` are all present and streaming. I had measured the GUIDE
+   * and concluded something about the LINEUP.
+   *
+   * The tool's wording had the identical flaw. Guide depth collapses off a
+   * cliff — 224/243 channels at T+0, 197 at T+2, **13 at T+3** — so at Friday's
+   * kickoff the window still returns ~65 programmes and "the guide does cover
+   * that window" was literally true and thoroughly misleading.
+   */
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () => res(guideBody([filler(1), filler(2)])),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  // The stub's roster is 4 channels; the filler sits on 1 of them → 25%.
+  assert.match(r.content, /only 1 of 4 channels have ANY programmes in that window/);
+});
+
+test('🔴 THIN coverage is called a gap in the GUIDE, not evidence about the lineup', async () => {
+  // 13 of 243 is 5%. The sentence that stops the next reader chasing a lineup
+  // problem that does not exist.
+  const many = Array.from({ length: 40 }, (_, i) => `${i}|CHAN ${i}|OK|h264|1280x720|30`).join('\n');
   const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res(guideBody([filler(1)])) });
-  await run(s, undefined, { exec: h.impl });
-  assert.equal(h.commands.length, 0);
+  const r = await run(s, undefined, { exec: healthStub({ rows: many }).impl });
+  assert.match(r.content, /only 1 of 40 channels have ANY programmes in that window \(3%\)/);
+  assert.match(r.content, /BARELY filled in that far ahead/);
+  assert.match(r.content, /not evidence that nobody is carrying the match/);
+});
+
+test('CONTROL: healthy coverage gets the fraction but NOT the gap warning', async () => {
+  // Without this, the warning could be unconditional and the test above would
+  // still pass. 3 of 4 is 75%.
+  const s = spy({
+    espn: () => res(espnBody([espnEvent()])),
+    guide: () =>
+      res(
+        guideBody([
+          { ...filler(1), ChannelName: 'TBS HD' },
+          { ...filler(2), ChannelName: 'US: TRUTV 4K' },
+          { ...filler(3), ChannelName: 'UK: SKY SPORTS MAIN EVENT' },
+        ]),
+      ),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  assert.match(r.content, /only 3 of 4 channels have ANY programmes in that window \(75%\)/);
+  assert.doesNotMatch(r.content, /BARELY filled in/);
+});
+
+test('an unreadable sweep gives NO coverage claim rather than a guessed one', async () => {
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res(guideBody([filler(1)])) });
+  const r = await run(s, undefined, { exec: healthStub({ exit: 1 }).impl });
+  assert.doesNotMatch(r.content, /channels have ANY programmes/);
+  assert.match(r.content, /NO CHANNELS LISTED YET/);
 });
 
 test('🔴 duplicate listings are collapsed only when IDENTICAL, and the collapse is REPORTED', async () => {
@@ -859,6 +913,32 @@ test('🔴 a later fixture lists ALL its channels too, not just the first', asyn
     assert.ok(laterBlock.includes(c), `${c} is missing from the later fixture`);
   }
   assert.match(laterBlock, /4 channel\(s\), 3 working at the last check, 1 FAILED the last check/);
+});
+
+test('the stream check is NOT read when the guide could not be searched at all', async () => {
+  // Nothing to annotate and no denominator to report — so no ssh round trip.
+  const h = healthStub();
+  const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res('boom', 500) });
+  await run(s, undefined, { exec: h.impl });
+  assert.equal(h.commands.length, 0);
+});
+
+test('🔴 health is read when the NEXT fixture\'s guide FAILED but a later one succeeded', async () => {
+  // The case that separates "the next fixture was searched" from "any fixture
+  // was searched". Without it, a mutation narrowing the condition to the next
+  // fixture alone leaves the suite green.
+  const soon = '2026-08-27T19:00Z';
+  let call = 0;
+  const s = spy({
+    espn: () => res(espnBody([espnEvent(), espnEvent({ id: '2', date: soon })])),
+    guide: () => (call++ === 0 ? res('gateway timeout', 504) : multiChannel()),
+  });
+  const h = healthStub();
+  const r = await run(s, undefined, { exec: h.impl });
+  assert.equal(h.commands.length, 1, 'the later fixture was searched, so the sweep is worth reading');
+  assert.match(r.content, /UK: SKY SPORTS MAIN EVENT {2}\[WORKING at the last check/);
+  // And the failed next-fixture lookup still does not suppress the kickoff.
+  assert.match(r.content, /2026-08-28T19:00Z/);
 });
 
 test('🔴 a later fixture BEYOND the guide reach is UNCHECKED, never "no channel"', async () => {

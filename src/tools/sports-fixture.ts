@@ -198,6 +198,35 @@ function overviewNote(guide: Extract<GuideAnswer, { state: 'searched' }>): strin
   );
 }
 
+/**
+ * 🔴 "THE GUIDE COVERS THAT WINDOW" NEEDS A DENOMINATOR OR IT OVERSTATES.
+ *
+ * Measured 2026-08-25, and it is the same mistake this file's own author made
+ * in prose before making it in code: guide depth collapses off a CLIFF, not a
+ * slope. Channels with any data in a four-hour window —
+ *
+ *     T+0  224/243     T+1  220/243     T+2  197/243     T+3  13/243     T+4  12/243
+ *
+ * At T+3 the window still returns ~65 programmes, so "the guide does cover that
+ * window" was literally true and thoroughly misleading: 13 of 243 channels had
+ * filled in, and NONE of the fifteen UK sports channels had. Reporting the
+ * fraction turns an implied "nobody is showing it" into the real finding, which
+ * is "the guide has barely reached this far".
+ *
+ * ⚠️ The denominator is the channel count from the stream check, so it is
+ * "channels the last sweep knows about", not a subscription list. Absent when
+ * the sweep could not be read — and then this says nothing rather than guessing.
+ */
+function coverageNote(channelsWithData: number, health: HealthRow[] | null): string {
+  if (!health || health.length === 0) return '';
+  const pct = Math.round((channelsWithData / health.length) * 100);
+  const base = `  Coverage: only ${channelsWithData} of ${health.length} channels have ANY programmes in that window (${pct}%).`;
+  return pct < 25
+    ? `${base} 🔴 The guide has BARELY filled in that far ahead, so this is a gap in the guide, not ` +
+        'evidence that nobody is carrying the match. Expect channels to appear as the date gets closer.'
+    : base;
+}
+
 /** Append a line only when it has content, so an inapplicable note is absent rather than blank. */
 function pushIf(parts: string[], line: string): void {
   if (line) parts.push(line);
@@ -386,10 +415,17 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
 
       let healthRows: HealthRow[] | null = null;
       let healthNote = '';
-      const anyChannelFound =
-        (guide.state === 'searched' && guide.matches.length > 0) ||
-        laterGuides.some((l) => l.guide?.state === 'searched' && l.guide.matches.length > 0);
-      if (anyChannelFound) {
+      /**
+       * 🔴 READ WHENEVER THE GUIDE WAS SEARCHED, NOT ONLY WHEN IT FOUND SOMETHING.
+       *
+       * It used to be gated on a channel having been found, because health was
+       * the only thing it was for. The roster COUNT turned out to matter just as
+       * much in the opposite case — see `coverageNote`. A "no channels" answer
+       * needs a denominator, and the denominator is in the same file.
+       */
+      const anyGuideSearched =
+        guide.state === 'searched' || laterGuides.some((l) => l.guide?.state === 'searched');
+      if (anyGuideSearched) {
         const read = await readStreamCheck(ctx.config, ctx.exec);
         if (read.ok) {
           healthRows = read.snapshot.rows;
@@ -459,9 +495,10 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
           );
         } else {
           parts.push(
-            '  NO CHANNELS LISTED YET — the guide does cover that window, but no programme in it ' +
-              'names both teams.',
+            '  NO CHANNELS LISTED YET — the guide has some data for that window, but no programme ' +
+              'in it names both teams.',
           );
+          pushIf(parts, coverageNote(guide.channels, healthRows));
         }
         pushIf(parts, overviewNote(guide));
         parts.push(
