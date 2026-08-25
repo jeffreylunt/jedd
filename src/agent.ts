@@ -91,6 +91,16 @@ function systemPrompt(config: Config): string {
     // The earlier answer had been about the next fixture over 30 days; "today"
     // is a different window, so the old result did not cover the new question
     // and re-stating it was guessing with extra steps.
+    // 🔴 Jeff: "always give the time zone because we don't know where users will
+    // be." Measured in data/audit.jsonl across two turns: the model wrote the
+    // zone in full ONCE and truncated it to "M" for every repeat — "19:30 M",
+    // which reads as a typo rather than a zone. A mangled label is worse than
+    // an absent one, and the degradation began at the SECOND occurrence.
+    'ALWAYS write a time zone with every clock time — every one, including the second and third in',
+    'the same message. People reading this are not all in the same place as the server. Never',
+    'shorten a zone to a letter or two ("19:30 M" is meaningless); write "MDT"/"MST" or the UTC time',
+    'in full. If you must shorten something, keep the UTC time — it is the one that works everywhere.',
+    '',
     'A follow-up that changes WHEN — "today", "tonight", "this week", "what about tomorrow" — is a',
     'NEW question. Your earlier answer covered a different window and does not answer it. Call the',
     'tool again. Never answer a factual question about a specific time from something you already',

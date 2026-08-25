@@ -112,28 +112,72 @@ const GUIDE_HORIZON_MS = 5 * 86_400_000;
  * guess. UTC, local wall-clock and a relative phrase are all rendered here so
  * that none of it is arithmetic anybody has to do.
  */
+/** The zone abbreviation for DISPLAY_TZ at this instant — "MDT" or "MST". */
+function zoneAbbrev(at: Date): string {
+  // ⚠️ LOCALE DECIDES WHETHER THIS IS USABLE. `en-GB` renders the zone as
+  // "GMT-6"; `en-US` gives "MDT". An earlier version used en-GB throughout and
+  // produced a generic offset that read like noise, which is half of why the
+  // model felt free to compress it. Same ICU data, different locale.
+  const part = new Intl.DateTimeFormat('en-US', { timeZone: DISPLAY_TZ, timeZoneName: 'short' })
+    .formatToParts(at)
+    .find((p) => p.type === 'timeZoneName');
+  return part?.value ?? '';
+}
+
+/**
+ * A kickoff, rendered so that EVERY clock time carries a zone.
+ *
+ * 🔴 JEFF: *"Let's make sure it always gives the time zone because we don't know
+ * where users will be."* Jedd answers people who are not in Denver, and a bare
+ * "19:30" is unusable to them.
+ *
+ * ── THE MEASURED FAILURE IS DEGRADATION ON REPETITION, NOT OMISSION ──────────
+ *
+ * From `data/audit.jsonl`, reproduced across two independent turns: the model
+ * writes the zone in full ONCE and then truncates it for every repeat.
+ *
+ *     Tue 25 Aug, 20:30 Mountain     ← first occurrence, correct
+ *     Sat 29 Aug, 19:30 M            ← second
+ *     Sat 5 Sept, 19:30 M            ← third
+ *     Wed 9 Sept, 18:30 M            ← fourth
+ *
+ * 🔴 `19:30 M` is WORSE than no zone at all. A missing label prompts a reader to
+ * ask; a mangled one looks like a stray character they should ignore, and a
+ * reader in London cannot tell whether the `M` meant anything.
+ *
+ * ⚠️ And note the shape for anything else that formats a repeated value: **the
+ * first instance was perfect.** Any check that samples the lead passes here.
+ *
+ * ── SO EVERY TIME GETS TWO INDEPENDENT ANCHORS ──────────────────────────────
+ *
+ * UTC first, because it is the one form that cannot be shortened into
+ * ambiguity — there is no abbreviation of "UTC" that loses its meaning — and it
+ * is what a reader outside Mountain time actually needs. The local time follows
+ * with a real abbreviation (`MDT`/`MST`, correct across the DST boundary), so a
+ * compression that drops one still leaves the other.
+ */
 export function renderKickoff(kickoffMs: number, nowMs: number): string {
-  // Minute precision, matching the form ESPN itself uses (`2026-08-28T19:00Z`),
-  // so the rendered stamp and the source agree character for character.
-  const iso = `${new Date(kickoffMs).toISOString().slice(0, 16)}Z`;
-  let local: string;
+  const at = new Date(kickoffMs);
+  // `2026-08-28 19:00 UTC` — full date, so the line stands alone.
+  const utc = `${at.toISOString().slice(0, 10)} ${at.toISOString().slice(11, 16)} UTC`;
+
+  let local = '';
   try {
-    const formatted = new Intl.DateTimeFormat('en-GB', {
+    const wall = new Intl.DateTimeFormat('en-GB', {
       timeZone: DISPLAY_TZ,
       weekday: 'short',
       day: 'numeric',
       month: 'short',
-      hour: 'numeric',
+      hour: '2-digit',
       minute: '2-digit',
-      timeZoneName: 'short',
-    }).format(new Date(kickoffMs));
-    // ⚠️ Under a small-ICU node `timeZoneName: 'short'` renders as "GMT-6", not
-    // "MDT". Both are unambiguous about the offset and neither says WHOSE local
-    // time it is, so the zone is named alongside rather than left to be inferred.
-    local = `${formatted} Mountain`;
+      hour12: false,
+    }).format(at);
+    const abbrev = zoneAbbrev(at);
+    local = abbrev ? `${wall} ${abbrev}` : '';
   } catch {
-    local = 'local time unavailable';
+    local = '';
   }
+
   const deltaMs = kickoffMs - nowMs;
   const hours = deltaMs / 3_600_000;
   let relative: string;
@@ -148,7 +192,13 @@ export function renderKickoff(kickoffMs: number, nowMs: number): string {
     const d = Math.round(hours / 24);
     relative = `in ${d} ${d === 1 ? 'day' : 'days'}`;
   }
-  return `${iso} — ${local} (${relative})`;
+
+  /**
+   * 🔴 THE FALLBACK KEEPS THE TIME. The previous version returned "local time
+   * unavailable" and dropped the clock entirely — a total loss, when the UTC
+   * stamp was already in hand and answers the question for everyone.
+   */
+  return local ? `${utc} = ${local} — ${relative}` : `${utc} (local time unavailable) — ${relative}`;
 }
 
 const HEALTH_LABEL: Record<ChannelOption['health'], string> = {
