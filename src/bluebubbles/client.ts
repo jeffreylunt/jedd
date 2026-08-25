@@ -107,6 +107,19 @@ export interface BlueBubblesOptions {
 export interface ServerInfo {
   detectedIMessage: string;
   serverVersion: string;
+  /**
+   * 🔴 THESE TWO ARE NOT THE SAME QUESTION, AND EITHER ONE ALONE LIES.
+   *
+   * `privateApiEnabled` is a SETTING in BlueBubbles' own config.
+   * `helperConnected` is whether the helper dylib is actually loaded into
+   * Messages.app, which only happens with SIP disabled.
+   *
+   * Measured on this server 2026-08-25: `true` and `false` respectively. Reading
+   * only the first would say the Private API is on — and every typing indicator
+   * and read receipt would still fail. The pair is the state.
+   */
+  privateApiEnabled: boolean;
+  helperConnected: boolean;
 }
 
 export interface SendResult {
@@ -193,6 +206,9 @@ export class BlueBubblesClient {
     return {
       detectedIMessage: detected,
       serverVersion: String(d?.['server_version'] ?? 'unknown'),
+      // Strict `=== true`: an absent or unparseable field is NOT a capability.
+      privateApiEnabled: d?.['private_api'] === true,
+      helperConnected: d?.['helper_connected'] === true,
     };
   }
 

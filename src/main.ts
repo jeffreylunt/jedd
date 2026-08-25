@@ -68,6 +68,26 @@ async function main(): Promise<void> {
   });
   const info = await client.assertIdentity();
   console.error(`[jedd] BlueBubbles ${info.serverVersion} bridging ${info.detectedIMessage}`);
+  /**
+   * 🔴 THE ONE LINE THAT SAYS WHETHER DISABLING SIP WORKED.
+   *
+   * Typing indicators and read receipts need the helper bundle, and the failure
+   * is otherwise completely silent by design — `Presence` swallows it so it can
+   * never touch a reply. Silence is the right behaviour and the wrong diagnostic,
+   * so the state is stated once at boot where somebody looking for it will find
+   * it.
+   *
+   * ⚠️ BOTH FLAGS, NOT ONE. `private_api` is the setting; `helper_connected` is
+   * whether the dylib actually loaded. On 2026-08-25 they read `true` and
+   * `false` — the setting alone would have said the feature was on.
+   */
+  console.error(
+    info.helperConnected
+      ? '[jedd] presence: typing indicators and read receipts are LIVE (private api on, helper connected).'
+      : `[jedd] presence: typing indicators and read receipts are OFF — private_api=${info.privateApiEnabled}, ` +
+        'helper_connected=false. Needs SIP disabled and the BlueBubbles helper bundle installed. ' +
+        'Nothing else is affected; the calls fail in ~3ms and are swallowed.',
+  );
   console.error(
     audience === 'everyone'
       ? '[jedd] 🔴 SEND AUDIENCE: everyone — this is a real cutover, not a rehearsal.'

@@ -181,6 +181,39 @@ test('🔴 typing addresses the SAME chat guid that a send addresses — not a s
   assert.ok(calls[1]?.url.includes(encodeURIComponent(String(sentGuid))), calls[1]?.url);
 });
 
+test('🔴 serverInfo reports the SETTING and the HELPER separately — either alone lies', async () => {
+  // The live state on 2026-08-25: the Private API setting is ON and the helper
+  // is NOT loaded. Reading only `private_api` says the feature is available,
+  // and every call would still fail.
+  const { impl } = scripted(() => ({
+    body: {
+      status: 200,
+      data: {
+        detected_imessage: 'jedd@invalid',
+        server_version: '1.9.9',
+        private_api: true,
+        helper_connected: false,
+      },
+    },
+  }));
+  const info = await client(impl).serverInfo();
+  assert.equal(info.privateApiEnabled, true);
+  assert.equal(info.helperConnected, false);
+});
+
+test('a missing or non-boolean helper flag is NOT read as a capability', async () => {
+  for (const helper of [undefined, 'true', 1, null]) {
+    const { impl } = scripted(() => ({
+      body: {
+        status: 200,
+        data: { detected_imessage: 'jedd@invalid', server_version: '1.9.9', helper_connected: helper },
+      },
+    }));
+    const info = await client(impl).serverInfo();
+    assert.equal(info.helperConnected, false, `helper_connected=${JSON.stringify(helper)} was read as available`);
+  }
+});
+
 test('🔴 the LIVE helper-absent 500 is recognised as expected, not as a fault', async () => {
   const { impl } = scripted(() => ({ status: 500, body: HELPER_ABSENT_BODY }));
   const r = await client(impl).startTyping(chatGuidFor(OWNER));
