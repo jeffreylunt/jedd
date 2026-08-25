@@ -6,8 +6,8 @@ import { test } from 'node:test';
 import { DEDUPE_MS, InviteLedger, QUOTA_MAX, QUOTA_WINDOW_MS } from '../src/invite-ledger.js';
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jedd-inv-')), 'l.jsonl');
-const JEFF = '+15555550100';
-const GUEST = '+13854346068';
+const JEFF = '+18015550123';
+const GUEST = '+13855550168';
 const now = new Date('2026-08-24T20:00:00Z');
 const ago = (ms: number) => new Date(now.getTime() - ms).toISOString();
 

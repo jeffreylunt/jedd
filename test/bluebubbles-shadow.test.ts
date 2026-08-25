@@ -26,7 +26,7 @@ const echo = (text: string) =>
       guid: 'G',
       text,
       isFromMe: true,
-      handle: { address: '+15555550100' },
+      handle: { address: '+18015550123' },
     },
   });
 

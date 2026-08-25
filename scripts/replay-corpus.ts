@@ -33,8 +33,17 @@ import { buildTools } from '../src/tools/index.js';
 const CORPUS = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v1-parity-corpus.jsonl';
 const OUT = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v2-replay.jsonl';
 
-/** Jeff's real handle. Set as owner so the OWNER path is measured, not assumed. */
-const REAL_OWNER = '+15555550100';
+/**
+ * The handle to replay as OWNER, so the OWNER path is measured, not assumed.
+ *
+ * Sourced from `JEDD_REPLAY_OWNER_HANDLE`, falling back to the configured
+ * `OWNER_HANDLE`. It exists as a separate variable because the live shadow runs
+ * with a SYNTHETIC owner handle, and a replay wants the real one — but the value
+ * is never hardcoded here. An unset override simply replays as whoever
+ * `OWNER_HANDLE` names, which is the safe reading: it cannot silently promote a
+ * handle that the running config does not already treat as the owner.
+ */
+const REPLAY_OWNER = process.env.JEDD_REPLAY_OWNER_HANDLE?.trim();
 
 /**
  * 🔴 CONVERSATIONS, NOT ISOLATED TURNS.
@@ -117,7 +126,7 @@ async function main(): Promise<void> {
   // 🔴 Measure the OWNER path. It carries the write privileges, so it cannot ship
   // unmeasured — and offline, with writes blocked at the transport, setting this
   // costs nothing. The live shadow keeps the synthetic handle.
-  const config = { ...base, ownerHandle: REAL_OWNER };
+  const config = REPLAY_OWNER ? { ...base, ownerHandle: REPLAY_OWNER } : base;
 
   const llm = stub
     ? {

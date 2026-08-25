@@ -238,7 +238,7 @@ export function parseSendAudience(raw: string | undefined): SendAudience {
     throw new Error(
       'JEDD_SEND_TO is not set, so I do not know who I am allowed to text and I will not guess. ' +
         'Set it to "everyone" for a real cutover, or to a comma-separated list of handles ' +
-        '(e.g. JEDD_SEND_TO="+15555550100") for an attended rehearsal, where everyone else gets ' +
+        '(e.g. JEDD_SEND_TO="+15551234567") for an attended rehearsal, where everyone else gets ' +
         'silence rather than an untested answer.',
     );
   }

@@ -14,8 +14,8 @@ import { testConfig } from './helpers.js';
 const HASH = 'abcdef0123456789abcdef0123456789abcdef01';
 const BOOK = Buffer.from('epub bytes here');
 const SHA = createHash('sha256').update(BOOK).digest('hex');
-const JEFF = '+15555550100';
-const OTHER = '+13854346068';
+const JEFF = '+18015550123';
+const OTHER = '+13855550168';
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jedd-se-')), 'f.jsonl');
 

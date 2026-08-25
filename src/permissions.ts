@@ -19,6 +19,12 @@ export type Role = 'owner' | 'guest';
  * handle.
  */
 export function normaliseHandle(handle: string): string {
+  // 🔴 A non-string (an absent config key arrives as `undefined`) is NOT an
+  // identity. Returning '' makes it a guest; letting `.trim()` throw would send
+  // a TypeError up through the gate, and a caller that catches broadly could
+  // turn that into any answer at all. Deny explicitly instead of throwing.
+  if (typeof handle !== 'string') return '';
+
   const trimmed = handle.trim().toLowerCase();
   if (!trimmed) return '';
 
@@ -29,8 +35,29 @@ export function normaliseHandle(handle: string): string {
     // A bare 10-digit US number is the same number as `1` + those 10 digits.
     // This is an EXACT widening of one known case, not a suffix match.
     if (digits.length === 10) digits = `1${digits}`;
+    /**
+     * 🔴 TOO FEW DIGITS TO BE ANYBODY.
+     *
+     * Measured fail-OPEN this guard closes: `OWNER_HANDLE="+1 () -."` normalised
+     * to `tel:1`, and so did a sender whose handle was `1` — so a typo in the
+     * config GRANTED OWNER to a junk handle. The gate compares normalised forms
+     * for equality, which means every value that survives normalisation is a
+     * usable identity, and a one-digit fragment must not be one.
+     *
+     * 11 digits is the real floor: US numbers reach it via the `1` prepended
+     * above, and longer international forms pass through untouched.
+     */
+    if (digits.length < 11) return '';
     return `tel:${digits}`;
   }
+
+  /**
+   * 🔴 Punctuation with no alphanumeric content is not an identity either.
+   * `OWNER_HANDLE="+"` fell through to here and returned `'+'`, which compared
+   * EQUAL to a sender handle of `'+'` — the same fail-open by the other route,
+   * because `+` is not phone-shaped enough to reach the digit check above.
+   */
+  if (!/[a-z0-9]/.test(trimmed)) return '';
 
   return trimmed;
 }

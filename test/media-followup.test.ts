@@ -15,7 +15,7 @@ import { testConfig } from './helpers.js';
  * nothing. Every test here is about the telling, not the adding.
  */
 
-const GUEST = '+18017078488';
+const GUEST = '+18015550188';
 const OWNER = '+18015550123';
 
 function store(): FollowupStore {

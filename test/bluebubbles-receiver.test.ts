@@ -304,7 +304,7 @@ test('the cutover value has to be typed out in full', () => {
 });
 
 test('a rehearsal audience is parsed as a handle list', () => {
-  assert.deepEqual(parseSendAudience(' +15555550100 , jeff@example.com '), ['+15555550100', 'jeff@example.com']);
+  assert.deepEqual(parseSendAudience(' +18015550123 , jeff@example.com '), ['+18015550123', 'jeff@example.com']);
 });
 
 test('🔴 a reply to a handle outside the audience never reaches sendText', async () => {
@@ -319,17 +319,17 @@ test('🔴 a reply to a handle outside the audience never reaches sendText', asy
   const connector = new BlueBubblesConnector(
     null as unknown as BlueBubblesReceiver,
     client,
-    ['+15555550100'],
+    ['+18015550123'],
     (to) => suppressed.push(to),
   );
 
-  await connector.send('+15555550100', 'hello Jeff');
+  await connector.send('+18015550123', 'hello Jeff');
   await connector.send('+15551112222', 'hello somebody else');
 
   // 🔴 The gate is above the transport. Not a prompt line, not an agent check —
   // the suppressed reply has no path to the wire even if every layer above it
   // decided to answer.
-  assert.deepEqual(sent, ['+15555550100']);
+  assert.deepEqual(sent, ['+18015550123']);
   assert.deepEqual(suppressed, ['+15551112222']);
 });
 
@@ -407,7 +407,7 @@ function historyClient(history: number, calls: string[]): BlueBubblesClient {
     guid: `g${2601 - i}`,
     text: 'an old message',
     isFromMe: false,
-    handle: { address: '+15555550100' },
+    handle: { address: '+18015550123' },
   }));
   return new BlueBubblesClient({
     baseUrl: 'http://bb.invalid:1234',

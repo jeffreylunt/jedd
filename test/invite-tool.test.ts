@@ -17,8 +17,8 @@ const inertDeps = (): InviteDeps => ({
 });
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jedd-it-')), 'l.jsonl');
-const GUEST = '+13854346068';
-const JEFF = '+15555550100';
+const GUEST = '+13855550168';
+const JEFF = '+18015550123';
 const TARGET = '+15551234567';
 
 /** A jfa-go that mints fine; `revokeOk:false` makes revocation itself fail. */

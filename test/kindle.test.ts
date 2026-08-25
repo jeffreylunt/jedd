@@ -10,8 +10,8 @@ function tempFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'jedd-kindle-')), 'kindle.jsonl');
 }
 
-const JEFF = '+15555550100';
-const OTHER = '+13854346068';
+const JEFF = '+18015550123';
+const OTHER = '+13855550168';
 
 // ── 🔴 the fabricated address ────────────────────────────────────────────────
 
