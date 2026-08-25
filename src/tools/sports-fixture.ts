@@ -112,6 +112,19 @@ const GUIDE_HORIZON_MS = 5 * 86_400_000;
  * guess. UTC, local wall-clock and a relative phrase are all rendered here so
  * that none of it is arithmetic anybody has to do.
  */
+/**
+ * `13, 5` → `"1:05 PM"`.
+ *
+ * 🔴 THE NOON/MIDNIGHT TRAP LIVES HERE. `h % 12` maps BOTH 0 and 12 to zero and
+ * prints "0:00 AM" for midnight and "0:00 PM" for noon. Hour 0 and hour 12 are
+ * both displayed as **12**, with only the meridiem differing.
+ */
+export function hourMinute12(hour: number, minute: number): string {
+  const h = hour % 12 === 0 ? 12 : hour % 12;
+  const meridiem = hour < 12 ? 'AM' : 'PM';
+  return `${h}:${String(minute).padStart(2, '0')} ${meridiem}`;
+}
+
 /** The zone abbreviation for DISPLAY_TZ at this instant — "MDT" or "MST". */
 function zoneAbbrev(at: Date): string {
   // ⚠️ LOCALE DECIDES WHETHER THIS IS USABLE. `en-GB` renders the zone as
@@ -158,19 +171,43 @@ function zoneAbbrev(at: Date): string {
  */
 export function renderKickoff(kickoffMs: number, nowMs: number): string {
   const at = new Date(kickoffMs);
-  // `2026-08-28 19:00 UTC` — full date, so the line stands alone.
-  const utc = `${at.toISOString().slice(0, 10)} ${at.toISOString().slice(11, 16)} UTC`;
+
+  /**
+   * 🔴 12-HOUR, BECAUSE THE MODEL WAS ALREADY CONVERTING IT — SILENTLY.
+   *
+   * Jeff: *"make it in 12 hour time too."* The tool had been emitting 24-hour
+   * because `en-GB` defaults to it, and the audit shows the model sometimes
+   * rewrote `19:30` into `7:30 PM` on its own. That rewriting is the mechanism
+   * behind the zone truncation: the zone SURVIVED wherever the model copied a
+   * value verbatim and was mangled to `M` wherever it reformatted.
+   *
+   * So emitting the form Jeff wants is not cosmetic — **it removes the motive
+   * to rewrite**, and output nobody wants to alter enforces itself. That is a
+   * better mechanism than another prompt instruction, which competes with
+   * everything else in the prompt. The instruction is kept as a backstop, not
+   * as the primary defence.
+   *
+   * ⚠️ `hour12: true` is what makes noon and midnight correct. A hand-rolled
+   * `h % 12` maps both to 0 and prints "0:00 AM"; Intl gives "12:00 PM" and
+   * "12:00 AM". The tests pick times that can only pass one way.
+   */
+  // 🔴 BUILT WITHOUT `Intl`, ON PURPOSE. This is the anchor the local time falls
+  // back to, so it must not share the dependency that can fail. An earlier
+  // version formatted it through Intl too, which meant a broken ICU took out
+  // the fallback and the thing it was falling back FROM — the test that stubs
+  // Intl to throw caught exactly that.
+  const utc = `${at.toISOString().slice(0, 10)} ${hourMinute12(at.getUTCHours(), at.getUTCMinutes())} UTC`;
 
   let local = '';
   try {
-    const wall = new Intl.DateTimeFormat('en-GB', {
+    const wall = new Intl.DateTimeFormat('en-US', {
       timeZone: DISPLAY_TZ,
       weekday: 'short',
       day: 'numeric',
       month: 'short',
-      hour: '2-digit',
+      hour: 'numeric',
       minute: '2-digit',
-      hour12: false,
+      hour12: true,
     }).format(at);
     const abbrev = zoneAbbrev(at);
     local = abbrev ? `${wall} ${abbrev}` : '';
@@ -195,10 +232,15 @@ export function renderKickoff(kickoffMs: number, nowMs: number): string {
 
   /**
    * 🔴 THE FALLBACK KEEPS THE TIME. The previous version returned "local time
-   * unavailable" and dropped the clock entirely — a total loss, when the UTC
-   * stamp was already in hand and answers the question for everyone.
+   * unavailable" and dropped the clock entirely — a total loss, with the UTC
+   * stamp already in hand.
+   *
+   * ⚠️ The UTC part carries its own DATE, which is load-bearing rather than
+   * verbose: a 8:30 PM MDT kickoff is the NEXT day in UTC, and a bare
+   * "(2:30 AM UTC)" beside "Tue 25 Aug" would read as the small hours of the
+   * same evening.
    */
-  return local ? `${utc} = ${local} — ${relative}` : `${utc} (local time unavailable) — ${relative}`;
+  return local ? `${local} (${utc}) — ${relative}` : `${utc} (local time unavailable) — ${relative}`;
 }
 
 const HEALTH_LABEL: Record<ChannelOption['health'], string> = {
@@ -604,7 +646,7 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
         if (read.ok) {
           healthRows = read.snapshot.rows;
           healthNote =
-            `Channel health is from the stream check that ran ${read.snapshot.when} UTC — ` +
+            `Channel health is from the stream check that ran ${read.snapshot.when} — ` +
             `${describeAge(read.snapshot.ageSeconds)}. ${describeFreshness(read.snapshot.ageSeconds)}` +
             (read.snapshot.unparsed
               ? ` ⚠️ ${read.snapshot.unparsed} line(s) of it did not parse, so the check itself may be malfunctioning.`

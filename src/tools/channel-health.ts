@@ -1,5 +1,6 @@
 import type { Config } from '../config.js';
 import { renderOutcome, runOnHp, type ExecImpl } from '../hp.js';
+import { hourMinute12 } from './sports-fixture.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -233,7 +234,10 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
       rows,
       unparsed,
       ageSeconds: mtime !== null && now !== null ? now - mtime : NaN,
-      when: mtime !== null ? new Date(mtime * 1000).toISOString().replace('T', ' ').slice(0, 16) : 'unknown',
+      // 🔴 12-hour with a zone, same rule as every other time a reader sees —
+      // Jeff: "always give the time zone" and "make it in 12 hour time too".
+      // This string is quoted straight into replies by both tools that use it.
+      when: mtime !== null ? formatSnapshotTime(new Date(mtime * 1000)) : 'unknown',
     },
   };
 }
@@ -247,6 +251,11 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
  * gates whether it may be quoted as current, so an unknown age has to be at
  * least as cautious as a stale one, never less.
  */
+/** `2026-08-23 3:15 PM UTC` — reader-facing, so 12-hour and zoned. */
+function formatSnapshotTime(at: Date): string {
+  return `${at.toISOString().slice(0, 10)} ${hourMinute12(at.getUTCHours(), at.getUTCMinutes())} UTC`;
+}
+
 export function describeFreshness(ageSeconds: number): string {
   if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
     return '⚠️ I could NOT work out how old this is, so treat it as stale: it may describe how things were at any point in the past.';
@@ -325,7 +334,7 @@ export const channelHealth: Tool = {
         'malfunctioning and this list may be incomplete.'
       : '';
 
-    const sections: string[] = [`Stream check last ran ${when} UTC — ${describeAge(ageSeconds)}. ${freshness}${garbage}`];
+    const sections: string[] = [`Stream check last ran ${when} — ${describeAge(ageSeconds)}. ${freshness}${garbage}`];
 
     /**
      * ── 🔴 THE ROSTER HALF IS OWNER-ONLY, AND THE REASON IS THE MECHANISM ────

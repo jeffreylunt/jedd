@@ -31,7 +31,7 @@ const ROSTER = [
   '90|NEWLY ADDED CHANNEL|f|f',
 ].join('\n');
 
-const MTIME = 1_787_498_113; // 2026-08-23 15:15:13Z, the live file's real mtime
+const MTIME = 1_787_498_113; // 2026-08-23 3:15 PM:13Z, the live file's real mtime
 const HOUR = 3600;
 
 /**
@@ -118,7 +118,7 @@ test('🔴 the age is stated first, always', async () => {
   const { impl } = execStub(MTIME + 3 * HOUR);
   const res = await channelHealth.run({}, ctx(impl));
   assert.equal(res.ok, true);
-  assert.match(res.content.split('\n')[0] ?? '', /Stream check last ran 2026-08-23 15:15 UTC — 3h ago/);
+  assert.match(res.content.split('\n')[0] ?? '', /Stream check last ran 2026-08-23 3:15 PM UTC — 3h ago/);
 });
 
 test('🔴 a snapshot older than a day is called STALE, not presented as current', async () => {
@@ -156,7 +156,7 @@ test('🔴 an empty mtime line is UNKNOWN, not 1970 — Number("") is 0', async 
     return cb(null, `${ROSTER}\n`, '');
   };
   const res = await channelHealth.run({}, ctx(noMtime));
-  assert.match(res.content, /last ran unknown UTC/);
+  assert.match(res.content, /last ran unknown —/);
   assert.doesNotMatch(res.content, /1970/);
   assert.match(res.content, /treat it as stale/);
 });

@@ -34,7 +34,7 @@ const KICKOFF = '2026-08-28T19:00Z';
  * holds the REASON on a fail row, not a codec, and rendering it as a codec
  * prints an HTTP error where a codec should be.
  */
-const HEALTH_MTIME = 1_787_498_113; // 2026-08-23 15:15:13Z
+const HEALTH_MTIME = 1_787_498_113; // 2026-08-23 3:15 PM:13Z
 const HEALTH_ROWS = [
   '1|UK: SKY SPORTS MAIN EVENT|OK|h264|1920x1080|60000/1001',
   '2|US: TRUTV 4K|OK|hevc|3840x2160|60000/1001',
@@ -280,7 +280,7 @@ test('🔴 a fixture BEYOND the guide reports the KICKOFF and says the channel i
 
   assert.equal(r.ok, true, 'this is an ANSWER — the kickoff is known');
   assert.match(r.content, /NEXT: Manchester City at Crystal Palace/);
-  assert.match(r.content, /2026-08-28 19:00 UTC/, 'the kickoff must be in the reply');
+  assert.match(r.content, /2026-08-28 7:00 PM UTC/, 'the kickoff must be in the reply');
   assert.match(r.content, /NO CHANNELS LISTED YET/);
   assert.match(r.content, /does not reach that far ahead/);
   assert.match(r.content, /A MISSING CHANNEL IS NOT A MISSING FIXTURE/);
@@ -302,7 +302,7 @@ test('🔴 a guide that COVERS the window but lists no match says so DIFFERENTLY
   assert.match(r.content, /3 programmes on 1 channels/);
   assert.match(r.content, /has some data for that window/);
   assert.doesNotMatch(r.content, /does not reach that far ahead/);
-  assert.match(r.content, /2026-08-28 19:00 UTC/);
+  assert.match(r.content, /2026-08-28 7:00 PM UTC/);
 });
 
 test('🔴 a TRUNCATED guide scan is NOT reported as a clean zero', async () => {
@@ -327,7 +327,7 @@ test('🔴 a guide that cannot be READ still reports the kickoff', async () => {
   const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: () => res('nope', 500) });
   const r = await run(s);
   assert.equal(r.ok, true);
-  assert.match(r.content, /2026-08-28 19:00 UTC/);
+  assert.match(r.content, /2026-08-28 7:00 PM UTC/);
   assert.match(r.content, /could NOT be searched/);
   assert.match(r.content, /kickoff above still stands/);
   assert.doesNotMatch(r.content, /not playing/i);
@@ -573,7 +573,7 @@ test('🔴 RSL at León resolves WITHOUT a league argument — the competition w
   // satisfied by the SEARCHED scope line, which names every competition — so
   // dropping the per-fixture tag would leave the test green.
   assert.match(r.content, /NEXT: Real Salt Lake at León.*\[Leagues Cup\]/);
-  assert.match(r.content, /2026-08-26 02:30 UTC/);
+  assert.match(r.content, /2026-08-26 2:30 AM UTC/);
   assert.doesNotMatch(r.content, /NO FIXTURE FOUND/);
 });
 
@@ -817,7 +817,7 @@ test('🔴 the health snapshot AGE is reported, and a stale one is called stale'
   // "working at the last check" is a different claim from "working now".
   const s = spy({ espn: () => res(espnBody([espnEvent()])), guide: multiChannel });
   const r = await run(s, undefined, { exec: healthStub({ nowEpoch: HEALTH_MTIME + 3 * 86400 }).impl });
-  assert.match(r.content, /stream check that ran 2026-08-23 15:15 UTC/);
+  assert.match(r.content, /stream check that ran 2026-08-23 3:15 PM UTC/);
   assert.match(r.content, /3d ago/);
   assert.match(r.content, /STALE: this is more than a day old/);
 });
@@ -1028,9 +1028,10 @@ test('rankChannelOptions and qualityOf, as units', () => {
 function unzonedTimes(text: string): string[] {
   const bad: string[] = [];
   for (const m of text.matchAll(/\d{1,2}:\d{2}/g)) {
-    const after = text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 6);
+    const after = text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 10);
     // Either an ISO stamp (…T19:00Z) or an explicit zone token.
-    if (/^Z/.test(after) || /^\s*(UTC|MDT|MST)\b/.test(after)) continue;
+    // `1:00 PM MDT` / `7:00 PM UTC` / an ISO stamp ending in `Z`.
+    if (/^Z/.test(after) || /^\s*(AM|PM)?\s*(UTC|MDT|MST)\b/.test(after)) continue;
     bad.push(`${m[0]}${after}`);
   }
   return bad;
@@ -1069,18 +1070,18 @@ test('🔴 EVERY clock time in the whole reply carries a zone — not just the f
 test('CONTROL: unzonedTimes actually detects a stripped zone', () => {
   // A guard whose detector cannot fail is not a guard. This is the exact live
   // defect: full zone on the first, truncated on the rest.
-  const degraded = 'Tue 25 Aug, 20:30 MDT and Sat 29 Aug, 19:30 M and Sat 5 Sept, 19:30 M';
+  const degraded = 'Tue 25 Aug, 8:30 PM MDT and Sat 29 Aug, 7:30 M and Sat 5 Sept, 7:30 M';
   assert.equal(unzonedTimes(degraded).length, 2, 'must catch the SECOND and THIRD, not the first');
-  assert.deepEqual(unzonedTimes('2026-08-28 19:00 UTC = Fri 28 Aug, 13:00 MDT'), []);
+  assert.deepEqual(unzonedTimes('Fri, Aug 28, 1:00 PM MDT (2026-08-28 7:00 PM UTC)'), []);
 });
 
 test('🔴 renderKickoff gives every time TWO independent zone anchors', () => {
   const line = renderKickoff(Date.parse('2026-08-28T19:00Z'), NOW);
-  assert.match(line, /2026-08-28 19:00 UTC/, 'UTC cannot be shortened into ambiguity');
-  assert.match(line, /13:00 MDT/, 'and a real local abbreviation, not a generic offset');
+  assert.match(line, /2026-08-28 7:00 PM UTC/, 'UTC cannot be shortened into ambiguity');
+  assert.match(line, /1:00 PM MDT/, 'and a real local abbreviation, not a generic offset');
   assert.deepEqual(unzonedTimes(line), []);
   // Correct across the DST boundary — MST in January, not a hardcoded MDT.
-  assert.match(renderKickoff(Date.parse('2026-01-15T19:00Z'), NOW), /12:00 MST/);
+  assert.match(renderKickoff(Date.parse('2026-01-15T19:00Z'), NOW), /12:00 PM MST/);
 });
 
 test('🔴 when the local zone cannot be formatted the UTC time SURVIVES', () => {
@@ -1093,12 +1094,67 @@ test('🔴 when the local zone cannot be formatted the UTC time SURVIVES', () =>
       throw new Error('no ICU data');
     };
     const line = renderKickoff(Date.parse('2026-08-28T19:00Z'), NOW);
-    assert.match(line, /2026-08-28 19:00 UTC/, 'the time must still be readable');
+    assert.match(line, /2026-08-28 7:00 PM UTC/, 'the time must still be readable');
     assert.match(line, /local time unavailable/);
     assert.deepEqual(unzonedTimes(line), []);
   } finally {
     Intl.DateTimeFormat = real;
   }
+});
+
+test('🔴 every human-facing time is 12-HOUR with an explicit AM/PM', async () => {
+  /**
+   * 🔴 Jeff: *"make it in 12 hour time too."*
+   *
+   * And it is probably the same bug as the zone truncation: the audit shows the
+   * model rewriting `19:30` into `7:30 PM` unprompted, and the zone survived
+   * only where it copied verbatim. Emitting the wanted form removes the motive
+   * to rewrite — self-enforcing, unlike an instruction that competes with the
+   * rest of the prompt.
+   *
+   * ⚠️ SCOPE. This covers times written for a READER. The ISO window stamps
+   * (`2026-08-28T17:30Z`) are machine markers for the model's own date
+   * arithmetic and stay ISO — converting them would make them neither ISO nor
+   * friendly. They are separately required to carry `Z`, which `unzonedTimes`
+   * already enforces.
+   */
+  const s = spy({
+    espn: () =>
+      res(
+        espnBody([
+          espnEvent({ id: '1', date: '2026-08-26T02:30Z' }),
+          espnEvent({ id: '2', date: '2026-08-30T01:30Z' }),
+          espnEvent({ id: '3', date: '2026-09-06T01:30Z' }),
+          espnEvent({ id: '4', date: '2026-09-13T01:30Z' }),
+        ]),
+      ),
+    guide: () => res(guideBody([programme()])),
+  });
+  const r = await run(s, undefined, { exec: healthStub().impl });
+  // Every non-ISO clock time must be 12-hour: no 13:00-and-up anywhere.
+  const twentyFour = [...r.content.matchAll(/(?<!T)\b(1[3-9]|2[0-3]):\d{2}\b/g)].map((m) => m[0]);
+  assert.deepEqual(twentyFour, [], `24-hour times leaked into the reply: ${JSON.stringify(twentyFour)}`);
+  assert.ok((r.content.match(/\d{1,2}:\d{2}\s?(AM|PM)/g) ?? []).length >= 8, 'too few 12-hour times to prove anything');
+});
+
+test('🔴 NOON and MIDNIGHT are correct — the naive `h % 12` trap', () => {
+  // A hand-rolled `% 12` maps both noon and midnight to 0 and prints "0:00".
+  // These four times can only pass one way.
+  assert.match(renderKickoff(Date.parse('2026-08-26T18:00Z'), NOW), /12:00 PM MDT/, 'local noon');
+  assert.match(renderKickoff(Date.parse('2026-08-26T06:00Z'), NOW), /12:00 AM MDT/, 'local midnight');
+  assert.match(renderKickoff(Date.parse('2026-08-26T12:00Z'), NOW), /12:00 PM UTC/, 'UTC noon');
+  assert.match(renderKickoff(Date.parse('2026-08-26T00:00Z'), NOW), /12:00 AM UTC/, 'UTC midnight');
+  for (const t of ['2026-08-26T18:00Z', '2026-08-26T06:00Z', '2026-08-26T12:00Z', '2026-08-26T00:00Z']) {
+    assert.doesNotMatch(renderKickoff(Date.parse(t), NOW), /\b0:\d{2}/, 'no 0:00 — that is the % 12 signature');
+  }
+});
+
+test('🔴 the UTC anchor carries its own DATE, because the day can differ', () => {
+  // 8:30 PM MDT on the 25th is 2:30 AM UTC on the 26th. A bare "(2:30 AM UTC)"
+  // beside "Tue, Aug 25" would read as the small hours of the same evening.
+  const line = renderKickoff(Date.parse('2026-08-26T02:30Z'), NOW);
+  assert.match(line, /Tue, Aug 25, 8:30 PM MDT/);
+  assert.match(line, /\(2026-08-26 2:30 AM UTC\)/);
 });
 
 // ── 🔴 THE MODEL HAS NO CLOCK ──────────────────────────────────────────────
@@ -1241,7 +1297,7 @@ test('🔴 health is read when the NEXT fixture\'s guide FAILED but a later one 
   assert.equal(h.commands.length, 1, 'the later fixture was searched, so the sweep is worth reading');
   assert.match(r.content, /UK: SKY SPORTS MAIN EVENT {2}\[WORKING at the last check/);
   // And the failed next-fixture lookup still does not suppress the kickoff.
-  assert.match(r.content, /2026-08-28 19:00 UTC/);
+  assert.match(r.content, /2026-08-28 7:00 PM UTC/);
 });
 
 test('🔴 a later fixture BEYOND the guide reach is UNCHECKED, never "no channel"', async () => {
@@ -1318,9 +1374,9 @@ test('🔴 kickoff is rendered in UTC, LOCAL wall-clock and RELATIVE terms', asy
   // There is no current time in the system prompt, so a bare ISO stamp leaves
   // the model to guess whether "Friday" is tonight or next week.
   const line = renderKickoff(Date.parse(KICKOFF), NOW);
-  assert.match(line, /2026-08-28 19:00 UTC/, 'UTC');
+  assert.match(line, /2026-08-28 7:00 PM UTC/, 'UTC');
   assert.match(line, /Fri/, 'local weekday');
-  assert.match(line, /13:00 MDT/, 'local wall-clock with a real zone abbreviation');
+  assert.match(line, /1:00 PM MDT/, 'local wall-clock, 12-hour, with a real zone abbreviation');
   assert.match(line, /in 3 days/, 'relative');
 });
 
