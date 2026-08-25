@@ -60,9 +60,11 @@ const nodeTimers: TimerSeam = {
 /**
  * ── 🔴 THE REFRESH DECISION, AND WHAT IS AND IS NOT KNOWN ─────────────────────
  *
- * A model turn here runs LONG: `llm.ts` aborts at 240s and a real turn has been
- * measured at 95s. So the question is whether one `startTyping` call covers a
- * whole turn, or goes dark partway through.
+ * A model turn here runs LONG. `llm.ts` aborts at 240s, and the live bot's own
+ * log on 2026-08-25 shows two consecutive real turns at **156565ms and
+ * 159988ms** — both `sports_fixture`, both to Jeff. So the question is whether
+ * one `startTyping` call covers a whole turn, or goes dark partway through, and
+ * a two-and-a-half-minute turn puts that well beyond any plausible answer.
  *
  * **What is measured:** nothing in BlueBubbles or its helper expires it. The
  * helper calls Apple's `-[IMChat setLocalUserIsTyping:]` (verified in the
@@ -80,9 +82,9 @@ const nodeTimers: TimerSeam = {
  * **The choice: refresh, at 30s.** The asymmetry decides it, not the number.
  *   - If the indicator does not expire, a refresh is a redundant re-assertion of
  *     a flag that is already set. Cost: one 3ms call per 30s. Harmless.
- *   - If it does expire, a single call goes dark ~60s into a 95–240s turn, and
- *     the feature does nothing for the majority of exactly the long turns it was
- *     asked for.
+ *   - If it does expire at anything under two minutes, a single call goes dark
+ *     partway through a MEASURED 156s turn, and the feature does nothing for the
+ *     majority of exactly the long turns it was asked for.
  * A wrong guess in one direction is free; in the other it is the whole feature.
  *
  * 🔴 The refresh loop is itself the main new way to strand an indicator, which
