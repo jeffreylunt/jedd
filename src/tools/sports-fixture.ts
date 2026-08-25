@@ -163,11 +163,18 @@ function zoneAbbrev(at: Date): string {
  *
  * ── SO EVERY TIME GETS TWO INDEPENDENT ANCHORS ──────────────────────────────
  *
- * UTC first, because it is the one form that cannot be shortened into
- * ambiguity — there is no abbreviation of "UTC" that loses its meaning — and it
- * is what a reader outside Mountain time actually needs. The local time follows
- * with a real abbreviation (`MDT`/`MST`, correct across the DST boundary), so a
- * compression that drops one still leaves the other.
+ *     Tue, Aug 25, 8:30 PM MDT (2026-08-26 2:30 AM UTC) — in 4 h
+ *
+ * The LOCAL time leads, because it is the one a reader acts on and the one the
+ * model is copying into a text message; UTC follows in parentheses as the
+ * anchor that works from anywhere. Both carry a zone, so a compression that
+ * drops one still leaves the other — which is the property that matters, not
+ * the order.
+ *
+ * ⚠️ An earlier version led with UTC and this paragraph still said so after the
+ * order changed. A comment asserting something the code does not do is the same
+ * defect as a report asserting something the artifact does not contain, and it
+ * is the one a reader has no way to catch.
  */
 export function renderKickoff(kickoffMs: number, nowMs: number): string {
   const at = new Date(kickoffMs);
