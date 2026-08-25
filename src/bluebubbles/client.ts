@@ -30,6 +30,62 @@ export function stripMarkdown(text: string): string {
     .trim();
 }
 
+/**
+ * The chat guid for a 1:1 conversation with `handle`.
+ *
+ * ⚠️ ONE OWNER FOR THIS STRING. Sending, typing and read receipts all address
+ * the same conversation, and three inlined copies of `iMessage;-;${x}` are three
+ * places for the form to drift — with the drift invisible, because each one
+ * looks right on its own and only the *pairing* is wrong. A typing indicator
+ * that lands on a different guid from the reply is a stuck indicator on one
+ * thread and a silent one on another.
+ *
+ * 🔴 THIS IS 1:1 ONLY, exactly like `sendText`. V1 had no group support and V2
+ * has not added any: a message from a group thread is answered as a stray DM to
+ * the sender, and these presence signals inherit that same limitation rather
+ * than quietly inventing a second addressing scheme. See the "Group chats"
+ * section of `knowledge/bluebubbles-connector.md`.
+ */
+export function chatGuidFor(handle: string): string {
+  return `iMessage;-;${handle}`;
+}
+
+/**
+ * What a Private API call did.
+ *
+ * 🔴 `helperAbsent` IS A FIRST-CLASS OUTCOME, NOT AN ERROR.
+ *
+ * Typing indicators and read receipts are the only BlueBubbles operations that
+ * require the Private API helper bundle, and the helper only loads with SIP
+ * disabled. Measured on this server 2026-08-25 with `helper_connected: false`:
+ *
+ *     POST   /api/v1/chat/{guid}/typing  → 500 in ~7ms
+ *     DELETE /api/v1/chat/{guid}/typing  → 500 in ~3ms
+ *     POST   /api/v1/chat/{guid}/read    → 500 in ~3ms
+ *     {"status":500,
+ *      "message":"Please make sure you have completed the setup for the Private
+ *                 API, and your helper is connected!",
+ *      "error":{"type":"iMessage Error",
+ *               "message":"iMessage Private API Helper is not connected!"}}
+ *
+ * It **fails fast and never hangs** — BlueBubbles' `restrictedPrivateApi`
+ * middleware runs the check *before* the controller touches the helper socket,
+ * so nothing waits on a connection that is not there. That is why this is a
+ * cheap thing to attempt on every turn.
+ *
+ * Distinguishing it matters because it will be the outcome of EVERY call until
+ * SIP is disabled, and a caller that cannot tell it apart from a real fault will
+ * either log an error twelve times a day about a known, expected, harmless
+ * condition — or learn to ignore the log, which is worse.
+ */
+export interface PrivateApiResult {
+  ok: boolean;
+  status: number;
+  /** The helper bundle is not loaded. Expected until SIP is disabled. */
+  helperAbsent: boolean;
+  detail: string;
+}
+
 export interface BlueBubblesOptions {
   baseUrl: string;
   password: string;
@@ -101,10 +157,14 @@ export class BlueBubblesClient {
    * text endpoint fails fast in ~1s. Do not assume one endpoint's timing
    * generalises to another.
    */
-  private async call(path: string, init?: RequestInit): Promise<{ status: number; body: unknown }> {
+  private async call(
+    path: string,
+    init?: RequestInit,
+    timeoutMs?: number,
+  ): Promise<{ status: number; body: unknown }> {
     const res = await this.fetchImpl(this.url(path), {
       ...init,
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(timeoutMs ?? this.timeoutMs),
       headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     });
     let body: unknown = null;
@@ -337,7 +397,7 @@ export class BlueBubblesClient {
     const { status, body } = await this.call('/message/text', {
       method: 'POST',
       body: JSON.stringify({
-        chatGuid: `iMessage;-;${to}`,
+        chatGuid: chatGuidFor(to),
         message: stripMarkdown(text),
         tempGuid: `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       }),
@@ -358,6 +418,84 @@ export class BlueBubblesClient {
       delivery: 'unknown',
       detail: 'accepted with no error code at send time — this is NOT a delivery confirmation',
     };
+  }
+
+  /**
+   * ── PRIVATE API SURFACE: typing indicators and read receipts ───────────────
+   *
+   * 🔴 THESE DELIBERATELY DO NOT SWALLOW THEIR OWN FAILURES.
+   *
+   * They are the only calls in this file whose whole point is that they must
+   * never break a reply — so the temptation is to make them un-throwable right
+   * here. That would be a mistake, because the swallow belongs in exactly one
+   * place (`Presence`) and a subject that cannot throw cannot be used to prove
+   * that its caller survives a throw. A test that stubs `fetch` to reject and
+   * asserts the turn still completes only means something while these can
+   * genuinely propagate. So an HTTP error comes back as a RESULT and a transport
+   * failure comes back as a THROW, the same as every other method here.
+   *
+   * ⚠️ The timeout is short and separate from `this.timeoutMs`. A presence
+   * signal that is 5 seconds late is worthless even if it succeeds, and holding
+   * a request open for 15s to deliver one is 15s of an open socket bought for
+   * nothing.
+   */
+  private static readonly PRESENCE_TIMEOUT_MS = 5_000;
+
+  private async presenceCall(path: string, method: 'POST' | 'DELETE'): Promise<PrivateApiResult> {
+    const { status, body } = await this.call(path, { method }, BlueBubblesClient.PRESENCE_TIMEOUT_MS);
+    const b = body as { message?: unknown; error?: { message?: unknown } } | null;
+    const inner = typeof b?.error?.message === 'string' ? b.error.message : '';
+    const outer = typeof b?.message === 'string' ? b.message : '';
+    // Match on the helper's own wording. `restrictedPrivateApi` throws with the
+    // outer sentence and carries the inner one from `checkPrivateApiStatus()`;
+    // both are checked because only one of them names the *helper* specifically
+    // and the other also fires when the setting itself is off.
+    const helperAbsent =
+      status >= 400 && /helper is not connected|your helper is connected/i.test(`${inner} ${outer}`);
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      helperAbsent,
+      detail: helperAbsent
+        ? `Private API helper is not connected (http ${status}). Expected until SIP is disabled and the ` +
+          'BlueBubbles helper bundle is installed — this is not a fault and nothing was lost but a nicety.'
+        : status >= 400
+          ? `http ${status}: ${outer || inner || 'no message'}`
+          : `http ${status}`,
+    };
+  }
+
+  /**
+   * Show "…" in the recipient's thread.
+   *
+   * 🔴 IT DOES NOT STOP BY ITSELF ON OUR SIDE. The helper calls Apple's
+   * `-[IMChat setLocalUserIsTyping:]` (confirmed in the shipped
+   * `BlueBubblesHelper.dylib`), and neither BlueBubbles nor the helper holds any
+   * expiry timer — BlueBubbles only tracks a `typingCache` array so it can stop
+   * on send. Whatever hides the indicator afterwards is Apple's, on the
+   * RECIPIENT'S device, and is not a number this codebase can see. So the stop
+   * is ours to guarantee: see `Presence`.
+   */
+  async startTyping(chatGuid: string): Promise<PrivateApiResult> {
+    return this.presenceCall(`/chat/${encodeURIComponent(chatGuid)}/typing`, 'POST');
+  }
+
+  /** Hide the "…". Must always run — see `Presence.withTyping`. */
+  async stopTyping(chatGuid: string): Promise<PrivateApiResult> {
+    return this.presenceCall(`/chat/${encodeURIComponent(chatGuid)}/typing`, 'DELETE');
+  }
+
+  /**
+   * Mark the conversation read, so the sender sees "Read" rather than
+   * "Delivered".
+   *
+   * ⚠️ It marks the **CHAT**, not the one message — BlueBubbles' controller
+   * forwards `mark-chat-read` with a chat guid and nothing finer. On a 1:1
+   * thread that is the same thing in practice, but it means a backlog recovered
+   * by replay is marked read wholesale by the first message we act on.
+   */
+  async markChatRead(chatGuid: string): Promise<PrivateApiResult> {
+    return this.presenceCall(`/chat/${encodeURIComponent(chatGuid)}/read`, 'POST');
   }
 
   /** Three-state delivery verdict for a sent message. `unknown` is not a "no". */

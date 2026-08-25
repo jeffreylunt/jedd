@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { Connector, IncomingMessage } from '../connector.js';
 import { BlueBubblesClient } from './client.js';
 import { classifyPayload, type InboundVerdict } from './payload.js';
+import type { Presence } from './presence.js';
 import type { SeenStore } from './seen.js';
 
 export interface ReceiverOptions {
@@ -272,6 +273,13 @@ export class BlueBubblesConnector implements Connector {
     private readonly audience: SendAudience,
     /** Told about every suppressed reply, so a rehearsal can see what it did not say. */
     private readonly onSuppressed?: (toHandle: string, text: string) => void,
+    /**
+     * Typing indicators and read receipts. **Optional by construction** — a
+     * connector built without one has no way to signal presence at all, which is
+     * the same argument `ShadowConnector` makes about sending. `undefined` is
+     * not a disabled feature; it is an absent capability.
+     */
+    private readonly presence?: Presence,
   ) {}
 
   /** Is this handle allowed to receive a reply? Exact match; no normalisation, no prefixes. */
@@ -332,6 +340,32 @@ export class BlueBubblesConnector implements Connector {
     if (r.state === 'failed') throw new Error(`send failed: ${r.detail}`);
   }
 
+  /**
+   * ── 🔴 PRESENCE GOES THROUGH THE SAME AUDIENCE GATE AS A SEND ──────────────
+   *
+   * A read receipt and a typing indicator are both **visible to the other
+   * person**. During a rehearsal, `JEDD_SEND_TO` promises everyone outside the
+   * list SILENCE — and "Read 9:14 PM" followed by a typing bubble and then
+   * nothing at all is not silence. It is worse than a wrong answer in one
+   * specific way: it is unambiguous evidence that something read the message and
+   * chose not to reply, and the person cannot tell whether that something was
+   * Jeff.
+   *
+   * The gate lives here, above the transport, for the same reason `send` does:
+   * one place, not re-derived per signal. `withTyping` still runs `fn` for a
+   * suppressed handle — the turn is not the thing being suppressed, only the
+   * announcement of it.
+   */
+  markRead(toHandle: string): void {
+    if (!this.allowed(toHandle)) return;
+    this.presence?.markRead(toHandle);
+  }
+
+  async withTyping<T>(toHandle: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.presence || !this.allowed(toHandle)) return fn();
+    return this.presence.withTyping(toHandle, fn);
+  }
+
   async listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void> {
     await this.receiver.start(handler);
     await this.receiver.replayMissed();
@@ -357,6 +391,26 @@ export class ShadowConnector implements Connector {
         'holds no BlueBubbles client, so this is not a disabled feature — there is no send path ' +
         'to enable.',
     );
+  }
+
+  /**
+   * 🔴 A SHADOW IS INVISIBLE, AND A READ RECEIPT IS VISIBLE.
+   *
+   * The whole premise of shadow mode is that V1 keeps serving the household
+   * while V2 watches — nobody is supposed to be able to tell V2 exists. A read
+   * receipt or a typing bubble would be the *only* outward sign of it, and it
+   * would appear on real people's phones alongside V1's real replies, looking
+   * like V1 behaving strangely.
+   *
+   * Absent for the same structural reason `send` is: this object holds no
+   * client and no `Presence`, so there is nothing here to enable. Unlike `send`
+   * these do not throw — a shadow turn is *expected* to reach them, and a throw
+   * would turn a correct no-op into a logged fault every message.
+   */
+  markRead(): void {}
+
+  async withTyping<T>(_toHandle: string, fn: () => Promise<T>): Promise<T> {
+    return fn();
   }
 
   async listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void> {

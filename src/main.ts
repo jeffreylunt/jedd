@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, type TurnRecord } from './agent.js';
 import { BlueBubblesClient } from './bluebubbles/client.js';
+import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
@@ -96,8 +97,24 @@ async function main(): Promise<void> {
     },
   });
 
-  const connector = new BlueBubblesConnector(receiver, client, audience, (to, text) =>
-    console.error(`[jedd] SUPPRESSED ${text.length} chars to ${to} — not in the send audience.`),
+  /**
+   * Typing indicators and read receipts.
+   *
+   * ⚠️ REQUIRES THE BLUEBUBBLES PRIVATE API HELPER, WHICH NEEDS SIP DISABLED.
+   * As of 2026-08-25 `server/info` reports `private_api: true` but
+   * `helper_connected: false`, so every one of these calls returns HTTP 500 in
+   * ~3ms and nothing appears on anybody's phone. That is the expected state, it
+   * is handled, and it is invisible: `Presence` swallows it and says so once.
+   * Nothing else about this process changes when it starts working.
+   */
+  const presence = new Presence({ client });
+
+  const connector = new BlueBubblesConnector(
+    receiver,
+    client,
+    audience,
+    (to, text) => console.error(`[jedd] SUPPRESSED ${text.length} chars to ${to} — not in the send audience.`),
+    presence,
   );
 
   /**
@@ -164,6 +181,11 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.error(`\n[jedd] ${signal} — deregistering ${config.bluebubbles.publicUrl}`);
+    // 🔴 FIRST, and bounded. A pm2 restart lands mid-turn sooner or later, and
+    // exiting with a "…" still showing leaves a real person watching a reply
+    // that is never coming — for however long Apple keeps it up, which is not a
+    // number this codebase knows. `stopAll` cannot hang shutdown.
+    await presence.stopAll().catch(() => {});
     try {
       const rows = await client.listWebhooks();
       const ours = rows.filter((w) => w.url === config.bluebubbles.publicUrl);
@@ -200,9 +222,25 @@ async function main(): Promise<void> {
   await connector.listen(async (message) => {
     turns += 1;
     const started = Date.now();
+    /**
+     * 🔴 BEFORE THE MODEL, AND NOT AWAITED. `markRead` returns `void` — there is
+     * no promise here to accidentally block on, which is the point: a turn that
+     * waited on a read receipt would have made a nicety into a dependency of the
+     * answer.
+     */
+    connector.markRead(message.senderHandle);
     try {
-      const record = await agent.handle(message.senderHandle, message.text);
-      await connector.send(message.senderHandle, record.replyText);
+      /**
+       * The typing region covers the model turn AND the send, so the "…" runs
+       * for exactly as long as Jedd owes this person a reply. `withTyping` is
+       * transparent — it rethrows whatever `agent.handle` or `send` throws into
+       * the catch below, and stops the indicator on the way past either way.
+       */
+      const record = await connector.withTyping(message.senderHandle, async () => {
+        const r = await agent.handle(message.senderHandle, message.text);
+        await connector.send(message.senderHandle, r.replyText);
+        return r;
+      });
       console.error(
         `[jedd] turn ${turns} from ${message.senderHandle}: ` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ${Date.now() - started}ms`,
