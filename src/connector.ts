@@ -38,6 +38,34 @@ export interface Connector {
 }
 
 /**
+ * Run one turn with both presence signals attached.
+ *
+ * 🔴 THE TWO CALLS ARE ONE CALL SO THAT HALF OF THEM CANNOT BE FORGOTTEN.
+ *
+ * `markRead` and `withTyping` always belong together at exactly one place — the
+ * moment Jedd picks a message up — and there are two entry points that do it
+ * (`main.ts` and `index.ts`). Left as two lines in each, they are two places to
+ * drift, and the drift is silent: a turn missing its read receipt still answers
+ * perfectly and nothing anywhere reports the omission.
+ *
+ * ⚠️ It also gives the tests something real to hold. A test that re-types the
+ * handler proves the *shape* is possible, not that the shipped loop does it —
+ * this is the function both the loop and the test call.
+ *
+ * Transparent: `turn`'s value and its exceptions pass straight through.
+ */
+export async function withPresence<T>(
+  connector: Connector,
+  message: IncomingMessage,
+  turn: () => Promise<T>,
+): Promise<T> {
+  // Not awaited, and it returns `void` so it cannot be. The read receipt goes
+  // out as Jedd picks the message up, not after it has thought about it.
+  connector.markRead(message.senderHandle);
+  return connector.withTyping(message.senderHandle, turn);
+}
+
+/**
  * Terminal connector. Lines typed on stdin arrive as messages from
  * `defaultSender`; replies print to stdout.
  *
@@ -57,7 +85,7 @@ export class StdoutConnector implements Connector {
   }
 
   /** A terminal has no read receipts. Nothing to do, said out loud. */
-  markRead(): void {}
+  markRead(_toHandle: string): void {}
 
   /**
    * A terminal has no typing indicator either — but it DOES have the long wait,

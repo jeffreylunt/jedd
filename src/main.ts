@@ -5,6 +5,7 @@ import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
+import { withPresence } from './connector.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
@@ -222,21 +223,15 @@ async function main(): Promise<void> {
   await connector.listen(async (message) => {
     turns += 1;
     const started = Date.now();
-    /**
-     * 🔴 BEFORE THE MODEL, AND NOT AWAITED. `markRead` returns `void` — there is
-     * no promise here to accidentally block on, which is the point: a turn that
-     * waited on a read receipt would have made a nicety into a dependency of the
-     * answer.
-     */
-    connector.markRead(message.senderHandle);
     try {
       /**
-       * The typing region covers the model turn AND the send, so the "…" runs
-       * for exactly as long as Jedd owes this person a reply. `withTyping` is
-       * transparent — it rethrows whatever `agent.handle` or `send` throws into
-       * the catch below, and stops the indicator on the way past either way.
+       * 🔴 THE READ RECEIPT AND THE TYPING INDICATOR ARE ONE CALL — see
+       * `withPresence`. The typing region covers the model turn AND the send, so
+       * the "…" runs for exactly as long as Jedd owes this person a reply, and
+       * it is transparent: it rethrows whatever `agent.handle` or `send` throws
+       * into the catch below, stopping the indicator on the way past either way.
        */
-      const record = await connector.withTyping(message.senderHandle, async () => {
+      const record = await withPresence(connector, message, async () => {
         const r = await agent.handle(message.senderHandle, message.text);
         await connector.send(message.senderHandle, r.replyText);
         return r;

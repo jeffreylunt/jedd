@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, type TurnRecord } from './agent.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
-import { StdoutConnector } from './connector.js';
+import { StdoutConnector, withPresence } from './connector.js';
 import { FollowupStore } from './followups.js';
 import { runDueFollowups } from './followup-runner.js';
 import { createLlmClient } from './llm.js';
@@ -73,9 +73,16 @@ async function main(): Promise<void> {
   }, TICK_MS);
   timer.unref();
 
+  // ⚠️ The same presence calls the live path makes, so the terminal exercises
+  // the whole shape rather than a shorter one. On `StdoutConnector` they are a
+  // no-op and a `(thinking…)` line — but a seam only stays honest if every entry
+  // point goes through it, and a `withTyping` nothing ever calls is dead code
+  // that will be wrong by the time somebody needs it.
   await connector.listen(async (message) => {
-    const record = await agent.handle(message.senderHandle, message.text);
-    await connector.send(message.senderHandle, record.replyText || '(no reply)');
+    await withPresence(connector, message, async () => {
+      const record = await agent.handle(message.senderHandle, message.text);
+      await connector.send(message.senderHandle, record.replyText || '(no reply)');
+    });
   });
 }
 

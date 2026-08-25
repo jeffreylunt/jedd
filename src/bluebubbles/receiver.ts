@@ -407,7 +407,7 @@ export class ShadowConnector implements Connector {
    * these do not throw — a shadow turn is *expected* to reach them, and a throw
    * would turn a correct no-op into a logged fault every message.
    */
-  markRead(): void {}
+  markRead(_toHandle: string): void {}
 
   async withTyping<T>(_toHandle: string, fn: () => Promise<T>): Promise<T> {
     return fn();
