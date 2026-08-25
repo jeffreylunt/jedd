@@ -45,9 +45,21 @@ test('🔴 the method is GET, and there is no argument that changes it', async (
 });
 
 test('🔴 the host comes from the enum — a path cannot name a different one', () => {
-  for (const bad of ['http://evil.invalid/x', '//evil.invalid/x', '/x/../../http://evil.invalid']) {
+  // 🔴 Each case asserts WHICH guard refused. Asserting only `allowed === false`
+  // let a deleted guard stay green because a different check covered for it —
+  // measured on this very file, and it is why the `..` guard below is gone in
+  // favour of a structural containment check.
+  const cases: [string, RegExp][] = [
+    // Refused one guard earlier, and the message says so — which is the point of
+    // asserting the reason rather than the verdict.
+    ['http://evil.invalid/x', /must start with "\/"/],
+    ['//evil.invalid/x', /may not name a host/],
+    ['/x/http://evil.invalid', /may not name a host/],
+  ];
+  for (const [bad, why] of cases) {
     const plan = planRead('sonarr', bad, {}, config);
     assert.equal(plan.allowed, false, `${bad} was allowed`);
+    assert.match(plan.allowed === false ? plan.reason : '', why, `${bad} refused for the wrong reason`);
   }
   // CONTROL: the same gate lets a real path through, so the refusals above are
   // not just "everything is refused".
@@ -56,8 +68,70 @@ test('🔴 the host comes from the enum — a path cannot name a different one',
   assert.ok(good.allowed && good.url.startsWith(config.sonarr.baseUrl));
 });
 
+/**
+ * 🔴 THE BYPASS THAT SHIPPED, AND EVERY SPELLING OF IT.
+ *
+ * Every one of these was ALLOWED by the first version and reached the endpoint
+ * the tool exists to keep it away from — reproduced against the live gate before
+ * the fix. The denylist matched the string the caller typed; `fetch` sends the
+ * string the WHATWG URL parser produces, and the two are not required to be the
+ * same string. Dot-segments and percent-escapes are the two ways they diverge.
+ */
+const BYPASSES: [string, string, string][] = [
+  ['jellyfin', '/./LiveTv/Channels', 'dot segment at the front'],
+  ['jellyfin', '/LiveTv/./Channels', 'dot segment in the middle'],
+  ['jellyfin', '/LiveTv/x/../Channels', 'double-dot segment'],
+  ['jellyfin', '/%2e/LiveTv/Channels', 'percent-encoded dot segment'],
+  ['jellyfin', '/LiveTv/%43hannels', 'percent-encoded letter — the server decodes it'],
+  ['jellyfin', '/Live%54v/Channels', 'percent-encoded letter, other half'],
+  ['sonarr', '/./release', 'dot segment before an indexer search'],
+  ['sonarr', '/%72elease', 'percent-encoded letter before an indexer search'],
+  ['prowlarr', '/api/v1/./search', 'dot segment before the 20.9s indexer search'],
+  ['prowlarr', '/api/v1/%73earch', 'percent-encoded letter, same'],
+];
+
+for (const [service, path, how] of BYPASSES) {
+  test(`🔴 BYPASS CLOSED (${how}): ${service} ${path}`, () => {
+    const plan = planRead(service, path, {}, config);
+    assert.equal(plan.allowed, false, `${service} ${path} reached a denied endpoint`);
+  });
+}
+
+test('🔴 a path cannot climb out of the API prefix while keeping the API key', () => {
+  // `/sonarr/api/v3/../../../release` normalises to `/release` — off the API and
+  // still authenticated. The containment check is what makes that impossible;
+  // no string pattern is involved.
+  const plan = planRead('sonarr', '/../../../release', {}, config);
+  assert.equal(plan.allowed, false);
+  assert.match(plan.allowed === false ? plan.reason : '', /escapes Sonarr's API prefix/);
+});
+
+test('🔴 CONTROL: harmless dot-free paths still resolve, and normalisation is visible', () => {
+  const plan = planRead('sonarr', '/episode', { seriesId: 80, seasonNumber: 2 }, config);
+  assert.ok(plan.allowed);
+  // The exact read V1 could not express — the whole reason this tool exists.
+  assert.equal(plan.url, `${config.sonarr.baseUrl}/episode?seriesId=80&seasonNumber=2`);
+});
+
+test('🔴 a path character outside the allowed set is refused, and the character is named', () => {
+  // Nothing else in the gate looks at these, so this test is the ONLY thing
+  // holding PATH_CHARS in place. It had no coverage at all before.
+  for (const [bad, ch] of [
+    ['/Live Tv/Programs', ' '],
+    ['/series%20x', '%'],
+    ['/series\\x', '\\'],
+    ['/séries', 'é'],
+  ] as [string, string][]) {
+    const plan = planRead('sonarr', bad, {}, config);
+    assert.equal(plan.allowed, false, `${bad} was allowed`);
+    const reason = plan.allowed === false ? plan.reason : '';
+    assert.match(reason, /character I will not send/, bad);
+    assert.ok(reason.includes(JSON.stringify(ch)), `did not name ${JSON.stringify(ch)} in: ${reason}`);
+  }
+});
+
 test('🔴 the credential is chosen by code and is never the caller‘s to name', () => {
-  const jf = planRead('jellyfin', '/System/Info', { api_key: 'not-mine' }, config);
+  const jf = planRead('jellyfin', '/System/Info', {}, config);
   assert.ok(jf.allowed);
   assert.equal(jf.headers['X-Emby-Token'], config.jellyfin.apiKey);
   assert.equal(jf.headers['X-Api-Key'], undefined);
@@ -66,6 +140,20 @@ test('🔴 the credential is chosen by code and is never the caller‘s to name'
   assert.ok(sonarr.allowed);
   assert.equal(sonarr.headers['X-Api-Key'], config.sonarr.apiKey);
   assert.equal(sonarr.headers['X-Emby-Token'], undefined);
+
+  /**
+   * 🔴 …AND `query` IS PART OF THE REQUEST TOO.
+   *
+   * Jellyfin honours `?api_key=` and the arrs honour `?apikey=`, so a title
+   * about "the credential is chosen by code" that only inspected HEADERS was
+   * true of the wrong object. It also put a caller-supplied secret-shaped string
+   * into the transcript, because the tool echoes the URL it issued.
+   */
+  for (const key of ['api_key', 'apikey', 'API_KEY', 'token', 'X-Emby-Token']) {
+    const plan = planRead('jellyfin', '/System/Info', { [key]: 'not-mine' }, config);
+    assert.equal(plan.allowed, false, `query.${key} was accepted`);
+    assert.match(plan.allowed === false ? plan.reason : '', /names a credential/);
+  }
 });
 
 test('a path with a querystring in it is refused, and says to use `query`', () => {
@@ -137,7 +225,11 @@ for (const [service, path, why] of DENIED) {
 
 test('🔴 the denylist is case-insensitive and covers sub-paths', () => {
   for (const p of ['/livetv/channels', '/LIVETV/CHANNELS', '/LiveTv/Channels/abc123']) {
-    assert.equal(planRead('jellyfin', p, {}, config).allowed, false, `${p} was allowed`);
+    const plan = planRead('jellyfin', p, {}, config);
+    assert.equal(plan.allowed, false, `${p} was allowed`);
+    // The REASON, so "refused for some other reason" cannot read as
+    // "case-insensitive matching works".
+    assert.match(plan.allowed === false ? plan.reason : '', /wedged Jellyfin site-wide/, p);
   }
 });
 
@@ -204,6 +296,11 @@ test('🔴 /Sessions shape: field projection is what makes an oversized record r
   const raw = renderRead(sessions, { limit: 25, maxChars: 2000 });
   assert.match(raw, /ONE record is larger than/);
   assert.match(raw, /NowPlayingQueueFullItems \(\d+ chars\)/);
+  // 🔴 AND THE HEADER MUST AGREE WITH THE BODY. It said "showing 1 of 5" over a
+  // paragraph that shows none — a count we did not deliver, which is the same
+  // species of claim as a silent truncation.
+  assert.match(raw, /showing 0 of 5 record\(s\)/);
+  assert.doesNotMatch(raw, /showing 1 of 5/);
 
   const projected = renderRead(sessions, {
     limit: 25,

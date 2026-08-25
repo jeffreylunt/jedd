@@ -47,7 +47,17 @@ function execStub(now: number, opts: { results?: string; resultsExit?: number; r
     commands.push({ host, command });
     if (command.includes('check-streams-results.txt')) {
       if (opts.resultsExit) return callback({ code: opts.resultsExit }, '', 'cat: No such file or directory');
-      return callback(null, `${MTIME}\n${now}\n${opts.results ?? RESULTS}\n`, '');
+      /**
+       * 🔴 THE STUB ANSWERS WHAT WAS ASKED, NOT WHAT THE TOOL HOPED FOR.
+       *
+       * It used to prepend `mtime\nnow\n` regardless of the command, so deleting
+       * `stat -c %Y` and `date +%s` from RESULTS_CMD left every test green while
+       * production lost the age entirely AND ate the first two channel rows.
+       * The 🔴 age test was asserting this fixture, not the tool.
+       */
+      const head = command.includes('stat -c %Y') ? `${MTIME}\n` : '';
+      const clock = command.includes('date +%s') ? `${now}\n` : '';
+      return callback(null, `${head}${clock}${opts.results ?? RESULTS}\n`, '');
     }
     if (command.includes('psql')) {
       if (opts.rosterExit) return callback({ code: opts.rosterExit }, '', 'Error: No such container: dispatcharr');
@@ -119,6 +129,49 @@ test('🔴 a snapshot older than a day is called STALE, not presented as current
   const old = await channelHealth.run({}, ctx(execStub(MTIME + 50 * HOUR).impl));
   assert.match(old.content, /⚠️ STALE/);
   assert.match(old.content, /2d 2h ago/);
+});
+
+test('🔴 an UNKNOWN age takes the CAUTIOUS branch, never the fresh one', async () => {
+  /**
+   * The first version tested `isFinite(age) && age > threshold`, so a clock it
+   * could not read fell through to "This is a snapshot, not a live probe" — the
+   * sentence written for a FRESH result. The whole contract is that the age gates
+   * whether these numbers may be quoted as current.
+   */
+  const noClock: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) return cb(null, `${MTIME}\n\n${RESULTS}\n`, '');
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(noClock));
+  assert.equal(res.ok, true);
+  assert.match(res.content, /could NOT work out how old this is, so treat it as stale/);
+  assert.doesNotMatch(res.content, /This is a snapshot, not a live probe/);
+});
+
+test('🔴 an empty mtime line is UNKNOWN, not 1970 — Number("") is 0', async () => {
+  const noMtime: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) return cb(null, `\n${MTIME + HOUR}\n${RESULTS}\n`, '');
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(noMtime));
+  assert.match(res.content, /last ran unknown UTC/);
+  assert.doesNotMatch(res.content, /1970/);
+  assert.match(res.content, /treat it as stale/);
+});
+
+test('🔴 unparsed lines are reported on the FILTERED path too, not just the summary', async () => {
+  /**
+   * When this warning lived only in the whole-picture branch, a checker writing
+   * garbage answered "is ESPN working?" with a confident "no such channel" —
+   * exactly the false negative `parseStreamCheck` counts unparsed lines to stop.
+   */
+  const garbage = `${Array.from({ length: 30 }, (_, i) => `junk line ${i}`).join('\n')}\n1|COOKING CHANNEL HD|OK|h264|1920x1080|25/1`;
+  const { impl } = execStub(MTIME + HOUR, { results: garbage });
+  const res = await channelHealth.run({ channel: 'ESPN' }, ctx(impl));
+  assert.match(res.content, /30 line\(s\) in the results file did not parse/);
+  assert.match(res.content, /this list may be incomplete/);
 });
 
 test('describeAge renders days, hours and minutes', () => {

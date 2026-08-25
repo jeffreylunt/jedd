@@ -171,6 +171,14 @@ export function describeAge(seconds: number): string {
   return `${parts.join(' ') || '0m'} ago`;
 }
 
+/** A unix timestamp line, or null. Empty and non-numeric are both null, never 0. */
+function epoch(line: string | undefined): number | null {
+  const t = (line ?? '').trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** Does this row match what the caller asked about? Exact number, or name substring. */
 function matches(needle: string, number: string, name: string): boolean {
   const n = needle.trim().toLowerCase();
@@ -224,8 +232,10 @@ export const channelHealth: Tool = {
     }
 
     const lines = results.stdout.split('\n');
-    const mtime = Number((lines[0] ?? '').trim());
-    const now = Number((lines[1] ?? '').trim());
+    // ⚠️ `Number('')` is 0, not NaN — an empty first line would silently become
+    // 1970 and render as a very old but perfectly confident timestamp.
+    const mtime = epoch(lines[0]);
+    const now = epoch(lines[1]);
     const { rows, unparsed } = parseStreamCheck(lines.slice(2).join('\n'));
     if (rows.length === 0) {
       return fail(
@@ -234,16 +244,39 @@ export const channelHealth: Tool = {
       );
     }
 
-    const ageSeconds = Number.isFinite(mtime) && Number.isFinite(now) ? now - mtime : NaN;
-    const when = Number.isFinite(mtime) ? new Date(mtime * 1000).toISOString().replace('T', ' ').slice(0, 16) : 'unknown';
-    const stale = Number.isFinite(ageSeconds) && ageSeconds > STALE_AFTER_SECONDS;
+    const ageSeconds = mtime !== null && now !== null ? now - mtime : NaN;
+    const when = mtime !== null ? new Date(mtime * 1000).toISOString().replace('T', ' ').slice(0, 16) : 'unknown';
 
-    const sections: string[] = [
-      `Stream check last ran ${when} UTC — ${describeAge(ageSeconds)}.` +
-        (stale
-          ? ' ⚠️ STALE: this is more than a day old, so it describes how things WERE, not how they are.'
-          : ' This is a snapshot, not a live probe.'),
-    ];
+    /**
+     * 🔴 THREE AGE STATES, AND AN UNKNOWN ONE MUST NOT TAKE THE REASSURING BRANCH.
+     *
+     * The first version tested `isFinite(age) && age > threshold`, so an
+     * unreadable clock — NaN, or a negative age from skew — fell through to
+     * *"This is a snapshot, not a live probe"*, the sentence written for a FRESH
+     * result. The whole contract of this tool is that the age gates whether its
+     * numbers may be quoted as current, so an unknown age has to be at least as
+     * cautious as a stale one, never less.
+     */
+    const freshness =
+      !Number.isFinite(ageSeconds) || ageSeconds < 0
+        ? '⚠️ I could NOT work out how old this is, so treat it as stale: it may describe how things ' +
+          'were at any point in the past.'
+        : ageSeconds > STALE_AFTER_SECONDS
+          ? '⚠️ STALE: this is more than a day old, so it describes how things WERE, not how they are.'
+          : 'This is a snapshot, not a live probe.';
+
+    /**
+     * ⚠️ Carried on EVERY path, not just the whole-picture one. When it appeared
+     * only in the summary, a checker writing garbage answered "is ESPN working?"
+     * with a confident *"no such channel"* — the exact false negative
+     * `parseStreamCheck` counts unparsed lines in order to prevent.
+     */
+    const garbage = unparsed
+      ? ` ⚠️ ${unparsed} line(s) in the results file did not parse, so the check itself may be ` +
+        'malfunctioning and this list may be incomplete.'
+      : '';
+
+    const sections: string[] = [`Stream check last ran ${when} UTC — ${describeAge(ageSeconds)}. ${freshness}${garbage}`];
 
     // The roster half. Its own success flag — a failure here must never read as
     // "every channel is covered".
@@ -264,9 +297,11 @@ export const channelHealth: Tool = {
       }
       const checked = new Set(hits.map((h) => h.number));
       sections.push(
-        `${hits.length} matching channel(s) in the last check:\n` +
-          hits.slice(0, MAX_DETAIL_ROWS).map((r) => `  ${describeRow(r)}`).join('\n') +
-          (hits.length > MAX_DETAIL_ROWS ? `\n  … ${hits.length - MAX_DETAIL_ROWS} more not shown` : ''),
+        hits.length
+          ? `${hits.length} matching channel(s) in the last check:\n` +
+            hits.slice(0, MAX_DETAIL_ROWS).map((r) => `  ${describeRow(r)}`).join('\n') +
+            (hits.length > MAX_DETAIL_ROWS ? `\n  … ${hits.length - MAX_DETAIL_ROWS} more not shown` : '')
+          : `NONE of the matching channels appear in the last check at all.`,
       );
       const uncheckedHits = rosterHits.filter((r) => !checked.has(r.number));
       if (rosterKnown && uncheckedHits.length) {
@@ -287,10 +322,7 @@ export const channelHealth: Tool = {
     }
 
     const failing = rows.filter((r) => !r.ok);
-    sections.push(
-      `${rows.length} channels checked: ${rows.length - failing.length} OK, ${failing.length} FAIL.` +
-        (unparsed ? ` ⚠️ ${unparsed} line(s) in the results file did not parse.` : ''),
-    );
+    sections.push(`${rows.length} channels checked: ${rows.length - failing.length} OK, ${failing.length} FAIL.`);
     if (failing.length) {
       sections.push(
         `FAILING at that time:\n` +
@@ -309,20 +341,33 @@ export const channelHealth: Tool = {
     }
 
     const checkedNumbers = new Set(rows.map((r) => r.number));
-    const uncovered = rosterRows.filter((r) => !checkedNumbers.has(r.number));
     const noEpg = rosterRows.filter((r) => !r.hasEpg);
     const hidden = rosterRows.filter((r) => r.hidden);
     sections.push(
       `Dispatcharr roster: ${rosterRows.length} channels (${hidden.length} hidden from output, ` +
         `${noEpg.length} with no EPG mapping — the guide shows nothing for those even when the stream works).`,
     );
+    /**
+     * ⚠️ HIDDEN CHANNELS ARE EXCLUDED FROM THE COVERAGE GAP ON PURPOSE.
+     *
+     * A channel hidden from output is expected never to be checked, so listing
+     * it as UNKNOWN names the same rows on every single run. Over-reporting
+     * UNKNOWN is the safe direction and still the wrong one here: it dilutes the
+     * list that matters until nobody reads it. The count is still stated, so the
+     * exclusion is visible rather than silent.
+     */
+    const uncovered = rosterRows.filter((r) => !checkedNumbers.has(r.number) && !r.hidden);
+    const uncoveredHidden = rosterRows.filter((r) => !checkedNumbers.has(r.number) && r.hidden).length;
     sections.push(
-      uncovered.length
+      (uncovered.length
         ? `NOT COVERED by the last check (present in Dispatcharr, absent from the results file), so ` +
           `UNKNOWN rather than working: ${uncovered.length}\n` +
           uncovered.slice(0, MAX_NAMED).map((r) => `  ${r.number} ${r.name}`).join('\n') +
           (uncovered.length > MAX_NAMED ? `\n  … ${uncovered.length - MAX_NAMED} more` : '')
-        : 'Every channel in the Dispatcharr roster appears in the last check.',
+        : 'Every visible channel in the Dispatcharr roster appears in the last check.') +
+        (uncoveredHidden
+          ? `\n(${uncoveredHidden} hidden channel(s) were also not checked, which is expected.)`
+          : ''),
     );
     return ok(sections.join('\n'));
   },

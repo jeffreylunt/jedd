@@ -173,10 +173,24 @@ export type ReadPlan =
 /**
  * Characters a path may contain. Deliberately narrow — every real endpoint on
  * these four services is ASCII words, slashes, dots, hyphens and the occasional
- * GUID. Anything else is refused with the character named, rather than being
+ * hex GUID. Anything else is refused with the character named, rather than being
  * silently encoded into something that means a different thing.
+ *
+ * 🔴 `%` IS NOT IN THIS SET, AND ITS ABSENCE IS LOAD-BEARING.
+ *
+ * `/LiveTv/%43hannels` is `/LiveTv/Channels` to Jellyfin and to the arrs — they
+ * percent-decode the path before matching a route — but it is NOT `/livetv/channels`
+ * to any string comparison, and `new URL` deliberately leaves `%43` alone, so
+ * normalising first does not catch it either. `%2e%2e` is worse: it is a
+ * dot-segment to the URL parser, so `/%2e%2e/%2e%2e/%2e%2e/release` climbs out
+ * from under `/sonarr/api/v3` while still carrying the API key.
+ *
+ * Percent-escapes are never NEEDED here: search terms and dates go in `query`,
+ * which encodes them properly, and the only path-embedded identifiers on these
+ * services are hex GUIDs and integers. So the whole class is refused rather than
+ * decoded — and the refusal names the character.
  */
-const PATH_CHARS = /^[A-Za-z0-9/._~()@:,+%-]+$/;
+const PATH_CHARS = /^[A-Za-z0-9/._~()@:,+-]+$/;
 
 /**
  * Turn a (service, path, query) triple into the exact GET this tool will issue,
@@ -237,23 +251,71 @@ export function planRead(
         '`query` object instead, e.g. {"searchTerm": "Crystal Palace", "limit": 20}.',
     };
   }
-  if (trimmed.split('/').includes('..')) {
-    return { allowed: false, reason: `Path may not contain a ".." segment — got "${trimmed}".` };
-  }
   if (!PATH_CHARS.test(trimmed)) {
     const bad = [...trimmed].find((ch) => !PATH_CHARS.test(ch)) ?? '';
     return {
       allowed: false,
-      reason: `Path contains a character I will not send: ${JSON.stringify(bad)} in "${trimmed}".`,
+      reason:
+        `Path contains a character I will not send: ${JSON.stringify(bad)} in "${trimmed}". ` +
+        'Search terms, dates and ids with punctuation belong in `query`, which encodes them for you.',
     };
   }
 
-  const lowered = trimmed.toLowerCase();
+  const base = spec.baseUrl(config).replace(/\/$/, '');
+  let baseUrl: URL;
+  let target: URL;
+  try {
+    baseUrl = new URL(base);
+    target = new URL(`${base}${trimmed}`);
+  } catch {
+    return { allowed: false, reason: `Could not form a URL from ${spec.label}'s base and "${trimmed}".` };
+  }
+
+  /**
+   * 🔴 MATCH WHAT THE SERVER WILL ROUTE ON, NOT WHAT THE CALLER TYPED.
+   *
+   * Found by review and reproduced against the live gate: matching the raw
+   * string let **every** denylist member through by inserting a dot-segment.
+   *
+   *   `/./LiveTv/Channels`  → fetch sends `/jellyfin/LiveTv/Channels`
+   *   `/LiveTv/./Channels`  → the same
+   *   `/api/v1/./search`    → the 20.9 s indexer search, on all three arrs
+   *
+   * `fetch` hands the URL to the WHATWG parser, which removes single-dot
+   * segments and resolves double-dot ones before a byte goes out. So the string
+   * the denylist inspected and the string the server received were never
+   * required to be the same string, and a guard over the first is a guard over
+   * nothing.
+   *
+   * Normalising FIRST also retires the old `..` guard entirely: a `..` that
+   * climbs out of the base path now fails the containment check below, which is
+   * a property of the resulting URL rather than a pattern someone remembered to
+   * look for.
+   */
+  if (target.origin !== baseUrl.origin) {
+    return {
+      allowed: false,
+      reason: `Path may not name a host — "${trimmed}" resolves to ${target.origin}, not ${baseUrl.origin}.`,
+    };
+  }
+  const basePath = baseUrl.pathname.replace(/\/$/, '');
+  if (basePath && target.pathname !== basePath && !target.pathname.startsWith(`${basePath}/`)) {
+    return {
+      allowed: false,
+      reason:
+        `Path escapes ${spec.label}'s API prefix — "${trimmed}" resolves to "${target.pathname}", ` +
+        `which is outside "${basePath}".`,
+    };
+  }
+
+  // The path RELATIVE to the API prefix, normalised — the form the denylist is
+  // written in, and the form the service's own router sees.
+  const routed = target.pathname.slice(basePath.length).toLowerCase();
   for (const rule of spec.denied) {
-    if (lowered === rule.prefix || lowered.startsWith(`${rule.prefix}/`) || lowered.startsWith(`${rule.prefix}?`)) {
+    if (routed === rule.prefix || routed.startsWith(`${rule.prefix}/`)) {
       return {
         allowed: false,
-        reason: `REFUSED: ${spec.label} ${trimmed} is not readable through this tool, because ${rule.why}`,
+        reason: `REFUSED: ${spec.label} ${target.pathname} is not readable through this tool, because ${rule.why}`,
       };
     }
   }
@@ -261,12 +323,11 @@ export function planRead(
   const qs = buildQuery(query);
   if ('error' in qs) return { allowed: false, reason: qs.error };
 
-  const base = spec.baseUrl(config).replace(/\/$/, '');
   return {
     allowed: true,
     service: service as ReadService,
     label: spec.label,
-    url: `${base}${trimmed}${qs.value ? `?${qs.value}` : ''}`,
+    url: `${target.origin}${target.pathname}${qs.value ? `?${qs.value}` : ''}`,
     headers: { Accept: 'application/json', ...spec.auth(config) },
   };
 }
@@ -281,6 +342,17 @@ export function planRead(
  * services reads, so accepting one would send something meaningless and get a
  * plausible-looking wrong answer back.
  */
+/**
+ * 🔴 A CREDENTIAL IS NEVER THE CALLER'S TO NAME — INCLUDING THROUGH `query`.
+ *
+ * Jellyfin accepts `?api_key=` and the arrs accept `?apikey=`, both equivalent to
+ * the header this file chooses. Leaving that door open meant "the credential is
+ * chosen by code" was true of the HEADERS and false of the request, and it also
+ * put a caller-supplied secret-shaped string into the transcript, since the tool
+ * echoes the URL it issued.
+ */
+const CREDENTIAL_KEYS = new Set(['api_key', 'apikey', 'token', 'apitoken', 'x-emby-token', 'x-api-key']);
+
 function buildQuery(query: unknown): { value: string } | { error: string } {
   if (query === undefined || query === null) return { value: '' };
   if (typeof query !== 'object' || Array.isArray(query)) {
@@ -288,6 +360,13 @@ function buildQuery(query: unknown): { value: string } | { error: string } {
   }
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query as Record<string, unknown>)) {
+    if (CREDENTIAL_KEYS.has(key.toLowerCase())) {
+      return {
+        error:
+          `query.${key} names a credential. The credential is chosen by code from \`service\` and is ` +
+          'never yours to supply — remove it and the request will be authenticated correctly.',
+      };
+    }
     if (value === undefined || value === null) continue;
     if (Array.isArray(value)) {
       if (!value.every(isScalar)) return { error: `query.${key} is an array containing non-scalar values.` };
@@ -354,17 +433,38 @@ export function renderRead(body: unknown, opts: BoundOptions): string {
 
   let shown = Math.min(opts.limit, projected.length);
   let rendered = JSON.stringify(projected.slice(0, shown), null, 1);
-  // Drop RECORDS until it fits. Never slice the string: half a record is not a
-  // smaller answer, it is a syntactically broken one.
+  /**
+   * Drop RECORDS until it fits. Never slice the string: half a record is not a
+   * smaller answer, it is a syntactically broken one.
+   *
+   * Scaled by how far over the ceiling we are rather than halved — halving goes
+   * 25 → 12 → 6 → 3 → 1 and throws away most of what would have fitted. `0.9`
+   * leaves headroom for the records being uneven; the loop is the real guarantee.
+   */
   while (rendered.length > opts.maxChars && shown > 1) {
-    shown = Math.floor(shown / 2);
+    const next = Math.floor((shown * opts.maxChars) / rendered.length * 0.9);
+    shown = Math.max(1, Math.min(next, shown - 1));
     rendered = JSON.stringify(projected.slice(0, shown), null, 1);
   }
+
+  /**
+   * 🔴 THE HEADER STATES WHAT WAS ACTUALLY RENDERED.
+   *
+   * When even one record is over the ceiling, `shown` is the count the shrink
+   * loop STOPPED at, not the count that gets printed — and the oversized branch
+   * below prints none. Reporting "showing 1 of 5" above a paragraph that shows
+   * zero is a count we did not deliver, which is the same species of claim as a
+   * silent truncation. So the header is built after that question is settled.
+   */
+  const oversized = rendered.length > opts.maxChars;
+  if (oversized) shown = 0;
 
   const header = [`showing ${shown} of ${total} record(s)`];
   if (shown < total) header.push(`${total - shown} NOT SHOWN — narrow the query or raise \`limit\``);
   if (opts.fields?.length) header.push(`fields projected to: ${opts.fields.join(', ')}`);
   if (list.envelope.length) header.push(`envelope keys: ${list.envelope.join(', ')}`);
+
+  if (oversized) return `${header.join(' · ')}\n${describeOversized(projected[0], opts)}`;
 
   /**
    * 🔴 A PROJECTION THAT MATCHED NOTHING IS A FALSE ZERO, NOT AN EMPTY RESULT.
@@ -383,10 +483,6 @@ export function renderRead(body: unknown, opts: BoundOptions): string {
     );
   }
 
-  // A single record can still be over the ceiling — /Sessions is the live case.
-  if (rendered.length > opts.maxChars) {
-    return `${header.join(' · ')}\n${describeOversized(projected[0], opts)}`;
-  }
   return `${header.join(' · ')}\n${rendered}`;
 }
 
@@ -397,9 +493,13 @@ function renderSingle(body: unknown, opts: BoundOptions): string {
       ? project(body as Record<string, unknown>, opts.fields)
       : body;
   const rendered = JSON.stringify(value, null, 1);
-  const header = `showing 1 record (not a list)${opts.fields?.length ? ` · fields projected to: ${opts.fields.join(', ')}` : ''}`;
-  if (rendered !== undefined && rendered.length <= opts.maxChars) return `${header}\n${rendered}`;
-  return `${header}\n${describeOversized(value, opts)}`;
+  const projection = opts.fields?.length ? ` · fields projected to: ${opts.fields.join(', ')}` : '';
+  // Same rule as the list branch: the count reports what was RENDERED. A body
+  // too large to print is "showing 0", not "showing 1".
+  if (rendered !== undefined && rendered.length <= opts.maxChars) {
+    return `showing 1 record (not a list)${projection}\n${rendered}`;
+  }
+  return `showing 0 of 1 record (not a list, and too large to print)${projection}\n${describeOversized(value, opts)}`;
 }
 
 /**
@@ -409,7 +509,12 @@ function renderSingle(body: unknown, opts: BoundOptions): string {
  * that one key holds 500 KB.
  */
 function describeOversized(record: unknown, opts: BoundOptions): string {
-  if (!record || typeof record !== 'object') {
+  // ⚠️ Absence is not a measurement. Saying "the value is larger than N" about a
+  // value that is not there states a size fact about nothing.
+  if (record === undefined || record === null) {
+    return '⚠️ There is no record here to show. This is UNKNOWN, not an empty result.';
+  }
+  if (typeof record !== 'object') {
     return `⚠️ The single value is larger than ${opts.maxChars} characters and cannot be shown.`;
   }
   const sizes = Object.entries(record as Record<string, unknown>)

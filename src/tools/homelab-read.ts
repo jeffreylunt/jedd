@@ -199,15 +199,34 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       if ('error' in read) return fail(`${plan.label} answered but the body could not be read: ${read.error}.`);
       if (read.exceeded) {
         return fail(
-          `${plan.label} ${plan.url} exceeded the ${MAX_RESPONSE_BYTES.toLocaleString()}-byte ceiling ` +
-            `(stopped reading at ${read.bytes.toLocaleString()} bytes; the full response is larger). ` +
-            `Nothing is shown, rather than part of it. ${NARROW_ADVICE}`,
+          // ⚠️ The STATUS leads when there is one to report. An oversized error
+          // body otherwise renders an HTTP 500 as "that response was too big",
+          // which points at the query instead of at the server.
+          (res.ok ? `${plan.label} ${plan.url}` : `${plan.label} ${plan.url} → HTTP ${res.status}, and its body`) +
+            ` exceeded the ${MAX_RESPONSE_BYTES.toLocaleString()}-byte ceiling (stopped reading at ` +
+            `${read.bytes.toLocaleString()} bytes; the full response is larger). Nothing is shown, ` +
+            `rather than part of it. ${NARROW_ADVICE}`,
         );
       }
       const text = read.text;
 
       if (!res.ok) {
         return fail(`${plan.label} ${plan.url} → HTTP ${res.status}. Body: ${text.slice(0, 400)}`);
+      }
+
+      /**
+       * ⚠️ AN EMPTY BODY IS ITS OWN FACT, NOT THE WRONG-PREFIX SIGNATURE.
+       *
+       * `JSON.parse('')` throws exactly like `JSON.parse('<!doctype html>')`
+       * does, so both used to be reported as "your base URL is wrong" — a
+       * confident and specific diagnosis of the wrong thing for a 204 or an
+       * empty 200.
+       */
+      if (!text.trim()) {
+        return fail(
+          `${plan.label} ${plan.url} returned HTTP ${res.status} with an EMPTY body — no JSON at all. ` +
+            'That is not a wrong URL and not an error; it is a response with nothing in it. UNKNOWN.',
+        );
       }
 
       let body: unknown;
@@ -242,24 +261,21 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
  * Read a response body, stopping as soon as it passes `ceiling`.
  *
  * Returns `exceeded` rather than a partial string, because a partial body is
- * worse than none: it is invalid JSON that looks like data. Falls back to
- * `res.text()` only when the runtime gives no readable stream — a stubbed
- * `Response` in a test, for instance — and applies the same ceiling to it.
+ * worse than none: it is invalid JSON that looks like data.
+ *
+ * ⚠️ `res.body` is null only for a bodiless response — 204, 304, a HEAD. That
+ * branch is NOT a fallback for large bodies and must not be described as one:
+ * `res.text()` there is `''`, so no ceiling can apply. Every response with
+ * content, including every stubbed `Response` in the tests, has a real
+ * `ReadableStream` and takes the streaming path.
  */
 async function readBounded(
   res: Response,
   ceiling: number,
-): Promise<{ text: string; bytes: number; exceeded: false } | { text: string; bytes: number; exceeded: true } | { error: string }> {
+): Promise<{ text: string; bytes: number; exceeded: boolean } | { error: string }> {
   const body = res.body;
   if (!body || typeof body.getReader !== 'function') {
-    try {
-      const text = await res.text();
-      return text.length > ceiling
-        ? { text: '', bytes: text.length, exceeded: true }
-        : { text, bytes: text.length, exceeded: false };
-    } catch (e) {
-      return { error: (e as Error).message };
-    }
+    return { text: '', bytes: 0, exceeded: false };
   }
   const reader = body.getReader();
   const decoder = new TextDecoder();
