@@ -577,18 +577,34 @@ test('🔴 RSL at León resolves WITHOUT a league argument — the competition w
   assert.doesNotMatch(r.content, /NO FIXTURE FOUND/);
 });
 
-test("🔴 the venue is ATTRIBUTED to ESPN, because ESPN gets it wrong on cup ties", async () => {
-  // Measured: ESPN returned `Real Salt Lake at León` with venue "Dick's
-  // Sporting Goods Park, Commerce City, Colorado" — Colorado's ground, wrong
-  // country. We cannot check it, so we must not launder it as our own fact.
+test('🔴 the venue is ATTRIBUTED, not CAVEATED — and carries the city', async () => {
+  /**
+   * 🔴 THIS TEST ONCE ASSERTED THE OPPOSITE, AND THE ASSERTION WAS WRONG.
+   *
+   * It required "per ESPN, UNVERIFIED — often wrong for cup ties", on the
+   * strength of one fixture I misread: `Real Salt Lake at León` at Dick's
+   * Sporting Goods Park, Colorado. My premise was "a match involving a Mexican
+   * club is played in Mexico". **ESPN was right** — Leagues Cup is hosted in
+   * the US, verified against leaguescup.com and Ticketmaster, and all four
+   * fixtures that window sat at US venues with the Liga MX side nominally home.
+   *
+   * **A caveat is not a safe default.** It permanently marks a reliable field
+   * untrustworthy and nothing re-examines it, because a warning attracts none
+   * of the scrutiny a claim does. Attribution needs the same evidence bar as
+   * assertion.
+   *
+   * The CITY is the real fix: with it, "Commerce City, Colorado" beside a
+   * fixture named "at León" explains itself.
+   */
   const s = spy({ espn: espnByPath(), guide: () => res(guideBody([])) });
   const r = await makeSportsFixture(s.fetchImpl, () => Date.parse('2026-08-25T20:40:00Z')).run(
     { team: 'Real Salt Lake' },
     ctx(),
   );
-  assert.match(r.content, /venue \(per ESPN, UNVERIFIED/);
+  assert.match(r.content, /venue \(per ESPN\): Selhurst Park, London/, 'attributed, and located');
+  assert.doesNotMatch(r.content, /UNVERIFIED/, 'no unsupported reliability claim');
+  assert.doesNotMatch(r.content, /often wrong/i);
 });
-
 test('🔴 the EpisodeTitle is rendered — often the ONLY place the teams appear', async () => {
   /**
    * 🔴 MEASURED ON THE LIVE GUIDE, 2026-08-26.

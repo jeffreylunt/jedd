@@ -281,11 +281,25 @@ function parseFixture(event: Record<string, unknown>): Fixture | null {
     }
   }
 
+  /**
+   * 🔴 THE CITY IS CARRIED, AND ITS ABSENCE CAUSED A REAL MISDIAGNOSIS.
+   *
+   * With only `fullName`, "Dick's Sporting Goods Park" on a fixture named
+   * `Real Salt Lake at León` looked like corrupt data — Colorado's ground for a
+   * match I assumed was in Mexico. With the city attached it reads
+   * "Commerce City, Colorado" and the situation explains itself: Leagues Cup is
+   * hosted in the United States.
+   *
+   * A field that omits the part which disambiguates it invites exactly this.
+   */
   const venueRaw = comp?.['venue'];
   let venue: string | null = null;
   if (venueRaw && typeof venueRaw === 'object') {
-    const full = (venueRaw as Record<string, unknown>)['fullName'];
-    if (typeof full === 'string' && full) venue = full;
+    const v = venueRaw as Record<string, unknown>;
+    const full = typeof v['fullName'] === 'string' ? v['fullName'] : '';
+    const addr = (v['address'] ?? {}) as Record<string, unknown>;
+    const city = typeof addr['city'] === 'string' ? addr['city'] : '';
+    if (full) venue = city ? `${full}, ${city}` : full;
   }
 
   return { id, name, kickoff, kickoffMs, teams, venue, state: parseState(event) };

@@ -586,19 +586,33 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
       parts.push(`NEXT: ${teamLine(next)}${stateNote}  [${leagueLabel(nextRow.key)}]`);
       parts.push(`  kickoff ${renderKickoff(next.kickoffMs, nowMs)}`);
       /**
-       * 🔴 ATTRIBUTED, BECAUSE ESPN GETS THIS WRONG ON CUP TIES.
+       * ⚠️ ATTRIBUTED, NOT CAVEATED — AND THE DIFFERENCE COST A CORRECTION.
        *
-       * Measured 2026-08-25: `Real Salt Lake at León` in the Leagues Cup came
-       * back with `venue: Dick's Sporting Goods Park, Commerce City, Colorado`
-       * — Colorado Rapids' ground, in the wrong country, for a match in Mexico.
-       * ESPN's venue field is evidently stale or team-derived for neutral and
-       * cup fixtures.
+       * This line briefly read *"per ESPN, UNVERIFIED — it is often wrong for
+       * cup ties"*, on the strength of ONE fixture that looked wrong:
+       * `Real Salt Lake at León` at Dick's Sporting Goods Park, Colorado. I had
+       * assumed a match involving a Mexican club is played in Mexico. **ESPN was
+       * right and I was wrong.**
        *
-       * We cannot check it, so we do not launder it. Naming the source turns a
-       * confident wrong fact into a legible wrong claim, which is the whole
-       * distinction this tool is built around.
+       * Verified two ways on 2026-08-25. Within ESPN: all four Leagues Cup
+       * fixtures that window are at US venues with the Liga MX side nominally
+       * home (Monterrey at SeatGeek Stadium Illinois, Toluca at Red Bull Arena
+       * New Jersey, América at Dignity Health Sports Park California) — a
+       * systematic pattern, not a glitch. Outside ESPN: leaguescup.com's own
+       * preview and Ticketmaster both give Dick's Sporting Goods Park, Commerce
+       * City, Colorado, 8:30 p.m. MT. Leagues Cup is hosted in the US.
+       *
+       * 🔴 **A CAVEAT IS NOT A SAFE DEFAULT.** It feels like free insurance, so
+       * it goes in on weak evidence — but it permanently marks a reliable field
+       * as untrustworthy, and nothing ever re-examines it, because a warning
+       * attracts none of the scrutiny a claim does. **Attribution needs the same
+       * evidence bar as assertion.**
+       *
+       * "per ESPN" stays: it is honest, cheap, and says where the fact came
+       * from without editorialising about its quality. Do not re-add a
+       * reliability claim here without evidence, and cite it if you do.
        */
-      if (next.venue) parts.push(`  venue (per ESPN, UNVERIFIED — it is often wrong for cup ties): ${next.venue}`);
+      if (next.venue) parts.push(`  venue (per ESPN): ${next.venue}`);
       parts.push('');
 
       const guide = await findFixtureInGuide(ctx.config, next, fetchImpl);
