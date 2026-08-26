@@ -7,6 +7,7 @@ import { BlueBubblesClient, type FetchImpl } from '../src/bluebubbles/client.js'
 import { BlueBubblesConnector, BlueBubblesReceiver } from '../src/bluebubbles/receiver.js';
 import { SeenStore } from '../src/bluebubbles/seen.js';
 import { classifyPayload } from '../src/bluebubbles/payload.js';
+import { sendToken } from '../src/connector.js';
 import { BURST_TTL_MS, ReplyThreading } from '../src/bluebubbles/threading.js';
 
 /**
@@ -373,4 +374,83 @@ test('🔴 the self guard is NOT a suffix match — a lookalike address still ge
 test('a real person is unaffected by the self guard', () => {
   const v = classifyPayload(selfPayload({ handle: { address: OWNER } }), SELF);
   assert.equal(v.action, 'deliver');
+});
+
+// ── 🔴 the anchored fact has to REACH the log, or it may as well not exist ──
+
+test('🔴 an anchored send reports anchoredTo — the fact is a FIELD, not a substring', async () => {
+  // Measured 2026-08-26: `grep -c anchored jedd.log` returned 0 on a day
+  // threading demonstrably worked twice, because `send()` returns void and
+  // dropped the outcome. The first person to debug threading had to read
+  // BlueBubbles' database instead.
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
+  const out = await connector.sendReporting(OWNER, 'answer', 'G-1');
+  assert.equal(out.anchoredTo, 'G-1');
+});
+
+test('a plain send reports anchoredTo: null', async () => {
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
+  threading.arrived(OWNER, 'G-1');
+  const out = await connector.sendReporting(OWNER, 'answer', 'G-1');
+  assert.equal(out.anchoredTo, null);
+});
+
+test('🔴 a DOWNGRADED send reports plain, not the intention it started with', async () => {
+  // Reporting "anchored" here would make the log lie about what the person saw.
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, (url, body) => {
+    if (url.includes('/message/query')) return { status: 200, data: [] };
+    if ('selectedMessageGuid' in body) return { status: 500, data: null };
+    return { status: 200, data: { guid: 'sent-plain' } };
+  });
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
+  const out = await connector.sendReporting(OWNER, 'answer', 'G-1');
+  assert.match(out.detail, /sent PLAIN/);
+  assert.equal(out.anchoredTo, null, 'it went out plain, so it must not read as anchored');
+});
+
+test('🔴 send() fills the record BEFORE it throws — which kind of send failed is half the diagnosis', async () => {
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, () => ({ status: 500, data: null }));
+  threading.arrived(OWNER, 'G-1');
+  const rec = { anchored: false, detail: 'no send reached' };
+  await assert.rejects(() => connector.send(OWNER, 'answer', 'G-1', rec));
+  assert.notEqual(rec.detail, 'no send reached', 'the record must survive the throw');
+});
+
+test('sendToken renders the turn-log word', () => {
+  assert.equal(sendToken({ anchored: true, detail: '' }), 'anchored');
+  assert.equal(sendToken({ anchored: false, detail: '' }), 'plain');
+  assert.equal(sendToken(undefined), 'unknown');
+});
+
+test('🔴 send() marks the record ANCHORED on the success path — the log line depends on it', async () => {
+  // The gap this closes: every other test here asserts on `SendOutcome`, which
+  // `send()` does not return. A mutation that re-derived `record.anchored` from a
+  // REWORDED substring of `detail` passed the whole suite — the field was right
+  // and the thing the log actually reads was silently always false.
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
+
+  const rec = { anchored: false, detail: 'no send reached' };
+  await connector.send(OWNER, 'answer', 'G-1', rec);
+  assert.equal(rec.anchored, true, 'a quoted reply must read as anchored in the turn log');
+  assert.equal(sendToken(rec), 'anchored');
+});
+
+test('send() marks the record PLAIN for an ordinary reply', async () => {
+  const threading = new ReplyThreading();
+  const { connector } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
+  threading.arrived(OWNER, 'G-1');
+  const rec = { anchored: true, detail: 'stale' };
+  await connector.send(OWNER, 'answer', 'G-1', rec);
+  assert.equal(rec.anchored, false);
+  assert.equal(sendToken(rec), 'plain');
 });

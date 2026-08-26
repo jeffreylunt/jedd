@@ -33,7 +33,7 @@ export interface Connector {
    * ("that download finished") answers no incoming message at all, and must
    * never be anchored to a stale one.
    */
-  send(toHandle: string, text: string, inReplyTo?: string): Promise<void>;
+  send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void>;
   /** Begin delivering messages. Resolves when the source is exhausted. */
   listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void>;
 
@@ -71,6 +71,41 @@ export interface Connector {
    */
   markRead(toHandle: string): boolean;
   withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T>;
+}
+
+/**
+ * What the SEND actually did, for the per-turn log line.
+ *
+ * 🔴 THIS EXISTS BECAUSE `send()` RETURNS `void` AND WAS THROWING THE ANSWER AWAY.
+ *
+ * `sendReporting` builds a `SendOutcome` saying whether the reply was anchored to
+ * a specific message and why — and `send()` looked at `state` to decide whether
+ * to throw and **discarded the rest**. So the one string that distinguishes an
+ * anchored send from a plain one never reached the durable log, and the first
+ * person to debug threading had to go and read BlueBubbles' own database to find
+ * out what had happened. That is precisely the situation `[anchored: …]` was
+ * worded to prevent.
+ *
+ * ⚠️ PER-CALL, NOT A CONSTRUCTOR CALLBACK. Turns run concurrently — two replies
+ * to the same person can be in flight at once — so a single mutable field on the
+ * connector would be clobbered by whichever turn finished last, and the log line
+ * would confidently describe the wrong send. The record travels with the call for
+ * the same reason `PresenceRecord` does.
+ *
+ * It is filled from INSIDE the gate that makes the decision, never re-derived by
+ * a predicate out here that can drift away from it.
+ */
+export interface SendRecord {
+  /** Was this reply quoted to the message it answers? */
+  anchored: boolean;
+  /** The transport's own account of the send, including any downgrade. */
+  detail: string;
+}
+
+/** How a `SendRecord` reads in a log line. */
+export function sendToken(record: SendRecord | undefined): string {
+  if (!record) return 'unknown';
+  return record.anchored ? 'anchored' : 'plain';
 }
 
 /** What a turn actually put on the wire, for the per-turn log line. */
@@ -128,7 +163,13 @@ export class StdoutConnector implements Connector {
     this.currentSender = defaultSender;
   }
 
-  async send(toHandle: string, text: string): Promise<void> {
+  async send(toHandle: string, text: string, _inReplyTo?: string, record?: SendRecord): Promise<void> {
+    // A terminal cannot quote a message, and says so rather than leaving the
+    // record undefined and making an absent capability look like a lost one.
+    if (record) {
+      record.anchored = false;
+      record.detail = 'stdout has no message ids, so a reply can never be anchored here';
+    }
     console.log(`\n[jedd → ${toHandle}]\n${text}\n`);
   }
 
@@ -178,8 +219,12 @@ export class TestConnector implements Connector {
 
   constructor(private readonly script: IncomingMessage[] = []) {}
 
-  async send(toHandle: string, text: string, inReplyTo?: string): Promise<void> {
+  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void> {
     this.sent.push({ to: toHandle, text, inReplyTo });
+    if (record) {
+      record.anchored = false;
+      record.detail = 'test connector';
+    }
   }
 
   markRead(toHandle: string): boolean {

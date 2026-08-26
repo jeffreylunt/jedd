@@ -5,7 +5,7 @@ import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
-import { presenceToken, withPresence, type PresenceRecord } from './connector.js';
+import { presenceToken, sendToken, withPresence, type PresenceRecord, type SendRecord } from './connector.js';
 import { ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
@@ -277,6 +277,12 @@ async function main(): Promise<void> {
        * enforce. Do not swap these.
        */
       const signals: PresenceRecord = { signalled: [] };
+      /**
+       * ⚠️ DECLARED PER TURN, INSIDE the handler. Turns run concurrently, so a
+       * shared one would be overwritten by whichever reply finished last and the
+       * log line would describe the wrong send with total confidence.
+       */
+      const sent: SendRecord = { anchored: false, detail: 'no send reached' };
       const record = await withPresence(
         connector,
         message,
@@ -293,7 +299,7 @@ async function main(): Promise<void> {
            * `ReplyThreading` and it fires only when this person had more than
            * one reply outstanding.
            */
-          await connector.send(message.senderHandle, r.replyText, message.sourceGuid);
+          await connector.send(message.senderHandle, r.replyText, message.sourceGuid, sent);
           return r;
         },
         signals,
@@ -314,8 +320,27 @@ async function main(): Promise<void> {
       console.error(
         `[jedd] turn ${turns} from ${message.senderHandle}: ` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
-          `presence=${presenceToken(signals)} ${Date.now() - started}ms`,
+          /**
+           * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
+           *
+           * It exists because the answer used to be built and thrown away:
+           * `send()` returns void, so the `[anchored: …]` string never reached
+           * this file and the only way to find out whether threading had fired
+           * was to read BlueBubbles' own database. Measured 2026-08-26 —
+           * `grep -c anchored jedd.log` returned 0 on a day threading demonstrably
+           * worked twice.
+           *
+           * It is filled from inside the send gate and reports the OUTCOME, so a
+           * reply that was meant to be anchored and got downgraded to plain reads
+           * `reply=plain` — the downgrade reason is in the detail beside it.
+           */
+          `presence=${presenceToken(signals)} reply=${sendToken(sent)} ${Date.now() - started}ms`,
       );
+      // Only when there is something to say: an anchored send, or a downgrade.
+      // A plain reply on a quiet turn does not need a second line about itself.
+      if (sent.anchored || sent.detail.includes('PLAIN after')) {
+        console.error(`[jedd]   send: ${sent.detail}`);
+      }
     } catch (e) {
       // A failing turn must not stop the next message arriving.
       console.error(`[jedd] turn ${turns} THREW: ${(e as Error).message}`);

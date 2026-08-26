@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import type { Connector, IncomingMessage } from '../connector.js';
+import type { Connector, IncomingMessage, SendRecord } from '../connector.js';
 import { BlueBubblesClient } from './client.js';
 import { classifyPayload, type InboundVerdict } from './payload.js';
 import type { Presence } from './presence.js';
@@ -291,6 +291,20 @@ export interface SendOutcome {
   /** 🔴 `null` means no verdict yet. It is NEVER a synonym for `false`. */
   delivered: boolean | null;
   detail: string;
+  /**
+   * The message this reply was QUOTED to, or `null` for an ordinary send.
+   *
+   * ⚠️ A FIELD, NOT A SUBSTRING OF `detail`. The first version of this read
+   * `detail.includes('[anchored:')`, which is the same re-derivation this file
+   * warns about everywhere else: the fact would live in two places, and a
+   * reworded sentence would silently flip the log to the wrong answer with
+   * nothing failing. The decision is made once, above, and carried.
+   *
+   * 🔴 Set on the DOWNGRADE paths too, and set to `null` there — a reply that
+   * was meant to be anchored and went out plain is a plain reply, and reporting
+   * the intention rather than the outcome is how a log starts lying.
+   */
+  anchoredTo: string | null;
 }
 
 export class BlueBubblesConnector implements Connector {
@@ -359,6 +373,7 @@ export class BlueBubblesConnector implements Connector {
         state: 'suppressed',
         delivered: false,
         detail: `SUPPRESSED — ${toHandle} is outside the send audience, so nothing was sent.`,
+        anchoredTo: null,
       };
     }
 
@@ -383,11 +398,12 @@ export class BlueBubblesConnector implements Connector {
           state: 'accepted',
           delivered: null,
           detail: decision.replyTo ? `${r.detail} [anchored: ${decision.detail}]` : r.detail,
+          anchoredTo: decision.replyTo,
         };
       }
       if (!decision.replyTo) {
         this.threading?.answered(toHandle, inReplyTo);
-        return { state: 'failed', delivered: false, detail: r.detail };
+        return { state: 'failed', delivered: false, detail: r.detail, anchoredTo: null };
       }
       return this.retryPlain(toHandle, text, inReplyTo, r.detail);
     } catch (e) {
@@ -459,6 +475,9 @@ export class BlueBubblesConnector implements Connector {
         detail:
           `the anchored (reply-quoted) send reported failure — ${why} — but the text is ALREADY IN the sent ` +
           'history, so it went out and only the reply-quote is in doubt. NOT re-sent.',
+        // 🔴 `null`: we do not know whether the copy in the history carries the
+        // quote, so claiming it was anchored would be a guess in the log.
+        anchoredTo: null,
       };
     }
     if (already === null) {
@@ -470,6 +489,7 @@ export class BlueBubblesConnector implements Connector {
           '(BlueBubbles\' history was unreadable), so it was NOT re-sent. `null` is not `false`: an ' +
           'unreadable history is exactly when a duplicate would be invisible to us and obvious to the ' +
           'person holding the phone.',
+        anchoredTo: null,
       };
     }
     const plain = await this.client.sendText(toHandle, text);
@@ -478,11 +498,13 @@ export class BlueBubblesConnector implements Connector {
           state: 'accepted',
           delivered: null,
           detail: `sent PLAIN after the anchored send failed (${why}) — the reply is intact, only the reply-quote was lost. ${plain.detail}`,
+          anchoredTo: null,
         }
       : {
           state: 'failed',
           delivered: false,
           detail: `anchored send failed (${why}) AND the plain retry failed: ${plain.detail}`,
+          anchoredTo: null,
         };
   }
 
@@ -493,8 +515,21 @@ export class BlueBubblesConnector implements Connector {
    * paths would be two places for the audience check to drift, and the drift
    * would be invisible: each path is individually plausible.
    */
-  async send(toHandle: string, text: string, inReplyTo?: string): Promise<void> {
+  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void> {
     const r = await this.sendReporting(toHandle, text, inReplyTo);
+    /**
+     * 🔴 FILLED BEFORE THE THROW, NOT AFTER.
+     *
+     * A failed send is exactly when the caller most needs to know whether it was
+     * anchored — an anchored send routes through a different BlueBubbles path
+     * than a plain one, so "which kind of send failed" is half the diagnosis.
+     * Recording it only on the success path would lose it precisely when it
+     * matters.
+     */
+    if (record) {
+      record.anchored = r.anchoredTo !== null;
+      record.detail = r.detail;
+    }
     if (r.state === 'failed') throw new Error(`send failed: ${r.detail}`);
   }
 
@@ -545,7 +580,7 @@ export class ShadowConnector implements Connector {
 
   constructor(private readonly receiver: BlueBubblesReceiver) {}
 
-  async send(toHandle: string, text: string, _inReplyTo?: string): Promise<void> {
+  async send(toHandle: string, text: string, _inReplyTo?: string, _record?: SendRecord): Promise<void> {
     throw new Error(
       `shadow mode: this connector cannot send (refused ${text.length} chars to ${toHandle}). It ` +
         'holds no BlueBubbles client, so this is not a disabled feature — there is no send path ' +
