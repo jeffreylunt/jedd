@@ -825,6 +825,47 @@ export class ArrClient {
   }
 
   /**
+   * Remove ONE queue row, telling the arr to delete it from the download client
+   * and blocklist the release.
+   *
+   * ── 🔴 THE METHOD IS A LITERAL, AND `call()` IS NOT REUSED ──────────────────
+   *
+   * `call()` is GET-only by construction — the same discipline as
+   * `homelab-read.ts`, where adding a `method` parameter would turn a lookup
+   * table into a parser. So the one destructive verb this client has gets its
+   * own function with `DELETE` written out, rather than making every existing
+   * read one argument away from a delete.
+   *
+   * ⚠️ `blocklist=true` is what stops the arr immediately re-grabbing the same
+   * release. It keys on RELEASE and INDEXER identity, **not on infohash**, so
+   * the identical torrent offered by a different indexer walks straight back
+   * through it — measured 2026-08-23, a replacement grab re-added the exact
+   * infohash blocklisted minutes earlier because LimeTorrents advertised it at
+   * 1562 seeders while its real swarm had been 0 for 23 hours. The caller must
+   * diff any new infohash against what it removed.
+   */
+  async removeFromQueue(rowId: number): Promise<{ ok: boolean; detail: string }> {
+    const url = `${this.opts.baseUrl}/queue/${rowId}?removeFromClient=true&blocklist=true`;
+    try {
+      const res = await this.fetchImpl(url, {
+        method: 'DELETE',
+        headers: { 'X-Api-Key': this.opts.apiKey },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      if (res.status >= 400) {
+        return { ok: false, detail: `row ${rowId}: HTTP ${res.status}` };
+      }
+      return { ok: true, detail: `row ${rowId}: removed` };
+    } catch (e) {
+      return {
+        ok: false,
+        // ⚠️ A transport failure on a DELETE is not "it did not happen".
+        detail: `row ${rowId}: ${describeError(e, redactUrlSecrets)} — it MAY still have been removed`,
+      };
+    }
+  }
+
+  /**
    * The download queue, grouped into RELEASES.
    *
    * 🔴 THE ONLY SOURCE OF TRUTH FOR "WHAT IS DOWNLOADING". There is deliberately

@@ -46,6 +46,20 @@ export interface Release {
   service: QueueService;
   /** How many arr rows this one release expands into. Prose only, never a threshold. */
   rows: number;
+  /**
+   * 🔴 THE ARR QUEUE ROW IDS — every one of them, because a removal needs them ALL.
+   *
+   * A season pack is ONE torrent expanded into N arr rows sharing a
+   * `downloadId`. `DELETE /queue/{id}` takes a ROW id, not a release id, so
+   * deleting a single row of a nine-episode pack removes the torrent from the
+   * client and leaves EIGHT arr rows pointing at a download that no longer
+   * exists. Keeping every id is what makes a removal complete.
+   *
+   * ⚠️ This is a list for the same reason `rows` exists and is not a threshold:
+   * the release is the unit, and the rows are an implementation detail of the
+   * arr's own bookkeeping.
+   */
+  rowIds: number[];
   /** Total bytes. **0 means the torrent metadata has not resolved** — not "empty". */
   size: number;
   /** Bytes remaining. `sizeleft === size` means nothing has EVER moved. */
@@ -185,6 +199,7 @@ export function parseQueue(body: unknown, service: QueueService): Release[] {
       subject: String(subjectRow?.['title'] ?? first['title'] ?? '(unknown)'),
       service,
       rows: rows.length,
+      rowIds: rows.map((r) => Number(r['id'])).filter((n) => Number.isInteger(n)),
       size: numberOr(first['size'], 0),
       sizeleft: numberOr(first['sizeleft'], 0),
       status: String(first['status'] ?? 'unknown'),

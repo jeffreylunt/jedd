@@ -1,8 +1,11 @@
+import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
 import { ArrClient, type FetchImpl } from '../media/arr.js';
 import {
   byHash,
   fetchTorrents,
   qbitVerdict,
+  setTopPriority,
   type QbitTorrent,
   type QbitVerdict,
 } from '../media/qbit-torrents.js';
@@ -86,37 +89,313 @@ export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 THE DESTRUCTIVE HALF — gated on the VERDICT, never on what was asked for
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Find one item by infohash and say whether the verdict permits `need`.
+ *
+ * 🔴 THIS IS THE WHOLE SAFETY MODEL. The caller names a hash; the CODE decides
+ * whether that hash may be acted on, from the verdict it computed out of
+ * qBittorrent's own state. A held torrent, a finished one, an unstarted one or
+ * an unmanaged one is refused **whatever the model asks for**, so targeting one
+ * is unrepresentable rather than discouraged.
+ *
+ * It is deliberately not a confirmation prompt. Tool selection on this model was
+ * measured at 39%, and a confirm step asks an unreliable selector the same
+ * question twice, then treats the second correlated answer as corroboration.
+ */
+function gate(items: Item[], hash: string, need: QbitVerdict['kind']): { item: Item } | { refusal: string } {
+  const wanted = hash.trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(wanted)) {
+    return {
+      refusal:
+        `"${hash}" is not a 40-character infohash, so nothing was done. Run action "list" — every ` +
+        'item there prints its hash, and that is the only handle these actions take.',
+    };
+  }
+  const item = items.find((i) => (i.torrent?.hash ?? i.release?.releaseId ?? '').toLowerCase() === wanted);
+  if (!item) {
+    return { refusal: `Nothing in the queue has infohash ${wanted}. Run action "list" for the current set — and note the queue changes between reads, so a hash from an old listing may simply be gone.` };
+  }
+  if (item.verdict.kind === need) return { item };
+  return { refusal: `${refusalFor(item)}\nNothing was done.` };
+}
+
+/** Why this item is not actionable, in the words that matter to the person. */
+function refusalFor(item: Item): string {
+  const name = item.release?.releaseTitle || item.torrent?.name || 'that torrent';
+  switch (item.verdict.kind) {
+    case 'held':
+      return (
+        `REFUSED — ${name} is STOPPED, not stalled. Somebody stopped it deliberately, almost ` +
+        'certainly a person at the qBittorrent UI, and it still has ' +
+        `${item.torrent?.numComplete ?? 0} seed(s) in its swarm. Acting on it would route around ` +
+        'their decision. Report it and ask; there is no verb here that resumes it.'
+      );
+    case 'finished':
+      return (
+        `REFUSED — ${name} is FINISHED and seeding. Blocklisting it would destroy a completed ` +
+        'download AND poison the release so the arrs will not re-grab it. An upload-side state is ' +
+        'never a download fault.'
+      );
+    case 'not-started':
+      return (
+        `REFUSED — ${name} has NEVER STARTED. qBittorrent's own queue is holding it, so its 0 ` +
+        'seeds and 0 speed are the absence of any observation, not a dead swarm. Wait for it to ' +
+        'start, or use "promote" if something healthy is stuck behind dead torrents.'
+      );
+    case 'unmanaged':
+      return `REFUSED — ${name} is in state "${item.verdict.state}" and is not arr-managed. Outside what this tool may touch.`;
+    case 'progressing':
+      return `REFUSED — ${name} is DOWNLOADING right now. Nothing is wrong with it.`;
+    case 'starting':
+      return `REFUSED — ${name} started recently and has not had long enough to be called stalled.`;
+    case 'unseen':
+      return `REFUSED — ${name} is in the arr queue but qBittorrent has no record of it, so there is no torrent here to remove. That is a different fault.`;
+    default:
+      return `REFUSED — ${name} is not in an actionable state.`;
+  }
+}
+
+/**
+ * Remove a stalled release and blocklist it — CAPTURING IT FIRST.
+ *
+ * ── 🔴 CAPTURE BEFORE DELETE, AND A FAILED CAPTURE ABORTS ───────────────────
+ *
+ * The capture is not paperwork; it is the file the post-grab diff reads. The
+ * arrs' blocklist keys on RELEASE and INDEXER identity, **not on infohash**, so
+ * the identical torrent offered by another indexer walks straight back through
+ * it — measured 2026-08-23, a replacement grab re-added the exact infohash
+ * blocklisted minutes earlier because an indexer advertised 1562 seeders for a
+ * swarm that had been at 0 for 23 hours. **Indexer seeder counts are not swarm
+ * truth; only qBit's `num_complete` is.**
+ *
+ * ── 🔴 EVERY ROW, NOT THE FIRST ────────────────────────────────────────────
+ *
+ * A season pack is ONE torrent and N arr rows. Deleting one row removes the
+ * torrent and strands the other N-1 pointing at a download that no longer
+ * exists. All of `rowIds` or none.
+ */
+async function runUnstick(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchImpl) {
+  const hash = typeof rawHash === 'string' ? rawHash : '';
+  const state = await collect(ctx, fetchImpl);
+  if ('error' in state) return fail(state.error);
+
+  const found = gate(state.items, hash, 'stalled');
+  if ('refusal' in found) return fail(found.refusal);
+  const { item } = found;
+  if (!item.release) {
+    return fail(
+      'That torrent is in qBittorrent but no arr queue row claims it, so there is nothing to ' +
+        'blocklist — removing it here would leave the arr unaware. Not something this tool does.',
+    );
+  }
+  if (!item.release.rowIds.length) {
+    return fail('The arr queue rows for that release carry no usable id, so a removal cannot be addressed. Nothing was done.');
+  }
+
+  let savedTo: string;
+  try {
+    savedTo = captureRemoval(ctx.config.downloadBackupDir, item);
+  } catch (e) {
+    return fail(
+      `NOTHING WAS REMOVED. The record of what I was about to delete could not be written ` +
+        `(${(e as Error).message}), and that file is what makes this reversible AND what the ` +
+        'post-grab diff reads. This is a refusal, not a failed removal.',
+    );
+  }
+
+  const client = arrClientFor(ctx, item.release.service, fetchImpl);
+  const results: string[] = [];
+  let anyFailed = false;
+  for (const rowId of item.release.rowIds) {
+    const r = await client.removeFromQueue(rowId);
+    results.push(r.detail);
+    if (!r.ok) anyFailed = true;
+  }
+
+  /**
+   * 🔴 CONFIRM THE HASH IS ACTUALLY GONE. The spec's rule, and it is a rule
+   * because a 200 has lied here before: *"Confirm the hash is actually gone from
+   * qBit after a blocklist-delete rather than trusting the 200."*
+   */
+  const after = await fetchTorrents(ctx.config.qbittorrent.lanUrl, fetchImpl);
+  const stillThere = after.state === 'ok' && after.value.some((t) => t.hash === item.torrent?.hash);
+
+  const name = item.release.releaseTitle;
+  const lines = [
+    stillThere
+      ? `⚠️ ${name} — the arr accepted the removal but the torrent is STILL IN qBittorrent.`
+      : after.state === 'ok'
+        ? `Removed ${name} and blocklisted the release. Confirmed GONE from qBittorrent.`
+        : `Removed ${name} and blocklisted the release — but I could NOT re-read qBittorrent to confirm the torrent is gone, so that half is UNKNOWN.`,
+    '',
+    `arr rows (${item.release.rowIds.length}): ${results.join('; ')}`,
+  ];
+  if (anyFailed) {
+    lines.push(
+      '⚠️ At least one row did not remove cleanly. A season pack is one torrent across several rows, ' +
+        'so a partial removal leaves rows pointing at a download that no longer exists — run "list" ' +
+        'and look before doing anything else.',
+    );
+  }
+  lines.push(
+    '',
+    `🔴 DELETED INFOHASH: ${item.torrent?.hash ?? '(unknown)'}`,
+    'If you now grab a replacement, CHECK ITS INFOHASH AGAINST THAT ONE. The blocklist keys on ' +
+      'release and indexer identity, NOT on infohash, so the same dead torrent offered by a ' +
+      'different indexer passes straight back through it — and indexer seeder counts are not swarm ' +
+      'truth. Measured: a replacement grab re-added the exact hash blocklisted minutes earlier.',
+    `Recorded at ${savedTo}.`,
+    '',
+    'This did NOT search for a replacement. Use find_gaps and search_episode for that — and read ' +
+      'hasFile first, because a stalled torrent for an episode already on disk is pure redundancy.',
+  );
+  return ok(lines.join('\n'));
+}
+
+/**
+ * Push one torrent to the top of qBit's queue.
+ *
+ * ⚠️ Gated on `not-started` WITH A LIVE SWARM. Promoting a dead torrent moves it
+ * up a queue it will fail at anyway, and promoting one nothing is waiting behind
+ * achieves nothing. The case this exists for is real and documented:
+ * `dont_count_slow_torrents=False`, so dead torrents hold active slots
+ * indefinitely and qBit promotes by ADD ORDER rather than by health — which is
+ * how the client moved zero bytes for 24 h while looking fully busy.
+ */
+async function runPromote(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchImpl) {
+  const hash = typeof rawHash === 'string' ? rawHash : '';
+  const state = await collect(ctx, fetchImpl);
+  if ('error' in state) return fail(state.error);
+
+  const found = gate(state.items, hash, 'not-started');
+  if ('refusal' in found) return fail(found.refusal);
+  const torrent = found.item.torrent!;
+  if (torrent.numComplete <= 0) {
+    return fail(
+      `REFUSED — ${torrent.name} is waiting in the queue but its swarm has 0 seeds, so moving it up ` +
+        'the queue only gives it a slot to fail in. Promotion helps a HEALTHY torrent stuck behind ' +
+        'dead ones; this is not that.',
+    );
+  }
+
+  const before = torrent.priority;
+  const sent = await setTopPriority(ctx.config.qbittorrent.lanUrl, torrent.hash, fetchImpl);
+  if (sent.state !== 'ok') return fail(`Could not promote ${torrent.name}.\n${sent.detail}`);
+
+  const after = await fetchTorrents(ctx.config.qbittorrent.lanUrl, fetchImpl);
+  if (after.state !== 'ok') {
+    return fail(
+      `qBittorrent accepted the request (HTTP ${sent.value.status}) but I could NOT re-read the ` +
+        `priority, so whether ${torrent.name} actually moved is UNKNOWN. ` +
+        'The status code is not the outcome here — a topPrio call returns 200 even for a torrent ' +
+        'that does not exist.',
+    );
+  }
+  const now = after.value.find((t) => t.hash === torrent.hash)?.priority;
+
+  /**
+   * 🔴 THE COMPARISON IS THE RESULT. Measured: a batched `topPrio` returns 200
+   * with every priority unchanged, and a `topPrio` for a hash that does not
+   * exist also returns 200. There is no success signal in the response.
+   */
+  if (now === undefined) {
+    return fail(`${torrent.name} is no longer in qBittorrent at all, so its priority is UNKNOWN.`);
+  }
+  if (now === before) {
+    return fail(
+      `⚠️ ${torrent.name} did NOT move. qBittorrent returned HTTP ${sent.value.status} and the ` +
+        `priority is still ${now}. That combination is documented: the status code is not the ` +
+        'outcome. Do not report this as done.',
+    );
+  }
+  return ok(
+    `${torrent.name} moved to priority ${now} (was ${before}) — verified by re-reading, not by the ` +
+      `HTTP ${sent.value.status}.\nIt still has to find peers; ${torrent.numComplete} seed(s) in the ` +
+      'swarm say it can.',
+  );
+}
+
+/**
+ * Write down what is about to be deleted. 0600 in a 0700 directory, created
+ * with `wx` so an existing path is an error rather than something to widen.
+ *
+ * ⚠️ Throws rather than returning an error, so the delete below cannot be
+ * reached by ignoring a return value.
+ */
+function captureRemoval(dir: string, item: Item): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const hash = item.torrent?.hash ?? item.release?.releaseId ?? 'unknown';
+  const path = join(dir, `removed-${hash.slice(0, 12)}-${stamp}.json`);
+  const body = JSON.stringify(
+    {
+      removedAt: new Date().toISOString(),
+      infohash: item.torrent?.hash ?? null,
+      releaseTitle: item.release?.releaseTitle ?? item.torrent?.name ?? null,
+      subject: item.release?.subject ?? null,
+      service: item.release?.service ?? null,
+      arrRowIds: item.release?.rowIds ?? [],
+      qbitState: item.torrent?.state ?? null,
+      hoursActive: item.torrent ? Math.floor(item.torrent.timeActiveSeconds / 3600) : null,
+      swarmSeeds: item.torrent?.numComplete ?? null,
+      arrMessages: item.release?.messages ?? [],
+    },
+    null,
+    1,
+  );
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(fd, body, null, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
+  return path;
+}
+
 interface Item {
   release: Release | null;
   torrent: QbitTorrent | null;
   verdict: QbitVerdict | { kind: 'unseen' };
 }
 
-async function runList(ctx: ToolContext, fetchImpl?: FetchImpl) {
+/**
+ * 🔴 ONE GATHER, ONE JOIN, ONE VERDICT — used by the listing AND by every action.
+ *
+ * If the actions recomputed their own view, the thing the caller was shown and
+ * the thing the gate decides on could disagree, and the gap between them is
+ * exactly where a wrong target gets through. Same snapshot, same rules.
+ */
+async function collect(
+  ctx: ToolContext,
+  fetchImpl?: FetchImpl,
+): Promise<{ items: Item[]; torrentCount: number; unreadable: string[] } | { error: string }> {
   const torrents = await fetchTorrents(ctx.config.qbittorrent.lanUrl, fetchImpl);
 
   /**
    * 🔴 NO qBIT, NO VERDICT — AND THAT IS A REFUSAL, NOT A DEGRADED ANSWER.
    *
    * The arr queue alone cannot tell a stall from a healthy download; that is the
-   * whole reason this tool exists. Rendering the arr's own opinion here would
-   * reproduce the exact 10-of-18 blind spot, wearing the authority of a tool
-   * whose name says it finds stuck downloads.
+   * whole reason this tool exists. Answering from it would reproduce the
+   * measured 10-of-18 blind spot wearing the authority of a tool whose name says
+   * it finds stuck downloads.
    */
   if (torrents.state !== 'ok') {
-    return fail(
-      `I could NOT read qBittorrent, so I cannot tell you what is stuck.\n${torrents.detail}\n` +
+    return {
+      error:
+        `I could NOT read qBittorrent, so I cannot tell you what is stuck.\n${torrents.detail}\n` +
         'This is UNKNOWN, not "nothing is stuck". The arr queue on its own cannot distinguish a ' +
         'dead torrent from a healthy one — measured, it misses more than half of real stalls — so ' +
         'I am not going to answer from it.',
-    );
+    };
   }
 
   const index = byHash(torrents.value);
   const arr = await readArrQueues(ctx, fetchImpl);
 
-  // Join: every arr release matched to its torrent, then every torrent that no
-  // arr row claims (those are qBit-only, e.g. the unmanaged audiobook).
   const items: Item[] = [];
   const claimed = new Set<string>();
   for (const release of arr.releases) {
@@ -129,19 +408,34 @@ async function runList(ctx: ToolContext, fetchImpl?: FetchImpl) {
     if (claimed.has(t.hash)) continue;
     items.push({ release: null, torrent: t, verdict: qbitVerdict(t) });
   }
+  return { items, torrentCount: torrents.value.length, unreadable: arr.unreadable };
+}
 
-  const of = (kind: string) => items.filter((i) => i.verdict.kind === kind);
-  const stalled = of('stalled');
+function arrClientFor(ctx: ToolContext, service: 'sonarr' | 'radarr', fetchImpl?: FetchImpl): ArrClient {
+  return service === 'sonarr'
+    ? new ArrClient({ ...ctx.config.sonarr, fetchImpl }, 'series')
+    : new ArrClient({ ...ctx.config.radarr, fetchImpl }, 'movie');
+}
+
+async function runList(ctx: ToolContext, fetchImpl?: FetchImpl) {
+  const state = await collect(ctx, fetchImpl);
+  if ('error' in state) return fail(state.error);
+  const { items, torrentCount, unreadable } = state;
+  const arrCount = items.filter((i) => i.release).length;
+
   const lines: string[] = [
     `STUCK DOWNLOADS — read at ${new Date().toISOString()}. Nothing was changed.`,
-    `${torrents.value.length} torrents in qBittorrent; ${arr.releases.length} releases in the arr queues.`,
+    `${torrentCount} torrents in qBittorrent; ${arrCount} releases in the arr queues.`,
   ];
-  if (arr.unreadable.length) {
+  if (unreadable.length) {
     lines.push(
-      `⚠️ ${arr.unreadable.join('; ')}. Those queues are UNKNOWN, not empty — anything of theirs is ` +
+      `⚠️ ${unreadable.join('; ')}. Those queues are UNKNOWN, not empty — anything of theirs is ` +
         'missing from the list below, so do not read this as a complete picture.',
     );
   }
+
+  const of = (kind: string) => items.filter((i) => i.verdict.kind === kind);
+  const stalled = of('stalled');
 
   lines.push('', `🔴 STALLED — ${stalled.length}. ${stalled.length ? 'These are the only ones anything here may act on.' : 'Nothing is stuck.'}`);
   for (const i of stalled) lines.push(renderItem(i));

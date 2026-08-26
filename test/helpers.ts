@@ -60,6 +60,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     // `remove` against the default would write captured indexer definitions —
     // credentials included — into the user's real ~/.superbot2 backups.
     indexerBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-indexer-backup-')), 'captures'),
+    downloadBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-download-backup-')), 'captures'),
     ...overrides,
   };
 }

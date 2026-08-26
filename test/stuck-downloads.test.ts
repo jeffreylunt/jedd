@@ -34,6 +34,7 @@ const torrent = (over: Partial<QbitTorrent> = {}): QbitTorrent => ({
   dlspeed: 0,
   amountLeft: 1_000_000,
   size: 1_000_000,
+  priority: 1,
   ...over,
 });
 
@@ -162,6 +163,7 @@ const wire = (t: QbitTorrent) => ({
   dlspeed: t.dlspeed,
   amount_left: t.amountLeft,
   size: t.size,
+  priority: t.priority,
 });
 
 /**

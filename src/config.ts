@@ -224,6 +224,19 @@ export interface Config {
    * clean does not take the only copy of a deleted indexer's config with it.
    */
   indexerBackupDir: string;
+  /**
+   * Where `stuck_downloads` records what it removed from the queue, BEFORE it
+   * removes it. Same discipline and same reason as `indexerBackupDir`: a
+   * destructive action is made reversible rather than gated behind a prompt.
+   *
+   * ⚠️ It holds release titles and infohashes — not credentials — so it is less
+   * sensitive than the indexer captures. It is still written 0600 in a 0700
+   * directory, because the file's OTHER job is the post-grab diff: the arrs'
+   * blocklist keys on release identity, NOT infohash, so the same dead torrent
+   * from a different indexer passes straight back through. This file is the
+   * record of what must not come back.
+   */
+  downloadBackupDir: string;
 }
 
 function required(name: string): string {
@@ -348,6 +361,8 @@ export function loadConfig(): Config {
     runbookPath: process.env.RUNBOOK_PATH,
     indexerBackupDir:
       process.env.INDEXER_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'prowlarr-indexers'),
+    downloadBackupDir:
+      process.env.DOWNLOAD_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'removed-downloads'),
   };
 }
 

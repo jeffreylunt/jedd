@@ -103,6 +103,13 @@ export interface QbitTorrent {
   dlspeed: number;
   amountLeft: number;
   size: number;
+  /**
+   * qBit's queue position. 0 means "not queued" (already active).
+   *
+   * Read so a priority change can be asserted BEFORE and AFTER — see
+   * `setTopPriority`, where the HTTP status is documented as meaningless.
+   */
+  priority: number;
 }
 
 /**
@@ -210,8 +217,61 @@ export async function fetchTorrents(lanUrl: string, fetchImpl?: FetchImpl): Prom
       dlspeed: Number(r['dlspeed'] ?? 0),
       amountLeft: Number(r['amount_left'] ?? 0),
       size: Number(r['size'] ?? 0),
+      priority: Number(r['priority'] ?? 0),
     })),
   };
+}
+
+/**
+ * Move ONE torrent to the top of qBit's queue.
+ *
+ * ── 🔴 THE 200 MEANS NOTHING. ASSERT THE PRIORITY YOURSELF ──────────────────
+ *
+ * Measured 2026-08-23 and reproduced today: `topPrio` returns **HTTP 200 on a
+ * batched call that changes nothing**. `--data-urlencode 'hashes=h1|h2|…'` came
+ * back 200 with EVERY priority unchanged, while per-hash calls worked instantly.
+ * It is not an auth problem.
+ *
+ * I reproduced the same shape by accident while probing whether the LAN accepts
+ * writes at all: `POST topPrio` with a **hash that cannot exist** also returned
+ * 200. So the status code answers "were my credentials refused?" and nothing
+ * else whatsoever.
+ *
+ * Hence: ONE hash per call, and the CALLER compares the priority it read before
+ * against the priority it reads after. This function deliberately does not
+ * report success — it reports what happened and leaves the verdict to the
+ * comparison, because there is no success signal here to report.
+ *
+ * ⚠️ Why this matters beyond tidiness: `dont_count_slow_torrents=False`, so dead
+ * torrents hold active slots indefinitely and qBit promotes by ADD ORDER rather
+ * than by health. That is how the client moved zero bytes for 24 h while looking
+ * fully busy — and it is why clearing slots is a real remedy rather than a tidy-up.
+ */
+export async function setTopPriority(
+  lanUrl: string,
+  hash: string,
+  fetchImpl?: FetchImpl,
+): Promise<Fetched<{ status: number }>> {
+  if (!/^[a-fA-F0-9]{40}$/.test(hash)) {
+    return { state: 'unknown', detail: `"${hash}" is not a 40-character infohash; nothing was sent.` };
+  }
+  const doFetch = fetchImpl ?? ((u: string, i?: RequestInit) => fetch(u, i));
+  const url = `${lanUrl.replace(/\/$/, '')}/api/v2/torrents/topPrio`;
+  try {
+    const res = await doFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      // ONE hash. Never a `|`-joined batch — see the note above.
+      body: new URLSearchParams({ hashes: hash }).toString(),
+      signal: AbortSignal.timeout(20_000),
+    });
+    return { state: 'ok', value: { status: res.status } };
+  } catch (e) {
+    return {
+      state: 'unknown',
+      detail: `Could not reach qBittorrent at ${url}: ${(e as Error).message}. The priority may or may not have changed.`,
+    };
+  }
 }
 
 /**
