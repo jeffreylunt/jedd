@@ -4,6 +4,16 @@ export interface IncomingMessage {
   /** Whatever the transport calls the sender: a phone number, an email, a handle. */
   senderHandle: string;
   text: string;
+  /**
+   * The transport's own id for THIS message, when it has one.
+   *
+   * It exists so a reply can be anchored to the message it answers — iMessage's
+   * "reply to a specific message". Optional because it is a transport
+   * capability, not a property of a conversation: a terminal has no message
+   * ids, and a transport that cannot anchor a reply simply leaves it unset and
+   * every reply sends plain. See `bluebubbles/threading.ts` for when it is used.
+   */
+  sourceGuid?: string;
 }
 
 /**
@@ -13,7 +23,17 @@ export interface IncomingMessage {
  */
 export interface Connector {
   readonly name: string;
-  send(toHandle: string, text: string): Promise<void>;
+  /**
+   * `inReplyTo` names the message this reply ANSWERS — not the message it should
+   * be anchored to. Whether to anchor is decided below the interface, by the
+   * transport, because only the transport knows whether anchoring is possible
+   * and only it holds the state the rule needs (see `ReplyThreading`).
+   *
+   * ⚠️ Optional, and the absent case is REAL, not a shortcut: a follow-up
+   * ("that download finished") answers no incoming message at all, and must
+   * never be anchored to a stale one.
+   */
+  send(toHandle: string, text: string, inReplyTo?: string): Promise<void>;
   /** Begin delivering messages. Resolves when the source is exhausted. */
   listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void>;
 
@@ -152,14 +172,14 @@ export class StdoutConnector implements Connector {
 /** Connector for tests: scripted input, captured output. */
 export class TestConnector implements Connector {
   readonly name = 'test';
-  readonly sent: { to: string; text: string }[] = [];
+  readonly sent: { to: string; text: string; inReplyTo?: string }[] = [];
   /** Ordered presence events, so a test can assert start/stop ORDER, not just counts. */
   readonly presence: { event: 'read' | 'typing-start' | 'typing-stop'; to: string }[] = [];
 
   constructor(private readonly script: IncomingMessage[] = []) {}
 
-  async send(toHandle: string, text: string): Promise<void> {
-    this.sent.push({ to: toHandle, text });
+  async send(toHandle: string, text: string, inReplyTo?: string): Promise<void> {
+    this.sent.push({ to: toHandle, text, inReplyTo });
   }
 
   markRead(toHandle: string): boolean {

@@ -4,6 +4,7 @@ import { BlueBubblesClient } from './client.js';
 import { classifyPayload, type InboundVerdict } from './payload.js';
 import type { Presence } from './presence.js';
 import type { SeenStore } from './seen.js';
+import { ReplyThreading } from './threading.js';
 
 export interface ReceiverOptions {
   client: BlueBubblesClient;
@@ -21,6 +22,17 @@ export interface ReceiverOptions {
    * a verdict rather than a boolean for this reason.
    */
   onSkipped?: (verdict: InboundVerdict) => void;
+  /**
+   * Told about every message the loop is about to answer, so the send path can
+   * later ask whether this person had more than one reply outstanding.
+   *
+   * ⚠️ It is recorded HERE, at the one point every inbound message passes
+   * through — live webhook and replay both — rather than in the agent loop.
+   * There are two entry points that run turns and only one that ingests, and a
+   * burst counted in only one of them is a rule that is silently wrong half
+   * the time.
+   */
+  threading?: ReplyThreading;
   log?: (line: string) => void;
 }
 
@@ -129,6 +141,11 @@ export class BlueBubblesReceiver {
       this.log(`[bb] duplicate ${verdict.dedupKey} (${source}) — BlueBubbles double-fires; ignored`);
       return;
     }
+
+    // Before the turn, not after: the second message of a burst usually arrives
+    // WHILE the first turn is still running, and the whole point is that the
+    // first reply can see it.
+    this.opts.threading?.arrived(verdict.message.senderHandle, verdict.message.sourceGuid ?? null);
 
     const run = handler ?? this.handler;
     if (!run) return;
@@ -280,6 +297,15 @@ export class BlueBubblesConnector implements Connector {
      * not a disabled feature; it is an absent capability.
      */
     private readonly presence?: Presence,
+    /**
+     * The burst tracker. Optional for the same reason `presence` is: a connector
+     * built without one cannot anchor replies at all, and every reply sends
+     * plain — which is the old behaviour, not a broken one.
+     *
+     * 🔴 It must be the SAME instance the receiver was given. Two trackers would
+     * each see half the picture and neither would ever count a burst.
+     */
+    private readonly threading?: ReplyThreading,
   ) {}
 
   /** Is this handle allowed to receive a reply? Exact match; no normalisation, no prefixes. */
@@ -310,7 +336,7 @@ export class BlueBubblesConnector implements Connector {
    * `null` is never `false`. iMessage acquires delivery on ACK, so treating the
    * first few hundred milliseconds as failure would revoke every working invite.
    */
-  async sendReporting(toHandle: string, text: string): Promise<SendOutcome> {
+  async sendReporting(toHandle: string, text: string, inReplyTo?: string): Promise<SendOutcome> {
     // 🔴 The gate is HERE, above the transport, not in the agent and not in the
     // prompt. A suppressed reply must be unable to reach `sendText` even if
     // every layer above it decided to answer.
@@ -322,10 +348,107 @@ export class BlueBubblesConnector implements Connector {
         detail: `SUPPRESSED — ${toHandle} is outside the send audience, so nothing was sent.`,
       };
     }
-    const r = await this.client.sendText(toHandle, text);
-    return r.accepted
-      ? { state: 'accepted', delivered: null, detail: r.detail }
-      : { state: 'failed', delivered: false, detail: r.detail };
+
+    /**
+     * ── SHOULD THIS REPLY QUOTE THE MESSAGE IT IS ANSWERING? ─────────────────
+     *
+     * The decision is `ReplyThreading`'s and the reasoning lives there. The only
+     * thing decided here is what happens when the anchored send FAILS, and that
+     * is the part with teeth — see below.
+     */
+    const decision = this.threading?.decide(toHandle, inReplyTo) ?? {
+      replyTo: null,
+      burstSize: 0,
+      detail: 'no threading tracker on this connector, so every reply sends plain',
+    };
+
+    try {
+      const r = await this.client.sendText(toHandle, text, decision.replyTo);
+      if (r.accepted) {
+        this.threading?.answered(toHandle, inReplyTo);
+        return {
+          state: 'accepted',
+          delivered: null,
+          detail: decision.replyTo ? `${r.detail} [anchored: ${decision.detail}]` : r.detail,
+        };
+      }
+      if (!decision.replyTo) {
+        this.threading?.answered(toHandle, inReplyTo);
+        return { state: 'failed', delivered: false, detail: r.detail };
+      }
+      return this.retryPlain(toHandle, text, inReplyTo, r.detail);
+    } catch (e) {
+      /**
+       * 🔴 A THROW FROM AN ANCHORED SEND IS NOT THE SAME EVENT AS A THROW FROM
+       * A PLAIN ONE, AND IT MUST NOT COST JEFF THE REPLY.
+       *
+       * Anchoring silently reroutes the send through BlueBubbles' Private API
+       * (its validator forces `method = "private-api"` the moment
+       * `selectedMessageGuid` is present), so an anchored send can fail for
+       * reasons a plain send would not have: the helper bundle disconnecting —
+       * it was dead as recently as 2026-08-24 — or a reply target the server
+       * cannot resolve, which stalls 120s and then 500s.
+       *
+       * Threading is COSMETIC. Losing a reply is not. So a failure here is
+       * downgraded to a plain send rather than propagated, and the downgrade is
+       * announced.
+       */
+      if (!decision.replyTo) {
+        this.threading?.answered(toHandle, inReplyTo);
+        throw e;
+      }
+      return this.retryPlain(toHandle, text, inReplyTo, `threw: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * The anchored send failed. Send it plain instead — but ONLY after checking
+   * that the first one did not actually land.
+   *
+   * 🔴 THE READ-BACK IS THE POINT OF THIS FUNCTION, NOT THE RETRY.
+   *
+   * The failure that was actually measured (`Transaction timeout` on an
+   * unresolvable reply target) writes nothing, so retrying after it is safe. But
+   * a failure we did not measure — our own abort firing while the server was
+   * mid-send, a socket dropped after the message went out — would put the SAME
+   * TEXT on a real person's phone twice, and the second copy is not recallable.
+   *
+   * So `recentlySent` is asked first, and its three states are respected:
+   * `true` means do not resend, `false` means it is safe, and `null` means WE DO
+   * NOT KNOW — which is treated as "do not resend", because an unreadable
+   * history is exactly the situation in which a duplicate would be invisible to
+   * us and obvious to Jeff.
+   */
+  private async retryPlain(
+    toHandle: string,
+    text: string,
+    inReplyTo: string | undefined,
+    why: string,
+  ): Promise<SendOutcome> {
+    this.threading?.answered(toHandle, inReplyTo);
+    const already = await this.client.recentlySent(toHandle, text);
+    if (already !== false) {
+      return {
+        state: 'failed',
+        delivered: null,
+        detail:
+          `🔴 the anchored (reply-quoted) send failed — ${why} — and it is ${
+            already === true ? 'ALREADY IN the sent history' : 'UNKNOWN whether it went out (history unreadable)'
+          }, so it was NOT re-sent. A duplicate message is worse than a missing reply-quote.`,
+      };
+    }
+    const plain = await this.client.sendText(toHandle, text);
+    return plain.accepted
+      ? {
+          state: 'accepted',
+          delivered: null,
+          detail: `sent PLAIN after the anchored send failed (${why}) — the reply is intact, only the reply-quote was lost. ${plain.detail}`,
+        }
+      : {
+          state: 'failed',
+          delivered: false,
+          detail: `anchored send failed (${why}) AND the plain retry failed: ${plain.detail}`,
+        };
   }
 
   /**
@@ -335,8 +458,8 @@ export class BlueBubblesConnector implements Connector {
    * paths would be two places for the audience check to drift, and the drift
    * would be invisible: each path is individually plausible.
    */
-  async send(toHandle: string, text: string): Promise<void> {
-    const r = await this.sendReporting(toHandle, text);
+  async send(toHandle: string, text: string, inReplyTo?: string): Promise<void> {
+    const r = await this.sendReporting(toHandle, text, inReplyTo);
     if (r.state === 'failed') throw new Error(`send failed: ${r.detail}`);
   }
 
@@ -387,7 +510,7 @@ export class ShadowConnector implements Connector {
 
   constructor(private readonly receiver: BlueBubblesReceiver) {}
 
-  async send(toHandle: string, text: string): Promise<void> {
+  async send(toHandle: string, text: string, _inReplyTo?: string): Promise<void> {
     throw new Error(
       `shadow mode: this connector cannot send (refused ${text.length} chars to ${toHandle}). It ` +
         'holds no BlueBubbles client, so this is not a disabled feature — there is no send path ' +

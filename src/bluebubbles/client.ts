@@ -429,28 +429,63 @@ export class BlueBubblesClient {
   }
 
   /**
-   * Send text.
+   * Send text, optionally ANCHORED to a message it is replying to.
    *
    * 🔴 A 200 means "no error code at send time". It is NOT delivery. A real
    * verdict needs `deliveryVerdict(guid)`, and BlueBubbles reports a genuine
    * red-bubble failure as **HTTP 500 "Message sent with an error"** with a
    * written-but-undelivered row carrying `error: 22`.
+   *
+   * ── `replyToGuid` — MEASURED 2026-08-26 AGAINST THIS SERVER (1.9.9) ────────
+   *
+   * `selectedMessageGuid` + `partIndex` are the wire names, read out of the
+   * shipped `app.asar` (`messageValidator.sendTextRules`) and then exercised
+   * live. Two things about it are NOT guessable from the parameter names:
+   *
+   * 1. **It silently switches the send to the Private API.** BlueBubbles' own
+   *    validator does `if (effectId || subject || selectedMessageGuid || …)
+   *    saniMethod = "private-api"`, so a reply-anchored send goes down a wholly
+   *    different path from a plain one — one that needs the helper bundle
+   *    connected. `helper_connected` was **false** as recently as 2026-08-24, in
+   *    which case this route 500s and a plain send still works. That is why the
+   *    caller must be able to fall back, and why threading is never load-bearing.
+   *
+   * 2. 🔴 **A reply target BlueBubbles cannot find costs 120 SECONDS, not an
+   *    error.** Measured: an unknown `selectedMessageGuid` stalls for exactly
+   *    120s and then returns `500 {"error":{"message":"Transaction timeout"}}`.
+   *    The cause is in `MessageInterface.sendMessagePrivateApi`: it polls the
+   *    iMessage DB (`resultAwaiter`, `maxWaitMs: 60000`, exponential backoff
+   *    that overshoots) for a message that is never written. **Nothing is sent.**
+   *    A plain send with the same body fails fast or succeeds fast.
+   *
+   * So an anchored send gets its own, longer timeout. It is still far below the
+   * server's 120s wall — the point is not to wait it out, it is that aborting at
+   * the ordinary 15s would make every slow-but-fine reply look like a failure.
    */
-  async sendText(to: string, text: string): Promise<SendResult> {
-    const { status, body } = await this.call('/message/text', {
-      method: 'POST',
-      body: JSON.stringify({
-        chatGuid: chatGuidFor(to),
-        message: stripMarkdown(text),
-        tempGuid: `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      }),
-    });
+  async sendText(to: string, text: string, replyToGuid?: string | null): Promise<SendResult> {
+    const anchored = typeof replyToGuid === 'string' && replyToGuid.length > 0;
+    const { status, body } = await this.call(
+      '/message/text',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          chatGuid: chatGuidFor(to),
+          message: stripMarkdown(text),
+          tempGuid: `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          ...(anchored ? { selectedMessageGuid: replyToGuid, partIndex: 0 } : {}),
+        }),
+      },
+      anchored ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS : undefined,
+    );
     if (status >= 400) {
       return {
         accepted: false,
         guid: null,
         delivery: 'failed',
-        detail: `BlueBubbles refused the send (http ${status}). This is a delivery failure that has ALREADY happened, not a pending state.`,
+        detail:
+          `BlueBubbles refused the send (http ${status})` +
+          `${anchored ? ' — this one was anchored to a reply target, which routes it through the Private API' : ''}` +
+          '. This is a delivery failure that has ALREADY happened, not a pending state.',
       };
     }
     const d = BlueBubblesClient.data(body) as Record<string, unknown> | undefined;
@@ -461,6 +496,67 @@ export class BlueBubblesClient {
       delivery: 'unknown',
       detail: 'accepted with no error code at send time — this is NOT a delivery confirmation',
     };
+  }
+
+  /**
+   * ⚠️ Long, and deliberately not `this.timeoutMs`. An anchored send is a
+   * Private API send: it waits for the message to appear in the iMessage
+   * database before answering, so it is legitimately slower than the AppleScript
+   * path. See `sendText` for the 120s failure wall this sits under.
+   */
+  private static readonly ANCHORED_SEND_TIMEOUT_MS = 30_000;
+
+  /**
+   * DID THIS EXACT TEXT ALREADY GO OUT TO THIS PERSON JUST NOW?
+   *
+   * 🔴 THIS EXISTS SO THAT A RETRY CANNOT DOUBLE-TEXT SOMEBODY.
+   *
+   * An anchored send that fails is retried plain (`BlueBubblesConnector.send`),
+   * and the whole risk of that retry is the one case where the first send
+   * actually worked and only our *answer* was lost — an abort on our side, a
+   * dropped socket. The measured failure (`Transaction timeout`) writes nothing,
+   * so a retry there is safe; but "the failure I measured is safe" is not the
+   * same claim as "every failure is safe", and the difference is a duplicate
+   * message on a real person's phone.
+   *
+   * So the retry asks BlueBubbles' own database first. Three states, and the
+   * middle one is the important one:
+   *
+   *   `true`  — it is there. Do NOT resend.
+   *   `false` — we read the recent history and it is not there. Resending is safe.
+   *   `null`  — 🔴 we could not read it. **This is not `false`.** The caller must
+   *             not resend on it; an unread history is exactly when a duplicate
+   *             is most likely to be the thing we cannot see.
+   */
+  async recentlySent(to: string, text: string, withinMs = 180_000): Promise<boolean | null> {
+    const wanted = stripMarkdown(text).trim();
+    try {
+      const { status, body } = await this.call('/message/query', {
+        method: 'POST',
+        body: JSON.stringify({
+          limit: 25,
+          offset: 0,
+          sort: 'DESC',
+          with: ['chat'],
+          chatGuid: chatGuidFor(to),
+        }),
+      });
+      if (status >= 400) return null;
+      const rows = BlueBubblesClient.data(body);
+      if (!Array.isArray(rows)) return null;
+      const floor = Date.now() - withinMs;
+      for (const r of rows as Record<string, unknown>[]) {
+        if (r['isFromMe'] !== true) continue;
+        const when = Number(r['dateCreated']);
+        if (Number.isFinite(when) && when > 0 && when < floor) continue;
+        if (typeof r['text'] === 'string' && r['text'].trim() === wanted) return true;
+      }
+      return false;
+    } catch {
+      // A transport failure is UNKNOWN. Saying `false` here would turn "I could
+      // not check" into "it definitely did not send", which is how you get two.
+      return null;
+    }
   }
 
   /**

@@ -6,6 +6,7 @@ import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
 import { presenceToken, withPresence, type PresenceRecord } from './connector.js';
+import { ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
@@ -107,9 +108,17 @@ async function main(): Promise<void> {
   const seen = new SeenStore(`${DATA_DIR}seen.jsonl`);
   const invites = new InviteLedger(`${DATA_DIR}invites.jsonl`);
 
+  /**
+   * 🔴 ONE tracker, shared by the receiver that sees the messages arrive and the
+   * connector that sends the replies. Two instances would each hold half the
+   * facts and no burst would ever be counted.
+   */
+  const threading = new ReplyThreading();
+
   const receiver = new BlueBubblesReceiver({
     client,
     seen,
+    threading,
     host: config.bluebubbles.host,
     port: config.bluebubbles.port,
     path: config.bluebubbles.path,
@@ -136,6 +145,7 @@ async function main(): Promise<void> {
     audience,
     (to, text) => console.error(`[jedd] SUPPRESSED ${text.length} chars to ${to} — not in the send audience.`),
     presence,
+    threading,
   );
 
   /**
@@ -269,7 +279,18 @@ async function main(): Promise<void> {
         message,
         async () => {
           const r = await agent.handle(message.senderHandle, message.text);
-          await connector.send(message.senderHandle, r.replyText);
+          /**
+           * 🔴 `message.sourceGuid` NAMES THE MESSAGE THIS REPLY ANSWERS, AND IT
+           * IS A FACT, NOT A CHOICE.
+           *
+           * `agent.handle` is handed exactly one message's text, so a turn is
+           * structurally incapable of answering two — the target is the message
+           * that started this turn, always. Nothing here picks it, and nothing
+           * here decides whether to anchor to it; that rule lives in
+           * `ReplyThreading` and it fires only when this person had more than
+           * one reply outstanding.
+           */
+          await connector.send(message.senderHandle, r.replyText, message.sourceGuid);
           return r;
         },
         signals,

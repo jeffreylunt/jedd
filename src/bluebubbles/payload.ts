@@ -134,7 +134,10 @@ export function classifyPayload(raw: unknown): InboundVerdict {
 
   return {
     action: 'deliver',
-    message: { senderHandle, text: text.trim() },
+    // `sourceGuid` is what a threaded reply anchors to. It is the same `guid`
+    // reported alongside — carried on the message itself so the send path does
+    // not have to reach back into the verdict to find it.
+    message: { senderHandle, text: text.trim(), ...(guid ? { sourceGuid: guid } : {}) },
     dedupKey,
     rowid,
     guid,
