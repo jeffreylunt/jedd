@@ -977,7 +977,12 @@ test('🔴 the shipped SIGTERM handler still calls stopAll, and does it BEFORE e
     'stopAll runs after process.exit — it would never run at all',
   );
   assert.match(main, /process\.on\('SIGTERM'/, 'nothing is listening for SIGTERM');
-  assert.match(main, /process\.on\('SIGINT'/, 'nothing is listening for SIGINT');
+  // 🔴 SIGINT IS THE ONE THAT MATTERS MOST HERE. `pm2 restart` delivers SIGINT,
+  // not SIGTERM — measured in data/jedd.log, which reads `[jedd] SIGINT —
+  // deregistering` for the restarts. A deploy is the exact case this path
+  // exists for, so losing this listener loses the path in practice while
+  // SIGTERM keeps it looking covered.
+  assert.match(main, /process\.on\('SIGINT'/, 'nothing is listening for SIGINT — pm2 restart sends THAT');
 });
 
 test('stopAll is bounded — an unreachable BlueBubbles cannot stop the process dying', async () => {
