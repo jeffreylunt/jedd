@@ -29,7 +29,36 @@ module.exports = {
       name: 'jedd-v2',
       cwd: '/Users/jeff/dev/jedd-v2',
       script: 'src/main.ts',
-      interpreter: 'node',
+      /**
+       * 🔴 PINNED ABSOLUTE ON PURPOSE — do NOT relax this back to bare 'node'.
+       *
+       * macOS Local Network privacy denies LAN-PEER access PER BINARY, and the
+       * denial presents as EHOSTUNREACH with no prompt and nothing in any log.
+       * Measured 2026-08-25, same machine, same minute, literal IP (no DNS):
+       *
+       *   /opt/homebrew/bin/node        v25.2.1   192.168.1.7:8096 -> CONNECT ok
+       *   ~/.nvm/.../v24.12.0/bin/node  v24.12.0  192.168.1.7:8096 -> EHOSTUNREACH
+       *   ~/.nvm/.../v22.22.2/bin/node  v22.22.2  192.168.1.7:8096 -> EHOSTUNREACH
+       *
+       * CONTROLS that make it a permission boundary rather than a routing or
+       * library fault: all three reach the public internet fine, and all three
+       * reach the GATEWAY 192.168.1.1 — the gateway is EXEMPT, so "the router
+       * works" is not evidence the LAN works. Re-signing an nvm node with a
+       * fresh unique ad-hoc identity did NOT clear it, so it is not a stale
+       * grant keyed to Node Foundation's signing identity.
+       *
+       * Jedd ran on the nvm v24 build until 2026-08-25, which made EVERY
+       * direct-fetch homelab read fail while curl and ssh from the same machine
+       * succeeded — a total, binary-specific outage that looked intermittent and
+       * service-specific for days.
+       *
+       * ⚠️ BEFORE changing node versions, probe the CANDIDATE binary first:
+       *   <candidate> -e 'require("net").connect(8096,"192.168.1.7")
+       *      .on("connect",()=>console.log("ok")).on("error",e=>console.log(e.code))'
+       * A version bump that silently loses LAN access is invisible until a user
+       * asks Jedd something about the homelab.
+       */
+      interpreter: '/opt/homebrew/bin/node',
       // Loads tsx in-process rather than re-execing through the tsx CLI wrapper.
       interpreter_args: '--import tsx',
       env: {
