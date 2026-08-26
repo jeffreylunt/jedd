@@ -34,16 +34,46 @@ export function unzipSingleTextEntry(buf: Buffer): UnzipOutcome {
 
     const entries = buf.readUInt16LE(eocd + 10);
     if (entries < 1) return { state: 'failed', detail: 'the ZIP is empty.' };
-    const cdOffset = buf.readUInt32LE(eocd + 16);
-    if (cdOffset + 46 > buf.length) return { state: 'failed', detail: 'the ZIP directory is truncated.' };
-    if (buf.readUInt32BE(cdOffset) !== 0x504b0102) {
-      return { state: 'failed', detail: 'the ZIP directory is malformed.' };
+    let cdOffset = buf.readUInt32LE(eocd + 16);
+
+    /**
+     * 🔴 FIND THE TEXT ENTRY. DO NOT ASSUME IT IS THE FIRST ONE.
+     *
+     * Reading entry 0 blindly means a results zip that ships anything ahead of
+     * the listing returns that other file's bytes as the listing. It parses to
+     * zero offers and surfaces as "IRC found nothing fetchable" — **a false
+     * negative we manufactured**, which is the one answer this codebase refuses
+     * to give anywhere else. Scanning also means an unexpected archive is
+     * REPORTED rather than silently mistaken for an empty result.
+     */
+    let chosen = -1;
+    let names: string[] = [];
+    for (let i = 0; i < entries; i++) {
+      if (cdOffset + 46 > buf.length) return { state: 'failed', detail: 'the ZIP directory is truncated.' };
+      if (buf.readUInt32BE(cdOffset) !== 0x504b0102) {
+        return { state: 'failed', detail: 'the ZIP directory is malformed.' };
+      }
+      const nLen = buf.readUInt16LE(cdOffset + 28);
+      const eLen = buf.readUInt16LE(cdOffset + 30);
+      const cLen = buf.readUInt16LE(cdOffset + 32);
+      const name = buf.subarray(cdOffset + 46, cdOffset + 46 + nLen).toString('utf8');
+      names.push(name);
+      if (chosen < 0 && /\.txt$/i.test(name)) chosen = cdOffset;
+      cdOffset += 46 + nLen + eLen + cLen;
     }
+    if (chosen < 0) {
+      return {
+        state: 'failed',
+        detail:
+          `the results archive holds no .txt listing (it contains: ${names.slice(0, 5).join(', ')}). ` +
+          'That is an unexpected archive, not an empty result.',
+      };
+    }
+    cdOffset = chosen;
 
     const method = buf.readUInt16LE(cdOffset + 10);
     const compressedSize = buf.readUInt32LE(cdOffset + 20);
     const uncompressedSize = buf.readUInt32LE(cdOffset + 24);
-    const nameLen = buf.readUInt16LE(cdOffset + 28);
     const localOffset = buf.readUInt32LE(cdOffset + 42);
 
     if (uncompressedSize > MAX_INFLATED_BYTES) {
@@ -68,8 +98,6 @@ export function unzipSingleTextEntry(buf: Buffer): UnzipOutcome {
     } else {
       return { state: 'failed', detail: `unsupported ZIP compression method ${method}.` };
     }
-    void nameLen;
-    void entries;
     return { state: 'ok', text: text.toString('utf8') };
   } catch (e) {
     // A stranger's archive must not be able to throw into a caller.
