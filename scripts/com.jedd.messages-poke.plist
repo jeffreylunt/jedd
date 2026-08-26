@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>com.jedd.messages-poke</string>
+        <!-- 🔴 MUST be this exact node binary: it is the launchd job root and
+             therefore the TCC responsible process, and this path already holds
+             the Automation grant for com.apple.MobileSMS. A different node, a
+             shell, or bare osascript here silently loses the grant and every
+             poke times out at -1712. See scripts/messages-poke.mjs header. -->
+        <key>ProgramArguments</key>
+        <array>
+            <string>/Users/jeff/.nvm/versions/node/v24.12.0/bin/node</string>
+            <string>/Users/jeff/dev/jedd-v2/scripts/messages-poke.mjs</string>
+        </array>
+        <!-- 120s: the tightest measured failing idle gap is 5m31s and the
+             boundary below it is unmeasured down to ~20s, so the field's
+             usual 5-minute cadence is NOT proven safe for this machine. -->
+        <key>StartInterval</key>
+        <integer>120</integer>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>/Users/jeff/dev/jedd-v2/data/messages-poke.err</string>
+    </dict>
+</plist>
