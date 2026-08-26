@@ -25,7 +25,25 @@ import type { Config } from './config.js';
  */
 
 export type MailboxRead =
-  | { ok: true; emails: BounceEmail[]; folders: string[] }
+  | {
+      ok: true;
+      emails: BounceEmail[];
+      /** Folders actually opened and searched. */
+      folders: string[];
+      /**
+       * 🔴 FOLDERS THAT WERE ADVERTISED AND COULD NOT BE OPENED.
+       *
+       * Found by a mutation that dropped Spam and Trash from the sweep and was
+       * caught by NOTHING. Chasing it turned up the worse version of the same
+       * hole in this very file: a folder whose lock failed was `continue`d past,
+       * and the read still came back `ok` with a shorter list nobody compared
+       * against anything. **A folder that could not be opened is not a folder
+       * with no bounces in it** — and Amazon's notices demonstrably land in Spam.
+       *
+       * Reported rather than swallowed so the verifier can go blind on it.
+       */
+      skipped: string[];
+    }
   /** Could not look. **NOT** "looked and found nothing." */
   | { ok: false; reason: string };
 
@@ -52,7 +70,7 @@ export const AMAZON_NOTIFY = 'do-not-reply@amazon.com';
  * `[Gmail]/All Mail` is localised per account, so a hardcoded English name is a
  * silent zero on a non-English mailbox.
  */
-const WANTED_SPECIAL_USE = ['\\All', '\\Junk', '\\Trash'] as const;
+export const WANTED_SPECIAL_USE = ['\\All', '\\Junk', '\\Trash'] as const;
 
 export interface ImapSettings {
   host: string;
@@ -103,6 +121,7 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
 
     const emails: BounceEmail[] = [];
     const folders: string[] = [];
+    const skipped: string[] = [];
     try {
       await withTimeout(client.connect(), timeoutMs, 'IMAP connect');
       const boxes = await client.list();
@@ -127,9 +146,9 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
         let lock;
         try {
           lock = await client.getMailboxLock(path);
-        } catch {
-          // A folder that cannot be opened is not an empty folder. Recording it
-          // as unsearched is what stops `folders` being read as full coverage.
+        } catch (e) {
+          // Recorded, never swallowed — see `skipped` on MailboxRead.
+          skipped.push(`${path} (${(e as Error).message ?? 'could not open'})`);
           continue;
         }
         try {
@@ -167,6 +186,7 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
     return {
       ok: true,
       folders,
+      skipped,
       emails: emails.filter((e) => {
         const at = Date.parse(e.receivedAt);
         return Number.isFinite(at) && at >= since.getTime() && at <= upper;

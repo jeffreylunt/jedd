@@ -166,6 +166,24 @@ export async function verifyKindleDelivery(
     };
   }
 
+  /**
+   * 🔴 A FOLDER THAT COULD NOT BE OPENED IS NOT A FOLDER WITH NO BOUNCES IN IT.
+   *
+   * Amazon's notices land in Spam, and Gmail's All Mail excludes Spam and Trash
+   * — so a Spam folder that failed to open turns a real refusal into a clean
+   * result, in the one direction that matters. Partial coverage is blindness,
+   * not a smaller answer.
+   */
+  if (read2.skipped.length > 0) {
+    return {
+      state: 'blind',
+      detail:
+        `The controls passed but ${read2.skipped.length} folder(s) could not be searched ` +
+        `(${read2.skipped.join('; ')}). No verdict — Amazon's notices land in Spam, and Gmail's ` +
+        'All Mail excludes Spam and Trash, so an unsearched folder can hide the whole answer.',
+    };
+  }
+
   const verdict = findDeliveryFailure(read2.emails, input.sentAt, input.filename);
   if (verdict.state === 'failed') {
     return { ...verdict, folders: read2.folders };

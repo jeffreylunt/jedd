@@ -37,10 +37,11 @@ const CONTROL_E014 = bounce(
   '2026-03-13T20:07:32Z',
 );
 
-function fakeMailbox(emails: BounceEmail[]): MailboxReader {
+function fakeMailbox(emails: BounceEmail[], skipped: string[] = []): MailboxReader {
   return async (since, until) => ({
     ok: true,
     folders: ['INBOX', '[Gmail]/All Mail', '[Gmail]/Spam', '[Gmail]/Trash'],
+    skipped,
     emails: emails.filter((e) => {
       const at = Date.parse(e.receivedAt);
       return at >= since.getTime() && at <= (until?.getTime() ?? Number.POSITIVE_INFINITY);
@@ -263,4 +264,18 @@ test('🔴 a send the mail server REFUSED schedules NO check — there is nothin
   });
   assert.equal(s.all().filter((f) => f.kind === 'kindle-verify').length, 0);
   assert.match(out[0]?.detail ?? '', /refused it/i);
+});
+
+// ── 🔴 THE WORDING, WHICH SHIPS REGARDLESS OF WHETHER ANYTHING ELSE DOES ────
+
+test('🔴 an accepted send says the mail server took it, NEVER that it arrived', async () => {
+  // V1 said "It should show up on your Kindle in a few minutes" — an outcome it
+  // had no way to observe, about a channel where a nonexistent address is
+  // discarded in silence. The sentence a person reads has to be one that is true
+  // at the moment it is written.
+  const { out } = await deliverThroughRunner(async () => ({ messageId: 'x' }));
+  const detail = out[0]?.detail ?? '';
+  assert.match(detail, /mail server accepted it/i);
+  assert.match(detail, /NOT confirmed it reached the device/i);
+  assert.doesNotMatch(detail, /should show up|has arrived|is on your Kindle|delivered to/i);
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { BounceEmail } from '../src/kindle-delivery.js';
-import { extractText, type MailboxReader } from '../src/kindle-mailbox.js';
+import { extractText, WANTED_SPECIAL_USE, type MailboxReader } from '../src/kindle-mailbox.js';
 import {
   CONTROL_BOUNCE,
   CONTROL_QUIET,
@@ -37,10 +37,11 @@ const CONTROL_E014 = bounce(
 );
 
 /** An in-memory mailbox that honours the window, like the real reader does. */
-function fakeMailbox(emails: BounceEmail[]): MailboxReader {
+function fakeMailbox(emails: BounceEmail[], skipped: string[] = []): MailboxReader {
   return async (since, until) => ({
     ok: true,
     folders: ['INBOX', '[Gmail]/All Mail', '[Gmail]/Spam', '[Gmail]/Trash'],
+    skipped,
     emails: emails.filter((e) => {
       const at = Date.parse(e.receivedAt);
       return at >= since.getTime() && at <= (until?.getTime() ?? Number.POSITIVE_INFINITY);
@@ -163,6 +164,28 @@ test('🔴 the two controls must DISAGREE — a check that answers the same eith
   assert.equal(report.bounce.passed, true);
   assert.equal(report.quiet.passed, true);
   assert.notEqual(report.bounce.got, report.quiet.got);
+});
+
+test('🔴 a folder that could NOT be opened makes the whole run blind', async () => {
+  // Amazon's notices land in Spam and Gmail's All Mail excludes Spam and Trash,
+  // so an unsearched Spam folder turns a real refusal into a clean result. The
+  // reader used to `continue` past a folder it could not lock and still return
+  // ok — partial coverage reported as full coverage.
+  const v = await verifyKindleDelivery(
+    fakeMailbox([CONTROL_E014], ['[Gmail]/Spam (NONEXISTENT)']),
+    { sentAt: SENT_AT },
+    NOW,
+  );
+  assert.equal(v.state, 'blind');
+  assert.match(v.detail, /could not be searched/i);
+  assert.match(v.detail, /Spam/);
+});
+
+test('🔴 the folder sweep names Spam and Trash, and the reason is measured', () => {
+  // Pinned as a constant because no unit test can open a real IMAP folder. The
+  // BEHAVIOURAL proof that all four are really opened is the live harness,
+  // `scripts/kindle-verify-live.ts`, which asserts the four real paths.
+  assert.deepEqual([...WANTED_SPECIAL_USE], ['\\All', '\\Junk', '\\Trash']);
 });
 
 test('the control windows do not overlap the send being checked', () => {
