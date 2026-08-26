@@ -22,6 +22,7 @@ import { resolveChoice } from './choice.js';
 import { kindleStatus, saveKindleEmail } from './kindle.js';
 import { librarySearch } from './library.js';
 import { makeFindGaps, makeGrabRelease, makeSearchEpisode } from './fill-gaps.js';
+import { makeIndexerAdmin } from './indexer-admin.js';
 import { makeInviteTool, type InviteDeps } from './invite.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
@@ -208,7 +209,33 @@ const OWNER_READ_TOOLS: Tool[] = [
  * the only one that can be applied while someone is watching. Safe-to-run and
  * allowed-to-run are different axes, and this file only decides the second.
  */
-const OWNER_WRITE_TOOLS: Tool[] = [restartContainer, restartArrStack, shedHostLoad, restoreQbitSpeed];
+const OWNER_WRITE_TOOLS: Tool[] = [
+  restartContainer,
+  restartArrStack,
+  shedHostLoad,
+  restoreQbitSpeed,
+  /**
+   * 🔴 THE FIRST WRITE PATH TO AN INDEXER, AND IT IS ITS OWN PRODUCER.
+   *
+   * Jeff, 2026-08-26: *"Can you fix the torrent indexers in prowler?"* — Jedd
+   * had no way to, and was right to say so. `homelab_read` could see indexer
+   * health and, being a GET by construction, could never change it.
+   *
+   * ⚠️ It carries `action: "list"` for a reason that belongs in THIS file:
+   * `test` / `enable` / `disable` all need an indexer id, and nothing else
+   * registered here can supply one for a HEALTHY indexer. Prowlarr's
+   * `/api/v1/indexerstatus` — the only indexer path `homelab_read` may read —
+   * lists ONLY the ones currently failing and is `[]` the rest of the time, and
+   * `/api/v1/indexer` is denied to it as SECRET. So without its own list action
+   * this would be an orphaned consumer that happened to work while something was
+   * broken: `add_audiobook`'s defect wearing a disguise good enough to pass a
+   * live test.
+   *
+   * ⚠️ Owner-only rather than guest, unlike `add_movie`: nothing here gets a
+   * guest content, and disabling an indexer degrades searching for the house.
+   */
+  makeIndexerAdmin(),
+];
 
 /**
  * Build the tool registry for this process.
