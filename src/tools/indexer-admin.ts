@@ -4,7 +4,6 @@ import {
   IndexerAdminClient,
   INDEXER_SERVICES,
   classifyFailure,
-  readsBackoff,
   type BackoffRow,
   type FetchImpl,
   type IndexerRow,
@@ -80,8 +79,9 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
       'restarting.\n' +
       '• "the indexers are down / an indexer is red in Prowlarr" → run test_all against "prowlarr".\n' +
       "• Not sure → do prowlarr first (it is the upstream and it can be READ), then both arrs.\n" +
-      'ACTIONS: list — every indexer with its id, whether it is on, and its backoff. Run this FIRST; ' +
-      'ids are per-service and do NOT match between Prowlarr, Sonarr and Radarr. test — force-test ' +
+      'ACTIONS: list — every indexer with its id and whether it is on, plus its backoff on Prowlarr ' +
+      '(the arrs do not expose backoff at all, so do not promise a figure for those). Run this ' +
+      'FIRST; ids are per-service and do NOT match between Prowlarr, Sonarr and Radarr. test — force-test ' +
       'one id; this is the backoff reset. test_all — force-test every ENABLED indexer on that ' +
       'service in one call (a disabled one is skipped, so a missing id is not a missing result); ' +
       'takes 20-40s. enable / disable — turn one indexer on or off; PROWLARR ONLY, because a Sonarr ' +
@@ -96,8 +96,10 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
       'indexer, and it never restarts a container. If a test fails with a timeout or a network error ' +
       'rather than a 403, the VPN tunnel is the likely cause and that is a separate problem — say so ' +
       'instead of retrying.\n' +
-      'Every call ends by re-reading the live state and printing it, so the answer is what IS, not ' +
-      'what was requested. Report the per-indexer result; do not summarise it as "done".',
+      'Every call tries to re-read the live state afterwards and print it. When that re-read ' +
+      'SUCCEEDS the printed state is what IS; when it fails the tool says so, and then nothing ' +
+      'about the current state is verified — repeat that caveat rather than dropping it. Report ' +
+      'the per-indexer result; do not summarise it as "done".',
     /**
      * 🔴 OWNER-ONLY. Jeff asked for this **"as the owner"**, and it is a write
      * against shared infrastructure: disabling an indexer degrades searching for
@@ -172,14 +174,14 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
 
       switch (action as Action) {
         case 'list':
-          return runList(client, svc);
+          return runList(client);
         case 'test':
-          return runTest(client, svc, args['id']);
+          return runTest(client, args['id']);
         case 'test_all':
-          return runTestAll(client, svc);
+          return runTestAll(client);
         case 'enable':
         case 'disable':
-          return runToggle(client, svc, args['id'], action === 'enable');
+          return runToggle(client, args['id'], action === 'enable');
         default:
           return fail(`Unhandled action "${action}". Nothing was done.`);
       }
@@ -191,100 +193,96 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
 // ACTIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runList(client: IndexerAdminClient, service: IndexerService) {
-  const snap = await snapshot(client, service);
+async function runList(client: IndexerAdminClient) {
+  const snap = await snapshot(client);
   if ('error' in snap) return fail(snap.error);
-  return ok(`${client.label} indexers — nothing was changed.\n\n${renderSnapshot(client, service, snap)}`);
+  return ok(`${client.label} indexers — nothing was changed.\n\n${renderSnapshot(client, snap)}`);
 }
 
-async function runTest(client: IndexerAdminClient, service: IndexerService, rawId: unknown) {
-  const id = asId(rawId);
-  if (id === null) {
-    return fail(
-      'No indexer `id` supplied, so nothing was tested. Run this tool with action "list" against ' +
-        `"${service}" first — that is where the ids come from, and they differ per service.`,
-    );
-  }
+async function runTest(client: IndexerAdminClient, rawId: unknown) {
+  const id = asId(rawId, client);
+  if (typeof id === 'string') return fail(id);
 
-  const before = await snapshot(client, service);
+  const before = await snapshot(client);
   if ('error' in before) return fail(before.error);
   const name = before.indexers.find((i) => i.id === id)?.name ?? `id ${id}`;
 
   const result = await client.testOne(id, name);
   if (result.state !== 'ok') return fail(`Force-test of ${client.label} ${name} did not complete.\n${result.detail}`);
 
-  const after = await snapshot(client, service);
-  const lines = [
-    `Force-tested ${client.label} indexer ${id} (${name}).`,
-    '',
-    renderOutcome(result.value, before.indexers),
-    ...verdictNotes([result.value], before, 'error' in after ? null : after, client, service),
-  ];
-  if ('error' in after) {
-    lines.push('', `⚠️ The test ran, but re-reading the state afterwards failed: ${after.error}`);
-    return ok(lines.join('\n'));
-  }
-  lines.push('', renderSnapshot(client, service, after));
-  return ok(lines.join('\n'));
+  const after = await snapshot(client);
+  const settled = 'error' in after ? null : after;
+  return ok(
+    finish(
+      [
+        `Force-tested ${client.label} indexer ${id} (${name}).`,
+        '',
+        renderOutcome(result.value),
+        ...verdictNotes([result.value], before, settled, client),
+      ],
+      client,
+      after,
+      'The test ran',
+    ),
+  );
 }
 
-async function runTestAll(client: IndexerAdminClient, service: IndexerService) {
-  const before = await snapshot(client, service);
+async function runTestAll(client: IndexerAdminClient) {
+  const before = await snapshot(client);
   if ('error' in before) return fail(before.error);
 
   const result = await client.testAll();
   if (result.state !== 'ok') return fail(`Force-test of all ${client.label} indexers did not complete.\n${result.detail}`);
 
+  // Name resolution happens ONCE, here. `renderOutcome` used to repeat the same
+  // fallback chain, so there were two rules for one fact.
   const outcomes = result.value.map((o) => ({
     ...o,
     name: o.name || before.indexers.find((i) => i.id === o.id)?.name || `id ${o.id}`,
   }));
-  const passed = outcomes.filter((o) => o.passed);
-  const failed = outcomes.filter((o) => !o.passed);
-  const after = await snapshot(client, service);
+  const passed = outcomes.filter((o) => o.passed === true);
+  const failed = outcomes.filter((o) => o.passed === false);
+  const unclear = outcomes.filter((o) => o.passed === null);
+  const after = await snapshot(client);
+  const settled = 'error' in after ? null : after;
 
-  const lines = [
-    `Force-tested all ${outcomes.length} ENABLED ${client.label} indexer(s): ` +
-      `${passed.length} passed, ${failed.length} failed.` +
-      (before.indexers.length > outcomes.length
-        ? ` (${before.indexers.length - outcomes.length} disabled indexer(s) were not tested — ` +
-          'that is not a missing result.)'
-        : ''),
-    '',
-    ...outcomes.map((o) => renderOutcome(o, before.indexers)),
-    ...verdictNotes(outcomes, before, 'error' in after ? null : after, client, service),
-  ];
-  if ('error' in after) {
-    lines.push('', `⚠️ The tests ran, but re-reading the state afterwards failed: ${after.error}`);
-    return ok(lines.join('\n'));
-  }
-  lines.push('', renderSnapshot(client, service, after));
-  return ok(lines.join('\n'));
+  return ok(
+    finish(
+      [
+        `Force-tested all ${outcomes.length} ENABLED ${client.label} indexer(s): ` +
+          `${passed.length} passed, ${failed.length} failed` +
+          // 🔴 An unrecognised row is counted APART. Folding it into "failed"
+          // would report a verdict the service never gave.
+          (unclear.length ? `, ${unclear.length} with NO verdict reported` : '') +
+          '.' +
+          (before.indexers.length > outcomes.length
+            ? ` (${before.indexers.length - outcomes.length} disabled indexer(s) were not tested — ` +
+              'that is not a missing result.)'
+            : ''),
+        '',
+        ...outcomes.map((o) => renderOutcome(o)),
+        ...verdictNotes(outcomes, before, settled, client),
+      ],
+      client,
+      after,
+      'The tests ran',
+    ),
+  );
 }
 
-async function runToggle(
-  client: IndexerAdminClient,
-  service: IndexerService,
-  rawId: unknown,
-  enable: boolean,
-) {
+async function runToggle(client: IndexerAdminClient, rawId: unknown, enable: boolean) {
   const verb = enable ? 'enable' : 'disable';
-  const id = asId(rawId);
-  if (id === null) {
-    return fail(
-      `No indexer \`id\` supplied, so nothing was ${verb}d. Run this tool with action "list" ` +
-        `against "${service}" first.`,
-    );
-  }
+  const id = asId(rawId, client);
+  if (typeof id === 'string') return fail(`Nothing was ${verb}d. ${id}`);
 
-  const before = await snapshot(client, service);
+  const before = await snapshot(client);
   if ('error' in before) return fail(before.error);
   const name = before.indexers.find((i) => i.id === id)?.name ?? `id ${id}`;
 
   const result = await client.setEnable(id, enable);
   if (result.state !== 'ok') return fail(`Could not ${verb} ${client.label} ${name}.\n${result.detail}`);
 
-  const after = await snapshot(client, service);
+  const after = await snapshot(client);
   const headline = result.value.changed
     ? `${client.label} indexer ${id} (${name}) is now ${enable ? 'ENABLED' : 'DISABLED'}.`
     : `${client.label} indexer ${id} (${name}) was ALREADY ${enable ? 'enabled' : 'disabled'} — ` +
@@ -305,12 +303,32 @@ async function runToggle(
         'the tracker actually answers.',
     );
   }
+  return ok(finish(lines, client, after, 'The change was made'));
+}
+
+/**
+ * The common tail: print the live state, or say plainly that it could not be
+ * read. Three call sites had a byte-identical copy of this.
+ *
+ * 🔴 THE "COULD NOT RE-READ" LINE IS NOT DECORATION. Everything a caller reads
+ * about the CURRENT state comes from that snapshot, so when it is missing the
+ * answer above it is the last thing we know, not the latest thing that is true.
+ */
+function finish(
+  lines: string[],
+  client: IndexerAdminClient,
+  after: Snapshot | { error: string },
+  what: string,
+): string {
   if ('error' in after) {
-    lines.push('', `⚠️ The change was made, but re-reading the state afterwards failed: ${after.error}`);
-    return ok(lines.join('\n'));
+    return [
+      ...lines,
+      '',
+      `⚠️ ${what}, but re-reading ${client.label} afterwards FAILED: ${after.error}`,
+      'So nothing below this line is verified, and the state above is what was true BEFORE, not now.',
+    ].join('\n');
   }
-  lines.push('', renderSnapshot(client, service, after));
-  return ok(lines.join('\n'));
+  return [...lines, '', renderSnapshot(client, after)].join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,12 +345,14 @@ export interface Snapshot {
   readAt: Date;
 }
 
-async function snapshot(client: IndexerAdminClient, service: IndexerService): Promise<Snapshot | { error: string }> {
-  const list = await client.list();
+async function snapshot(client: IndexerAdminClient): Promise<Snapshot | { error: string }> {
+  // Three independent reads. Sequentially they were six round trips per action.
+  const [list, backoff, health] = await Promise.all([
+    client.list(),
+    client.backoff(),
+    client.indexerHealth(),
+  ]);
   if (list.state !== 'ok') return { error: list.detail };
-
-  const backoff = await client.backoff();
-  const health = await client.indexerHealth();
 
   return {
     indexers: [...list.value].sort((a, b) => a.id - b.id),
@@ -344,7 +364,7 @@ async function snapshot(client: IndexerAdminClient, service: IndexerService): Pr
   };
 }
 
-function renderSnapshot(client: IndexerAdminClient, service: IndexerService, snap: Snapshot): string {
+function renderSnapshot(client: IndexerAdminClient, snap: Snapshot): string {
   const lines = [`STATE NOW — ${client.label}, read at ${snap.readAt.toISOString()}:`];
   for (const row of snap.indexers) {
     lines.push(`  id ${row.id}  ${row.name}  ${describeSwitches(row)}  ${describeBackoff(row.id, snap)}`);
@@ -354,7 +374,7 @@ function renderSnapshot(client: IndexerAdminClient, service: IndexerService, sna
   if (snap.health.length) {
     lines.push(`${client.label} health, indexer-related:`);
     for (const m of snap.health) lines.push(`  ${m}`);
-    if (!readsBackoff(service)) {
+    if (!client.readsBackoff) {
       lines.push(
         '  ⚠️ This warning is SLOW to clear — the runbook records it taking a few hours after a ' +
           'successful reset. Still seeing it right after a passing test does NOT mean the reset ' +
@@ -397,12 +417,20 @@ function describeBackoff(id: number, snap: Snapshot): string {
   return `🔴 ${since}${till}`;
 }
 
-function renderOutcome(outcome: TestOutcome, before: IndexerRow[]): string {
-  const name = outcome.name || before.find((i) => i.id === outcome.id)?.name || `id ${outcome.id}`;
-  if (outcome.passed) {
+function renderOutcome(outcome: TestOutcome): string {
+  const name = outcome.name || `id ${outcome.id}`;
+  if (outcome.passed === true) {
     return `  ✅ id ${outcome.id} ${name} — PASSED. Its backoff timer is reset.`;
   }
-  const why = outcome.errors.length ? outcome.errors.join(' / ') : 'no reason reported';
+  if (outcome.passed === null) {
+    // 🔴 The service returned a row and no verdict in it. Printing FAILED here
+    // would be us supplying the verdict.
+    return (
+      `  ⚠️ id ${outcome.id} ${name} — NO VERDICT. The service returned a row for this indexer ` +
+      'with no pass/fail in it, so whether it works is UNKNOWN. That is not a failure.'
+    );
+  }
+  const why = outcome.errors.length ? outcome.errors.join(' / ') : 'and gave NO reason';
   return `  ❌ id ${outcome.id} ${name} — FAILED: ${why}`;
 }
 
@@ -424,46 +452,21 @@ function verdictNotes(
   before: Snapshot,
   after: Snapshot | null,
   client: IndexerAdminClient,
-  service: IndexerService,
 ): string[] {
   const notes: string[] = [];
-  const failed = outcomes.filter((o) => !o.passed);
-  const passed = outcomes.filter((o) => o.passed);
+  const failed = outcomes.filter((o) => o.passed === false);
+  const passed = outcomes.filter((o) => o.passed === true);
 
-  // What the PASSES actually achieved, told apart from a no-op.
-  if (passed.length) {
-    const cleared = passed.filter((o) => wasBackedOff(before, o.id) && !wasBackedOff(after, o.id));
-    if (cleared.length) {
-      notes.push(
-        '',
-        `✅ REAL FIX: ${cleared.length} indexer(s) were in backoff before this and are not now — ` +
-          `${cleared.map((o) => `${o.id} (${o.name})`).join(', ')}. That is the stale-backoff fault, ` +
-          'and it is now cleared. Searches that were returning 0 should return results again.',
-      );
-    } else if (before.backoff !== null) {
-      notes.push(
-        '',
-        `⚠️ NOTHING WAS ACTUALLY STUCK on ${client.label}: the indexer(s) that passed were not in ` +
-          'backoff before the test either, so the test confirmed health rather than repairing ' +
-          'anything. Do not report this as a fix.',
-      );
-    } else {
-      notes.push(
-        '',
-        `⚠️ The passes reset ${client.label}'s backoff timers, and that is the documented remedy — ` +
-          'but this service does not expose backoff over its API, so there is no before/after to ' +
-          'show you. The passing test IS the evidence the reset happened. Say it that way: "tested ' +
-          'and they pass, which resets the timer", not "I confirmed the backoff cleared".',
-      );
-    }
-  }
+  // What the PASSES actually achieved, told apart from a no-op and from an
+  // unverified one.
+  if (passed.length) notes.push('', passVerdict(passed, before, after, client));
 
-  // What the FAILURES mean, and whether retrying is worth anything. Three
-  // classes, three different next actions — see `classifyFailure`.
+  // What the FAILURES mean, and whether retrying is worth anything. Four
+  // classes, four different next actions — see `classifyFailure`.
   for (const o of failed) {
     const kind = classifyFailure(o.errors);
     if (kind === 'forbidden') {
-      notes.push('', siteRefusalNote(o, before, after, client, service));
+      notes.push('', siteRefusalNote(o, before, after, client));
     } else if (kind === 'rate-limited') {
       /**
        * 🔴 THE REQUEST NEVER REACHED THE TRACKER, AND THE FAULT IS ONE HOP UP.
@@ -478,10 +481,23 @@ function verdictNotes(
         '',
         `⏳ id ${o.id} (${o.name}) was RATE-LIMITED, not refused by the tracker — the request never ` +
           'reached the tracker at all. On an arr this almost always means the UPSTREAM Prowlarr is ' +
-          'throttling it because Prowlarr\'s own copy of that indexer is already in backoff. ' +
+          "throttling it because Prowlarr's own copy of that indexer is already in backoff. " +
           'Re-testing here cannot fix that. Run this tool with service "prowlarr", action "list", ' +
           'find the indexer with the same NAME, and read ITS state — the real fault and its real ' +
           'reason are there, and they may not look like this error at all.',
+      );
+    } else if (kind === 'unreported') {
+      /**
+       * 🔴 A FAILURE WITH NO REASON IS NOT EVIDENCE FOR ANY CAUSE.
+       *
+       * This used to fall into the branch below, which names the VPN tunnel — a
+       * confident causal claim built on the service having said nothing at all.
+       */
+      notes.push(
+        '',
+        `❓ id ${o.id} (${o.name}) FAILED and the service gave NO reason for it. The cause is ` +
+          `UNKNOWN — do not guess at one. ${client.label}'s own log around this moment is the only ` +
+          'place the reason exists; say that rather than offering a likely-sounding explanation.',
       );
     } else {
       notes.push(
@@ -498,6 +514,56 @@ function verdictNotes(
 }
 
 /**
+ * 🔴 A PASS IS ONLY A FIX IF SOMETHING WAS STUCK **AND** WE COULD SEE THAT IT
+ * STOPPED BEING STUCK.
+ *
+ * Found in review: `wasBackedOff(null, id)` is `false`, and `after` is `null`
+ * exactly when the re-read FAILED. So "was in backoff before" AND "is not in
+ * backoff now" was satisfied by **never having looked**, and an UNKNOWN rendered
+ * as this tool's single strongest positive claim — "✅ REAL FIX … searches
+ * should return results again" — directly above a line admitting the state could
+ * not be read. The confident half is the half that becomes a text message.
+ *
+ * Four cases, and only one of them is a fix.
+ */
+function passVerdict(
+  passed: TestOutcome[],
+  before: Snapshot,
+  after: Snapshot | null,
+  client: IndexerAdminClient,
+): string {
+  if (before.backoff === null) {
+    return (
+      `⚠️ The passes reset ${client.label}'s backoff timers, and that is the documented remedy — ` +
+      'but this service does not expose backoff over its API, so there is no before/after to ' +
+      'show you. The passing test IS the evidence the reset happened. Say it that way: "tested ' +
+      'and they pass, which resets the timer", not "I confirmed the backoff cleared".'
+    );
+  }
+  if (after === null || after.backoff === null) {
+    return (
+      `⚠️ The passes reset ${client.label}'s backoff timers — that is the documented remedy and it ` +
+      'was applied. But re-reading the backoff afterwards did NOT succeed, so whether it actually ' +
+      'cleared is UNKNOWN. Say "tested and they pass, which resets the timer"; do NOT claim you ' +
+      'confirmed anything cleared.'
+    );
+  }
+  const cleared = passed.filter((o) => wasBackedOff(before, o.id) && !wasBackedOff(after, o.id));
+  if (cleared.length) {
+    return (
+      `✅ REAL FIX: ${cleared.length} indexer(s) were in backoff before this and are not now — ` +
+      `${cleared.map((o) => `${o.id} (${o.name})`).join(', ')}. That is the stale-backoff fault, ` +
+      'and it is now cleared. Searches that were returning 0 should return results again.'
+    );
+  }
+  return (
+    `⚠️ NOTHING WAS ACTUALLY STUCK on ${client.label}: the indexer(s) that passed were not in ` +
+    'backoff before the test either, so the test confirmed health rather than repairing ' +
+    'anything. Do not report this as a fix.'
+  );
+}
+
+/**
  * The paragraph that has to be in the OUTPUT rather than in a briefing
  * somewhere, because it is the difference between an honest report and an
  * implied repair.
@@ -507,7 +573,6 @@ function siteRefusalNote(
   before: Snapshot,
   after: Snapshot | null,
   client: IndexerAdminClient,
-  service: IndexerService,
 ): string {
   const lines = [
     `🔴 id ${outcome.id} (${outcome.name}) — THIS IS THE SITE REFUSING US, NOT A BACKOFF, AND THE ` +
@@ -519,23 +584,52 @@ function siteRefusalNote(
   ];
 
   const age = failureAgeHours(before, outcome.id) ?? failureAgeHours(after, outcome.id);
-  if (age !== null) {
+  // ⚠️ A negative age means the clocks disagree, not that it fails in the
+  // future. "It has been failing for in the future" is not a sentence.
+  if (age !== null && age >= 0) {
     lines.push(`  It has been failing for ${humaniseHours(age)} (measured from the FIRST failure, not the last retry).`);
     if (age >= REPORT_ONCE_HOURS) {
+      // The threshold is stated once, in REPORT_ONCE_HOURS, and the sentence is
+      // derived from it. Two copies of a number drift silently.
+      const days = REPORT_ONCE_HOURS / 24;
       lines.push(
-        `  That is past 3 days. The standing rule for this house: a 403 lasting more than 3 days ` +
-          'while the other indexers are green is REPORTED ONCE and then left alone — not escalated, ' +
-          'not retried on a schedule.',
+        `  That is past ${days} days. The standing rule for this house: a 403 lasting more than ` +
+          `${days} days while the other indexers are green is REPORTED ONCE and then left alone — ` +
+          'not escalated, not retried on a schedule.',
       );
     }
   }
 
+  /**
+   * 🔴 "SEARCHING STILL WORKS" IS A CLAIM, AND IT WAS BEING MADE UNCONDITIONALLY.
+   *
+   * Found in review: `if (green)` is true for ANY object, `{ok: 0, total: 1}`
+   * included. With two of three indexers down it said "(1 of 3) … so this is a
+   * single-indexer outage and searching still works" — twice, once per failure —
+   * and with one enabled indexer that was the failing one it said "(0 of 1) …
+   * searching still works" while search was entirely dead. False reassurance, on
+   * the exact question that was asked.
+   *
+   * So the reassuring sentence is emitted ONLY when this really is the only one
+   * down. Otherwise the same numbers get the opposite headline.
+   */
   const green = greenCount(after ?? before);
   if (green) {
-    lines.push(
-      `  Every other enabled ${client.label} indexer is green right now (${green.ok} of ${green.total}), ` +
-        'so this is a single-indexer outage and searching still works.',
-    );
+    const down = green.total - green.ok;
+    if (down <= 1) {
+      lines.push(
+        `  Every other enabled ${client.label} indexer is green right now (${green.ok} of ` +
+          `${green.total}), so this is a single-indexer outage and searching still works.`,
+      );
+    } else {
+      lines.push(
+        `  🔴 AND IT IS NOT ALONE: ${down} of ${green.total} enabled ${client.label} indexers are ` +
+          'down right now. More than one is failing, so searching IS degraded, and the "report ' +
+          'once and leave it" rule does not apply — that rule is for a lone indexer while the rest ' +
+          `are green. Say plainly that ${down} are down, and look for what they have in common; a ` +
+          'dead VPN tunnel is the usual answer when several fail together.',
+      );
+    }
   }
 
   const moved = backoffMoved(before, after, outcome.id);
@@ -545,7 +639,7 @@ function siteRefusalNote(
         'test re-arms the timer from now, so each retry pushes the next automatic attempt further ' +
         'out. Retrying gains nothing and loses that.',
     );
-  } else if (!readsBackoff(service)) {
+  } else if (!client.readsBackoff) {
     lines.push(
       `  ⚠️ A failed test re-arms ${client.label}'s backoff from now, and ${client.label} does not ` +
         'expose backoff over its API, so that cost is real but not visible here. Retrying is still ' +
@@ -585,7 +679,27 @@ function backoffMoved(
   return { from, to };
 }
 
-/** An id must be a real integer. `"6"`, `6.5` and `NaN` are not ids. */
-function asId(v: unknown): number | null {
-  return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null;
+/**
+ * An id must be a real integer. Returns the id, or the REFUSAL TEXT to show.
+ *
+ * ⚠️ "No id supplied" and "that is not an id" are different problems with
+ * different fixes, and models emit numeric arguments as strings often enough
+ * that the second is common. Telling a model to go and run `list` when it
+ * already has the right number and merely quoted it sends it round a loop it
+ * cannot escape.
+ */
+function asId(v: unknown, client: IndexerAdminClient): number | string {
+  if (v === undefined || v === null) {
+    return (
+      'No indexer `id` supplied. Run this tool with action "list" against ' +
+      `"${client.service}" first — that is where the ids come from, and they differ per service.`
+    );
+  }
+  if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return v;
+  return (
+    `\`id\` must be a whole number, and it was ${JSON.stringify(v)}. ` +
+    (typeof v === 'string' && /^\d+$/.test(v)
+      ? `Send it as the number ${v}, not as text — you already have the right id.`
+      : `Run action "list" against "${client.service}" to see the ids it actually has.`)
+  );
 }

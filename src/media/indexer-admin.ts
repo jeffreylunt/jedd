@@ -97,14 +97,6 @@ const SERVICES: Record<IndexerService, ServiceSpec> = {
 
 export const INDEXER_SERVICES = Object.keys(SERVICES) as IndexerService[];
 
-export function serviceLabel(service: IndexerService): string {
-  return SERVICES[service].label;
-}
-
-export function readsBackoff(service: IndexerService): boolean {
-  return SERVICES[service].readsBackoff;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SHAPES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +136,17 @@ export interface TestOutcome {
   id: number;
   /** Empty when the id was not in the list — `testAll` reports ids, not names. */
   name: string;
-  passed: boolean;
+  /**
+   * 🔴 `null` MEANS THE SERVICE DID NOT SAY, AND THAT IS NOT `false`.
+   *
+   * `testall` rows were mapped with `raw['isValid'] === true`, which turns a
+   * MISSING field, a renamed field, or the string `"true"` into a definite
+   * FAILURE with no reason attached — and an empty reason then reached the
+   * catch-all verdict, which confidently blames the VPN tunnel. That is the same
+   * defect the `rate-limited` class was added to fix, one layer down: a shape we
+   * did not recognise, rendered as a diagnosis.
+   */
+  passed: boolean | null;
   /** The service's own error prose, credential-scrubbed. Empty when it passed. */
   errors: string[];
 }
@@ -179,9 +181,13 @@ export type Fetched<T> = { state: 'ok'; value: T } | { state: 'unknown'; detail:
  * tunnel". That was a confidently wrong diagnosis on the very first live arr
  * test: the tunnel was fine, Prowlarr answered promptly, and it answered 429.
  */
-export type FailureKind = 'forbidden' | 'rate-limited' | 'other';
+export type FailureKind = 'forbidden' | 'rate-limited' | 'unreported' | 'other';
 
 export function classifyFailure(errors: string[]): FailureKind {
+  // 🔴 NO REASON IS NOT A REASON. An empty list used to fall through to `other`,
+  // whose note names the VPN tunnel as the cause — a confident causal claim
+  // built on the service having told us nothing at all.
+  if (errors.length === 0) return 'unreported';
   if (errors.some((e) => /\bforbidden\b|\b403\b/i.test(e))) return 'forbidden';
   if (errors.some((e) => /\btoo\s*many\s*requests\b|\b429\b|\brate.?limit/i.test(e))) return 'rate-limited';
   return 'other';
@@ -271,6 +277,34 @@ export function scrubMessage(message: string): string {
   });
 }
 
+/**
+ * 🔴 SCRUB A RESPONSE **BODY**. `scrubMessage` CANNOT DO THIS AND MUST NOT BE
+ * USED FOR IT.
+ *
+ * Found in review, reproduced against stubs: `scrubMessage` is a URL-only
+ * redactor. It looks for `http(s)://…` in prose. **A JSON body has no URL in
+ * it** — the credential sits in `"apiKey": "…"` and in the `{name, value}` pairs
+ * — so every unexpected-body path printed the resource verbatim, credential
+ * included. And Servarr write endpoints **echo the full resource back**, which
+ * this file's own `setEnable` doc records: a `PUT` that 500s hands us the
+ * indexer, api key and all, and we were quoting it into the answer.
+ *
+ * ⚠️ TRUNCATE AFTER SCRUBBING, NEVER BEFORE. `slice(0, 300)` on the raw text
+ * does not remove a credential, it only decides WHICH one survives — and it
+ * mangles the JSON so the parse below fails and the whole thing falls through to
+ * the prose path. That ordering was the actual bug at two of the three sites.
+ */
+export function scrubBody(text: string, maxChars: number): string {
+  let scrubbed: string;
+  try {
+    scrubbed = JSON.stringify(stripCredentials(JSON.parse(text)).value);
+  } catch {
+    // Not JSON: an HTML error page, a stack trace, a bare string. Prose rules.
+    scrubbed = scrubMessage(text);
+  }
+  return scrubbed.length > maxChars ? `${scrubbed.slice(0, maxChars)}…(truncated)` : scrubbed;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THE CLIENT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,6 +333,22 @@ export class IndexerAdminClient {
 
   get label(): string {
     return this.spec.label;
+  }
+
+  /**
+   * 🔴 THE CLIENT IS THE SINGLE SOURCE OF WHICH SERVICE THIS IS.
+   *
+   * Every renderer used to take `(client, service)` as two arguments, and
+   * `snapshot(prowlarrClient, 'sonarr')` typechecked — it would have rendered
+   * "backoff UNREADABLE here" over perfectly readable Prowlarr data. A fact
+   * carried twice is a fact that can disagree with itself.
+   */
+  get service(): IndexerService {
+    return this.opts.service;
+  }
+
+  get readsBackoff(): boolean {
+    return this.spec.readsBackoff;
   }
 
   get configured(): boolean {
@@ -364,8 +414,9 @@ export class IndexerAdminClient {
         // Same signature `homelab_read` documents: a 200 that is not JSON is the
         // SPA, i.e. a wrong base URL — not an unreachable service.
         detail:
-          `${this.spec.label} ${path} returned HTTP ${r.status} but the body is not JSON (starts ` +
-          `"${r.text.slice(0, 60).replace(/\s+/g, ' ')}"). That is a wrong base URL, not a broken service.`,
+          `${this.spec.label} ${path} returned HTTP ${r.status} but the body is NOT JSON ` +
+          `(${describeNonJson(r.text)}). That is the signature of a wrong base URL — the SPA served ` +
+          'HTML with a 200 — not of an unreachable service. The data is UNKNOWN.',
         status: r.status,
       };
     }
@@ -511,7 +562,7 @@ export class IndexerAdminClient {
       state: 'unknown',
       detail:
         `${this.spec.label} POST /indexer/test returned HTTP ${r.status}, which is neither a pass ` +
-        `(200) nor a reported failure (400). Body: ${scrubMessage(r.text.slice(0, 300))}`,
+        `(200) nor a reported failure (400). Body: ${scrubBody(r.text, 300)}`,
     };
   }
 
@@ -550,9 +601,10 @@ export class IndexerAdminClient {
     return {
       state: 'ok',
       value: (rows as Record<string, unknown>[]).map((raw) => ({
-        id: Number(raw['id']),
+        id: Number.isInteger(Number(raw['id'])) ? Number(raw['id']) : -1,
         name: '',
-        passed: raw['isValid'] === true,
+        // A row without a boolean verdict is UNKNOWN. See TestOutcome.passed.
+        passed: typeof raw['isValid'] === 'boolean' ? (raw['isValid'] as boolean) : null,
         errors: collectFailures(raw['validationFailures']),
       })),
     };
@@ -611,11 +663,35 @@ export class IndexerAdminClient {
         state: 'unknown',
         detail:
           `${this.spec.label} PUT /indexer/${id}?forceSave=true → HTTP ${r.status}. The change may or ` +
-          `may not have been saved. Body: ${scrubMessage(r.text.slice(0, 300))}`,
+          `may not have been saved. Body: ${scrubBody(r.text, 300)}`,
       };
     }
     return { state: 'ok', value: { changed: true } };
   }
+}
+
+/**
+ * 🔴 DESCRIBE AN UNPARSEABLE BODY. DO NOT QUOTE ONE.
+ *
+ * The point of this message is to distinguish "your base URL is wrong" from "the
+ * homelab is down", and the first 60 characters used to be quoted to show which.
+ * But a redactor works by RECOGNISING a shape — a field name, a querystring
+ * parameter — and an arbitrary blob has no shape to recognise. Quoting it and
+ * then hoping the scrubber catches whatever is inside is the same bet this repo
+ * has lost five times, and the endpoint being read here is the one that carries
+ * tracker credentials.
+ *
+ * So: say what KIND of thing arrived and how big it was. That answers the
+ * question the message exists to answer, and quotes nothing.
+ */
+function describeNonJson(text: string): string {
+  const trimmed = text.trimStart();
+  const kind = /^</.test(trimmed)
+    ? 'it starts with "<", i.e. HTML or XML'
+    : trimmed
+      ? 'it is not JSON and does not start with "<"'
+      : 'it is empty';
+  return `${kind}; ${text.length} characters, not shown`;
 }
 
 function asIso(v: unknown): string | null {

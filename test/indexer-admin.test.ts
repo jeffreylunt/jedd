@@ -760,6 +760,186 @@ test('🔴 a pass on an indexer that was NEVER stuck is NOT reported as a fix', 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🔴 UNEXPECTED BODIES — where the credential actually got out
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The mutation sweep stayed green over three paths that printed a raw response
+ * body, because every test exercised a body we EXPECTED. `scrubMessage` is a
+ * URL-only redactor — it looks for `http(s)://` in prose — and a JSON body has
+ * no URL in it, so `"apiKey": "…"` and the `{name, value}` pairs went straight
+ * through. Servarr write endpoints echo the whole resource back, so this was not
+ * theoretical: a PUT that 500s hands us the indexer, api key and all.
+ */
+
+test('🔴 an UNEXPECTED status from /indexer/test does not print the echoed resource', async () => {
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    // Neither 200 nor 400 — and Servarr echoes the resource.
+    [`POST ${P}/indexer/test`]: () => ({ status: 202, body: prowlarrIndexer() }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test', id: 6 });
+
+  assert.equal(r.ok, false, 'an unrecognised status is UNKNOWN, not a pass');
+  assert.ok(!r.content.includes(SECRET), '🔴 the echoed api key must not reach the answer');
+  assert.match(r.content, /REDACTED/);
+  assert.match(r.content, /neither a pass \(200\) nor a reported failure \(400\)/);
+});
+
+test('🔴 a FAILING PUT does not print the echoed resource either', async () => {
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer({ enable: false })] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer({ enable: false }) }),
+    [`PUT ${P}/indexer/6`]: () => ({ status: 500, body: prowlarrIndexer() }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'enable', id: 6 });
+
+  assert.equal(r.ok, false);
+  assert.ok(!r.content.includes(SECRET), '🔴 the echoed api key must not reach the answer');
+  assert.match(r.content, /may or may not have been saved/, 'and the outcome stays UNKNOWN');
+});
+
+test('🔴 a 200 that is NOT JSON is not quoted verbatim', async () => {
+  // The wrong-base-URL signature. The SPA's HTML is harmless, but this path
+  // quotes whatever arrived, and what arrives is not always HTML.
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: `<!doctype html><script>key=${SECRET}</script>` }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'list' });
+
+  assert.equal(r.ok, false);
+  assert.ok(!r.content.includes(SECRET));
+  assert.match(r.content, /wrong base URL/);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 AN UNKNOWN MUST NOT RENDER AS A VERDICT
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 MUTATION TARGET: a pass whose after-read FAILED is never "REAL FIX"', async () => {
+  /**
+   * `wasBackedOff(null, id)` is false, and `after` is null exactly when the
+   * re-read failed — so "was backed off, and is not now" was satisfied by never
+   * having looked. The tool printed its single strongest positive claim directly
+   * above a line admitting it could not read the state, and the confident half
+   * is the half that becomes a text message.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: (_c, nth) =>
+      nth === 1 ? { status: 200, body: [prowlarrIndexer()] } : { status: 500, body: 'boom' },
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [backoffRow()] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`POST ${P}/indexer/test`]: () => ({ status: 200, body: {} }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test', id: 6 });
+
+  assert.match(r.content, /PASSED/, 'the pass is real and is reported');
+  assert.ok(!/REAL FIX/.test(r.content), '🔴 a fix cannot be claimed against a state never read');
+  assert.match(r.content, /whether it actually cleared is UNKNOWN/);
+  assert.match(r.content, /nothing below this line is verified/);
+});
+
+test('🔴 with TWO indexers down it must not say "single-indexer outage"', async () => {
+  // `if (green)` was true for any object, including {ok: 0, total: 1}. With two
+  // of three down it reassured twice that searching still works.
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({
+      status: 200,
+      body: [
+        prowlarrIndexer({ id: 1, name: 'The Pirate Bay' }),
+        prowlarrIndexer({ id: 2, name: 'EZTV' }),
+        prowlarrIndexer({ id: 6, name: '1337x' }),
+      ],
+    }),
+    [`GET ${P}/indexerstatus`]: () => ({
+      status: 200,
+      body: [backoffRow({ indexerId: 6 }), backoffRow({ indexerId: 2 })],
+    }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: HEALTH_1337X }),
+    [`POST ${P}/indexer/testall`]: () => ({
+      status: 400,
+      body: [
+        { id: 1, isValid: true, validationFailures: [] },
+        { id: 2, isValid: false, validationFailures: [{ errorMessage: FORBIDDEN }] },
+        { id: 6, isValid: false, validationFailures: [{ errorMessage: FORBIDDEN }] },
+      ],
+    }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test_all' });
+
+  /**
+   * ⚠️ The phrase must be ABSENT, not negated. "This is NOT a single-indexer
+   * outage" would satisfy a human and still leave the words in front of a model
+   * that reads past the negation — which is exactly how V1's audiobook detector
+   * turned a preference ON from "no, NOT the graphic audio version".
+   */
+  assert.ok(!/single-indexer outage/.test(r.content), '🔴 two down is not one down');
+  assert.ok(!/searching still works/.test(r.content), '🔴 and it must not reassure');
+  assert.match(r.content, /AND IT IS NOT ALONE: 2 of 3/);
+  assert.match(r.content, /searching IS degraded/);
+  assert.match(r.content, /"report once and leave it" rule does not apply/);
+});
+
+test('CONTROL: with ONE down it DOES give the reassurance', async () => {
+  // Without this, the assertions above are equally consistent with the sentence
+  // having been deleted outright.
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({
+      status: 200,
+      body: [prowlarrIndexer({ id: 1, name: 'The Pirate Bay' }), prowlarrIndexer({ id: 6, name: '1337x' })],
+    }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [backoffRow({ indexerId: 6 })] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: HEALTH_1337X }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`POST ${P}/indexer/test`]: () => ({ status: 400, body: [{ errorMessage: FORBIDDEN }] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test', id: 6 });
+  assert.match(r.content, /single-indexer outage and searching still works/);
+});
+
+test('🔴 a testall row with NO isValid is UNKNOWN, not a failure, and blames nothing', async () => {
+  /**
+   * `passed: raw['isValid'] === true` mapped a missing or renamed field to a
+   * definite FAILURE with no reason — and an empty reason reached the catch-all
+   * verdict, which names the VPN tunnel as the cause. A shape we did not
+   * recognise, rendered as a diagnosis.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer/testall`]: () => ({ status: 200, body: [{ id: 6, validationFailures: [] }] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test_all' });
+
+  assert.match(r.content, /NO VERDICT/);
+  assert.match(r.content, /1 with NO verdict reported/);
+  assert.ok(!/FAILED/.test(r.content), '🔴 we must not supply a verdict the service withheld');
+  assert.ok(!/VPN tunnel/.test(r.content), '🔴 nor a cause');
+});
+
+test('a reported failure with NO reason blames nothing either', async () => {
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`POST ${P}/indexer/test`]: () => ({ status: 400, body: [] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'test', id: 6 });
+
+  assert.match(r.content, /gave NO reason/);
+  assert.match(r.content, /The cause is UNKNOWN — do not guess at one/);
+  assert.ok(!/VPN tunnel/.test(r.content));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THE PRODUCER, AND THE ARGUMENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -795,12 +975,18 @@ test('a missing id refuses and issues NO request', async () => {
   assert.deepEqual(s.calls, [], 'a refused call must not reach the server');
 });
 
-test('a non-integer id is not an id', async () => {
+test('a non-integer id is not an id, and a STRINGIFIED one is told so', async () => {
   const s = stub({});
-  for (const id of ['6', 6.5, -1, null]) {
+  for (const id of ['6', 6.5, -1]) {
     const r = await run(s, { service: 'prowlarr', action: 'test', id });
     assert.equal(r.ok, false, `${JSON.stringify(id)} must be refused`);
   }
+  // ⚠️ "No id supplied" and "that is not an id" are different problems. A model
+  // that quoted the right number and is told to go and run `list` cannot escape
+  // the loop, because `list` will hand it the same number again.
+  const quoted = await run(s, { service: 'prowlarr', action: 'test', id: '6' });
+  assert.match(quoted.content, /Send it as the number 6, not as text/);
+  assert.ok(!/No indexer `id` supplied/.test(quoted.content));
   assert.deepEqual(s.calls, []);
 });
 
