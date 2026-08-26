@@ -7,7 +7,7 @@ import {
   IndexerAdminClient,
   hoursBetween,
   humaniseHours,
-  isSiteRefusal,
+  classifyFailure,
   type FetchImpl,
 } from '../src/media/indexer-admin.js';
 import { makeIndexerAdmin } from '../src/tools/indexer-admin.js';
@@ -135,6 +135,24 @@ const arrIndexer = (over: Record<string, unknown> = {}) => ({
 });
 
 const FORBIDDEN = 'Unable to connect to indexer. Unexpected response status Forbidden code from indexer request';
+
+/**
+ * 🔴 VERBATIM FROM THE FIRST LIVE ARR RUN, 2026-08-26T16:52Z — including the
+ * credential that came with it.
+ *
+ * Sonarr's test of "1337x (Prowlarr)" did NOT report a 403. It reported a 429
+ * against `localhost:9696`, which is PROWLARR — the request never reached the
+ * tracker. Prowlarr was throttling the arr because its own indexer 6 was already
+ * backed off with the 403. So the arr's symptom names a different fault than the
+ * real one, one hop upstream.
+ *
+ * ⚠️ And note where the api key sits: inside PROSE, in a URL, in an error
+ * message. This is the exact shape that defeated the first `scrubMessage`.
+ */
+const RATE_LIMITED =
+  'Unable to connect to indexer: HTTP request failed: [429:TooManyRequests] [GET] at ' +
+  `[http://localhost:9696/6/api?t=tvsearch&cat=5000&extended=1&apikey=${SECRET}&offset=0&limit=100]. ` +
+  'Check the log surrounding this error for details';
 
 const backoffRow = (over: Record<string, unknown> = {}) => ({
   indexerId: 6,
@@ -379,8 +397,9 @@ test('CONTROL: the same body at HTTP 200 is read identically', () => {
   // and something else were wrong, this would not distinguish it — so the point
   // of this control is that the STATUS is genuinely not consulted for the
   // per-indexer verdict, which comes from `isValid`.
-  assert.equal(isSiteRefusal([FORBIDDEN]), true);
-  assert.equal(isSiteRefusal(['Unable to connect to indexer. Connection timed out']), false);
+  assert.equal(classifyFailure([FORBIDDEN]), 'forbidden');
+  assert.equal(classifyFailure(['Unable to connect to indexer. Connection timed out']), 'other');
+  assert.equal(classifyFailure([RATE_LIMITED]), 'rate-limited');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -650,7 +669,36 @@ test('🔴 a FAILED test that pushed the backoff further out SAYS so', async () 
   assert.match(r.content, /Retrying gains nothing/);
 });
 
-test('a NON-403 failure points at the tunnel, not at the tracker', async () => {
+test('🔴 a 429 is reported as UPSTREAM throttling, not as a tunnel fault — and is scrubbed', async () => {
+  /**
+   * The regression this exact test exists for: before `classifyFailure` split
+   * out `rate-limited`, this message fell into the catch-all branch and the tool
+   * said "check the VPN tunnel". On the live run that was confidently wrong —
+   * the tunnel was fine and Prowlarr answered promptly, with a 429.
+   */
+  const s = stub({
+    [`GET ${S}/indexer`]: () => ({ status: 200, body: [arrIndexer()] }),
+    [`GET ${S}/indexerstatus`]: () => ({ status: 404, body: '' }),
+    [`GET ${S}/health`]: () => ({ status: 200, body: HEALTH_1337X }),
+    [`GET ${S}/indexer/4`]: () => ({ status: 200, body: arrIndexer() }),
+    [`POST ${S}/indexer/test`]: () => ({
+      status: 400,
+      body: [{ errorMessage: RATE_LIMITED, severity: 'error' }],
+    }),
+  });
+  const r = await run(s, { service: 'sonarr', action: 'test', id: 4 });
+
+  assert.match(r.content, /RATE-LIMITED, not refused by the tracker/);
+  assert.match(r.content, /never reached the tracker/);
+  assert.match(r.content, /service "prowlarr"/, 'it must point one hop upstream');
+  assert.ok(!/VPN tunnel/.test(r.content), '🔴 a 429 is NOT a tunnel fault');
+  assert.ok(!/THIS IS THE SITE REFUSING US/.test(r.content), 'nor a tracker refusal');
+  // 🔴 And the api key that rode in on that message is gone.
+  assert.ok(!r.content.includes(SECRET), 'the api key inside the error URL must be redacted');
+  assert.match(r.content, /apikey=\[REDACTED\]/);
+});
+
+test('a failure with NEITHER a 403 nor a rate limit points at the tunnel', async () => {
   // Different fault, different action. A timeout means the container has no
   // egress; poking the indexer again cannot help and re-arms the backoff.
   const s = stub({
@@ -665,7 +713,7 @@ test('a NON-403 failure points at the tunnel, not at the tracker', async () => {
   });
   const r = await run(s, { service: 'prowlarr', action: 'test', id: 6 });
 
-  assert.match(r.content, /NOT with a 403/);
+  assert.match(r.content, /neither a 403 nor a rate limit/);
   assert.match(r.content, /VPN tunnel/);
   assert.ok(!/THIS IS THE SITE REFUSING US/.test(r.content), 'a timeout is not a refusal');
 });

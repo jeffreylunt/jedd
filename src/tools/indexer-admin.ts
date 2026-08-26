@@ -3,7 +3,7 @@ import {
   humaniseHours,
   IndexerAdminClient,
   INDEXER_SERVICES,
-  isSiteRefusal,
+  classifyFailure,
   readsBackoff,
   type BackoffRow,
   type FetchImpl,
@@ -458,17 +458,38 @@ function verdictNotes(
     }
   }
 
-  // What the FAILURES mean, and whether retrying is worth anything.
+  // What the FAILURES mean, and whether retrying is worth anything. Three
+  // classes, three different next actions — see `classifyFailure`.
   for (const o of failed) {
-    if (isSiteRefusal(o.errors)) {
+    const kind = classifyFailure(o.errors);
+    if (kind === 'forbidden') {
       notes.push('', siteRefusalNote(o, before, after, client, service));
+    } else if (kind === 'rate-limited') {
+      /**
+       * 🔴 THE REQUEST NEVER REACHED THE TRACKER, AND THE FAULT IS ONE HOP UP.
+       *
+       * MEASURED on the first live arr run: Sonarr's test of "1337x (Prowlarr)"
+       * failed `[429:TooManyRequests]` against `localhost:9696` — Prowlarr, not
+       * the tracker — because Prowlarr's OWN indexer 6 was already backed off
+       * with a 403. Retesting the arr cannot fix a fault that lives upstream,
+       * and the arr's error names a different failure than the real one.
+       */
+      notes.push(
+        '',
+        `⏳ id ${o.id} (${o.name}) was RATE-LIMITED, not refused by the tracker — the request never ` +
+          'reached the tracker at all. On an arr this almost always means the UPSTREAM Prowlarr is ' +
+          'throttling it because Prowlarr\'s own copy of that indexer is already in backoff. ' +
+          'Re-testing here cannot fix that. Run this tool with service "prowlarr", action "list", ' +
+          'find the indexer with the same NAME, and read ITS state — the real fault and its real ' +
+          'reason are there, and they may not look like this error at all.',
+      );
     } else {
       notes.push(
         '',
-        `❌ id ${o.id} (${o.name}) failed, and NOT with a 403 — so this is not the tracker refusing ` +
-          'us. A timeout or a network error here points at the VPN tunnel rather than at the ' +
-          'indexer: check whether the container has egress before touching the indexer again. Do ' +
-          'not keep retesting; a failed test re-arms the backoff from now.',
+        `❌ id ${o.id} (${o.name}) failed with neither a 403 nor a rate limit — it got no usable ` +
+          'answer at all. That is the shape of a dead VPN tunnel rather than an indexer fault: ' +
+          'check whether the container has egress before touching the indexer again. Do not keep ' +
+          'retesting; a failed test re-arms the backoff from now.',
       );
     }
   }

@@ -156,17 +156,35 @@ export type Fetched<T> = { state: 'ok'; value: T } | { state: 'unknown'; detail:
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 🔴 A 403 IS THE SITE REFUSING US. IT IS NOT BACKOFF, AND TESTING CANNOT FIX IT.
+ * 🔴 THREE KINDS OF FAILURE, AND THEY LEAD TO THREE DIFFERENT ACTIONS.
  *
  * The whole point of a force-test is that it clears a backoff timer. That only
- * helps when the indexer WOULD work and the arr has stopped asking. When the
- * tracker itself answers `403 Forbidden`, the test fails, and a failed test is
- * not neutral — **it re-arms the backoff from now**, measured below. So the two
- * cases have to be told apart in the OUTPUT, or Jedd reports "tested it" in a
- * tone that implies something was repaired.
+ * helps when the indexer WOULD work and the service has stopped asking. Every
+ * other failure means the test achieved nothing — and a failed test is not
+ * neutral, it **re-arms the backoff from now**. So these are told apart in the
+ * OUTPUT, or Jedd reports "tested it" in a tone that implies a repair.
+ *
+ *  - `forbidden` — the TRACKER turned us away (403). Nothing here changes that.
+ *  - `rate-limited` — **the request never reached the tracker.** MEASURED live
+ *    on the first real arr run: Sonarr's test of "1337x (Prowlarr)" failed with
+ *    `[429:TooManyRequests] [GET] at [http://localhost:9696/6/api…]` — that host
+ *    is PROWLARR, not the tracker. Prowlarr was throttling the arr's request
+ *    because ITS indexer 6 was already in backoff. So the arr's symptom is a
+ *    429 while the actual fault is a 403 one hop upstream, and the fix is to
+ *    look at the SAME indexer on Prowlarr rather than to keep poking the arr.
+ *  - `other` — a timeout or a connection error, i.e. no answer at all, which is
+ *    the shape of a dead VPN tunnel.
+ *
+ * ⚠️ `rate-limited` used to fall into `other`, and `other` says "check the
+ * tunnel". That was a confidently wrong diagnosis on the very first live arr
+ * test: the tunnel was fine, Prowlarr answered promptly, and it answered 429.
  */
-export function isSiteRefusal(errors: string[]): boolean {
-  return errors.some((e) => /\bforbidden\b|\b403\b/i.test(e));
+export type FailureKind = 'forbidden' | 'rate-limited' | 'other';
+
+export function classifyFailure(errors: string[]): FailureKind {
+  if (errors.some((e) => /\bforbidden\b|\b403\b/i.test(e))) return 'forbidden';
+  if (errors.some((e) => /\btoo\s*many\s*requests\b|\b429\b|\brate.?limit/i.test(e))) return 'rate-limited';
+  return 'other';
 }
 
 /** Whole hours between two ISO instants, or null if either is missing/unparsable. */
