@@ -136,6 +136,16 @@ class TypingSession {
    * while `start` is still in flight — two un-ordered fire-and-forget calls can
    * land in either order at the server, and the losing order leaves the
    * indicator ON with nothing left to turn it off.
+   *
+   * ⚠️ THE GUARANTEE IS PER-SESSION, AND THE TWO HALVES ARE NO LONGER THE SAME
+   * SIZE. `finish()` forgets the session before enqueuing its stop, so the next
+   * message from the same handle opens a fresh session on a fresh chain — and a
+   * stop (three socket round trips) now races that turn's start (one HTTP call)
+   * across two transports. That order can lose. It loses SAFELY: the new turn's
+   * indicator gets switched off early, so Jedd looks quiet rather than looking
+   * like it is about to speak forever, which is the direction this whole file
+   * chooses. Worth knowing before the paragraph above is read as covering
+   * back-to-back turns. It does not.
    */
   private chain: Promise<void> = Promise.resolve();
 
@@ -227,6 +237,13 @@ export class Presence {
    */
   private saidHelperAbsent = false;
 
+  /**
+   * The last failure reported for each operation, so a STANDING fault is stated
+   * once while a DIFFERENT one is still stated. Keyed by operation and bounded
+   * by it: there are four.
+   */
+  private readonly saidAlready = new Map<string, string>();
+
   constructor(opts: PresenceOptions) {
     this.client = opts.client;
     this.timers = opts.timers ?? nodeTimers;
@@ -243,25 +260,32 @@ export class Presence {
   /**
    * @internal — called by a session when an operation returns.
    *
-   * 🔴 ONE NOTICE COVERS EVERY CONSEQUENCE OF THE SAME CAUSE.
+   * 🔴 EACH DISTINCT FAILURE IS SAID ONCE, AND ANY SUCCESS RE-ARMS EVERYTHING.
    *
    * `stopTyping` goes over BlueBubbles' socket API (see `client.stopTyping` for
    * why it cannot go over HTTP), and BlueBubbles' socket handler catches the
    * helper error and answers a fixed `"Failed to stop typing!"`. The helper's
    * own wording never reaches us, so a stop CANNOT identify itself as
    * helper-absent the way the HTTP start can. Reported plainly, a disconnected
-   * helper would print a red line per turn, forever, about a condition already
-   * stated once — which is how a log gets ignored.
+   * helper would print that same red line every turn, forever, about a condition
+   * already stated once — which is how a log gets ignored.
    *
-   * So a failure that ARRIVES while the helper is already known absent is
-   * treated as the same known condition and says nothing further. ⚠️ The first
-   * SUCCESS clears that, because once the helper is back a failure is news
-   * again — without the reset this would mute real faults for the life of the
-   * process.
+   * ⚠️ THE RULE IS PER OPERATION AND PER MESSAGE, NOT A BLANKET MUTE. An earlier version muted
+   * every failure once the helper was known absent, and the helper being absent
+   * is a STANDING condition here — so no call would ever return `ok`, the mute
+   * would never lift, and a brand-new fault in the brand-new socket transport
+   * would have been invisible for the life of the process behind a notice about
+   * something else. Deduplicating on the detail says each thing once and still
+   * says every NEW thing.
    */
   report(what: string, handle: string, r: PrivateApiResult): void {
     if (r.ok) {
+      // Whatever was wrong with THIS operation is over, so the next occurrence
+      // is news again. ⚠️ Per operation, not global: `startTyping` succeeding
+      // every turn must not re-arm a `stopTyping` failure that is still
+      // standing, or the standing failure prints once per turn regardless.
       this.saidHelperAbsent = false;
+      this.saidAlready.delete(what);
       return;
     }
     if (r.helperAbsent) {
@@ -273,7 +297,8 @@ export class Presence {
       );
       return;
     }
-    if (this.saidHelperAbsent) return;
+    if (this.saidAlready.get(what) === r.detail) return;
+    this.saidAlready.set(what, r.detail);
     this.logLine(`[presence] ${what} for ${handle} failed — ${r.detail} (ignored; a reply is unaffected)`);
   }
 
@@ -347,8 +372,18 @@ export class Presence {
    *
    * ⚠️ BOUNDED. Shutdown must not hang because BlueBubbles is unreachable; a
    * missed stop is bad, a process that will not die is worse.
+   *
+   * 🔴 THE BOUND IS SIZED AGAINST THE STOP'S NEW COST, NOT PICKED. A stop is no
+   * longer one HTTP round trip: `client.stopTyping` handshakes, joins and emits,
+   * and the emit that actually stops typing is the THIRD trip. At 2s the old
+   * bound would race a slow-but-alive BlueBubbles and exit with that emit still
+   * in flight — a stranded "…" on a real person's phone, which this file calls
+   * the one unrecoverable outcome. 4s covers three trips with room to spare, and
+   * it fits inside the budget: pm2's `kill_timeout` for this app is 10s (see
+   * `ecosystem.config.cjs`), and all that follows is the webhook
+   * deregistration, which needs a couple of seconds at most.
    */
-  async stopAll(boundMs = 2_000): Promise<void> {
+  async stopAll(boundMs = 4_000): Promise<void> {
     const sessions = [...this.active.values()];
     for (const s of sessions) s.finish();
     if (sessions.length === 0) return;

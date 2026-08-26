@@ -602,45 +602,80 @@ export class BlueBubblesClient {
     // 1. Handshake. The reply is an Engine.IO `0` packet carrying the session id.
     const hs = await get(at());
     if (hs.status >= 400) return fail(hs.status, `socket handshake refused (http ${hs.status})`);
-    const brace = hs.text.indexOf('{');
     let sid = '';
     try {
-      sid = String((JSON.parse(hs.text.slice(brace, hs.text.indexOf('}', brace) + 1)) as { sid?: string })?.sid ?? '');
+      // The whole packet after the leading `0` is the JSON. Do NOT slice to the
+      // first `}` — that is correct only while the handshake object stays flat.
+      sid = String((JSON.parse(hs.text.slice(hs.text.indexOf('{'))) as { sid?: string })?.sid ?? '');
     } catch {
       sid = '';
     }
     if (!sid) return fail(hs.status, `socket handshake returned no session id: ${hs.text.slice(0, 80)}`);
 
-    // 2. Join the default namespace, 3. emit, 4. read what came back.
-    await post(at(sid), '40');
-    await post(at(sid), `42${JSON.stringify([event, payload])}`);
-    const back = await get(at(sid));
-    // Best effort: tell BlueBubbles the session is done rather than leaving it
-    // to expire. A failure here changes nothing that matters.
-    await post(at(sid), '41').catch(() => undefined);
-
-    // Engine.IO packs several packets into one polling response, separated by
-    // the record separator. `42[...]` is a server-emitted event.
-    const packets = back.text.split(SOCKET_IO_RECORD_SEPARATOR);
-    const emitted = packets.find((p) => p.startsWith('42'));
-    if (!emitted) return fail(back.status, `no answer to ${event}: ${back.text.slice(0, 120)}`);
-    let channel = '';
-    let data: { status?: unknown; message?: unknown } = {};
     try {
-      const [c, d] = JSON.parse(emitted.slice(2)) as [string, { status?: unknown; message?: unknown }];
-      channel = c;
-      data = d ?? {};
-    } catch {
-      return fail(back.status, `unparseable answer to ${event}: ${emitted.slice(0, 120)}`);
+      // 2. Join the default namespace, then 3. emit.
+      //
+      // ⚠️ BOTH STATUSES ARE CHECKED. A rejected join means the emit is dropped
+      // server-side, and the stop is genuinely lost — but the symptom surfaces
+      // three steps later as "no answer", pointing at the wrong leg.
+      const joined = await post(at(sid), '40');
+      if (joined.status >= 400) return fail(joined.status, `socket join refused (http ${joined.status})`);
+      const sent = await post(at(sid), `42${JSON.stringify([event, payload])}`);
+      if (sent.status >= 400) return fail(sent.status, `socket emit refused (http ${sent.status})`);
+
+      /**
+       * 4. Read what came back.
+       *
+       * 🔴 MATCH ON THE CHANNEL, NEVER ON POSITION. This socket joined the
+       * default namespace, so BlueBubbles broadcasts every server event to it —
+       * and the moment we stop typing is the moment it is dispatching webhooks
+       * for the message just sent. Taking the first `42` frame would report a
+       * healthy stop as `answered on "new-message"`, once per turn.
+       *
+       * ⚠️ AND POLL TWICE. Engine.IO flushes whatever is buffered the instant a
+       * poll opens, so the first one can return the `40` join ack alone, with
+       * the handler's answer still a tick away. One retry is the difference
+       * between reporting a stop that worked and reporting a failure.
+       */
+      let answer: { channel: string; data: { status?: unknown; message?: unknown } } | null = null;
+      let last = '';
+      let status = 200;
+      for (let poll = 0; poll < 2 && !answer; poll += 1) {
+        const back = await get(at(sid));
+        status = back.status;
+        last = back.text;
+        for (const packet of back.text.split(SOCKET_IO_RECORD_SEPARATOR)) {
+          if (!packet.startsWith('42')) continue;
+          try {
+            const [c, d] = JSON.parse(packet.slice(2)) as [string, { status?: unknown; message?: unknown }];
+            if (c === `${event}-sent` || c === `${event}-error`) {
+              answer = { channel: c, data: d ?? {} };
+              break;
+            }
+          } catch {
+            // Not ours, or not parseable. Keep looking; the answer may be next.
+          }
+        }
+      }
+      if (!answer) return fail(status, `no answer to ${event}: ${last.slice(0, 120)}`);
+
+      const reported = typeof answer.data.status === 'number' ? answer.data.status : status;
+      // 🔴 The CHANNEL is the verdict, not the HTTP status. Every polling
+      // response is a 200; BlueBubbles reports the outcome by answering on
+      // `${event}-sent` or `${event}-error`.
+      if (answer.channel !== `${event}-sent`) {
+        return fail(
+          reported,
+          `${event} answered on "${answer.channel}": ${String(answer.data.message ?? 'no message')}`,
+        );
+      }
+      return { ok: true, status: reported, helperAbsent: false, detail: `socket ${answer.channel} (${reported})` };
+    } finally {
+      // Tell BlueBubbles the session is done rather than leaving it to expire.
+      // In a `finally` so it also runs when a step above threw — otherwise the
+      // comment promising an explicit close is true only on the happy path.
+      await post(at(sid), '41').catch(() => undefined);
     }
-    const status = typeof data.status === 'number' ? data.status : back.status;
-    // 🔴 The CHANNEL is the verdict, not the HTTP status. Every polling response
-    // is a 200; BlueBubbles reports the outcome by answering on `${event}-sent`
-    // or `${event}-error`.
-    if (channel !== `${event}-sent`) {
-      return fail(status, `${event} answered on "${channel}": ${String(data.message ?? 'no message')}`);
-    }
-    return { ok: true, status, helperAbsent: false, detail: `socket ${channel} (${status})` };
   }
 
   /**

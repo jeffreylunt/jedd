@@ -108,9 +108,29 @@ const RS = '\u001e';
  * separated by the record separator.
  */
 function socketServer(
-  opts: { channel?: (event: string) => string; data?: unknown; sid?: string | null } = {},
+  opts: {
+    channel?: (event: string) => string;
+    data?: unknown;
+    sid?: string | null;
+    /** Status for the `40` join POST. */
+    joinStatus?: number;
+    /** Status for the `42` emit POST. */
+    emitStatus?: number;
+    /**
+     * Frames to put in front of our answer, as BlueBubbles does — it broadcasts
+     * every server event to every connected socket, and we stop typing at the
+     * exact moment it is dispatching webhooks for the message just sent.
+     */
+    noise?: [string, unknown][];
+    /**
+     * Hold the answer back for this many polls, returning only the join ack.
+     * Engine.IO flushes whatever is buffered the instant a poll opens.
+     */
+    withholdPolls?: number;
+  } = {},
 ) {
   let emitted: [string, unknown] | null = null;
+  let polls = 0;
   const handle = (c: Call): { status?: number; body: unknown } | null => {
     if (!c.url.includes('/socket.io/')) return null;
     if (c.method === 'GET' && !c.url.includes('sid=')) {
@@ -118,13 +138,21 @@ function socketServer(
       return { body: sid === null ? '0{"upgrades":[]}' : `0{"sid":"${sid}","upgrades":[]}` };
     }
     if (c.method === 'POST') {
-      if (c.raw?.startsWith('42')) emitted = JSON.parse(c.raw.slice(2)) as [string, unknown];
+      if (c.raw === '40' && opts.joinStatus) return { status: opts.joinStatus, body: 'nope' };
+      if (c.raw?.startsWith('42')) {
+        if (opts.emitStatus) return { status: opts.emitStatus, body: 'nope' };
+        emitted = JSON.parse(c.raw.slice(2)) as [string, unknown];
+      }
       return { body: 'ok' };
     }
+    polls += 1;
+    const ack = polls === 1 ? `40{"sid":"FAKESID"}${RS}` : '';
+    const noise = (opts.noise ?? []).map((n) => `42${JSON.stringify(n)}${RS}`).join('');
+    if (polls <= (opts.withholdPolls ?? 0)) return { body: `${ack}${noise}` };
     const event = emitted?.[0] ?? 'nothing-was-emitted';
     const channel = opts.channel ? opts.channel(event) : `${event}-sent`;
     const data = opts.data ?? { status: 200, message: 'Success', data: null, encrypted: false };
-    return { body: `40{"sid":"FAKESID"}${RS}42${JSON.stringify([channel, data])}` };
+    return { body: `${ack}${noise}42${JSON.stringify([channel, data])}` };
   };
   return { handle, emitted: () => emitted };
 }
@@ -285,9 +313,68 @@ test('the socket session is CLOSED, not left for BlueBubbles to time out', async
   await client(impl).stopTyping(chatGuidFor(OWNER));
 
   assert.ok(
-    calls.some((k) => k.method === 'POST' && k.raw === '41'),
-    'no Engine.IO disconnect frame — every stop would leak a session until ping timeout',
+    calls.some((k) => k.method === 'POST' && k.raw === '41' && k.url.includes('sid=')),
+    'no Engine.IO disconnect frame at the SESSION — a 41 with no sid closes nothing',
   );
+});
+
+test('🔴 an unrelated broadcast in front of the answer is not mistaken for it', async () => {
+  // BlueBubbles broadcasts every server event to every connected socket, and we
+  // stop typing at the exact moment it is dispatching webhooks for the message
+  // just sent. Taking the FIRST `42` frame reports a healthy stop as a failure,
+  // once per turn.
+  const socket = socketServer({
+    noise: [
+      ['new-message', { status: 200, data: { guid: 'just-sent' } }],
+      ['typing-indicator', { status: 200, data: { display: false } }],
+    ],
+  });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, true, r.detail);
+  assert.match(r.detail, /stopped-typing-sent/);
+});
+
+test('a poll carrying only the join ack is retried, not called a failure', async () => {
+  // Engine.IO flushes whatever is buffered the instant a poll opens, so the
+  // first poll can return the `40` ack alone with the answer a tick behind. The
+  // emit already landed; the indicator really did stop.
+  const socket = socketServer({ withholdPolls: 1 });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, true, r.detail);
+});
+
+test('a silent server is reported as no answer rather than retried forever', async () => {
+  const socket = socketServer({ withholdPolls: 99 });
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /no answer to stopped-typing/);
+  assert.ok(calls.filter((k) => k.method === 'GET' && k.url.includes('sid=')).length <= 2, 'unbounded polling');
+});
+
+test('🔴 a refused namespace join is named as such, not surfaced three steps later', async () => {
+  // A rejected join means the emit is dropped server-side and the stop is
+  // genuinely lost. Reported as "no answer" it would point at the wrong leg.
+  const socket = socketServer({ joinStatus: 401 });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /join refused/);
+});
+
+test('a refused emit is named as such', async () => {
+  const socket = socketServer({ emitStatus: 400 });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /emit refused/);
 });
 
 test('🔴 CONTROL: a transport failure still THROWS out of stopTyping', async () => {
@@ -433,9 +520,31 @@ test('🔴 with the helper ABSENT, a turn returns its reply exactly as it would 
     calls.some((c) => c.url.includes('/message/text')),
     'the reply never went out',
   );
-  // Every presence call failed, and the only thing said about it was one notice.
-  assert.equal(lines.length, 1, `expected one notice, got:\n${lines.join('\n')}`);
-  assert.match(lines[0] ?? '', /once per process/);
+});
+
+test('🔴 the helper being absent does not add a line per turn, forever', async () => {
+  // Its own test: the assertion above dies on the reply, and if these shared a
+  // test body this one would never run. Every presence call fails on every turn
+  // here, which is the state this machine has been in since the feature shipped.
+  const socket = socketServer({
+    channel: (e) => `${e}-error`,
+    data: { status: 500, message: 'Failed to stop typing!' },
+  });
+  const { impl } = scripted((c) => socket.handle(c) ?? { status: 500, body: HELPER_ABSENT_BODY });
+  const bb = client(impl);
+  const lines: string[] = [];
+  const presence = new Presence({ client: bb, log: (l) => lines.push(l) });
+
+  for (let turn = 0; turn < 5; turn += 1) {
+    presence.markRead(OWNER);
+    await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+  }
+
+  // One notice naming the cause, and one line for the stop — which cannot name
+  // it, because BlueBubbles' socket handler discards the helper's wording.
+  assert.equal(lines.length, 2, `five turns produced ${lines.length} lines:\n${lines.join('\n')}`);
+  assert.equal(lines.filter((l) => l.includes('once per process')).length, 1, lines.join('\n'));
 });
 
 test('🔴 with the transport THROWING, a turn still returns its reply', async () => {
@@ -471,18 +580,26 @@ test('the helper-absent notice is said ONCE, not on every turn for the rest of t
 });
 
 /**
- * A hand-built presence client whose next answer can be set per call, so the
- * two halves of the suppression rule can be asserted separately. Each half gets
- * its own test: an assertion that dies first hides the one after it.
+ * A hand-built presence client whose answer can be set PER OPERATION.
+ *
+ * ⚠️ Per-operation on purpose. An earlier version returned one answer for all
+ * three, which made "the stop is the call that cannot self-identify" untestable:
+ * the START failed identically, so an assertion about the stop was satisfied by
+ * the start being quiet.
  */
 function switchableClient() {
-  let next: PrivateApiResult = { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+  const ok: PrivateApiResult = { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+  const next: Record<'start' | 'stop' | 'read', PrivateApiResult> = { start: ok, stop: ok, read: ok };
   const impl: PresenceCapableClient = {
-    startTyping: async () => next,
-    stopTyping: async () => next,
-    markChatRead: async () => next,
+    startTyping: async () => next.start,
+    stopTyping: async () => next.stop,
+    markChatRead: async () => next.read,
   };
-  return { impl, set: (r: PrivateApiResult) => { next = r; } };
+  return {
+    impl,
+    ok,
+    set: (which: Partial<typeof next>) => Object.assign(next, which),
+  };
 }
 
 const HELPER_ABSENT: PrivateApiResult = {
@@ -493,49 +610,83 @@ const SOCKET_STOP_ERROR: PrivateApiResult = {
   ok: false, status: 500, helperAbsent: false, detail: 'stopped-typing-error: Failed to stop typing!',
 };
 
-test('a failure arriving while the helper is KNOWN absent adds no second line', async () => {
+test('🔴 the stop\'s standing failure is said ONCE, not once per turn', async () => {
   const { impl, set } = switchableClient();
   const lines: string[] = [];
   const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
 
-  set(HELPER_ABSENT);
-  await presence.withTyping(OWNER, async () => 'ok');
-  await flush();
-  const afterNotice = lines.length;
+  // Only the STOP fails, and it fails with BlueBubbles' fixed wording, which
+  // carries no hint that the helper is the cause. Start and read are fine, so
+  // nothing else can account for the quiet.
+  set({ stop: SOCKET_STOP_ERROR });
+  for (let turn = 0; turn < 4; turn += 1) {
+    await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+  }
 
-  // The stop cannot say "helper absent" — BlueBubbles' socket handler answers a
-  // fixed string. Unsuppressed, this is one red line per turn, forever.
-  set(SOCKET_STOP_ERROR);
-  await presence.withTyping(OWNER, async () => 'ok');
-  await flush();
-
-  assert.equal(afterNotice, 1, lines.join('\n'));
-  assert.equal(lines.length, 1, `a consequence of an already-stated cause was reported:\n${lines.join('\n')}`);
+  const about = lines.filter((l) => l.includes('Failed to stop typing'));
+  assert.equal(about.length, 1, `four turns, ${about.length} lines about one standing condition:\n${lines.join('\n')}`);
 });
 
-test('🔴 a SUCCESS re-arms reporting — the suppression must not outlive its cause', async () => {
+test('🔴 a DIFFERENT failure is still reported while the first one stands', async () => {
+  // The mute must be per-message, not a blanket. A blanket version would have
+  // hidden every fault in the new socket transport behind an unrelated notice,
+  // for the life of the process.
   const { impl, set } = switchableClient();
   const lines: string[] = [];
   const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
 
-  set(HELPER_ABSENT);
+  set({ stop: SOCKET_STOP_ERROR });
   await presence.withTyping(OWNER, async () => 'ok');
   await flush();
 
-  // The helper comes back...
-  set({ ok: true, status: 200, helperAbsent: false, detail: 'http 200' });
-  await presence.withTyping(OWNER, async () => 'ok');
-  await flush();
-
-  // ...and a genuine fault after that is news again, not old news.
-  set({ ok: false, status: 503, helperAbsent: false, detail: 'http 503: upstream gone' });
+  set({ stop: { ok: false, status: 401, helperAbsent: false, detail: 'socket handshake refused (http 401)' } });
   await presence.withTyping(OWNER, async () => 'ok');
   await flush();
 
   assert.ok(
-    lines.some((l) => l.includes('upstream gone')),
-    `a real fault was muted for the life of the process:\n${lines.join('\n')}`,
+    lines.some((l) => l.includes('handshake refused')),
+    `a new fault was muted by an unrelated standing one:\n${lines.join('\n')}`,
   );
+});
+
+test('🔴 the helper-absent notice does not repeat while every call keeps failing', async () => {
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set({ start: HELPER_ABSENT, read: HELPER_ABSENT, stop: SOCKET_STOP_ERROR });
+  for (let turn = 0; turn < 4; turn += 1) {
+    presence.markRead(OWNER);
+    await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+  }
+
+  const notices = lines.filter((l) => l.includes('once per process'));
+  assert.equal(notices.length, 1, `expected one notice across four turns:\n${lines.join('\n')}`);
+});
+
+test('🔴 a SUCCESS re-arms reporting — the suppression must not outlive its cause', async () => {
+  const { impl, set, ok } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set({ stop: SOCKET_STOP_ERROR });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  // Whatever was wrong is over...
+  set({ stop: ok });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  // ...so the same condition returning is news again, not old news.
+  set({ stop: SOCKET_STOP_ERROR });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  const about = lines.filter((l) => l.includes('Failed to stop typing'));
+  assert.equal(about.length, 2, `a recurrence after a success was muted:\n${lines.join('\n')}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -702,6 +853,36 @@ function connectorWith(audience: 'everyone' | string[], presence?: Presence): Bl
   );
 }
 
+test('🔴 stopAll WAITS for a stop that takes several sequential round trips', async () => {
+  // A stop is no longer one request: `client.stopTyping` handshakes, joins and
+  // emits, and the emit that actually stops typing is the third leg. A bound
+  // that expires before the legs finish exits with the emit in flight, and the
+  // "…" is stranded on a real person's phone. Real timers, deliberately — the
+  // point is elapsed work, not a clock this test controls.
+  let landed = false;
+  const impl: PresenceCapableClient = {
+    startTyping: async () => ({ ok: true, status: 200, helperAbsent: false, detail: 'http 200' }),
+    markChatRead: async () => ({ ok: true, status: 200, helperAbsent: false, detail: 'http 200' }),
+    stopTyping: async () => {
+      for (let leg = 0; leg < 3; leg += 1) await new Promise((r) => setTimeout(r, 20));
+      landed = true;
+      return { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+    },
+  };
+  const presence = new Presence({ client: impl, log: () => {} });
+  // A SIGTERM lands MID-turn — that is the case `stopAll` exists for, and the
+  // only one in which there is a live indicator left to strand.
+  let endTurn = (): void => {};
+  void presence.withTyping(OWNER, () => new Promise<string>((r) => {
+    endTurn = () => r('ok');
+  }));
+  await flush();
+  await presence.stopAll();
+  endTurn();
+
+  assert.equal(landed, true, 'shutdown returned with the stop still in flight — that strands the indicator');
+});
+
 test('🔴 a handle outside JEDD_SEND_TO gets NO read receipt and NO typing bubble', async () => {
   const { impl, calls } = stubClient();
   const presence = new Presence({ client: impl, log: () => {} });
@@ -746,6 +927,18 @@ const turnOf = async (connector: BlueBubblesConnector): Promise<PresenceRecord> 
   return signals;
 };
 
+test('🔴 Connector.markRead hands back a boolean, never a promise', async () => {
+  // The interface makes this claim explicitly. A promise here would be a thing a
+  // caller could await on the reply path, which is the one rule presence.ts
+  // exists to enforce — and `withPresence` puts the return value in an `if`,
+  // where a promise is always truthy and the mistake is invisible.
+  const { impl } = stubClient();
+  const connector = connectorWith('everyone', new Presence({ client: impl, log: () => {} }));
+  const returned: unknown = connector.markRead(OWNER);
+  assert.equal(typeof returned, 'boolean');
+  assert.equal(returned instanceof Promise, false);
+});
+
 test('🔴 a wired connector records BOTH signals — read and typing', async () => {
   const { impl } = stubClient();
   const record = await turnOf(connectorWith('everyone', new Presence({ client: impl, log: () => {} })));
@@ -763,6 +956,17 @@ test('🔴 a handle outside the send audience records none, even though presence
   const { impl } = stubClient();
   const connector = connectorWith(['+15550001111'], new Presence({ client: impl, log: () => {} }));
   assert.equal(presenceToken(await turnOf(connector)), 'none');
+});
+
+test('🔴 the token says ATTEMPTED, not arrived — a failing call still reads read+typing', async () => {
+  // Deliberate, and the comments say so. The outcome does not exist yet at the
+  // line that prints this: presence runs on a chain nobody awaits, and awaiting
+  // it to improve a log line would put presence latency on the reply path. A
+  // FAILURE announces itself separately on its own [presence] line, so the pair
+  // is unambiguous — this token alone is not, and must not be read as delivery.
+  const { impl } = stubClient('helper-absent');
+  const record = await turnOf(connectorWith('everyone', new Presence({ client: impl, log: () => {} })));
+  assert.equal(presenceToken(record), 'read+typing');
 });
 
 test('the turn still returns its reply while nothing is signalled', async () => {

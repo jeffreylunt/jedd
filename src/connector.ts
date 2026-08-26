@@ -34,12 +34,20 @@ export interface Connector {
    * `fn` returns and rethrows exactly what `fn` throws, and any failure of its
    * own is swallowed inside.
    *
-   * 🔴 THE RETURN VALUE AND `onTyping` ARE THE ONLY HONEST WITNESS THAT A
-   * SIGNAL WENT OUT. `Presence.report()` returns early on success, so a
-   * successful call and a call that was never made are byte-identical in the
-   * log — that is how a turn silently lost its read receipt and nobody could
-   * tell. These report from INSIDE the gate that makes the decision, rather
-   * than from a predicate somewhere else that re-derives it and drifts.
+   * 🔴 THE RETURN VALUE AND `onTyping` WITNESS THAT THE SIGNAL WAS ATTEMPTED —
+   * NOT THAT IT ARRIVED. They fire from INSIDE the gate that makes the decision,
+   * rather than from a predicate elsewhere that re-derives it and drifts, and
+   * they answer the question that used to be unanswerable: was the call made at
+   * all? `Presence.report()` returns early on success, so a call that succeeded
+   * and a call that was never made are byte-identical in the log, and that is
+   * how a turn silently lost its read receipt with nobody able to tell which.
+   *
+   * ⚠️ THE OUTCOME DELIBERATELY IS NOT HERE. Presence runs on a chain nobody
+   * awaits — that is the rule `presence.ts` exists to enforce — so the result
+   * does not exist yet when the turn line is printed. Waiting for it would put
+   * presence latency on the reply path to improve a log line. A FAILED call
+   * still says its own name, once, through `Presence.report`; this token covers
+   * the silence that used to sit underneath it.
    */
   markRead(toHandle: string): boolean;
   withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T>;

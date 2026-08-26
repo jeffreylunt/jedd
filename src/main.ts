@@ -275,11 +275,17 @@ async function main(): Promise<void> {
         signals,
       );
       /**
-       * 🔴 `presence=` DISTINGUISHES A SIGNAL THAT WENT OUT FROM ONE THAT WAS
-       * NEVER SENT. `Presence.report()` returns early on success, so those two
-       * states used to log identically — and when Jeff said he got no read
-       * receipt, the log could not say whether the call had been made. The token
-       * is written by the gate itself, not re-derived here.
+       * 🔴 `presence=` SAYS WHAT WAS ATTEMPTED, NOT WHAT ARRIVED.
+       *
+       * `Presence.report()` returns early on success, so a call that worked and
+       * a call that was never made used to log identically — and when Jeff said
+       * he got no read receipt, the log could not say which. This token settles
+       * that half. It cannot settle delivery, because presence runs on a chain
+       * nobody awaits and the outcome does not exist yet at this line; a failure
+       * announces itself separately, once, on its own `[presence]` line. So
+       * `presence=read+typing` with no `[presence]` line under it is a clean
+       * turn, and `presence=none` means Jedd said nothing to this person on
+       * purpose — an absent `Presence`, or a handle outside `JEDD_SEND_TO`.
        */
       console.error(
         `[jedd] turn ${turns} from ${message.senderHandle}: ` +
