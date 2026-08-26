@@ -85,11 +85,17 @@ export const QUERIES: Record<QueryName, QuerySpec> = {
    * Channels with no programme ending in the future.
    *
    * 🔴 THE TABLE IS `epg_programdata` AND THE COLUMN IS `end_time`. Verified
-   * against `information_schema` on the live database, because the job specs
-   * disagree with themselves here: there is **no** `dispatcharr_epg_programdata`
-   * and **no** `stop_time`. A query naming either fails hard, which makes the
-   * night's EPG result UNKNOWN rather than PASS — and a hard failure that reads
-   * as a pass is the whole hazard.
+   * against `information_schema` on the live database: there is **no**
+   * `dispatcharr_epg_programdata` and **no** `stop_time`.
+   *
+   * ⚠️ The job spec says exactly this too — both wrong names appear there as
+   * WARNINGS, which is why skimming it reads as self-contradiction. Verifying
+   * against the database rather than any document is what makes this KNOWN
+   * rather than believed, and it independently confirmed the spec.
+   *
+   * A query naming either fails hard, which makes the night's EPG result UNKNOWN
+   * rather than PASS — and a hard failure that reads as a pass is the whole
+   * hazard.
    */
   epg_coverage: {
     what: 'channels with NO programme ending in the future',
