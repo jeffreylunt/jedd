@@ -1101,8 +1101,9 @@ test('the capture file is 0600 — it can hold a tracker credential', async () =
 });
 
 test('remove says the id will NOT come back the same', async () => {
-  // Measured: a removed id 8 came back as 10. Sonarr and Radarr reference
-  // Prowlarr indexers BY id, so "put it back" is not "nothing changed".
+  // Measured: the same definition, added and removed twice, came back as id 10
+  // and then id 11 — never its original. Sonarr and Radarr reference Prowlarr
+  // indexers BY id, so "put it back" is not "nothing changed".
   const dir = captureDir();
   const s = stub({
     [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
@@ -1343,6 +1344,15 @@ test('🔴 add and remove are REFUSED on an arr, and issue no write', async () =
     assert.match(r.content, /is a PROWLARR operation/);
     assert.match(r.content, /Re-run with service "prowlarr"/);
     assert.match(r.content, /Force-testing Sonarr still works/);
+    /**
+     * ⚠️ Found on a live run: the sentence used to interpolate `${verb}d`,
+     * which produced "one Removing an indexerd on Sonarr directly". A template
+     * that inflects a caller-supplied string will eventually be handed one it
+     * cannot inflect, and this is prose a person reads. Assert the artifact is
+     * gone rather than trusting the phrasing to stay short.
+     */
+    assert.ok(!/indexerd|cataloguedd|\ban indexerd\b/.test(r.content), 'no mangled conjugation');
+    assert.match(r.content, /a coverage change made on Sonarr directly/);
     assert.deepEqual(s.calls, [], `${action} must not reach Sonarr at all`);
   }
 });

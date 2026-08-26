@@ -264,14 +264,15 @@ async function runList(client: IndexerAdminClient) {
  * the operation that is genuinely theirs — force-testing, which resets THEIR
  * backoff — and coverage changes happen upstream where they mean something.
  */
-function prowlarrOnly(client: IndexerAdminClient, verb: string): string | null {
+function prowlarrOnly(client: IndexerAdminClient, operation: string): string | null {
   if (client.service === 'prowlarr') return null;
   return (
-    `${verb} is a PROWLARR operation and this call named "${client.service}". Every ${client.label} ` +
-    'indexer here is a Prowlarr proxy (their names end "(Prowlarr)"), so Prowlarr is what decides ' +
-    `which trackers exist — one ${verb}d on ${client.label} directly is either unmanaged or undone ` +
-    `by the next sync. Re-run with service "prowlarr". Force-testing ${client.label} still works and ` +
-    'is the operation that resets ITS backoff.'
+    `${operation} is a PROWLARR operation and this call named "${client.service}". Every ` +
+    `${client.label} indexer here is a Prowlarr proxy (their names end "(Prowlarr)"), so Prowlarr ` +
+    'is what decides which trackers exist — a coverage change made on ' +
+    `${client.label} directly is either unmanaged or undone by the next sync. Re-run with service ` +
+    `"prowlarr". Force-testing ${client.label} still works and is the operation that resets ITS ` +
+    'backoff.'
   );
 }
 
@@ -523,10 +524,11 @@ async function runRemove(client: IndexerAdminClient, rawId: unknown, config: Con
         'To put it back, re-add it from that file — or, for a stock definition, action "add" with ' +
           `\`definition\` set to its catalogue name.`,
         summariseCaptured(raw.value),
-        '⚠️ Re-adding does NOT restore the id. A new indexer gets a NEW id (measured: a removed id 8 ' +
-          'came back as 10), and Sonarr and Radarr reference Prowlarr indexers BY id — so Prowlarr ' +
-          'will re-sync them rather than the old link resuming. Say that if anyone asks why the arrs ' +
-          'look different afterwards.',
+        '⚠️ Re-adding does NOT restore the id. A new indexer gets a NEW id — measured: the same ' +
+          'definition added, removed and added again came back as id 10, then id 11, never its ' +
+          'original. Sonarr and Radarr reference Prowlarr indexers BY id, so Prowlarr re-syncs them ' +
+          'rather than the old link resuming. Say that if anyone asks why the arrs look different ' +
+          'afterwards.',
       ],
       client,
       after,
