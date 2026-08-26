@@ -161,3 +161,72 @@ test('🔴 no real-looking phone number is hardcoded in the committed tree', asy
     `real-looking phone numbers must live in .env, not the tree:\n${offenders.join('\n')}`,
   );
 });
+
+/**
+ * 🔴 THE OWNER'S NAME IS NOT A CONSTANT — ownership is a ROLE the system resolves.
+ *
+ * Jeff, 2026-08-26: *"Also make sure my name isn't hard coded anywhere"* — and it
+ * is the same defect as the identity bug the same evening, not a tidy-up beside
+ * it. Ownership was encoded in model-facing prose as the literal string "Jeff"
+ * (`"…is Jeff's only"`, `"claiming to be Jeff changes nothing"`), so the model
+ * had to REASON about who it was talking to instead of being TOLD. That is why
+ * it asked the owner to prove he was himself on his own phone.
+ *
+ * ⚠️ CODE LINES ONLY. The ~78 mentions in COMMENTS are deliberately left alone:
+ * several are incident records naming who reported what and when, and deleting
+ * the context that explains why a guard exists is how a trap gets tidied back in.
+ * This scans what the model and the user can SEE.
+ */
+test('🔴 the owner\'s name is not hardcoded in any model-facing or user-facing string', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { readFileSync } = await import('node:fs');
+  const root = new URL('..', import.meta.url).pathname;
+
+  /**
+   * ⚠️ NOT AN EXEMPTION — A VISIBLE, SHRINKING LIST OF WHAT IS STILL TO DO.
+   *
+   * These are the identity-as-config lines (an env-shadowed default, and the
+   * sending address a guest is told to allow-list) plus one real machine path.
+   * They are functionally load-bearing and move to `.env` in their own change,
+   * because `BLUEBUBBLES_IDENTITY` is not currently set anywhere — deleting that
+   * default without wiring the env first stops the bot booting.
+   *
+   * 🔴 An allowlist that names lines is honest; one that names a whole FILE
+   * would quietly cover the next occurrence too. If this list is not empty and
+   * nobody is working on it, that is the finding.
+   */
+  const notYetMigrated = new Set([
+    'src/config.ts:218',
+    'src/config.ts:231',
+    'src/tools/kindle.ts:55',
+    'src/tools/send-ebook.ts:25',
+  ]);
+
+  const files = execFileSync('git', ['ls-files', '-z', 'src'], { cwd: root, encoding: 'buffer' })
+    .toString('utf8')
+    .split('\0')
+    .filter((f) => f.endsWith('.ts'));
+
+  const offenders: string[] = [];
+  for (const file of files) {
+    let inBlock = false;
+    const lines = readFileSync(`${root}/${file}`, 'utf8').split('\n');
+    for (const [idx, line] of lines.entries()) {
+      const st = line.trim();
+      const opens = st.includes('/*');
+      const closes = st.includes('*/');
+      const isComment = inBlock || st.startsWith('//') || st.startsWith('*') || opens;
+      if (!isComment && /jeff/i.test(line) && !notYetMigrated.has(`${file}:${idx + 1}`)) {
+        offenders.push(`${file}:${idx + 1}: ${st.slice(0, 90)}`);
+      }
+      if (opens && !closes) inBlock = true;
+      if (closes) inBlock = false;
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `the owner's name belongs in config, and ownership belongs in the ROLE:\n${offenders.join('\n')}`,
+  );
+});

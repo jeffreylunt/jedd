@@ -819,7 +819,12 @@ test('🔴 the stripper runs on EVERY response, including an allowed CONTENT pat
       assert.equal(res.ok, true, '/history is CONTENT and must stay readable');
       assert.doesNotMatch(res.content, /LEAKED123/, 'a credential reached the transcript');
       assert.match(res.content, /REDACTED before you saw it: passkey \(in a URL\)/);
-      assert.match(res.content, /removed for everyone including Jeff/);
+      // ⚠️ Asserts the PROPERTY — that the note says the strip applies to the
+      // owner too — not the owner's name. The name was removed from every
+      // model-facing string on 2026-08-26 so that ownership is a ROLE the system
+      // resolves rather than a name the model matches against a claim.
+      assert.match(res.content, /removed for everyone including the owner/i);
+      assert.doesNotMatch(res.content, /jeff/i, 'the owner\'s name is back in a model-facing string');
     });
 });
 

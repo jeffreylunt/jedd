@@ -96,7 +96,7 @@ export function makeInviteTool(deps: InviteDeps): Tool {
         if (used >= QUOTA_MAX) {
           return fail(
             `RATE_LIMITED — this person has already sent ${used} invites in the last 24 hours, which ` +
-              'is the limit. Nothing was created. Ask Jeff if they need more.',
+              'is the limit. Nothing was created. Tell them to ask the owner if they need more.',
           );
         }
       }
@@ -117,7 +117,7 @@ export function makeInviteTool(deps: InviteDeps): Tool {
 
       // ── send ─────────────────────────────────────────────────────────────
       const text =
-        `You've been invited to Jeff's Jellyfin. Set up your account here: ${minted.invite.link}\n` +
+        `You've been invited to the Jellyfin server. Set up your account here: ${minted.invite.link}\n` +
         `This link works once and expires in 24 hours.`;
       let delivered: boolean | null = null;
       let sendDetail = '';
@@ -152,7 +152,7 @@ export function makeInviteTool(deps: InviteDeps): Tool {
               `to try a different number. Do NOT repeat any link.`
             : `🔴 DELIVERY_FAILED AND REVOKE FAILED — the text did not go through AND the invite ` +
               `could not be revoked, so a live single-use invite exists. ${revoke.detail} ` +
-              `Tell them something went wrong and that Jeff needs to look at it.`,
+              `Tell them something went wrong and that the owner needs to look at it.`,
         );
       }
 

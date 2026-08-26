@@ -281,7 +281,7 @@ export const channelHealth: Tool = {
     'It NEVER opens a stream — probing costs about 10 seconds per channel and has wedged the whole ' +
     '242-channel run for three hours — so this is a SNAPSHOT and the first line always says how old ' +
     'it is. Report that age with the answer; if it is stale, say so instead of presenting it as ' +
-    'current. Pass `channel` to ask about one channel by name or number. For Jeff it also reports ' +
+    'current. Pass `channel` to ask about one channel by name or number. For the owner it also reports ' +
     'which channels Dispatcharr knows about that the check never covered.',
   // CONTENT: which channel works is not about a person and is not a secret, so
   // it is everyone's. The privileged half of it is gated inside `run`.

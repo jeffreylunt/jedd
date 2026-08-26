@@ -117,9 +117,10 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       'WHAT IS REFUSED, and every refusal says which of these it is. Everything about the CONTENT is ' +
       'open to everyone: the library, what is missing, the queue, the guide, channel line-ups, ' +
       'indexer health, and an arr /history (what was grabbed and when). PERSONAL data — who is ' +
-      'watching what, who logged in, the user list — is Jeff\'s only; for anyone else say so plainly ' +
+      'watching what, who logged in, the user list — is the OWNER\'S only, and you are told at the top ' +
+      'of this conversation whether you are speaking with the owner. For a guest say so plainly ' +
       'rather than implying it is broken. SECRETS — API keys, passwords, tokens, the config and ' +
-      'download-client and indexer endpoints — are refused to EVERYONE INCLUDING JEFF, because a ' +
+      'download-client and indexer endpoints — are refused to EVERYONE INCLUDING THE OWNER, because a ' +
       'credential quoted into a reply is copied into the message thread and the logs. If he asks, say ' +
       'that; do not look for another route, there is not one. Also refused: anything enumerating ' +
       'Jellyfin channels or tuners, and the release-search endpoints. For per-channel Live TV health ' +
@@ -299,7 +300,7 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       const stripped = stripCredentials(body);
       const redactionNote = stripped.redacted.length
         ? `\n🔴 REDACTED before you saw it: ${stripped.redacted.join(', ')}. These are credentials, ` +
-          'and they are removed for everyone including Jeff — a secret quoted into a reply is copied ' +
+          'and they are removed for everyone including the owner — a secret quoted into a reply is copied ' +
           'into the message thread, the history and the log file. Do not ask for them another way; ' +
           'there is no other way. Tell the user the field exists and was withheld.'
         : '';
