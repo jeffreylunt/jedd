@@ -1,3 +1,4 @@
+import { describeError, redactUrlSecrets } from './errors.js';
 /**
  * jfa-go — minting Jellyfin invites.
  *
@@ -110,7 +111,7 @@ export class JfagoClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (e) {
-      return { ok: false, status: 0, body: { error: (e as Error).message } };
+      return { ok: false, status: 0, body: { error: describeError(e, redactUrlSecrets) } };
     }
     const text = await res.text().catch(() => '');
     let body: unknown = {};

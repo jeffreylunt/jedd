@@ -1,3 +1,4 @@
+import { describeError, redactUrlSecrets } from '../errors.js';
 import { plausible, type Candidate } from './matching.js';
 import { parseQueue, type Release } from './queue.js';
 import { parseShowSeasons, type ShowSeasons } from './seasons.js';
@@ -141,7 +142,13 @@ export class ArrClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (e) {
-      return { ok: false, status: 0, body: null, detail: `could not reach ${url}: ${(e as Error).message}` };
+      // 🔴 `.message` alone is the constant string "fetch failed" — see src/errors.ts.
+      return {
+        ok: false,
+        status: 0,
+        body: null,
+        detail: `could not reach ${redactUrlSecrets(url)}: ${describeError(e, redactUrlSecrets)}`,
+      };
     }
     let body: unknown = null;
     let raw = '';

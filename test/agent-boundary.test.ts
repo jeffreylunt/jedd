@@ -237,3 +237,99 @@ test('the prompt forbids asking anyone to identify themselves', async () => {
   assert.match(llm.systemPrompt, /Never ask anyone to prove/i);
   assert.match(llm.systemPrompt, /take their word for it/i);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 THE TURN RECORD MUST ANSWER "WHY DID THIS FAIL" ON ITS OWN
+//
+// The durable record used to carry name/args/ok and nothing else, so a failed
+// turn was indistinguishable from any other failed turn and the only way to
+// diagnose was to be watching when it happened.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A model that calls one tool, then answers. */
+class OneToolLlm implements LlmClient {
+  readonly label = 'one-tool';
+  private calls = 0;
+  constructor(private readonly toolName: string) {}
+  async chat(): Promise<LlmReply> {
+    this.calls += 1;
+    return this.calls === 1
+      ? { text: '', toolCalls: [{ id: 'c1', name: this.toolName, arguments: {} }] }
+      : { text: 'done', toolCalls: [] };
+  }
+}
+
+function toolThat(outcome: 'fails' | 'throws' | 'works'): Tool {
+  return {
+    name: 'probe',
+    description: 'probe',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      if (outcome === 'throws') {
+        throw Object.assign(new Error('fetch failed'), {
+          cause: Object.assign(new Error('connect EHOSTUNREACH 192.168.1.7:8096'), { code: 'EHOSTUNREACH' }),
+        });
+      }
+      if (outcome === 'fails') return { ok: false, content: 'Could not read Jellyfin /Sessions: EHOSTUNREACH.' };
+      return { ok: true, content: 'fine' };
+    },
+  };
+}
+
+test('🔴 a FAILED tool call records WHY, not just that it failed', async () => {
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [toolThat('fails')]).handle(
+    OWNER_HANDLE,
+    'check',
+  );
+  assert.match(record.toolCalls[0]?.error ?? '', /EHOSTUNREACH/);
+});
+
+test('🔴 a THROWN tool call records the cause, not "fetch failed"', async () => {
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [toolThat('throws')]).handle(
+    OWNER_HANDLE,
+    'check',
+  );
+  assert.match(record.toolCalls[0]?.error ?? '', /EHOSTUNREACH/, 'the cause was discarded again');
+});
+
+test('CONTROL: a SUCCESSFUL call records no error — this is diagnostics, not an audit log', async () => {
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [toolThat('works')]).handle(
+    OWNER_HANDLE,
+    'check',
+  );
+  assert.equal(record.toolCalls[0]?.ok, true);
+  assert.equal(record.toolCalls[0]?.error, undefined, 'recording every result grows the file without answering anything');
+});
+
+test('every tool call records a duration — a timeout and a refusal look identical without it', async () => {
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [toolThat('works')]).handle(
+    OWNER_HANDLE,
+    'check',
+  );
+  assert.equal(typeof record.toolCalls[0]?.ms, 'number');
+});
+
+test('🔴 a credential in a tool result never reaches the turn record', async () => {
+  const leaky: Tool = {
+    ...toolThat('fails'),
+    async run() {
+      return { ok: false, content: 'could not reach http://arr.invalid/api/v3/queue?apikey=SECRET123: EHOSTUNREACH' };
+    },
+  };
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [leaky]).handle(OWNER_HANDLE, 'check');
+  assert.doesNotMatch(record.toolCalls[0]?.error ?? '', /SECRET123/, 'a secret was persisted to disk');
+  assert.match(record.toolCalls[0]?.error ?? '', /EHOSTUNREACH/, 'and the diagnosis survived the redaction');
+});
+
+test('the recorded error is BOUNDED — a page of JSON must not land in every turn', async () => {
+  const chatty: Tool = {
+    ...toolThat('fails'),
+    async run() {
+      return { ok: false, content: 'x'.repeat(9000) };
+    },
+  };
+  const record = await new Agent(config, new OneToolLlm('probe'), undefined, [chatty]).handle(OWNER_HANDLE, 'check');
+  assert.ok((record.toolCalls[0]?.error ?? '').length <= 300);
+});

@@ -1,3 +1,4 @@
+import { describeError, MAX_ERROR_CHARS, redactUrlSecrets } from './errors.js';
 import type { Config } from './config.js';
 import type { ChoiceStore } from './choices.js';
 import type { FollowupStore } from './followups.js';
@@ -10,6 +11,18 @@ import type { Tool, ToolContext } from './tools/types.js';
 
 const MAX_STEPS = 8;
 
+/**
+ * The head of a tool result, for the durable record.
+ *
+ * ⚠️ Bounded on the way IN, not on the way out. A tool that returns a page of
+ * JSON must not put a page of JSON into every turn record — the point is the
+ * reason, and the reason is in the first line or two.
+ */
+function firstLines(content: string): string {
+  const trimmed = redactUrlSecrets(content).trim().split('\n').slice(0, 2).join(' ').trim();
+  return trimmed.length > MAX_ERROR_CHARS ? `${trimmed.slice(0, MAX_ERROR_CHARS - 1)}…` : trimmed;
+}
+
 export interface ToolInvocation {
   name: string;
   args: Record<string, unknown>;
@@ -17,6 +30,18 @@ export interface ToolInvocation {
   ok: boolean;
   /** set when the permission gate refused before the tool ran */
   refused?: boolean;
+  /**
+   * 🔴 WHY IT FAILED, NOT JUST THAT IT DID. Redacted, bounded, failures only.
+   *
+   * An evening was lost to `fetch failed` because the durable record of a turn
+   * said a tool returned `ok: false` and nothing else. The cause — EHOSTUNREACH
+   * — existed at the moment of failure and was discarded, so no later reader
+   * could answer "why did this turn fail" from the artifact. Without this, the
+   * only way to diagnose is to be watching when it happens.
+   */
+  error?: string;
+  /** Wall time for the call. A timeout and a refusal look identical without it. */
+  ms?: number;
 }
 
 /**
@@ -35,45 +60,56 @@ export interface TurnRecord {
 }
 
 /**
- * 🔴 THE PROMPT NEVER STATES WHO IT IS TALKING TO.
+ * 🔴 THE ROLE IS STATED AS A FACT — AND THIS REVERSES AN EARLIER DECISION, SO
+ * READ WHY BEFORE CHANGING IT BACK.
  *
- * An earlier version said "You are talking to the owner." That makes identity an
- * assertion inside the context window, and **anything else in the context window
- * can contend with it** — a forwarded message, a quoted complaint, a media title
- * carrying an injection, or simply the user writing "I'm Jeff".
+ * ── WHAT USED TO BE HERE, AND WHY ────────────────────────────────────────────
  *
- * Identity is resolved from the TRANSPORT before the model sees anything, and it
- * is expressed as **which tools exist in this turn** — not as a sentence. A
- * guest's tool list has no admin tools in it at all, and no text can add one.
+ * This file used to say: *"THE PROMPT NEVER STATES WHO IT IS TALKING TO. An
+ * earlier version said 'You are talking to the owner.' That makes identity an
+ * assertion inside the context window, and anything else in the context window
+ * can contend with it — a forwarded message, a quoted complaint, a media title
+ * carrying an injection, or simply the user writing 'I'm Jeff'."*
  *
- * The prompt is also deliberately short, and stays short as capabilities grow:
- * per-capability detail belongs in the tool's own description, so adding a tool
- * is one declaration and never an edit here. (V1's prompt reached 2,052 lines
- * exactly by taking the other option.)
- */
-/**
- * 🔴 THE ROLE IS STATED AS A FACT, BECAUSE THE SYSTEM ALREADY KNOWS IT.
+ * **That reasoning is still correct** and it is why the role fact below is
+ * written the way it is. What it did not account for is that the gate does not
+ * depend on the prompt at all.
+ *
+ * ── WHAT IT COST, MEASURED ───────────────────────────────────────────────────
  *
  * A REAL TURN, 2026-08-25: the owner asked "Can you see who is watching?" from
  * his own phone and Jedd asked him to prove he was himself — then, when he said
- * "I'm jeff", offered to proceed "taking your word for it". Both halves are
- * wrong, and the second is worse: it invites exactly the thing that must never
- * work.
+ * "I'm jeff", offered to proceed "taking your word for it". Both halves wrong,
+ * and the second worse: it invites exactly the thing that must never work.
  *
- * The cause was not the gate — `roleFor` had already resolved him as owner and
- * had put the owner-only tools in his list. The cause is that **nothing told the
- * model**, while tool descriptions kept describing data as belonging to a NAMED
- * PERSON. So the model was asked, implicitly, to judge identity — which it
- * cannot do and must never do — and it did the conservative thing.
+ * `roleFor` had already resolved him as owner and put the owner-only tools in
+ * his list. **Nothing told the model**, while tool descriptions described data
+ * as belonging to a NAMED PERSON. So the model was asked, implicitly, to judge
+ * identity — which it cannot do — and it did the conservative thing.
  *
- * ⚠️ THIS IS NOT A SECURITY CONTROL AND MUST NEVER BECOME ONE. The real gate is
- * `roleSatisfies` below, re-checked at call time before any side effect, on a
- * role derived from the TRANSPORT HANDLE. A model wholly convinced it is talking
- * to the owner still gets REFUSED there. That is what makes stating this safe:
- * the worst case of a wrong fact here is a wrong sentence, never a wrong action.
+ * ── WHY STATING IT IS SAFE, AND THE CONDITION THAT WOULD MAKE IT UNSAFE ──────
+ *
+ * ⚠️ THIS IS NOT A SECURITY CONTROL AND MUST NEVER BECOME ONE. The gate is
+ * `roleSatisfies`, re-checked at call time before any side effect, on a role
+ * derived from the TRANSPORT HANDLE — plus the tool list, which a guest never
+ * receives owner tools in. A model wholly convinced it is talking to the owner
+ * still gets REFUSED there, and finds it has no owner tools to call.
+ *
+ * So the earlier warning is right that context can contend with this sentence —
+ * and the blast radius of winning that contention is **a wrong sentence, never
+ * a wrong action.** That asymmetry is the entire licence for stating it.
+ *
+ * 🔴 THE CONDITION: if anything ever starts making a decision from this fact
+ * rather than from `roleFor`, the old reasoning applies again in full and this
+ * must come back out. Do not let the prompt become load-bearing.
  *
  * 🔴 The role comes from `roleFor(senderHandle)`. It never comes from anything
  * the person typed. Do not add a path by which it could.
+ *
+ * The prompt is otherwise deliberately short, and stays short as capabilities
+ * grow: per-capability detail belongs in the tool's own description, so adding a
+ * tool is one declaration and never an edit here. (V1's prompt reached 2,052
+ * lines exactly by taking the other option.)
  */
 function whoIsSpeaking(role: Role): string {
   return role === 'owner'
@@ -274,15 +310,26 @@ export class Agent {
 
         let content: string;
         let succeeded: boolean;
+        const startedAt = Date.now();
         try {
           const result = await tool.run(call.arguments, ctx);
           content = result.content;
           succeeded = result.ok;
         } catch (e) {
-          content = `Tool "${tool.name}" threw: ${(e as Error).message}`;
+          content = `Tool "${tool.name}" threw: ${describeError(e, redactUrlSecrets)}`;
           succeeded = false;
         }
-        toolCalls.push({ name: tool.name, args: call.arguments, ok: succeeded });
+        toolCalls.push({
+          name: tool.name,
+          args: call.arguments,
+          ok: succeeded,
+          ms: Date.now() - startedAt,
+          // ⚠️ FAILURES ONLY, and redacted and bounded on the way in. A success
+          // needs no reason, and this is diagnostics rather than an audit log —
+          // recording every result would grow the file without answering a
+          // question anybody asks.
+          ...(succeeded ? {} : { error: firstLines(content) }),
+        });
         history.push({ role: 'tool', toolName: tool.name, toolCallId: call.id, content });
       }
     }

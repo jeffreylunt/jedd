@@ -1,3 +1,4 @@
+import { describeError, redactUrlSecrets } from './errors.js';
 import type { Config } from './config.js';
 import type { FetchImpl } from './media/arr.js';
 
@@ -54,7 +55,8 @@ export async function jellyfinGet(
       return { ok: false, status: res.status, error: `response was not JSON: ${text.slice(0, 300)}` };
     }
   } catch (e) {
-    return { ok: false, status: 0, error: `request failed: ${(e as Error).message}` };
+    // 🔴 `.message` alone is the constant string "fetch failed" — see src/errors.ts.
+    return { ok: false, status: 0, error: `request failed: ${describeError(e, redactUrlSecrets)}` };
   } finally {
     clearTimeout(timer);
   }
