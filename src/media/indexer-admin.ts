@@ -218,18 +218,39 @@ export function assertTogglable(service: IndexerService, body: unknown): string 
 /**
  * Scrub a service's own error prose before it is quoted anywhere.
  *
- * Servarr error messages sometimes embed the request URL, and for a private
- * tracker that URL carries the passkey in its querystring. `stripCredentials`
- * already rewrites exactly that shape for `homelab_read`, so it is reused here
- * rather than re-derived — one implementation, one place to fix.
+ * Servarr error messages embed the request URL, and for a private tracker that
+ * URL carries the passkey in its querystring. `stripCredentials` already
+ * rewrites exactly that shape, so its key list is reused rather than re-derived.
+ *
+ * ── 🔴 WHY IT CANNOT JUST CALL `stripCredentials(message)` ───────────────────
+ *
+ * Found by the test, not by reading: `stripCredentials`'s URL scrubber is
+ * guarded by `/^https?:\/\//`, so it only fires on a string that **IS** a URL.
+ * An error message is PROSE CONTAINING one — `"Unable to connect to
+ * https://tracker/rss?passkey=…"` — which fails that test at character one and
+ * sails through untouched. The redactor was real, the key list was right, and
+ * the credential still came out, because the shape it was written for is not the
+ * shape it was handed.
+ *
+ * So the URLs are extracted from the prose first and scrubbed individually.
+ *
+ * ⚠️ `stripCredentials` itself is deliberately NOT widened to scan prose: it
+ * runs over every string field of every `homelab_read` response, and a
+ * prose-scanning version would start rewriting descriptions and log lines for
+ * every caller. The wider blast radius belongs to that file's owner, not to a
+ * fix for error messages.
  *
  * ⚠️ Today every indexer on this box is a public tracker, so this fires on
  * nothing. That is a fact about the current tracker list, not a property of the
  * endpoint, and it stops being true the moment one private tracker is added.
  */
+const URL_IN_PROSE = /https?:\/\/[^\s"'<>]+/gi;
+
 export function scrubMessage(message: string): string {
-  const stripped = stripCredentials(message);
-  return typeof stripped.value === 'string' ? stripped.value : message;
+  return message.replace(URL_IN_PROSE, (url) => {
+    const stripped = stripCredentials(url);
+    return typeof stripped.value === 'string' ? stripped.value : url;
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
