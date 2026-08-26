@@ -360,8 +360,16 @@ export class IndexerAdminClient {
    * ~19 KB and its `fields` array is the `{name, value}` shape that hides
    * credentials from a key-name walker — `/indexer` is denied outright to
    * `homelab_read` for exactly that reason. Here the projection is a WHITELIST
-   * of four scalars, so there is no path by which a credential reaches a caller,
-   * rather than a redactor that has to recognise one.
+   * of four scalars, so a credential is never IN the value a caller holds,
+   * rather than being removed from it by a redactor that has to recognise one.
+   *
+   * ⚠️ It is one of TWO layers and neither is the whole defence — the mutation
+   * sweep proved that by ablating this one. Spreading the raw resource into the
+   * row left every test green, because the renderer reads four named fields and
+   * simply never printed the extras. So: this projection keeps the credential
+   * out of the VALUE, and the renderer keeps it out of the OUTPUT. Both are
+   * asserted separately, because relying on the renderer alone puts the whole
+   * guarantee one `JSON.stringify(row)` away from a leak.
    */
   async list(): Promise<Fetched<IndexerRow[]>> {
     const r = await this.getJson('/indexer');

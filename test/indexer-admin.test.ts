@@ -4,6 +4,7 @@ import { Agent } from '../src/agent.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
 import {
   assertTogglable,
+  IndexerAdminClient,
   hoursBetween,
   humaniseHours,
   isSiteRefusal,
@@ -273,6 +274,37 @@ test('🔴 the indexer resource carries a credential and NONE of it reaches the 
   assert.match(r.content, /id 6/);
   assert.match(r.content, /1337x/);
   assert.match(r.content, /enabled/);
+});
+
+test('🔴 MUTATION TARGET: list() PROJECTS to four scalars — the credential never enters the row', async () => {
+  /**
+   * Found by the mutation sweep: spreading the raw resource into the row left
+   * the suite GREEN, because the renderer reads four named fields and simply
+   * never printed the extras. That made the projection look load-bearing when
+   * only the renderer was — and a renderer is one `JSON.stringify` away from
+   * printing everything it holds.
+   *
+   * Two layers, asserted separately: the row must not CONTAIN a credential, and
+   * the output must not PRINT one. A leak would have to defeat both.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+  });
+  const client = new IndexerAdminClient({
+    service: 'prowlarr',
+    config: testConfig({ readOnly: false }),
+    fetchImpl: s.fetch,
+  });
+  const list = await client.list();
+  assert.equal(list.state, 'ok');
+  const row = list.state === 'ok' ? list.value[0] : undefined;
+  assert.ok(row);
+  assert.deepEqual(
+    Object.keys(row).sort(),
+    ['enable', 'id', 'name', 'switches'],
+    '🔴 exactly four scalars — nothing from the resource may ride along',
+  );
+  assert.ok(!JSON.stringify(row).includes(SECRET));
 });
 
 test('a FAILING indexer test message is scrubbed before it is quoted', async () => {
@@ -579,6 +611,17 @@ test('🔴 MUTATION TARGET: the failure age comes from initialFailure, NEVER mos
 
   assert.match(r.content, /failing for 5d/i, '🔴 five days, measured from the FIRST failure');
   assert.ok(!/failing for 0h/.test(r.content), 'the last retry is not the age');
+  /**
+   * 🔴 AND THE SAME AGE IN THE STATE BLOCK, WHICH IS A SECOND COMPUTATION.
+   *
+   * Found by the mutation sweep: swapping `initialFailure` for
+   * `mostRecentFailure` inside `describeBackoff` left the suite GREEN, because
+   * only the 403 note's age was asserted. `STATE NOW` renders its own age from
+   * its own call, and that is the line a person actually reads. Two computations
+   * of the same fact need two assertions.
+   */
+  assert.match(r.content, /FAILING since \S+ \(5d 0h\)/, 'the STATE block computes the age too');
+  assert.ok(!/FAILING since \S+ \(0h\)/.test(r.content), 'and must not compute it from the last retry');
   assert.match(r.content, /past 3 days/);
   assert.match(r.content, /REPORTED ONCE and then left alone/);
   // And it says the rest of the stack is fine, which is the other half of that rule.
