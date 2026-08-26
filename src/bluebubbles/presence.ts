@@ -146,34 +146,35 @@ export const REFRESH_MS = 30_000;
  * 🔴 HOW LONG THAT STALE INDICATOR LASTS IS AN OPEN QUESTION, DELIBERATELY NOT
  * ANSWERED WITH A NUMBER HERE.
  *
- * Two mechanisms are on the table and NEITHER is established. Both are stated
- * because picking one would be guessing, and they differ by a factor of ~120.
+ * 🔴 THE CEILING DOES NOT GOVERN HOW LONG A STALE INDICATOR LASTS. SETTLED
+ * FROM THE CODE, NOT ASSUMED.
  *
- *  (A) **The ceiling governs.** The stale "…" lasts as long as the indicator
- *      would have been kept alive — so this change makes it **120 minutes**
- *      instead of 6. The intuitive reading, and the worst case.
+ * The intuitive fear is "as long as the ceiling", which would make this change
+ * 120 minutes' worth of harm instead of 6. **It is wrong on mechanism.** Look at
+ * the order inside `finish()`: it sets `stopped`, then clears the timer, and
+ * only THEN enqueues the stop — and `arm()`'s callback returns early on
+ * `stopped` before it can enqueue another refresh. So the moment `finish()`
+ * runs, **Jedd sends no further `start` packets for that session, ever,
+ * regardless of whether the stop packet lands.**
  *
- *  (B) **The recipient's own client expiry governs, and the ceiling is
- *      irrelevant.** After `finish()` we stop sending REFRESHES too, so the
- *      recipient stops receiving `start` packets and their indicator should
- *      time out on its own — on the order of a minute. On this reading the
- *      ceiling governs only how long the indicator is *deliberately* kept
- *      alive, and this change does not lengthen the hazard at all.
+ * The recipient therefore stops being told "still typing" at `finish()`, and a
+ * stale "…" is bounded by **the recipient's own client-side expiry** — a
+ * property of Jeff's phone, not of this constant. Raising the ceiling lengthens
+ * how long the indicator is *deliberately* kept alive and does not lengthen the
+ * hazard at all.
  *
- * 🔴 THE 59.8s KEEPALIVE MEASUREMENT DOES NOT DECIDE BETWEEN THEM, AND IT IS
- * TEMPTING TO THINK IT DOES. A keepalive re-asserting at 59.8s with no
- * intervening stop shows IMCore clearing the **SENDER'S** local flag on roughly
- * a one-minute timer. That is our side. **It is not evidence about what the
- * recipient's client does**, which is the entire question in (B) — a different
- * device, a different implementation, possibly a different timeout.
+ * ⚠️ THE DURATION ITSELF REMAINS UNKNOWN, AND IS NOT MEASURABLE FROM HERE. Our
+ * instruments read this Mac's outbound wire; what iOS renders and when it gives
+ * up is invisible to them. Settling it means a person watching a thread.
  *
- * ⚠️ It is also **n=1 and warm-path only**: the cold-window run emitted nothing
- * at +60s or +90s, so whatever auto-clear exists may not operate on a cold path
- * — precisely the path a dropped packet is on.
- *
- * The discriminator is a measurement nobody has taken: **after a dropped stop,
- * is the recipient's indicator bounded by their own client-side expiry, or does
- * something keep it alive?** Until that is answered this stays UNKNOWN.
+ * The ~60s guess is INFERENCE, recorded as an argument rather than a number:
+ * IMCore re-sends a start roughly every 60s while typing is active (measured
+ * once, at 59.8s, warm path), and **a periodic re-send is only useful if the
+ * receiver forgets** — otherwise one packet would do. BlueBubbles' own IMCore
+ * notes corroborate the shape, building a 2s anti-stuck timeout on the RECEIVE
+ * side and preferring a prematurely cancelled indicator to a permanently stuck
+ * one. That is reasoning about why a re-send exists, **not a measurement of the
+ * recipient**, and n=1.
  *
  * The hazard is pre-existing and is NOT fixed here — the restart carrying this
  * was deliberately kept small. It is tracked on the concurrency/typing task.
