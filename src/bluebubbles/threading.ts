@@ -43,6 +43,58 @@
  */
 
 /**
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🔴 DISABLED 2026-08-26. THE PREMISE BELOW IS FALSE. DO NOT RE-ENABLE UNTIL
+ *    THE CONCURRENCY BUG IS FIXED — task-2026-08-26T17-22-35Z.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * Everything in this file is correct about WHICH MESSAGE TRIGGERED A TURN, and
+ * that turned out to be the wrong thing to anchor to.
+ *
+ * Measured on Jeff's own thread, and he spotted it before we did:
+ *
+ *   11:43:30 JEFF  "Yes run the search"
+ *   11:45:24 JEFF  "How many people watching?"
+ *   11:46:32 JEDD  "Nobody's watching — 5 sessions…"   anchored to "Yes run the search"
+ *   11:47:39 JEDD  "The search works now…"             anchored to "How many people watching?"
+ *
+ * **Both answers are anchored to the other question.** The anchors are not
+ * buggy — they are FAITHFUL. Turn start times reconstructed from the log
+ * durations (180836ms and 133563ms) land at 11:43:31 and 11:45:25, one second
+ * after each message, so each reply really was anchored to the message that
+ * started its turn. What is crossed is the CONTENT: both turns called both tool
+ * families (`find_gaps,search_episode…,jellyfin_sessions` and
+ * `jellyfin_sessions,search_episode…`), each had every fact available, and each
+ * answered the other one's question.
+ *
+ * The design note further down says a turn is handed one message's text and so
+ * is structurally incapable of answering two. That is still true. The inference
+ * drawn from it — that the turn therefore answers ITS OWN message — is what
+ * died. **The trigger is not the subject.**
+ *
+ * So threading currently makes a SPECIFIC, CONFIDENT claim it cannot support,
+ * and that is worse than the ambiguity it was built to remove: an unanchored
+ * reply is merely unclear, an inverted one asserts "I am answering *this*"
+ * while answering something else.
+ *
+ * ⚠️ THIS IS NOT A THREADING BUG AND MUST NOT BE "FIXED" HERE. Threading is the
+ * instrument that made a pre-existing defect visible for the first time —
+ * Jedd has been answering the wrong question for as long as two turns have run
+ * concurrently, and before anchoring there was no way to see it, because a bare
+ * reply is read as answering whatever is newest. Turning this flag on again
+ * without repairing trigger→content re-hides the defect; deleting this file
+ * loses the only detector.
+ *
+ * TO RE-ENABLE: the mapping from trigger to content must be sound — one turn
+ * per burst, or a turn that cannot answer outside its own message. If neither
+ * is achievable, the open question is whether to anchor on the message the
+ * answer is ABOUT rather than the one that triggered the turn, which means a
+ * heuristic. That was correctly refused while the trigger was believed
+ * reliable; that premise is now dead, so the choice is a heuristic or nothing.
+ */
+export const REPLY_THREADING_ENABLED = false;
+
+/**
  * 🔴 A BURST HAS TO BE ABLE TO EXPIRE, OR ONE LOST TURN THREADS FOREVER.
  *
  * `answered()` runs on the send path. A turn that throws inside the model call

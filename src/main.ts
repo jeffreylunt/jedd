@@ -6,7 +6,7 @@ import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
 import { presenceToken, sendToken, withPresence, type PresenceRecord, type SendRecord } from './connector.js';
-import { ReplyThreading } from './bluebubbles/threading.js';
+import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
@@ -113,7 +113,13 @@ async function main(): Promise<void> {
    * connector that sends the replies. Two instances would each hold half the
    * facts and no burst would ever be counted.
    */
-  const threading = new ReplyThreading();
+  const threading = REPLY_THREADING_ENABLED ? new ReplyThreading() : undefined;
+  console.error(
+    REPLY_THREADING_ENABLED
+      ? '[jedd] reply-threading ON: a reply is quoted to its message when more than one is owed.'
+      : '[jedd] 🔴 reply-threading OFF — anchors were faithful to the TRIGGER but turns answer each ' +
+          "other's questions, so every quote pointed at the wrong message. See threading.ts.",
+  );
 
   const receiver = new BlueBubblesReceiver({
     client,

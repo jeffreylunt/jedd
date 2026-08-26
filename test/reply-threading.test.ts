@@ -8,7 +8,7 @@ import { BlueBubblesConnector, BlueBubblesReceiver } from '../src/bluebubbles/re
 import { SeenStore } from '../src/bluebubbles/seen.js';
 import { classifyPayload } from '../src/bluebubbles/payload.js';
 import { sendToken } from '../src/connector.js';
-import { BURST_TTL_MS, ReplyThreading } from '../src/bluebubbles/threading.js';
+import { BURST_TTL_MS, REPLY_THREADING_ENABLED, ReplyThreading } from '../src/bluebubbles/threading.js';
 
 /**
  * "Reply to a specific message", and the narrow case it is allowed to fire in.
@@ -453,4 +453,28 @@ test('send() marks the record PLAIN for an ordinary reply', async () => {
   await connector.send(OWNER, 'answer', 'G-1', rec);
   assert.equal(rec.anchored, false);
   assert.equal(sendToken(rec), 'plain');
+});
+
+// ── 🔴 the kill switch, and why the rule's own tests must keep passing ──────
+
+test('🔴 threading is DISABLED — the trigger is not the subject (2026-08-26)', () => {
+  // Jeff caught both anchors pointing at the other question. The anchors were
+  // FAITHFUL to the message that triggered each turn; the turns answered each
+  // other's questions. A confidently-wrong quote is worse than no quote.
+  //
+  // This asserts the shipped default, so re-enabling cannot happen by accident
+  // or by a stray edit — it takes deleting this test, which means reading why.
+  assert.equal(REPLY_THREADING_ENABLED, false);
+});
+
+test('the rule itself is kept intact and still correct about bursts', () => {
+  // ⚠️ The flag is off because the INPUT (trigger→content) is unsound, not
+  // because the rule is wrong. Every test above still passes and must keep
+  // passing: when concurrency is fixed this is the logic that comes back, and
+  // deleting it would mean re-deriving it from scratch.
+  const t = new ReplyThreading();
+  t.arrived(OWNER, 'G-1');
+  assert.equal(t.decide(OWNER, 'G-1').replyTo, null);
+  t.arrived(OWNER, 'G-2');
+  assert.equal(t.decide(OWNER, 'G-1').replyTo, 'G-1');
 });
