@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { Agent } from '../src/agent.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
@@ -981,6 +984,367 @@ test('a reported failure with NO reason blames nothing either', async () => {
   assert.match(r.content, /gave NO reason/);
   assert.match(r.content, /The cause is UNKNOWN — do not guess at one/);
   assert.ok(!/VPN tunnel/.test(r.content));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 REMOVE — RECOVERABLE BY CONSTRUCTION, NOT BY AN APPROVAL PROMPT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A capture directory per test, so one test can never read another's files. */
+const captureDir = () => join(mkdtempSync(join(tmpdir(), 'jedd-capture-')), 'captures');
+
+const removeCtx = (dir: string) => ({ config: testConfig({ readOnly: false, indexerBackupDir: dir }) });
+
+test('🔴 MUTATION TARGET: remove CAPTURES the full definition to disk BEFORE deleting', async () => {
+  const dir = captureDir();
+  const order: string[] = [];
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => {
+      order.push('read');
+      return { status: 200, body: prowlarrIndexer() };
+    },
+    [`DELETE ${P}/indexer/6`]: () => {
+      order.push('delete');
+      // 🔴 THE ORDERING ASSERTION, MADE AT THE MOMENT IT MATTERS. By the time
+      // the DELETE is issued the file must ALREADY exist — checking afterwards
+      // cannot tell "captured first" from "captured second".
+      const files = readdirSync(dir);
+      assert.equal(files.length, 1, 'the capture file must exist BEFORE the DELETE is issued');
+      return { status: 200, body: {} };
+    },
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
+
+  assert.equal(r.ok, true);
+  assert.deepEqual(order, ['read', 'delete'], 'read the config, THEN delete');
+
+  const files = readdirSync(dir);
+  assert.equal(files.length, 1);
+  const saved = JSON.parse(readFileSync(join(dir, files[0]!), 'utf8'));
+  // 🔴 The FILE keeps the credential — that is the point of it. The REPLY must not.
+  assert.equal(saved.apiKey, SECRET, 'the saved copy must be complete, or it is not a backup');
+  assert.ok(!r.content.includes(SECRET), '🔴 but the reply must never carry it');
+
+  assert.match(r.content, /THIS IS RECOVERABLE/);
+  assert.match(r.content, new RegExp(files[0]!.replace(/[.]/g, '\\.')), 'the path is in the reply');
+  assert.match(r.content, /contains 1 CREDENTIAL field\(s\) — apiKey/);
+  assert.match(r.content, /do not read them out/);
+});
+
+test('🔴 MUTATION TARGET: if the capture CANNOT be written, NOTHING is deleted', async () => {
+  /**
+   * The ordering is only a guarantee if a failed write aborts. "Best effort"
+   * capture beside a delete that proceeds regardless is a promise of
+   * recoverability that is void exactly when it is needed.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    // Routed on purpose: if the abort ever stops working the DELETE lands here
+    // and the assertion below fails, rather than the test erroring on a missing
+    // route and looking like a harness problem.
+    [`DELETE ${P}/indexer/6`]: () => ({ status: 200, body: {} }),
+  });
+  // A path under a FILE cannot be created as a directory.
+  const blocker = join(mkdtempSync(join(tmpdir(), 'jedd-blocked-')), 'not-a-dir');
+  writeFileSync(blocker, 'i am a file');
+
+  const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(join(blocker, 'captures')));
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /NOTHING WAS REMOVED/);
+  assert.match(r.content, /backup could not be written/);
+  assert.deepEqual(
+    s.calls.filter((c) => c.method === 'DELETE'),
+    [],
+    '🔴 no DELETE may be issued when the config could not be saved',
+  );
+});
+
+test('🔴 if the config cannot be READ, nothing is deleted either', async () => {
+  const dir = captureDir();
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 500, body: 'boom' }),
+    [`DELETE ${P}/indexer/6`]: () => ({ status: 200, body: {} }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /NOTHING WAS REMOVED/);
+  assert.match(r.content, /without a copy would be irreversible/);
+  assert.deepEqual(s.calls.filter((c) => c.method === 'DELETE'), []);
+  // Stronger than "no files": the capture directory was never even created,
+  // because the abort happens before anything is written.
+  assert.equal(existsSync(dir), false, 'no directory, no half-written file');
+});
+
+test('the capture file is 0600 — it can hold a tracker credential', async () => {
+  const dir = captureDir();
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`DELETE ${P}/indexer/6`]: () => ({ status: 200, body: {} }),
+  });
+  await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
+  const file = join(dir, readdirSync(dir)[0]!);
+  assert.equal(statSync(file).mode & 0o777, 0o600, 'a file holding a credential is not world-readable');
+});
+
+test('remove says the id will NOT come back the same', async () => {
+  // Measured: a removed id 8 came back as 10. Sonarr and Radarr reference
+  // Prowlarr indexers BY id, so "put it back" is not "nothing changed".
+  const dir = captureDir();
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`DELETE ${P}/indexer/6`]: () => ({ status: 200, body: {} }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
+  assert.match(r.content, /Re-adding does NOT restore the id/);
+  assert.match(r.content, /reference Prowlarr indexers BY id/);
+});
+
+test('a failed DELETE does not claim the removal happened', async () => {
+  const dir = captureDir();
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`DELETE ${P}/indexer/6`]: () => ({ status: 500, body: prowlarrIndexer() }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /was NOT removed/);
+  assert.match(r.content, /may or may not have been removed/);
+  assert.ok(!r.content.includes(SECRET), 'and the echoed body is still scrubbed');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 ADD — AND THE PRODUCER THAT MAKES IT REACHABLE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const schemaEntry = (over: Record<string, unknown> = {}) => ({
+  definitionName: 'btdirectory',
+  name: 'BTdirectory',
+  description: 'BTdirectory (BT目录) is a Public DHT Crawler',
+  privacy: 'public',
+  protocol: 'torrent',
+  language: 'en-US',
+  // 🔴 The trap, reproduced exactly as the live server hands it over.
+  appProfileId: 0,
+  fields: [{ name: 'definitionFile', value: 'btdirectory' }],
+  ...over,
+});
+
+test('🔴 MUTATION TARGET: add REPLACES appProfileId 0 — posting the schema verbatim always fails', async () => {
+  /**
+   * MEASURED: POSTing the catalogue entry exactly as handed over returns
+   * HTTP 400 — "'App Profile Id' must be greater than '0'" — every single time.
+   * "Fetch the definition, post the definition" is the natural implementation
+   * and it has a 100% failure rate.
+   *
+   * The stub reproduces that rejection, so dropping the fix turns this test red
+   * rather than passing against a stub more forgiving than production.
+   */
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 7, name: 'Standard' }] }),
+    [`GET ${P}/indexer`]: (_c, nth) => ({
+      status: 200,
+      body: nth === 1 ? [prowlarrIndexer()] : [prowlarrIndexer(), prowlarrIndexer({ id: 10, name: 'BTdirectory' })],
+    }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer`]: (call) => {
+      const body = JSON.parse(call.body ?? '{}');
+      if (!(body.appProfileId > 0)) {
+        return {
+          status: 400,
+          body: [{ propertyName: 'AppProfileId', errorMessage: "'App Profile Id' must be greater than '0'." }],
+        };
+      }
+      return { status: 201, body: { id: 10, name: 'BTdirectory' } };
+    },
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'BTdirectory' });
+
+  assert.equal(r.ok, true);
+  assert.match(r.content, /Added BTdirectory to Prowlarr as id 10/);
+  const post = s.calls.find((c) => c.method === 'POST');
+  // 🔴 And it is READ from /appprofile, not hardcoded to the 1 this box uses.
+  assert.equal(JSON.parse(post?.body ?? '{}').appProfileId, 7);
+});
+
+test('🔴 add REFUSES a private tracker before sending anything', async () => {
+  /**
+   * 475 of 625 definitions are private and 63 semiPrivate. The create would fail
+   * validation 25 seconds later with a confusing message about a missing field,
+   * and the only way to make it succeed is to REGISTER an account — the owner's
+   * decision, and something the knowledge file says explicitly not to do
+   * unprompted. Refuse first, and say which of the two problems it is.
+   */
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [schemaEntry({ name: 'AlphaRatio', definitionName: 'alpharatio', privacy: 'private' })],
+    }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'AlphaRatio' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /is a private tracker, so it was NOT added and nothing was sent/);
+  assert.match(r.content, /REGISTER for the tracker, which is the owner's decision/);
+  assert.deepEqual(s.calls.filter((c) => c.method === 'POST'), [], 'nothing may be sent');
+});
+
+test('🔴 a definition that does not exist is a REAL ANSWER, not a near-miss guess', async () => {
+  /**
+   * The Audiobook Bay lesson, encoded. The orchestrator asserted from memory
+   * that Prowlarr ships an ABB definition, told the owner so, and it was false —
+   * having been disproven ten days earlier. The live catalogue is the authority.
+   */
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'Audiobook Bay' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /has NO definition called "Audiobook Bay"/);
+  assert.match(r.content, /do not guess at a near-miss name/);
+  assert.deepEqual(s.calls.filter((c) => c.method === 'POST'), []);
+});
+
+test('add does not create a DUPLICATE of something already installed', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry({ name: '1337x', definitionName: '1337x' })] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: '1337x' });
+
+  assert.match(r.content, /ALREADY has 1337x as id 6/);
+  assert.match(r.content, /Say it was already there rather than reporting a new install/);
+  assert.deepEqual(s.calls.filter((c) => c.method === 'POST'), []);
+});
+
+test('a REJECTED add says the site did not answer, not that the request was wrong', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 1 }] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer`]: () => ({ status: 400, body: [{ errorMessage: FORBIDDEN }] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'BTdirectory' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /was NOT added/);
+  assert.match(r.content, /live-tests a new indexer before saving/);
+  assert.match(r.content, /not that the request was wrong/);
+});
+
+test('🔴 search_available is the PRODUCER: it yields the name add needs', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [
+        schemaEntry(),
+        schemaEntry({ name: 'AlphaRatio', definitionName: 'alpharatio', privacy: 'private' }),
+      ],
+    }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: 'bt' });
+
+  assert.equal(r.ok, true);
+  assert.match(r.content, /\[definition: btdirectory\]/, 'the exact string `add` takes');
+  assert.match(r.content, /NOTHING was added/);
+  assert.match(r.content, /ONLY A "public" DEFINITION CAN BE ADDED/);
+  assert.match(r.content, /action "add" with `definition`/);
+});
+
+test('search_available marks what is ALREADY installed', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry({ name: '1337x', definitionName: '1337x' })] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: '1337' });
+  assert.match(r.content, /ALREADY INSTALLED/);
+});
+
+test('🔴 an empty catalogue result is stated as a fact about Prowlarr, not a gap in knowledge', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: 'audiobook bay' });
+
+  assert.match(r.content, /has NO definition matching "audiobook bay"/);
+  assert.match(r.content, /a real answer from the live instance, not a gap in what I know/);
+});
+
+test('search_available puts PUBLIC definitions above private ones', async () => {
+  // 475 of 625 are private. A relevance sort that ignores privacy buries the
+  // only ones anybody can actually add.
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [
+        schemaEntry({ name: 'ZtorrentsPrivate', definitionName: 'zprivate', privacy: 'private' }),
+        schemaEntry({ name: 'ZtorrentsPublic', definitionName: 'zpublic', privacy: 'public' }),
+      ],
+    }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: 'ztorrents' });
+  /**
+   * ⚠️ CONTROL FIRST. The original version of this test queried a string neither
+   * name contained, so BOTH `indexOf` calls returned -1 and `-1 < -1` was simply
+   * false — it would have failed for a correct sort and passed for none. Assert
+   * both are PRESENT before comparing their positions.
+   */
+  const pub = r.content.indexOf('ZtorrentsPublic');
+  const priv = r.content.indexOf('ZtorrentsPrivate');
+  assert.ok(pub >= 0 && priv >= 0, `both must be listed before their order means anything: ${r.content}`);
+  assert.ok(pub < priv, 'the addable one comes first');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 COVERAGE CHANGES ARE PROWLARR-ONLY
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 add and remove are REFUSED on an arr, and issue no write', async () => {
+  // Every arr indexer is a Prowlarr proxy pointing at localhost:9696/{id}/api.
+  // One added on an arr is unmanaged; one removed comes back on the next sync.
+  const dir = captureDir();
+  for (const action of ['add', 'remove'] as const) {
+    const s = stub({});
+    const r = await run(
+      s,
+      { service: 'sonarr', action, id: 4, definition: 'BTdirectory' },
+      removeCtx(dir),
+    );
+    assert.equal(r.ok, false, `${action} must be refused on an arr`);
+    assert.match(r.content, /is a PROWLARR operation/);
+    assert.match(r.content, /Re-run with service "prowlarr"/);
+    assert.match(r.content, /Force-testing Sonarr still works/);
+    assert.deepEqual(s.calls, [], `${action} must not reach Sonarr at all`);
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
