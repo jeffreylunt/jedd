@@ -10,6 +10,7 @@ import {
 import type { ExecImpl } from '../src/hp.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+import { commandFor, QUERIES, QUERY_NAMES, type QueryName } from '../src/media/dispatcharr-queries.js';
 
 /** Real rows, copied from the live file and the live database on 2026-08-25. */
 const RESULTS = [
@@ -359,4 +360,169 @@ test('🔴 a guest never sees the privileged command‘s stderr', async () => {
   const owner = await channelHealth.run({}, ctx(asOwner.impl, 'owner'));
   assert.match(owner.content, /No such container/);
   assert.match(owner.content, /stderr=/);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 NAMED DISPATCHARR QUERIES — the SQL is a literal, the model picks a name
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Records every command, and answers a named query with fixture rows. */
+function queryStub(rows: string, exitCode = 0) {
+  const commands: { host: string; command: string }[] = [];
+  const impl: ExecImpl = (_file, args, _options, callback) => {
+    commands.push({ host: args[args.length - 2] ?? '', command: args[args.length - 1] ?? '' });
+    if (exitCode) return callback({ code: exitCode }, '', 'ERROR:  relation "epg_programdata" does not exist');
+    return callback(null, `${rows}\n`, '');
+  };
+  return { commands, impl };
+}
+
+test('🔴 MUTATION TARGET: no query selects a CREDENTIAL COLUMN — quantified over all of them', () => {
+  /**
+   * 🔴 THE COLUMN WHITELIST IS THE ENTIRE DEFENCE HERE, and `stripCredentials`
+   * cannot help. Measured on the live database 2026-08-26:
+   *
+   *  - `m3u_m3uaccount` has POPULATED `username` and `password` (10 chars each
+   *    on all three live accounts) — the IPTV provider login.
+   *  - `dispatcharr_channels_stream.url` is Xtream format,
+   *    `http://znq234.live/live/<credential>/...`, so the secret is a PATH
+   *    SEGMENT. The URL scrubber rewrites querystring keys and matches nothing
+   *    here.
+   *
+   * Quantified over every query rather than checked one by one, so a query
+   * nobody has written yet is covered the moment it exists.
+   */
+  for (const name of QUERY_NAMES) {
+    const sql = QUERIES[name].sql(1).toLowerCase();
+    assert.ok(!/select\s+\*/.test(sql), `${name} must not SELECT *`);
+    for (const column of ['url', 'username', 'password']) {
+      assert.ok(
+        !new RegExp(`\\b(s|a)\\.${column}\\b`).test(sql),
+        `${name} must not select the credential-bearing column ${column}`,
+      );
+    }
+  }
+});
+
+test('🔴 MUTATION TARGET: epg_coverage names the table and column that EXIST', () => {
+  /**
+   * Verified against `information_schema` on the live database, because the job
+   * specs disagree with themselves: there is no `dispatcharr_epg_programdata`
+   * and no `stop_time`. A query naming either fails HARD — which is the good
+   * failure, but only if the failure is reported as UNKNOWN rather than as an
+   * empty result.
+   */
+  const sql = QUERIES.epg_coverage.sql(0);
+  assert.match(sql, /\bepg_programdata\b/);
+  assert.match(sql, /\bend_time\b/);
+  assert.ok(!/dispatcharr_epg_programdata/.test(sql), 'that table does not exist');
+  assert.ok(!/stop_time/.test(sql), 'that column does not exist');
+});
+
+test('🔴 m3u_staleness keeps its load-bearing guard and its control', () => {
+  // Account 1 is the local 'custom' account with no server and no streams;
+  // without this it trips a NULL alarm permanently. Scoped by the REASON, not
+  // by `id <> 1`, which would silently stop working if ids moved.
+  assert.match(QUERIES.m3u_staleness.sql(0), /a\.server_url is not null/i);
+  assert.equal(QUERIES.m3u_staleness.control?.minRows, 3);
+  // And it keys on STREAM freshness, never the account row's own frozen fields.
+  assert.match(QUERIES.m3u_staleness.sql(0), /max\(s\.updated_at\)/i);
+});
+
+test('`order` is quoted — it is a reserved word in Postgres', () => {
+  assert.match(QUERIES.channel_streams.sql(7), /cs\."order"/);
+  assert.match(QUERIES.channel_streams.sql(7), /channel_number = 7/);
+});
+
+test('🔴 MUTATION TARGET: a GUEST is refused and the privileged command is NEVER SENT', async () => {
+  const { commands, impl } = queryStub('2|acct|2026-01-01|1.0|10');
+  const res = await channelHealth.run({ query: 'm3u_staleness' }, ctx(impl, 'guest'));
+
+  assert.equal(res.ok, false);
+  assert.match(res.content, /owner-only/);
+  assert.match(res.content, /capability rather than a kind of data/);
+  assert.deepEqual(commands, [], '🔴 a guest must not cause the privileged docker exec at all');
+  // ⚠️ And it must not invite them to claim otherwise — the role came from the
+  // number they texted from, before the model read a word.
+  assert.match(res.content, /Do not offer to take their word/);
+});
+
+test('🔴 MUTATION TARGET: a non-integer channel is refused BEFORE anything is sent', async () => {
+  // The only value that ever reaches SQL, on the privileged identity. The spec
+  // records a Python repr leaking into `WHERE name IN (...)` and crashing the
+  // job on 2026-08-14. A type constraint is a proof; escaping is a promise.
+  for (const bad of ['ESPN', '1; drop table x', 7.5, null, undefined]) {
+    const { commands, impl } = queryStub('');
+    const res = await channelHealth.run(
+      { query: 'channel_streams', channel_number: bad },
+      ctx(impl, 'owner'),
+    );
+    assert.equal(res.ok, false, JSON.stringify(bad));
+    assert.match(res.content, /whole number/);
+    assert.deepEqual(commands, [], `nothing may be sent for ${JSON.stringify(bad)}`);
+  }
+});
+
+test('🔴 MUTATION TARGET: a SHORT result trips the control and is UNKNOWN, not a clean answer', async () => {
+  // Two rows where three are required. The rows themselves look perfectly
+  // healthy — which is exactly why the control runs BEFORE they are read.
+  const { impl } = queryStub(['2|a|2026-08-26 16:00:00+00|3.1|100', '3|b|2026-08-26 16:00:00+00|3.1|100'].join('\n'));
+  const res = await channelHealth.run({ query: 'm3u_staleness' }, ctx(impl, 'owner'));
+
+  assert.equal(res.ok, false);
+  assert.match(res.content, /returned 2 row\(s\) and needs at least 3/);
+  assert.match(res.content, /would report a healthy system from a query that did not see it/);
+  assert.ok(!/refreshed within 30 hours/.test(res.content), 'the verdict must not be rendered');
+});
+
+test('🔴 a query that could not RUN is UNKNOWN, never "nothing found"', async () => {
+  const { impl } = queryStub('', 1);
+  const res = await channelHealth.run({ query: 'epg_coverage' }, ctx(impl, 'owner'));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN — NOT "nothing found"/);
+});
+
+test('CONTROL: a full result IS rendered, with its verdict', async () => {
+  // Without this, every assertion above is equally consistent with the query
+  // path never returning anything at all.
+  const { commands, impl } = queryStub(
+    ['2|a|2026-08-26 16:00:00+00|3.1|100', '3|b|2026-08-26 16:00:00+00|3.1|100', '4|c|2026-08-26 16:00:00+00|3.1|100'].join('\n'),
+  );
+  const res = await channelHealth.run({ query: 'm3u_staleness' }, ctx(impl, 'owner'));
+  assert.equal(res.ok, true);
+  assert.match(res.content, /All accounts refreshed within 30 hours/);
+  assert.match(res.content, /Nothing was changed/);
+  assert.equal(commands[0]?.host, testConfig().adminSshHost, 'psql needs the privileged account');
+  assert.match(commands[0]?.command ?? '', /docker exec dispatcharr psql/);
+});
+
+test('a stale account and a never-refreshed one are DIFFERENT and reported apart', async () => {
+  const { impl } = queryStub(
+    ['2|a|2026-08-20 00:00:00+00|99.0|100', '3|b|2026-08-26 16:00:00+00|3.1|100', '4|c|||0'].join('\n'),
+  );
+  const res = await channelHealth.run({ query: 'm3u_staleness' }, ctx(impl, 'owner'));
+  assert.match(res.content, /1 account\(s\) have NEVER refreshed/);
+  assert.match(res.content, /1 account\(s\) older than 30 hours/);
+});
+
+test('channel_streams says a single-account failure is NOT a reason to swap', async () => {
+  const { impl } = queryStub(['1|COOKING|2|f|2026-08-26|0', '1|COOKING|3|f|2026-08-26|1'].join('\n'));
+  const res = await channelHealth.run({ query: 'channel_streams', channel_number: 1 }, ctx(impl, 'owner'));
+  assert.match(res.content, /FAILING ON ONE ACCOUNT IS NOT A REASON TO SWAP/);
+  assert.match(res.content, /true BY CONSTRUCTION/);
+  assert.match(res.content, /never from the channel's display name/);
+});
+
+test('an unknown query name is refused and names the ones that exist', async () => {
+  const { commands, impl } = queryStub('');
+  const res = await channelHealth.run({ query: 'drop_everything' }, ctx(impl, 'owner'));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /epg_coverage, channel_profiles, m3u_staleness, channel_streams/);
+  assert.deepEqual(commands, []);
+});
+
+test('the command is code-composed: psql, pipe-separated, on the privileged host', () => {
+  const cmd = commandFor('channel_streams' as QueryName, 42);
+  assert.match(cmd, /^docker exec dispatcharr psql -U dispatch -d dispatcharr -At -F'\|' -c /);
+  assert.match(cmd, /channel_number = 42/);
 });

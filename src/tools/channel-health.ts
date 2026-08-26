@@ -1,7 +1,15 @@
 import type { Config } from '../config.js';
+import {
+  asChannelNumber,
+  commandFor,
+  parseRows,
+  QUERIES,
+  QUERY_NAMES,
+  type QueryName,
+} from '../media/dispatcharr-queries.js';
 import { renderOutcome, runOnHp, type ExecImpl } from '../hp.js';
 import { hourMinute12 } from './sports-fixture.js';
-import { fail, ok, type Tool } from './types.js';
+import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
 /**
  * PER-CHANNEL LIVE TV HEALTH — the one verb a generic GET cannot replace.
@@ -296,11 +304,32 @@ export const channelHealth: Tool = {
           'Optional. A channel number (exact) or part of a channel name (case-insensitive), e.g. ' +
           '"ESPN" or "1234". Omit for the whole picture.',
       },
+      query: {
+        type: 'string',
+        enum: QUERY_NAMES,
+        description:
+          'Optional, OWNER ONLY. Ask Dispatcharr\'s database one named question instead of reading ' +
+          'the snapshot: epg_coverage (who has no guide data), channel_profiles (who is on which ' +
+          'stream profile), m3u_staleness (when each provider account last refreshed), ' +
+          'channel_streams (which accounts serve one channel — needs channel_number).',
+      },
+      channel_number: {
+        type: 'number',
+        description:
+          'A whole channel number, for channel_streams. Names are deliberately not accepted — run ' +
+          'without a query to get the roster and read the number off it.',
+      },
     },
     required: [],
   },
 
   async run(args, ctx) {
+    // A named query is a different question from the health snapshot, so it
+    // answers and returns rather than decorating the snapshot with a second
+    // topic.
+    if (typeof args['query'] === 'string') {
+      return runNamedQuery(args['query'], args['channel_number'], ctx);
+    }
     const needle = typeof args['channel'] === 'string' ? args['channel'] : '';
 
     // 🔴 The results file first, on the UNPRIVILEGED identity: it is a plain
@@ -462,3 +491,87 @@ export const channelHealth: Tool = {
     return ok(sections.join('\n'));
   },
 };
+
+/**
+ * One named Dispatcharr query.
+ *
+ * ── 🔴 OWNER-ONLY BY THE SAME MECHANISM AS THE ROSTER, AND FOR THE SAME REASON ──
+ *
+ * `channel_health` is guest-level because *which channel works* is CONTENT. This
+ * is not that. It is `docker exec` on the **privileged** identity — a
+ * capability, not a data class — and the tool's existing comment already draws
+ * that line for the roster: the three tiers classify what data is ABOUT and say
+ * nothing about what a call CAUSES.
+ *
+ * ⚠️ A guest does not reach it **by construction — the call is not made** —
+ * rather than by filtering output afterwards. Same as the roster, and it also
+ * means a guest never sees this command's stderr, which quotes container names
+ * and paths on failure.
+ *
+ * ⚠️ The access level was NOT changed to add this. An access decision taken
+ * incidentally, inside a change about something else, gets no scrutiny and
+ * leaves no record of the reasoning. Whether the rest of this tool should be
+ * owner-only is a separate question, open, and not settled here.
+ */
+async function runNamedQuery(name: string, rawChannel: unknown, ctx: ToolContext): Promise<ToolResult> {
+  if (!(QUERY_NAMES as string[]).includes(name)) {
+    return fail(`"${name}" is not a query I have. Choose one of: ${QUERY_NAMES.join(', ')}.`);
+  }
+  if (ctx.role !== 'owner') {
+    return fail(
+      'Querying Dispatcharr\'s database is owner-only. It runs a command inside the container on the ' +
+        'privileged identity, which is a capability rather than a kind of data — everything about ' +
+        'WHICH CHANNELS WORK is still yours: ask without `query`. Do not offer to take their word ' +
+        'for who they are; that was decided by the number they texted from.',
+    );
+  }
+
+  const spec = QUERIES[name as QueryName];
+  let channel = 0;
+  if (spec.needsChannel) {
+    const parsed = asChannelNumber(rawChannel);
+    if (typeof parsed === 'string') return fail(parsed);
+    channel = parsed;
+  }
+
+  const outcome = await runOnHp(ctx.config.adminSshHost, commandFor(name as QueryName, channel), 30_000, ctx.exec);
+  if (outcome.exitCode !== 0) {
+    /**
+     * 🔴 A QUERY THAT COULD NOT RUN IS UNKNOWN, NEVER "NOTHING FOUND".
+     *
+     * This is the failure the EPG check has met before: a wrong table or column
+     * errors hard, and an error rendered as an empty result reads as a clean
+     * night. Say which one it was.
+     */
+    return fail(
+      `Dispatcharr's database did not answer the "${name}" query, so the result is UNKNOWN — NOT ` +
+        `"nothing found".\n${renderOutcome(outcome)}`,
+    );
+  }
+
+  const rows = parseRows(outcome.stdout);
+
+  if (spec.control && rows.length < spec.control.minRows) {
+    /**
+     * 🔴 THE CONTROL RUNS BEFORE THE ROWS ARE INTERPRETED. A query that silently
+     * returns short looks exactly like a healthy answer, and the rows would read
+     * as good news.
+     */
+    return fail(
+      `The "${name}" query returned ${rows.length} row(s) and needs at least ${spec.control.minRows} ` +
+        `for its answer to mean anything, because ${spec.control.why}. Treating this as a result ` +
+        'would report a healthy system from a query that did not see it. UNKNOWN.',
+    );
+  }
+
+  const shown = rows.slice(0, MAX_DETAIL_ROWS);
+  return ok(
+    [
+      `Dispatcharr — ${spec.what}. Read at ${new Date().toISOString()}. Nothing was changed.`,
+      `${rows.length} row(s)` + (rows.length > shown.length ? `, showing ${shown.length}` : '') + ':',
+      ...shown.map((r) => `  ${r.join(' | ')}`),
+      '',
+      spec.note(rows),
+    ].join('\n'),
+  );
+}
