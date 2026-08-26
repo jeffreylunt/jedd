@@ -146,21 +146,34 @@ export const REFRESH_MS = 30_000;
  * 🔴 HOW LONG THAT STALE INDICATOR LASTS IS AN OPEN QUESTION, DELIBERATELY NOT
  * ANSWERED WITH A NUMBER HERE.
  *
- * The intuitive answer is "as long as the ceiling", which would make this change
- * much worse — 120 minutes rather than 6. But after `finish()` we also stop
- * sending REFRESHES, and a measured keepalive re-assert at **59.8s** implies
- * IMCore clears the local typing flag on roughly a one-minute timer; if the
- * recipient's client behaves the same way, a dropped stop should expire on its
- * own in about a minute REGARDLESS of the ceiling. On that reading the ceiling
- * governs how long the indicator is *deliberately* kept alive, not how long a
- * stale one lingers, and this change does not lengthen the hazard at all.
+ * Two mechanisms are on the table and NEITHER is established. Both are stated
+ * because picking one would be guessing, and they differ by a factor of ~120.
  *
- * ⚠️ That 59.8s figure is **n=1 and warm-path only** — the cold-window run
- * emitted nothing at +60s or +90s, so the auto-clear may not rescue a cold path,
- * which is precisely the path a dropped packet is on. **Do not treat either
- * duration as established.** The discriminator is a measurement nobody has
- * taken: after a dropped stop, is the recipient's indicator bounded by their own
- * client-side expiry, or does something keep it alive?
+ *  (A) **The ceiling governs.** The stale "…" lasts as long as the indicator
+ *      would have been kept alive — so this change makes it **120 minutes**
+ *      instead of 6. The intuitive reading, and the worst case.
+ *
+ *  (B) **The recipient's own client expiry governs, and the ceiling is
+ *      irrelevant.** After `finish()` we stop sending REFRESHES too, so the
+ *      recipient stops receiving `start` packets and their indicator should
+ *      time out on its own — on the order of a minute. On this reading the
+ *      ceiling governs only how long the indicator is *deliberately* kept
+ *      alive, and this change does not lengthen the hazard at all.
+ *
+ * 🔴 THE 59.8s KEEPALIVE MEASUREMENT DOES NOT DECIDE BETWEEN THEM, AND IT IS
+ * TEMPTING TO THINK IT DOES. A keepalive re-asserting at 59.8s with no
+ * intervening stop shows IMCore clearing the **SENDER'S** local flag on roughly
+ * a one-minute timer. That is our side. **It is not evidence about what the
+ * recipient's client does**, which is the entire question in (B) — a different
+ * device, a different implementation, possibly a different timeout.
+ *
+ * ⚠️ It is also **n=1 and warm-path only**: the cold-window run emitted nothing
+ * at +60s or +90s, so whatever auto-clear exists may not operate on a cold path
+ * — precisely the path a dropped packet is on.
+ *
+ * The discriminator is a measurement nobody has taken: **after a dropped stop,
+ * is the recipient's indicator bounded by their own client-side expiry, or does
+ * something keep it alive?** Until that is answered this stays UNKNOWN.
  *
  * The hazard is pre-existing and is NOT fixed here — the restart carrying this
  * was deliberately kept small. It is tracked on the concurrency/typing task.
