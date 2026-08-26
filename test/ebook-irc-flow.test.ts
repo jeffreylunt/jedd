@@ -304,3 +304,90 @@ test('the same book is not scheduled twice — no double delivery', async () => 
   const all = [...(followups as unknown as { items: Map<string, unknown> }).items.values()];
   assert.equal(all.length, 1, 'a second ask must not queue a second send of one book');
 });
+
+test('🔴 overlapping runner ticks cannot double-fetch or double-SEND one book', async () => {
+  /**
+   * The tick is `void`-called every 60s and an ebook delivery can occupy a run
+   * for minutes. Until it finishes, the record is still pending with a past
+   * dueAt, so every intervening tick used to pick it up again — the same book
+   * requested from the bot repeatedly and EMAILED more than once. A duplicate
+   * email is the one outcome here that cannot be taken back.
+   */
+  const mailed: unknown[] = [];
+  let fetches = 0;
+  const slowIrc = fakeIrc({
+    fetch: async () => {
+      fetches += 1;
+      await new Promise((r) => setTimeout(r, 60));
+      return { state: 'ok' as const, filename: 'A Book.epub', bytes: EPUB, detail: 'ok' };
+    },
+  });
+  const followups = new FollowupStore(tmp());
+  const kindle = new KindleRegistry(tmp());
+  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  followups.schedule({
+    kind: 'ebook-deliver',
+    senderHandle: JEFF,
+    dueAt: new Date(Date.now() - 1000),
+    reason: 'started fetching for them',
+    observed: 'queued',
+    ebook: { source: 'irc', command: '!Bsk A Book.epub', bot: 'Bsk', title: 'A Book.epub' },
+  });
+
+  const deps = {
+    config: testConfig({ readOnly: false }),
+    send: async () => {},
+    kindle,
+    mail: async (m: unknown) => {
+      mailed.push(m);
+      return { messageId: 'x' };
+    },
+    irc: slowIrc,
+  };
+
+  // Two ticks land while the first delivery is still in flight.
+  await Promise.all([
+    runDueFollowups(followups, deps as never),
+    runDueFollowups(followups, deps as never),
+    runDueFollowups(followups, deps as never),
+  ]);
+
+  assert.equal(fetches, 1, 'one book, one request to the bot');
+  assert.equal(mailed.length, 1, 'a duplicate email cannot be retracted');
+});
+
+test('🔴 an uncertain SMTP result is NOT retried — better one maybe-sent than two sent', async () => {
+  const spoke: string[] = [];
+  let sends = 0;
+  const followups = new FollowupStore(tmp());
+  const kindle = new KindleRegistry(tmp());
+  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  followups.schedule({
+    kind: 'ebook-deliver',
+    senderHandle: JEFF,
+    dueAt: new Date(Date.now() - 1000),
+    reason: 'started fetching for them',
+    observed: 'queued',
+    ebook: { source: 'irc', command: '!Bsk A Book.epub', bot: 'Bsk', title: 'A Book.epub' },
+  });
+
+  const deps = {
+    config: testConfig({ readOnly: false }),
+    send: async (_to: string, text: string) => {
+      spoke.push(text);
+    },
+    kindle,
+    mail: async () => {
+      sends += 1;
+      throw new Error('socket hang up'); // neither a 5xx nor a success
+    },
+    irc: fakeIrc(),
+  };
+
+  await runDueFollowups(followups, deps as never);
+  // The follow-up must be CLOSED, not deferred for another attempt.
+  assert.equal(followups.pendingEbook(JEFF, 'A Book.epub'), undefined, 'must not be left pending to retry');
+  await runDueFollowups(followups, deps as never);
+  assert.equal(sends, 1, 'a second attempt could deliver the same book twice');
+  assert.match(spoke[0]!, /may already have gone|twice/i);
+});

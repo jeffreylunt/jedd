@@ -125,10 +125,30 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        * Prowlarr 7 results for a title where IRC had 27. **A source that was
        * never asked cannot be evidence of absence.**
        */
+      /**
+       * ⚠️ THE TWO SOURCES RUN CONCURRENTLY, NOT ONE AFTER THE OTHER.
+       *
+       * Awaiting IRC first made every ebook search pay IRC's latency before
+       * Prowlarr was even asked — up to the connect timeout plus the search
+       * timeout, inside a guest-facing turn, even when Prowlarr would have
+       * answered in milliseconds. Same reasoning as never blocking a turn on a
+       * DCC transfer, with only the number changed.
+       */
+      const [ircFound, found] = await Promise.all([
+        hasIrc
+          ? irc!.search(query)
+          : Promise.resolve({ state: 'none' as const, detail: 'IRC is not enabled here.' }),
+        ctx.config.prowlarr.apiKey
+          ? new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl }).search(
+              query,
+              isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
+            )
+          : Promise.resolve({ state: 'none' as const, detail: 'Prowlarr is not configured here.' } as const),
+      ]);
+
       let ircOffers: Offer[] = [];
       let ircNote = '';
       if (hasIrc) {
-        const ircFound = await irc!.search(query);
         if (ircFound.state === 'ok') {
           ircOffers = ircFound.results.map(ircOffer);
           if (ircFound.detail) ircNote = `IRC ${ircFound.detail}`;
@@ -138,13 +158,6 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         }
       }
 
-      const found = ctx.config.prowlarr.apiKey
-        ? await new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl }).search(
-            query,
-            isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
-          )
-        : ({ state: 'none' as const, detail: 'Prowlarr is not configured here.', discarded: 0 } as const);
-
       // 🔴 An unreachable indexer is UNKNOWN — a failure to LOOK is not a finding
       // of absence. But with IRC offers in hand it is a PARTIAL result, not a
       // dead end, so it degrades to a note instead of taking the whole tool down.
@@ -153,7 +166,18 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         if (ircOffers.length === 0) return fail(`UNKNOWN — ${found.detail}`);
         prowlarrNote = `the torrent indexers could not be reached (${found.detail})`;
       }
-      if (found.state === 'none' && ircOffers.length === 0) return ok(`NONE — ${found.detail}`);
+      /**
+       * 🔴 AN ABSENCE REPORT MUST NAME WHAT WAS NOT REACHED.
+       *
+       * Reporting "NONE" while IRC was unreachable states a finding of absence
+       * on the strength of one source — the same two-zeros error this file
+       * guards everywhere else, just moved up a level. The note travels with the
+       * NONE so the model can say "and I could not reach the other source",
+       * rather than implying the book does not exist.
+       */
+      if (found.state === 'none' && ircOffers.length === 0) {
+        return ok(`NONE — ${found.detail}${ircNote ? ` (${ircNote})` : ''}`);
+      }
 
       const wantsGraphic = args['graphic_audio'] === true;
       const all = found.state === 'results' ? found.releases : [];
@@ -170,7 +194,8 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        */
       if (releases.length === 0 && ircOffers.length === 0) {
         return ok(
-          `FILTERED OUT — found ${before} ${medium} release(s) for "${query}", but ` +
+          `${ircNote ? `[${ircNote}] ` : ''}` +
+            `FILTERED OUT — found ${before} ${medium} release(s) for "${query}", but ` +
             (wantsGraphic
               ? 'NONE of them are GraphicAudio dramatisations. Say so and ask whether an ordinary ' +
                 'reading is fine.'

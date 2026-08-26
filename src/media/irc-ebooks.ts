@@ -30,9 +30,28 @@ import { unzipSingleTextEntry } from './irc-unzip.js';
  * ── BEING A GUEST ───────────────────────────────────────────────────────────
  *
  * We are a guest in someone else's channel. Stable nick, identifiably a client,
- * no NickServ registration, exponential backoff on reconnect, and no nick
- * cycling — **if ops throttle or ban us that is a stop-and-report, never
- * something to route around.**
+ * no NickServ registration, and no nick cycling — **if ops throttle or ban us
+ * that is a stop-and-report, never something to route around.**
+ *
+ * ⚠️ THERE IS NO AUTOMATIC RECONNECT. A dropped connection is re-established
+ * lazily, by the next `search`/`fetch` calling `connect()` — which pays the ~70s
+ * cold join inside that caller's wait. Said plainly because an earlier version
+ * of this comment claimed "exponential backoff on reconnect" and no such code
+ * existed; a reader would have assumed warm-up was self-healing.
+ *
+ * ── 🔴 ONE CONNECTION, ONE OPERATION AT A TIME ──────────────────────────────
+ *
+ * This object is SHARED by every user. There is one channel, one nick, and one
+ * stream of incoming DCC offers, and an offer does not identify which request it
+ * answers beyond who sent it. An earlier version kept a single `pending` slot
+ * and installed into it unconditionally: two users searching at once meant the
+ * second overwrote the first, and **the arriving book was handed to whoever held
+ * the slot** — one person receiving another person's book, which is the same
+ * class of failure as the fabricated-address incident, reached through the
+ * payload instead of the address.
+ *
+ * So operations are SERIALISED and CORRELATED: one at a time, and an offer is
+ * only accepted from the bot the live request actually asked.
  */
 
 export interface IrcSocketLike {
@@ -63,6 +82,8 @@ export interface IrcOptions {
    * server's, not ours.
    */
   connectTimeoutMs?: number;
+  /** Deadline on a single DCC transfer once it has started. */
+  transferTimeoutMs?: number;
   dial?: Dialer;
   now?: () => number;
   log?: (msg: string) => void;
@@ -78,6 +99,7 @@ const DEFAULTS = {
   offerTimeoutMs: 8 * 60_000,
   maxBytes: 25 * 1024 * 1024,
   connectTimeoutMs: 110_000,
+  transferTimeoutMs: 5 * 60_000,
 };
 
 export type IrcSearchOutcome =
@@ -91,7 +113,12 @@ export type IrcFetchOutcome =
   | { state: 'unknown'; detail: string };
 
 interface PendingTransfer {
-  wantResults: boolean;
+  /** Distinguishes one caller's slot from another's, so a timer clears only its own. */
+  id: number;
+  /** 'search' accepts the results zip from whichever nick SearchBot runs under. */
+  kind: 'search' | 'fetch';
+  /** For 'fetch': the ONLY nick whose offer may be accepted, lowercased. */
+  bot: string | null;
   resolve: (b: { filename: string; bytes: Buffer } | null, detail: string) => void;
 }
 
@@ -109,6 +136,9 @@ export class IrcEbooks {
   private connecting: Promise<boolean> | null = null;
   private lastError = '';
   private pending: PendingTransfer | null = null;
+  private nextPendingId = 1;
+  /** Live DCC sockets, so `stop()` can actually close a stalled transfer. */
+  private transfers = new Set<IrcSocketLike>();
   private stopped = false;
 
   constructor(opts: IrcOptions = {}) {
@@ -122,6 +152,7 @@ export class IrcEbooks {
       offerTimeoutMs: opts.offerTimeoutMs ?? DEFAULTS.offerTimeoutMs,
       maxBytes: opts.maxBytes ?? DEFAULTS.maxBytes,
       connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULTS.connectTimeoutMs,
+      transferTimeoutMs: opts.transferTimeoutMs ?? DEFAULTS.transferTimeoutMs,
       dial: opts.dial ?? defaultDial,
       now: opts.now ?? Date.now,
       log: opts.log ?? (() => {}),
@@ -204,14 +235,27 @@ export class IrcEbooks {
         }
       }) as never);
 
+      /**
+       * ⚠️ BOTH HANDLERS CHECK THAT THEY STILL OWN THE CONNECTION.
+       *
+       * Node emits `error` and then `close` as separate events. Without this
+       * guard the sequence was: drop -> `error` -> teardown -> a user searches
+       * -> `connect()` builds a NEW socket -> the OLD socket's `close` finally
+       * lands -> and it tore down the new connection and failed its in-flight
+       * transfer with "the IRC connection closed mid-transfer."
+       */
+      const stillOurs = () => this.sock === sock;
+
       sock.on('error', ((e: Error) => {
         this.o.log(`[irc] socket error: ${e?.message}`);
+        if (!stillOurs()) return;
         this.failPending(`the IRC connection dropped: ${e?.message}`);
         this.teardown();
         done(false, `socket error: ${e?.message}`);
       }) as never);
 
       sock.on('close', (() => {
+        if (!stillOurs()) return;
         this.failPending('the IRC connection closed mid-transfer.');
         this.teardown();
         done(false, 'the IRC connection closed before we joined.');
@@ -226,6 +270,13 @@ export class IrcEbooks {
 
   private onData(chunk: Buffer, onJoined: () => void): void {
     this.buf += chunk.toString('binary');
+    // IRC lines are 512 bytes. A peer that never sends a newline would otherwise
+    // grow this until the process dies.
+    if (this.buf.length > 64 * 1024) {
+      this.o.log('[irc] dropping an oversized unterminated line');
+      this.buf = '';
+      return;
+    }
     let i: number;
     while ((i = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, i).replace(/\r$/, '');
@@ -275,11 +326,39 @@ export class IrcEbooks {
       else this.roster.delete(nick);
       return;
     }
+    // A KICKed bot is gone too. Missing this left it "present", which defeats
+    // the very refusal the roster exists to produce.
+    const kicked = line.match(/^:\S+ KICK \S+ (\S+)/);
+    if (kicked) {
+      this.roster.delete(bareNick(kicked[1]!).toLowerCase());
+      return;
+    }
 
     const pm = line.match(/^:(\S+?)!\S+ PRIVMSG (\S+) :(.*)$/);
     if (!pm) return;
+    const from = bareNick(pm[1] ?? '').toLowerCase();
     const body = pm[3] ?? '';
     if (!body.includes('DCC SEND')) return;
+
+    /**
+     * 🔴 AN OFFER IS ONLY ACCEPTED IF IT ANSWERS A LIVE REQUEST.
+     *
+     * `#ebooks` had 603 members when measured. Without this, ANY of them could
+     * PRIVMSG us a DCC SEND and we would dial the address in it — an arbitrary
+     * outbound connection driven by a stranger, from inside the agent process —
+     * and hand the bytes to whatever transfer happened to be waiting. That is
+     * content substitution: the validator would confirm the result is *a* book
+     * while saying nothing about it being *the* book that was asked for.
+     */
+    const waiting = this.pending;
+    if (!waiting) {
+      this.o.log(`[irc] ignoring an unsolicited DCC offer from ${from}`);
+      return;
+    }
+    if (waiting.kind === 'fetch' && waiting.bot && from !== waiting.bot) {
+      this.o.log(`[irc] ignoring a DCC offer from ${from}; we asked ${waiting.bot}`);
+      return;
+    }
 
     const offer = parseDccSend(body);
     if (offer.state === 'unparsed') {
@@ -315,6 +394,8 @@ export class IrcEbooks {
           const finish = (ok: boolean, detail: string) => {
             if (settled) return;
             settled = true;
+            clearTimeout(timer);
+            this.transfers.delete(d);
             try {
               d.destroy();
             } catch {
@@ -326,28 +407,66 @@ export class IrcEbooks {
           };
 
           const d = this.o.dial(ip, port, () => {});
-          d.on('data', ((c: Buffer) => {
-            chunks.push(c);
-            got += c.length;
-            if (got > this.o.maxBytes) {
-              finish(false, `"${filename}" exceeded the ${this.o.maxBytes}-byte limit mid-transfer. Aborted.`);
-              return;
-            }
-            const ack = Buffer.alloc(4);
-            ack.writeUInt32BE(got >>> 0, 0);
+          this.transfers.add(d);
+
+          /**
+           * ⚠️ A TRANSFER NEEDS ITS OWN DEADLINE.
+           *
+           * `awaitTransfer`'s timer resolves the CALLER; it does not touch this
+           * socket. A peer that connects, sends a few bytes and then goes quiet
+           * would otherwise leave the socket and its buffered chunks alive
+           * forever — and if it ever completed, it would hand its bytes to
+           * whichever request held the slot by then.
+           */
+          const timer = setTimeout(
+            () => finish(false, `"${filename}" stalled and was abandoned.`),
+            this.o.transferTimeoutMs,
+          );
+          timer.unref?.();
+
+          /**
+           * 🔴 THESE HANDLERS ARE OUTSIDE `guard()` BY CONSTRUCTION.
+           *
+           * `guard()` wraps an awaited call; by the time an event fires, the
+           * promise executor has returned and there is no caller on the stack.
+           * An escape here is an UNCAUGHT EXCEPTION, and under pm2 that restarts
+           * Jedd and deploys the working tree. So each one carries its own
+           * catch, the same way the IRC data handler does.
+           */
+          const safely = (fn: () => void) => {
             try {
-              d.write(ack);
-            } catch {
-              /* the far end may already be gone; the bytes still count */
+              fn();
+            } catch (e) {
+              this.o.log(`[irc] DCC handler failed: ${(e as Error)?.message}`);
+              finish(false, `the transfer of "${filename}" failed unexpectedly.`);
             }
-          }) as never);
-          d.on('error', ((e: Error) => finish(false, `the transfer of "${filename}" failed: ${e?.message}`)) as never);
-          d.on('close', (() => {
-            if (got === 0) finish(false, `"${filename}" closed with no data.`);
-            else if (got < size) {
-              finish(false, `"${filename}" stopped at ${got} of ${size} bytes — incomplete, so it was discarded.`);
-            } else finish(true, `received ${got} bytes`);
-          }) as never);
+          };
+
+          d.on('data', ((c: Buffer) =>
+            safely(() => {
+              chunks.push(c);
+              got += c.length;
+              if (got > this.o.maxBytes) {
+                finish(false, `"${filename}" exceeded the ${this.o.maxBytes}-byte limit mid-transfer. Aborted.`);
+                return;
+              }
+              const ack = Buffer.alloc(4);
+              ack.writeUInt32BE(got >>> 0, 0);
+              try {
+                d.write(ack);
+              } catch {
+                /* the far end may already be gone; the bytes still count */
+              }
+            })) as never);
+          d.on('error', ((e: Error) =>
+            safely(() => finish(false, `the transfer of "${filename}" failed: ${e?.message}`))) as never);
+          d.on('close', (() =>
+            safely(() => {
+              if (got === 0) finish(false, `"${filename}" closed with no data.`);
+              else if (got < size) {
+                finish(false, `"${filename}" stopped at ${got} of ${size} bytes — incomplete, so it was discarded.`);
+              } else finish(true, `received ${got} bytes`);
+            })) as never);
         }),
       () => undefined,
     );
@@ -367,8 +486,21 @@ export class IrcEbooks {
     p.resolve(null, detail);
   }
 
-  /** Wait for the next DCC file, whatever it turns out to be. */
-  private awaitTransfer(timeoutMs: number, wantResults: boolean): Promise<{ file: { filename: string; bytes: Buffer } | null; detail: string }> {
+  /**
+   * Wait for the DCC file that answers THIS request.
+   *
+   * ⚠️ The timeout clears the slot **only if it is still ours**. An earlier
+   * version wrote `if (this.pending) this.pending = null`, so a 45s search
+   * expiring would wipe an 8-minute fetch's slot that had been installed after
+   * it — the fetch's bytes then arrived, found no slot, and were DROPPED, while
+   * the caller waited out its own timeout and reported "nothing arrived" about a
+   * file that had in fact arrived.
+   */
+  private awaitTransfer(
+    timeoutMs: number,
+    kind: 'search' | 'fetch',
+    bot: string | null,
+  ): Promise<{ file: { filename: string; bytes: Buffer } | null; detail: string }> {
     return new Promise((resolve) => {
       let settled = false;
       const finish = (file: { filename: string; bytes: Buffer } | null, detail: string) => {
@@ -376,12 +508,29 @@ export class IrcEbooks {
         settled = true;
         resolve({ file, detail });
       };
-      this.pending = { wantResults, resolve: finish };
+      const slot: PendingTransfer = {
+        id: this.nextPendingId++,
+        kind,
+        bot: bot ? bot.toLowerCase() : null,
+        resolve: finish,
+      };
+      this.pending = slot;
       setTimeout(() => {
-        if (this.pending) this.pending = null;
+        if (this.pending?.id === slot.id) this.pending = null;
         finish(null, `nothing arrived within ${Math.round(timeoutMs / 1000)}s.`);
       }, timeoutMs).unref?.();
     });
+  }
+
+  /**
+   * 🔴 ONE OPERATION AT A TIME, and a second caller is TOLD rather than queued.
+   *
+   * Queueing behind an 8-minute fetch would leave the second person waiting with
+   * no explanation. Refusing is honest, and the follow-up runner already retries
+   * on its own schedule — so a busy IRC costs a delay, never a wrong delivery.
+   */
+  private busy(): boolean {
+    return this.pending !== null;
   }
 
   async search(query: string): Promise<IrcSearchOutcome> {
@@ -390,8 +539,11 @@ export class IrcEbooks {
       async (): Promise<IrcSearchOutcome> => {
         const up = await this.connect();
         if (!up) return { state: 'unknown', detail: `IRC is not available — ${this.status().detail}` };
+        if (this.busy()) {
+          return { state: 'unknown', detail: 'the IRC connection is already handling another request.' };
+        }
 
-        const wait = this.awaitTransfer(this.o.searchTimeoutMs, true);
+        const wait = this.awaitTransfer(this.o.searchTimeoutMs, 'search', null);
         this.send(`PRIVMSG ${this.o.channel} :@search ${sanitise(query)}`);
         const { file, detail } = await wait;
         if (!file) return { state: 'unknown', detail: `the #ebooks search bot did not answer — ${detail}` };
@@ -449,7 +601,13 @@ export class IrcEbooks {
           };
         }
 
-        const wait = this.awaitTransfer(this.o.offerTimeoutMs, false);
+        if (this.busy()) {
+          return {
+            state: 'unknown',
+            detail: 'the IRC connection is already handling another request; nothing was requested yet.',
+          };
+        }
+        const wait = this.awaitTransfer(this.o.offerTimeoutMs, 'fetch', bot);
         // 🔴 TO THE CHANNEL, NOT TO THE BOT, and the command VERBATIM.
         this.send(`PRIVMSG ${this.o.channel} :${sanitise(command)}`);
         const { file, detail } = await wait;
@@ -483,6 +641,16 @@ export class IrcEbooks {
   stop(): void {
     this.stopped = true;
     this.failPending('shutting down.');
+    // A stalled DCC socket is not reachable from the IRC socket; close it here
+    // or it survives shutdown.
+    for (const t of this.transfers) {
+      try {
+        t.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
+    this.transfers.clear();
     try {
       this.sock?.write('QUIT :bye\r\n');
       this.sock?.destroy();

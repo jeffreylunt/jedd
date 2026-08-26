@@ -39,6 +39,19 @@ export interface DeliverDeps {
   exec?: ExecImpl;
   irc?: IrcEbooks;
   mounts?: MountMap[];
+  /**
+   * 🔴 THE LIVE-TEST RESTRICTION LIVES HERE, NOT ONLY IN THE TOOL.
+   *
+   * `send_ebook` argues its `onlySendTo` is safe because the restricted build is
+   * "a DIFFERENT OBJECT, not the same object in a different mood". The follow-up
+   * runner bypassed that object entirely — it calls `deliverEbook` directly with
+   * the raw mail sender. Not reachable today, because the tool refuses before
+   * scheduling; but a follow-up OUTLIVES the turn that wrote it and can outlive
+   * an `OWNER_HANDLE` change, which is the same reason the runner already
+   * re-derives `role` instead of trusting the record. Putting the gate on the
+   * shared leg means both callers inherit it and neither has to remember.
+   */
+  onlySendTo?: string;
 }
 
 export async function deliverEbook(
@@ -55,6 +68,13 @@ export async function deliverEbook(
    * registry, keyed by the person asking — never from a parameter, and never
    * from a record written minutes or hours ago that may since have changed.
    */
+  if (deps.onlySendTo && senderHandle !== deps.onlySendTo) {
+    return {
+      state: 'failed',
+      detail: `this build only sends books to ${deps.onlySendTo}. Nothing was sent.`,
+    };
+  }
+
   const record = deps.kindle.get(senderHandle);
   if (!record) {
     return {
@@ -88,7 +108,25 @@ export async function deliverEbook(
     return { state: 'delivered', detail: `"${got.filename}" is on its way to your Kindle.` };
   }
   if (sent.state === 'rejected') return { state: 'failed', detail: sent.detail };
-  return { state: 'unknown', detail: sent.detail };
+  /**
+   * 🔴 UNKNOWN *AFTER* THE MAIL HAND-OFF IS TERMINAL, NOT A RETRY.
+   *
+   * `sendToKindle` documents this state as "It MAY have gone — do not simply
+   * retry without checking, or the person may receive it twice." Returning
+   * `unknown` here would do exactly that: the runner treats `unknown` as "no
+   * verdict yet", defers, and the next attempt re-fetches and re-mails a book
+   * that may already be on its way.
+   *
+   * `unknown` BEFORE the hand-off (could not read qBittorrent, could not reach
+   * the bot) is safe to retry. `unknown` AFTER it is not, and the two must not
+   * share a state. An uncertain single delivery beats a certain double one.
+   */
+  return {
+    state: 'failed',
+    detail:
+      `${sent.detail} I have NOT tried again, because it may already have gone and you would ` +
+      'get it twice. Check your Kindle, and ask me if it never turns up.',
+  };
 }
 
 type Got =

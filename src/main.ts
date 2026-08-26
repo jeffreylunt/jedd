@@ -290,6 +290,7 @@ async function main(): Promise<void> {
       kindle,
       mail: ebook.send,
       mounts: DEFAULT_MOUNTS,
+      onlySendTo: ebook.onlySendTo,
       ...(irc ? { irc } : {}),
     });
   }, TICK_MS);

@@ -160,6 +160,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
           ...(ctx.exec ? { exec: ctx.exec } : {}),
           ...(deps.irc ? { irc: deps.irc } : {}),
           mounts: deps.mounts ?? DEFAULT_MOUNTS,
+          ...(deps.onlySendTo ? { onlySendTo: deps.onlySendTo } : {}),
         },
         { mayBlock: false },
       );

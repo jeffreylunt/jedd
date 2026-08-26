@@ -54,6 +54,8 @@ export interface FollowupDeps {
   mail?: MailSender;
   irc?: IrcEbooks;
   mounts?: MountMap[];
+  /** Same live-test restriction the tool carries; see `DeliverDeps`. */
+  onlySendTo?: string;
   exec?: ExecImpl;
   sleep?: (ms: number) => Promise<void>;
   jellyfin?: (config: Config, path: string) => Promise<JellyfinResponse>;
@@ -67,8 +69,41 @@ export interface FollowupOutcome {
   detail: string;
 }
 
+/**
+ * 🔴 ONE RUN AT A TIME. A SECOND TICK MUST NOT ENTER.
+ *
+ * The tick is every 60s and `void`-called, so nothing awaits the previous run.
+ * An `ebook-deliver` can occupy a run for up to the IRC offer timeout — MINUTES
+ * — and it only marks the record deferred or resolved AFTER that await. Until
+ * then the record is still `pending` with a `dueAt` in the past, so every
+ * intervening tick picked it up again: the same book requested from the bot
+ * repeatedly, and **the same book emailed to the Kindle more than once.**
+ *
+ * A duplicate email is the one outcome on this path that cannot be taken back,
+ * which is why this is a hard gate rather than a nicety.
+ */
+let running = false;
+
 /** Run every follow-up that is due. Never throws — a bad one must not stop the rest. */
 export async function runDueFollowups(
+  store: FollowupStore,
+  deps: FollowupDeps,
+): Promise<FollowupOutcome[]> {
+  if (running) return [];
+  running = true;
+  try {
+    return await runDueFollowupsInner(store, deps);
+  } finally {
+    running = false;
+  }
+}
+
+/** Exposed only so a test can prove the overlap guard is what stops a second run. */
+export function isFollowupRunInProgress(): boolean {
+  return running;
+}
+
+async function runDueFollowupsInner(
   store: FollowupStore,
   deps: FollowupDeps,
 ): Promise<FollowupOutcome[]> {
@@ -464,6 +499,7 @@ async function runEbookDeliver(
       ...(deps.exec ? { exec: deps.exec } : {}),
       ...(deps.irc ? { irc: deps.irc } : {}),
       ...(deps.mounts ? { mounts: deps.mounts } : {}),
+      ...(deps.onlySendTo ? { onlySendTo: deps.onlySendTo } : {}),
     },
     { mayBlock: true },
   );

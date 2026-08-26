@@ -106,9 +106,14 @@ function makeZip(name: string, text: string): Buffer {
   return Buffer.concat([localAll, cdAll, eocd]);
 }
 
-function dccOffer(name: string, port: number, size: number): string {
+/**
+ * @param from the nick the offer comes from. It MATTERS: an offer answering a
+ * fetch is only accepted from the bot that fetch asked, so a test that offers a
+ * book from the wrong nick is testing the refusal, not the transfer.
+ */
+function dccOffer(name: string, port: number, size: number, from = 'SearchOok'): string {
   // 2130706433 = 127.0.0.1
-  return `:SearchOok!x@y PRIVMSG jeddtest :\x01DCC SEND "${name}" 2130706433 ${port} ${size}\x01`;
+  return `:${from}!x@y PRIVMSG jeddtest :\x01DCC SEND "${name}" 2130706433 ${port} ${size}\x01`;
 }
 
 test('🔴 a dialer that THROWS becomes a state, not an exception', async () => {
@@ -227,7 +232,7 @@ test('🔴 a mid-transfer disconnect DISCARDS the partial file', async () => {
   const { irc, sockets } = harness();
   const p = irc.fetch('!Bsk A Book.epub', 'Bsk');
   const s = await bringUp(sockets);
-  s.line(dccOffer('A Book.epub', 5001, 1000));
+  s.line(dccOffer('A Book.epub', 5001, 1000, 'Bsk'));
   await tick();
   const dcc = sockets[1]!;
   dcc.emit('data', Buffer.alloc(400, 1)); // less than promised
@@ -244,7 +249,7 @@ test('🔴 an oversized transfer is aborted while reading, not trusted from the 
   const p = irc.fetch('!Bsk Big.epub', 'Bsk');
   const s = await bringUp(sockets);
   // The offer UNDERSTATES the size: 100 bytes promised, megabytes sent.
-  s.line(dccOffer('Big.epub', 5002, 100));
+  s.line(dccOffer('Big.epub', 5002, 100, 'Bsk'));
   await tick();
   const dcc = sockets[1]!;
   dcc.emit('data', Buffer.alloc(9000, 7));
@@ -258,7 +263,7 @@ test('an offer larger than the cap is refused before dialling', async () => {
   const { irc, sockets } = harness();
   const p = irc.fetch('!Bsk Huge.epub', 'Bsk');
   const s = await bringUp(sockets);
-  s.line(dccOffer('Huge.epub', 5003, 900_000_000));
+  s.line(dccOffer('Huge.epub', 5003, 900_000_000, 'Bsk'));
   const r = await p;
   assert.equal(r.state, 'failed');
   assert.match(r.detail, /over the .* limit/);
@@ -270,7 +275,7 @@ test('🔴 passive DCC (port 0) fails with a reason instead of hanging', async (
   const { irc, sockets } = harness();
   const p = irc.fetch('!Bsk P.epub', 'Bsk');
   const s = await bringUp(sockets);
-  s.line(dccOffer('P.epub', 0, 500));
+  s.line(dccOffer('P.epub', 0, 500, 'Bsk'));
   const r = await p;
   assert.equal(r.state, 'failed');
   assert.match(r.detail, /reverse \(passive\)|incoming connection/);
@@ -281,7 +286,7 @@ test('a successful fetch returns the exact bytes', async () => {
   const { irc, sockets } = harness();
   const p = irc.fetch('!Bsk A Book.epub', 'Bsk');
   const s = await bringUp(sockets);
-  s.line(dccOffer('A Book.epub', 5004, 300));
+  s.line(dccOffer('A Book.epub', 5004, 300, 'Bsk'));
   await tick();
   const dcc = sockets[1]!;
   const payload = Buffer.alloc(300, 0x5a);
@@ -350,5 +355,199 @@ test('roster tracking follows JOIN and PART while connected', async () => {
   await tick();
   assert.equal(irc.rosterHas('newbot'), true);
   await p;
+  irc.stop();
+});
+
+/**
+ * ── 🔴 THE CONCURRENCY CLUSTER ──────────────────────────────────────────────
+ *
+ * One `IrcEbooks` is shared by every user, and an incoming DCC offer does not
+ * say which request it answers. A code review reproduced four ways that went
+ * wrong; each of these is one of them, and each was seen to FAIL before the fix.
+ */
+
+test('🔴 two callers cannot cross-deliver: a second request is REFUSED, not queued into one slot', async () => {
+  const { irc, sockets } = harness();
+  const a = irc.fetch('!Bsk AAA.epub', 'Bsk');
+  const s = await bringUp(sockets);
+  const b = await irc.fetch('!Oatmeal BBB.epub', 'Oatmeal');
+
+  // B must NOT be able to install itself over A's slot.
+  assert.equal(b.state, 'unknown');
+  assert.match(b.detail, /already handling another request/);
+  assert.match(b.detail, /nothing was requested/i);
+  assert.ok(!s.written.some((w) => w.includes('BBB.epub')), 'B must not have asked its bot');
+
+  // A's own book still reaches A.
+  s.line(dccOffer('AAA.epub', 5100, 5, 'Bsk'));
+  await tick();
+  sockets[1]!.emit('data', Buffer.from('AAAAA'));
+  sockets[1]!.emit('close');
+  const ra = await a;
+  assert.equal(ra.state, 'ok');
+  if (ra.state === 'ok') assert.equal(ra.filename, 'AAA.epub');
+  irc.stop();
+});
+
+test('🔴 an unsolicited DCC offer is IGNORED — a stranger cannot make us dial out', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.search('dune');
+  const s = await bringUp(sockets);
+  await tick();
+  const before = sockets.length;
+  // Nothing is pending: the search already timed out.
+  await p;
+  s.line(dccOffer('free-money.epub', 6000, 10, 'Attacker'));
+  await tick();
+  assert.equal(sockets.length, before, 'no outbound connection may be opened for an unsolicited offer');
+  irc.stop();
+});
+
+test('🔴 an offer from the WRONG bot cannot substitute the file', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.fetch('!Bsk Real.epub', 'Bsk');
+  const s = await bringUp(sockets);
+  const before = sockets.length;
+  // Someone else in the channel answers first with their own bytes.
+  s.line(dccOffer('Real.epub', 6001, 4, 'Attacker'));
+  await tick();
+  assert.equal(sockets.length, before, 'we must not dial the impostor');
+
+  // The real bot then answers and IS accepted.
+  s.line(dccOffer('Real.epub', 6002, 4, 'Bsk'));
+  await tick();
+  sockets[before]!.emit('data', Buffer.from('GOOD'));
+  sockets[before]!.emit('close');
+  const r = await p;
+  assert.equal(r.state, 'ok');
+  if (r.state === 'ok') assert.equal(r.bytes.toString(), 'GOOD');
+  irc.stop();
+});
+
+test('🔴 stop() destroys a STALLED transfer instead of leaking it', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.fetch('!Bsk Slow.epub', 'Bsk');
+  const s = await bringUp(sockets);
+  s.line(dccOffer('Slow.epub', 6003, 1000, 'Bsk'));
+  await tick();
+  const dcc = sockets[1]!;
+  dcc.emit('data', Buffer.alloc(100, 1)); // then silence, forever
+  await tick();
+  assert.equal(dcc.destroyed, false);
+  irc.stop();
+  assert.equal(dcc.destroyed, true, 'a stalled DCC socket must not survive shutdown');
+  await p;
+});
+
+test('🔴 a dead socket\'s late close does not tear down the NEW connection', async () => {
+  const { irc, sockets } = harness();
+  const p1 = irc.search('a');
+  await tick();
+  const first = sockets[0]!;
+  first.emit('error', new Error('ECONNRESET'));
+  await p1;
+
+  // Reconnect.
+  const p2 = irc.search('b');
+  await tick();
+  const second = sockets[1]!;
+  second.line(':srv 001 jeddtest :Welcome');
+  await tick();
+  second.line(':srv 353 jeddtest = #ebooks :Bsk jeddtest');
+  second.line(':srv 366 jeddtest #ebooks :End');
+  await tick();
+  assert.equal(irc.status().joined, true);
+
+  // The FIRST socket finally emits its close.
+  first.emit('close');
+  await tick();
+  assert.equal(irc.status().joined, true, 'the old socket must not tear down the live one');
+  await p2;
+  irc.stop();
+});
+
+test('a KICKed bot stops being offered', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.search('x');
+  const s = await bringUp(sockets);
+  assert.equal(irc.rosterHas('Bsk'), true);
+  s.line(':op!x@y KICK #ebooks Bsk :spam');
+  await tick();
+  assert.equal(irc.rosterHas('Bsk'), false);
+  await p;
+  irc.stop();
+});
+
+test('an unterminated flood does not grow the line buffer without bound', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.search('x');
+  await tick();
+  const s = sockets[0]!;
+  for (let i = 0; i < 40; i++) s.emit('data', Buffer.alloc(4096, 0x41)); // no newline, ever
+  await tick();
+  s.line(':srv 001 jeddtest :Welcome');
+  await tick();
+  s.line(':srv 353 jeddtest = #ebooks :Bsk jeddtest');
+  s.line(':srv 366 jeddtest #ebooks :End');
+  await tick();
+  assert.equal(irc.status().joined, true, 'the connection must still work after the flood');
+  await p;
+  irc.stop();
+});
+
+test('🔴 a COMPLETED request\'s stale timer must not clear the NEXT request\'s slot', async () => {
+  /**
+   * The mutex stops two slots existing at once, but not a stale TIMER. A's
+   * transfer completes and clears the slot; B then installs its own; A's
+   * original timeout finally fires. Without the id check it clears B's slot, and
+   * B's bytes then arrive to find nothing waiting and are DROPPED — B waits out
+   * its own timeout and is told "nothing arrived" about a file that did arrive.
+   *
+   * ⚠️ The two deadlines are deliberately far apart. With A and B on the same
+   * short timeout there is no window: B expires on its own before A's stale
+   * timer can be shown to matter, and the test fails for a reason that has
+   * nothing to do with the bug.
+   */
+  const sockets: FakeSocket[] = [];
+  const dial: Dialer = (_h, _p, onConnect) => {
+    const sk = new FakeSocket();
+    sockets.push(sk);
+    queueMicrotask(onConnect);
+    return sk;
+  };
+  const irc = new IrcEbooks({
+    dial,
+    joinDelayMs: 0,
+    searchTimeoutMs: 50, // A: expires quickly
+    offerTimeoutMs: 4000, // B: still waiting long after
+    connectTimeoutMs: 200,
+    maxBytes: 4096,
+    nick: 'jeddtest',
+  });
+
+  // A is a SEARCH; it completes, then its 50ms timer stays armed.
+  const a = irc.search('dune');
+  const s = await bringUp(sockets);
+  const zip = makeZip('results.txt', '!Bsk Real.epub ::INFO:: 1MB');
+  s.line(dccOffer('results.txt.zip', 7000, zip.length, 'SearchOok'));
+  await tick();
+  sockets[1]!.emit('data', zip);
+  sockets[1]!.emit('close');
+  assert.equal((await a).state, 'ok');
+
+  // B installs its own slot, then A's stale timer fires.
+  const b = irc.fetch('!Bsk Real.epub', 'Bsk');
+  await tick(2);
+  await tick(120); // well past A's 50ms, far short of B's 4000ms
+
+  s.line(dccOffer('Real.epub', 7001, 3, 'Bsk'));
+  await tick();
+  const dcc = sockets[2];
+  assert.ok(dcc, "B's offer must still be accepted — A's stale timer must not have cleared the slot");
+  dcc.emit('data', Buffer.from('BBB'));
+  dcc.emit('close');
+  const rb = await b;
+  assert.equal(rb.state, 'ok');
+  if (rb.state === 'ok') assert.equal(rb.bytes.toString(), 'BBB');
   irc.stop();
 });
