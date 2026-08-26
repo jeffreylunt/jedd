@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { deflateRawSync } from 'node:zlib';
 import { test } from 'node:test';
 import { IrcEbooks, type Dialer, type IrcSocketLike } from '../src/media/irc-ebooks.js';
@@ -699,4 +700,30 @@ test('🔴 the search timeout has headroom over MEASURED bot latency', () => {
     used > SLOWEST_OBSERVED_MS,
     `search timeout ${used}ms must exceed the slowest measured reply ${SLOWEST_OBSERVED_MS}ms`,
   );
+});
+
+test('🔴 the IRC OUTCOME lines carry the same [irc] prefix as the problem lines', () => {
+  /**
+   * The regression this pins: success used `[jedd] irc #ebooks joined` while all
+   * 12 problem paths used `[irc]`. Someone checking "did IRC run?" by counting
+   * `[irc]` lines got 0 on a perfectly healthy connection — with a valid control
+   * — and concluded the feature had never executed. Absence of PROBLEMS, read as
+   * absence of the FEATURE.
+   *
+   * A source-level assertion because the emit lives in `main.ts`, which has no
+   * unit seam; the invariant is about the STRING an operator greps for.
+   */
+  const main = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const emits = main.split('\n').filter((l) => /console\.error\(.*#ebooks/.test(l) || /`\[irc\] #ebooks/.test(l));
+  assert.ok(emits.length > 0, 'the IRC outcome must be logged at all');
+  for (const line of emits) {
+    assert.ok(
+      line.includes('[irc] #ebooks'),
+      `an IRC outcome line must use the [irc] prefix so one handle answers both questions: ${line.trim()}`,
+    );
+    assert.ok(!line.includes('[jedd] irc'), `the old split prefix must not come back: ${line.trim()}`);
+  }
+  // Both outcomes must be greppable by their outcome WORD, not by prefix alone.
+  assert.match(main, /#ebooks joined/);
+  assert.match(main, /#ebooks UNAVAILABLE/);
 });

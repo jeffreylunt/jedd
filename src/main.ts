@@ -214,7 +214,36 @@ async function main(): Promise<void> {
    */
   const irc = process.env.IRC_EBOOKS === '1' ? new IrcEbooks({ log: (m) => console.error(m) }) : undefined;
   if (irc) {
-    void irc.connect().then((up) => console.error(`[jedd] irc #ebooks ${up ? 'joined' : 'UNAVAILABLE'}`));
+    /**
+     * 🔴 SUCCESS AND FAILURE SHARE THE `[irc]` PREFIX. ON PURPOSE.
+     *
+     * This line used to read `[jedd] irc #ebooks joined`, while every problem
+     * the module reports carries `[irc]`. That split cost a real, confident
+     * wrong diagnosis on 2026-08-26: someone checked whether the source had run
+     * by counting `[irc]` lines, got **0**, and concluded nothing IRC had
+     * executed — with a VALID control (the same grep found 160 boot markers,
+     * growing in step with restarts). It was working the whole time. Every
+     * `[irc]` string was an error path, so a clean connection emitted none:
+     * **they measured the absence of PROBLEMS and read it as the absence of the
+     * FEATURE.**
+     *
+     * ⚠️ CONSEQUENCE, AND THE NEW RULE: `[irc]` IS NO LONGER A FAILURE COUNTER.
+     * A non-zero count no longer means trouble, so do not read it as a health
+     * signal. Read the OUTCOME WORD instead:
+     *
+     *   grep 'irc #ebooks joined'      -> connected. One per IRC-enabled boot.
+     *   grep 'irc #ebooks UNAVAILABLE' -> tried and could not.
+     *   grep '\[irc\]' | grep -v '#ebooks' -> the problem lines only.
+     *
+     * The point of one prefix is that "did this run?" and "did it have trouble?"
+     * are answerable with the same handle instead of requiring you to know which
+     * of two prefixes the answer hides behind.
+     */
+    void irc
+      .connect()
+      .then((up) =>
+        console.error(up ? `[irc] #ebooks joined — ${irc.status().detail}` : `[irc] #ebooks UNAVAILABLE — ${irc.status().detail}`),
+      );
   }
 
   const tools = buildTools(config, shellIdentity, { invite, ebook, ...(irc ? { irc } : {}) });
