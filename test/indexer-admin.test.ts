@@ -438,6 +438,50 @@ test('🔴 disabling uses ?forceSave=true, or a BROKEN indexer could never be tu
   assert.match(put.body ?? '', /"enable":false/, 'and it must actually carry the new value');
 });
 
+test('🔴 MUTATION TARGET: disabling a FAILING indexer warns that it mutes the recovery signal', async () => {
+  /**
+   * A recorded decision, not a preference. Escalation
+   * `esc-homelab-stream-cloudflare-check-1337x-indexer-403-for-4-days-replace`
+   * (resolved 2026-08-10) weighed exactly this and chose LEAVE IT ENABLED:
+   * "disabling quietly removes the signal that would tell us if 1337x comes
+   * back… a warning removed because it is currently noise takes the recovery
+   * signal with it."
+   *
+   * Disabling is also precisely how a model would make the warning go away when
+   * asked to "fix the indexers", which is why the tool says this at the moment
+   * it happens rather than leaving it in a runbook.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [backoffRow()] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: HEALTH_1337X }),
+    [`GET ${P}/indexer/6`]: () => ({ status: 200, body: prowlarrIndexer() }),
+    [`PUT ${P}/indexer/6`]: () => ({ status: 202, body: prowlarrIndexer({ enable: false }) }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'disable', id: 6 });
+
+  assert.match(r.content, /is now DISABLED/, 'it still does what was asked');
+  assert.match(r.content, /removes the signal that would tell us if it comes back/);
+  assert.match(r.content, /LEAVE IT ENABLED and report once/);
+  assert.match(r.content, /decision for Jeff/);
+});
+
+test('CONTROL: disabling a HEALTHY indexer gets no such warning', async () => {
+  // The warning is keyed on the indexer actually being in backoff, not on the
+  // verb. A warning that fires on every disable is one nobody reads.
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer({ id: 2, name: 'EZTV' })] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/indexer/2`]: () => ({ status: 200, body: prowlarrIndexer({ id: 2, name: 'EZTV' }) }),
+    [`PUT ${P}/indexer/2`]: () => ({ status: 202, body: prowlarrIndexer({ id: 2, enable: false }) }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'disable', id: 2 });
+
+  assert.match(r.content, /is now DISABLED/);
+  assert.ok(!/removes the signal/.test(r.content));
+});
+
 test('enabling warns that the forced save says nothing about whether it works', async () => {
   const s = stub({
     [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer({ enable: false })] }),

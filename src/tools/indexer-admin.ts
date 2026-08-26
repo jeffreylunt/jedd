@@ -289,6 +289,32 @@ async function runToggle(client: IndexerAdminClient, rawId: unknown, enable: boo
       'nothing was changed. Say that rather than reporting a change.';
 
   const lines = [headline];
+  /**
+   * 🔴 DISABLING A FAILING INDEXER MUTES THE ALARM THAT WOULD SHOW RECOVERY.
+   *
+   * This is a RECORDED DECISION, not a preference. Escalation
+   * `esc-homelab-stream-cloudflare-check-1337x-indexer-403-for-4-days-replace`,
+   * resolved 2026-08-10, weighed exactly this and chose LEAVE IT ENABLED —
+   * verbatim: *"disabling quietly removes the signal that would tell us if 1337x
+   * comes back. That is the alarm-muting failure this whole system keeps
+   * re-learning: a warning removed because it is currently noise takes the
+   * recovery signal with it."* It also recorded that **adding or disabling an
+   * indexer is a coverage decision for Jeff**, not something to do unprompted.
+   *
+   * And disabling is precisely how a model would "make the warning go away" when
+   * asked to fix the indexers. So the tool says this at the moment it happens.
+   */
+  if (!enable && result.value.changed && wasBackedOff(before, id)) {
+    lines.push(
+      '',
+      `⚠️ ${name} was FAILING when you disabled it, and that removes the signal that would tell us ` +
+        "if it comes back. Prowlarr's own backoff already handles the retry, so leaving a broken " +
+        'indexer enabled costs nothing and keeps the recovery visible. The standing decision here ' +
+        '(2026-08-10, after 1337x had been 403 for four days with the others green) was to LEAVE IT ' +
+        'ENABLED and report once. Adding or removing indexer coverage is a decision for Jeff, so if ' +
+        'he did not explicitly ask for this, say what you did and offer to put it back.',
+    );
+  }
   if (enable) {
     /**
      * ⚠️ ENABLING SAYS NOTHING ABOUT WHETHER IT WORKS. The save is forced past
