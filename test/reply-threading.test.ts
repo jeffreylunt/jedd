@@ -209,6 +209,7 @@ function connectorWith(
 ): { connector: BlueBubblesConnector; bodies: Record<string, unknown>[] } {
   const { client, bodies } = capturingClient(onCall);
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client,
     seen: new SeenStore(tempFile()),
     host: '127.0.0.1',
@@ -313,4 +314,63 @@ test('a plain send that fails is still a throw — the fallback did not swallow 
   const { connector } = connectorWith(threading, () => ({ status: 500, data: null }));
   threading.arrived(OWNER, 'G-1');
   await assert.rejects(() => connector.send(OWNER, 'the answer', 'G-1'), /send failed/);
+});
+
+// ── 🔴 the self-address loop, measured live 2026-08-26 ──────────────────────
+
+const SELF = 'jeffreylunt@outlook.com';
+
+function selfPayload(over: Record<string, unknown> = {}) {
+  // The shape BlueBubbles actually delivered. Note `isFromMe: false` — this is
+  // the SECOND copy, the one the account RECEIVED, and it is indistinguishable
+  // from real inbound by every field here.
+  return {
+    type: 'new-message',
+    data: {
+      originalROWID: 2731,
+      guid: 'SELF-1',
+      text: "I'm not replying to my own text.",
+      isFromMe: false,
+      handle: { address: SELF },
+      ...over,
+    },
+  };
+}
+
+test('🔴 a message from OUR OWN identity is skipped — it is an infinite self-reply loop', () => {
+  const v = classifyPayload(selfPayload(), SELF);
+  assert.equal(v.action, 'skip');
+  if (v.action !== 'skip') return;
+  assert.match(v.reason, /SELF-ADDRESSED/);
+});
+
+test('🔴 CONTROL: without the identity, that exact payload is DELIVERED', () => {
+  // The control has to invert, or the test above is only asserting that some
+  // payload gets skipped. This is the live defect: every other guard passes it.
+  const v = classifyPayload(selfPayload());
+  assert.equal(v.action, 'deliver', 'this is precisely the message that looped');
+});
+
+test('the guard is identity, not the isFromMe flag — both copies are stopped', () => {
+  // BlueBubbles delivers the self-sent message twice. The `true` copy was always
+  // caught as an outbound echo; the `false` copy is the one that looped.
+  assert.equal(classifyPayload(selfPayload({ isFromMe: true }), SELF).action, 'skip');
+  assert.equal(classifyPayload(selfPayload({ isFromMe: false }), SELF).action, 'skip');
+});
+
+test('the self guard is case- and formatting-insensitive, like every other handle compare', () => {
+  assert.equal(classifyPayload(selfPayload({ handle: { address: '  JeffreyLunt@Outlook.com ' } }), SELF).action, 'skip');
+});
+
+test('🔴 the self guard is NOT a suffix match — a lookalike address still gets answered', () => {
+  // `normaliseHandle` exists because a suffix compare was a full auth bypass.
+  // Someone who can pick their own handle must not be able to silence Jedd by
+  // ending it in our address.
+  assert.equal(classifyPayload(selfPayload({ handle: { address: `not${SELF}` } }), SELF).action, 'deliver');
+  assert.equal(classifyPayload(selfPayload({ handle: { address: `${SELF}.evil.com` } }), SELF).action, 'deliver');
+});
+
+test('a real person is unaffected by the self guard', () => {
+  const v = classifyPayload(selfPayload({ handle: { address: OWNER } }), SELF);
+  assert.equal(v.action, 'deliver');
 });

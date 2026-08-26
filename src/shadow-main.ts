@@ -80,6 +80,9 @@ async function main(): Promise<void> {
   const receiver = new BlueBubblesReceiver({
     client,
     seen,
+    // From the server, not from config: the loop guard must compare against the
+    // account BlueBubbles is actually signed in as.
+    selfIdentity: info.detectedIMessage,
     host: config.bluebubbles.host,
     port: config.bluebubbles.port,
     path: config.bluebubbles.path,

@@ -9,6 +9,19 @@ import { ReplyThreading } from './threading.js';
 export interface ReceiverOptions {
   client: BlueBubblesClient;
   seen: SeenStore;
+  /**
+   * 🔴 OUR OWN iMESSAGE ADDRESS. REQUIRED, AND NOT OPTIONAL ON PURPOSE.
+   *
+   * A message from this address is an infinite self-reply loop that every other
+   * inbound guard passes — see the SELF-ADDRESSED block in `classifyPayload`.
+   * An optional field would make the loop the thing you get by FORGETTING, and
+   * this codebase's rule is that the dangerous value has to be typed out.
+   *
+   * It comes from `assertIdentity()` (`detected_imessage`, read off the server
+   * at boot), never from a constant: the point is to compare against the account
+   * the bridge is actually signed in as.
+   */
+  selfIdentity: string;
   host: string;
   /** 0 asks the OS for an ephemeral port; `start()` returns the real one. */
   port: number;
@@ -118,7 +131,7 @@ export class BlueBubblesReceiver {
    * quiet period of our own sends does not leave it stale.
    */
   private async ingest(payload: unknown, source: 'live' | 'replay', handler?: Handler): Promise<void> {
-    const verdict = classifyPayload(payload);
+    const verdict = classifyPayload(payload, this.opts.selfIdentity);
 
     // The watermark tracks what we have SEEN, not what we delivered — an
     // outbound echo or a tapback still means that rowid is accounted for.

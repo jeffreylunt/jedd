@@ -1152,6 +1152,7 @@ test('🔴 a message arriving over the real webhook marks read, types, and stops
 
   const seen = { firstSight: () => true, advanceWatermark: () => {}, watermark: () => 5 };
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client: { newestRowid: async () => 5 } as unknown as BlueBubblesClient,
     seen: seen as unknown as ConstructorParameters<typeof BlueBubblesReceiver>[0]['seen'],
     host: '127.0.0.1',

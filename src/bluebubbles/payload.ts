@@ -1,4 +1,5 @@
 import type { IncomingMessage } from '../connector.js';
+import { normaliseHandle } from '../permissions.js';
 
 /**
  * Classify one BlueBubbles webhook payload. PURE — no I/O, no state.
@@ -57,7 +58,34 @@ function dedupKeyFor(rowid: number | null, guid: string | null): string | null {
   return null;
 }
 
-export function classifyPayload(raw: unknown): InboundVerdict {
+/**
+ * 🔴 A MESSAGE FROM OUR OWN ADDRESS IS AN INFINITE SELF-REPLY LOOP.
+ *
+ * MEASURED 2026-08-26, twice, on the live server. A message sent to Jedd's own
+ * iMessage address comes back through this webhook **twice**: once with
+ * `isFromMe: true` — skipped correctly below as an outbound echo — and once with
+ * `isFromMe: false`, because the same account also RECEIVED it.
+ *
+ * That second copy is not malformed. It is not a tapback. It has a real handle,
+ * real text, an explicit `isFromMe: false` and its own `originalROWID`, so the
+ * dedup key does not collide either. **Every other guard in this file passes it,
+ * correctly**, because by every field BlueBubbles reports it IS a genuine
+ * inbound message. Jedd answers it, the answer echoes back the same way, and
+ * nothing terminates the cycle — `main.ts` sends `replyText` unconditionally and
+ * a one-character reply is not an empty one. It ran at one exchange every ~10
+ * seconds until the process was stopped.
+ *
+ * ⚠️ THE POINT IS THAT `isFromMe` CANNOT EXPRESS THIS. It is a per-message flag
+ * and the loop is created by an IDENTITY equality. So this is the only guard
+ * here that needs to know who we are — and we already do: `assertIdentity()`
+ * reads `detected_imessage` at boot and refuses to start on a mismatch. The
+ * value is passed in rather than read from config so that the thing being
+ * compared against is the SERVER'S account, not a hopeful constant.
+ *
+ * Comparison goes through `normaliseHandle`, the same hardened comparator the
+ * permission gate uses — deliberately not a suffix match.
+ */
+export function classifyPayload(raw: unknown, selfIdentity?: string): InboundVerdict {
   const top = asRecord(raw);
   const data = asRecord(top?.['data']) ?? {};
 
@@ -120,6 +148,20 @@ export function classifyPayload(raw: unknown): InboundVerdict {
    */
   if (data['associatedMessageType'] != null) {
     return skip(`tapback/reaction (associatedMessageType=${String(data['associatedMessageType'])})`);
+  }
+
+  /**
+   * 🔴 Checked BEFORE the empty-text and handle checks are of any consequence,
+   * and placed with the other echo guards: this is the same class of failure as
+   * `isFromMe`, just the half that a flag cannot see.
+   */
+  const self = normaliseHandle(selfIdentity ?? '');
+  if (self && normaliseHandle(senderHandle) === self) {
+    return skip(
+      `SELF-ADDRESSED — this arrived from our own iMessage identity (${selfIdentity}). ` +
+        'BlueBubbles delivers a self-sent message a second time with isFromMe:false; answering it ' +
+        'is an infinite self-reply loop.',
+    );
   }
 
   if (!text.trim()) return skip('no text');

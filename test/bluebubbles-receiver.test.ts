@@ -54,6 +54,7 @@ async function withReceiver(
 ) {
   const got: IncomingMessage[] = [];
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client: opts.client ?? stubClient(),
     seen: opts.seen ?? new SeenStore(tempFile()),
     host: '127.0.0.1',
@@ -87,6 +88,7 @@ test('🔴 the 200 is returned BEFORE the handler runs, not after', async () => 
   let release!: () => void;
   const blocked = new Promise<void>((r) => (release = r));
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client: stubClient(),
     seen: new SeenStore(tempFile()),
     host: '127.0.0.1',
@@ -110,6 +112,7 @@ test('🔴 the 200 is returned BEFORE the handler runs, not after', async () => 
 
 test('a handler that throws does not break the listener or the response', async () => {
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client: stubClient(),
     seen: new SeenStore(tempFile()),
     host: '127.0.0.1',
@@ -250,6 +253,7 @@ test('🔴 a saturated replay is reported, not swallowed', async () => {
 
 test('🔴 ShadowConnector cannot send, and holds nothing that could', async () => {
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client: stubClient(),
     seen: new SeenStore(tempFile()),
     host: '127.0.0.1',
@@ -275,6 +279,7 @@ test('the real connector does send, so the shadow refusal is a real difference',
     return { ok: true, status: 200, json: async () => ({ data: { guid: 'g' } }) } as Response;
   });
   const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
     client,
     seen: new SeenStore(tempFile()),
     host: '127.0.0.1',
