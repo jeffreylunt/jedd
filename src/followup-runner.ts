@@ -53,6 +53,14 @@ export const EBOOK_RECHECK_MS = 10 * 60 * 1000;
  * retries a few times before it gives up — and when it gives up it SAYS so.
  */
 export const VERIFY_RETRY_MS = 5 * 60 * 1000;
+/**
+ * How long after the first clean look to take one more.
+ *
+ * ~45 minutes after the send in total. Amazon's observed notices arrive within
+ * minutes, but "observed" is a handful of samples and says nothing about the
+ * tail — and the cost of being wrong is the silence this feature exists to end.
+ */
+export const LATE_RECHECK_MS = 33 * 60 * 1000;
 
 export interface FollowupDeps {
   config: Config;
@@ -610,19 +618,30 @@ async function runKindleVerify(
   }
 
   /**
-   * The send already promised *"I will come back if Amazon refuses it"*. A
-   * deployment with no mailbox reader cannot keep that promise, so it says so
-   * rather than resolving quietly and leaving the promise standing.
+   * 🔴 A MISSING READER DEFERS; IT DOES NOT DISCARD THE CHECK.
+   *
+   * `src/index.ts` builds a FollowupStore over the SAME log file as the daemon
+   * and ticks it WITHOUT a mailbox reader. Resolving here meant a chat session
+   * could permanently destroy a check the daemon had scheduled — and the daemon
+   * would never look again, because the record was closed. Deferring leaves it
+   * for whichever runner does have a reader.
+   *
+   * And when it really does run out: the OWNER hears about it, not the
+   * requester. A deployment with no IMAP credentials is an operator problem, and
+   * telling a guest about it every single time a book goes out is guaranteed
+   * noise they cannot act on.
    */
   if (!deps.mailbox) {
-    const detail = 'this deployment cannot read the mailbox Amazon replies to';
-    const sent = await speak(
-      `${why}\n\nI said I would check whether Amazon refused "${subject.title}", and I cannot — ` +
-        `${detail}. So I do not know either way. If it has not appeared, the usual cause is that ` +
-        'my sending address is not on your Amazon approved-senders list.',
-    );
-    store.resolve(followup.id, 'abandoned', detail, now);
-    return { id: followup.id, action: sent ? 'abandoned' : 'not-delivered', sent, detail };
+    return asBlind(await deferOrGiveUp(
+      followup,
+      store,
+      now,
+      'no mailbox reader on this runner',
+      () => alertOwner(deps, followup.senderHandle, subject.title, subject.sentAt,
+        'This runner cannot read the mailbox Amazon replies to (no IMAP credentials), so refusals ' +
+        'are going undetected.'),
+      VERIFY_RETRY_MS,
+    ));
   }
 
   const result = await verifyKindleDelivery(
@@ -631,12 +650,39 @@ async function runKindleVerify(
     now,
   );
 
-  if (result.state === 'failed') {
-    const sent = await speak(
-      `${why}\n\n🔴 It did NOT go through. ${result.detail}\n` +
-        `Nothing arrived on your Kindle, and it will not arrive on its own.`,
-    );
-    store.resolve(followup.id, 'done', `refused: ${result.code} — ${result.reason}`, now);
+  if (result.state === 'failed' || result.state === 'failed-unattributed') {
+    /**
+     * 🔴 THE TELLING IS RETRIED, NOT ABANDONED, IF IT FAILS.
+     *
+     * `speak` was awaited outside a catch: a connector hiccup threw, the outer
+     * handler resolved the record `abandoned`, and the one message this whole
+     * feature exists to deliver was lost with no retry. The blind branch already
+     * guarded its send for exactly this reason; the branch carrying the actual
+     * bad news did not.
+     */
+    const text =
+      result.state === 'failed'
+        ? `${why}\n\n🔴 It did NOT go through. ${result.detail}\n` +
+          'Nothing arrived on your Kindle, and it will not arrive on its own.'
+        : `${why}\n\n⚠️ ${result.detail}\n` +
+          `Have a look for "${subject.title}" on your Kindle — if it is not there, that refusal was ` +
+          'probably yours.';
+    let sent = false;
+    try {
+      sent = await speak(text);
+    } catch (e) {
+      return await deferOrGiveUp(
+        followup,
+        store,
+        now,
+        `could not tell them about the refusal: ${(e as Error).message}`,
+        async () =>
+          alertOwner(deps, followup.senderHandle, subject.title, subject.sentAt,
+            `Amazon refused it (${result.code}) and I could not deliver that message to them.`),
+        VERIFY_RETRY_MS,
+      );
+    }
+    store.resolve(followup.id, 'done', `refused: ${result.code} — ${result.reason} (${result.state})`, now);
     return {
       id: followup.id,
       action: sent ? 'refusal-reported' : 'not-delivered',
@@ -646,28 +692,71 @@ async function runKindleVerify(
   }
 
   if (result.state === 'no-failure-seen') {
+    /**
+     * 🔴 ONE CONFIRMING LOOK BEFORE CLOSING.
+     *
+     * The 12-minute delay comes from the notices already in the mailbox — a
+     * handful of samples of Amazon's latency, with nothing said about the tail.
+     * A refusal that lands at minute 20 against a single check at minute 12
+     * restores exactly the silence this feature exists to end. The second look
+     * costs one mailbox session and closes that gap; it is bounded at one,
+     * because a checker that never stops looking never reports either.
+     */
+    if (followup.attempts === 0 && store.defer(followup.id, new Date(now.getTime() + LATE_RECHECK_MS), 'nothing yet; one more look', now)) {
+      return { id: followup.id, action: 'deferred', sent: false, detail: 'no refusal yet; looking once more' };
+    }
     store.resolve(followup.id, 'done', `no refusal found: ${result.detail}`, now);
     return { id: followup.id, action: 'no-failure-seen', sent: false, detail: result.detail };
   }
 
   // ── blind: defer, and when the deferrals run out tell the OWNER ────────────
-  const deferred = store.defer(followup.id, new Date(now.getTime() + VERIFY_RETRY_MS), result.detail, now);
-  if (deferred) {
-    return { id: followup.id, action: 'deferred', sent: false, detail: result.detail };
-  }
-  store.resolve(followup.id, 'abandoned', `blind: ${result.detail}`, now);
-  let sent = false;
+  return asBlind(
+    await deferOrGiveUp(
+      followup,
+      store,
+      now,
+      result.detail,
+      () => alertOwner(deps, followup.senderHandle, subject.title, subject.sentAt, result.detail),
+      VERIFY_RETRY_MS,
+    ),
+  );
+}
+
+/**
+ * Label a give-up on this path `blind` rather than the generic `abandoned`.
+ *
+ * The action string is what lands in the operator's follow-up log line. "This
+ * check stopped because it could not SEE" and "this check stopped" are different
+ * facts, and only the first one names something that needs fixing.
+ */
+function asBlind(outcome: FollowupOutcome): FollowupOutcome {
+  if (outcome.action === 'deferred') return outcome;
+  return { ...outcome, action: 'blind' };
+}
+
+/**
+ * Tell the owner that the delivery check itself is in trouble.
+ *
+ * Never throws: the record's outcome is already written, and a failed alert must
+ * not turn into an exception that resolves the follow-up as "threw".
+ */
+async function alertOwner(
+  deps: FollowupDeps,
+  requester: string,
+  title: string,
+  sentAt: string,
+  detail: string,
+): Promise<boolean> {
   try {
     await deps.send(
       deps.config.ownerHandle,
-      `Heads up: my Kindle delivery check is BLIND and I have stopped retrying it for ` +
-        `"${subject.title}" (sent ${subject.sentAt}).\n${result.detail}\n` +
-        'Nobody has been told anything wrong — the requester was told it was sent, which is true. ' +
-        'But refusals are going undetected until this is fixed.',
+      `Heads up: my Kindle delivery check is BLIND and has stopped retrying for "${title}" ` +
+        `(sent ${sentAt}, for ` +
+        `${requester}).\n${detail}\nNobody has been told anything wrong — the requester was told it ` +
+        'was sent, which is true. But refusals are going undetected until this is fixed.',
     );
-    sent = true;
+    return true;
   } catch {
-    /* the outcome is recorded either way; a failed alert must not throw here */
+    return false;
   }
-  return { id: followup.id, action: 'blind', sent, detail: result.detail };
 }

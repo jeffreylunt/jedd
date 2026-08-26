@@ -65,7 +65,7 @@ console.log(
 // for a refusal that is sitting right there. The four are named explicitly
 // rather than counted, because "four folders" is satisfied by the wrong four.
 console.log('── FOLDER COVERAGE (live IMAP) ──────────────────────────────────');
-const probe = await read(CONTROL_BOUNCE.since, CONTROL_BOUNCE.until);
+const probe = await read([{ since: CONTROL_BOUNCE.since, until: CONTROL_BOUNCE.until }]);
 let foldersOk = false;
 if (!probe.ok) {
   console.log(`  🔴 could not read the mailbox: ${probe.reason}`);
@@ -138,7 +138,9 @@ const result = await verifyKindleDelivery(
   until,
 );
 console.log(`  state = ${result.state}`);
-if (result.state === 'failed') console.log(`  code  = ${result.code} — ${result.reason}`);
+if (result.state === 'failed' || result.state === 'failed-unattributed') {
+  console.log(`  code  = ${result.code} — ${result.reason}`);
+}
 console.log(`  ${result.detail}`);
 if (result.state === 'no-failure-seen') {
   console.log(

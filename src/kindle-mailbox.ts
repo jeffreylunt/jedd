@@ -24,10 +24,31 @@ import type { Config } from './config.js';
  * prevent. `unavailable` is a separate state and the caller cannot ignore it.
  */
 
+/** One question: what arrived between these two instants. */
+export interface MailboxWindow {
+  since: Date;
+  until?: Date;
+}
+
 export type MailboxRead =
   | {
       ok: true;
-      emails: BounceEmail[];
+      /**
+       * One entry per requested window, in the order they were asked for.
+       *
+       * 🔴 ONE CONNECTION ANSWERS ALL OF THEM, AND THAT IS LOAD-BEARING.
+       *
+       * Every verification asks three questions — two controls and the real one.
+       * Three separate logins meant Gmail's connection and login limits could
+       * refuse the third, which reads as `blind`, which schedules a retry, which
+       * opens three more. **A rate limit and the reaction to it formed a loop.**
+       *
+       * It also makes the controls honest in a way separate reads could not: all
+       * three questions are answered from the SAME folder set on the SAME
+       * session, so a control cannot pass against a sweep the real question
+       * never got.
+       */
+      windows: BounceEmail[][];
       /** Folders actually opened and searched. */
       folders: string[];
       /**
@@ -48,12 +69,12 @@ export type MailboxRead =
   | { ok: false; reason: string };
 
 /**
- * Read Amazon's Kindle notices received in `[since, until]`.
+ * Answer several window questions from one mailbox session.
  *
  * Injectable so the verifier can be driven from fixtures, from a deliberately
  * broken reader, and from the real IMAP server without changing a line.
  */
-export type MailboxReader = (since: Date, until?: Date) => Promise<MailboxRead>;
+export type MailboxReader = (windows: MailboxWindow[]) => Promise<MailboxRead>;
 
 /** Only Amazon's notification address is ever fetched. Nothing else is read. */
 export const AMAZON_NOTIFY = 'do-not-reply@amazon.com';
@@ -105,7 +126,8 @@ export function imapSettingsFrom(config: Config): ImapSettings | { missing: stri
  * the blindness path.
  */
 export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): MailboxReader {
-  return async (since, until) => {
+  return async (windows) => {
+    if (windows.length === 0) return { ok: false, reason: 'no window was asked about' };
     const { ImapFlow } = await import('imapflow');
     const client = new ImapFlow({
       host: settings.host,
@@ -119,17 +141,44 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
       socketTimeout: timeoutMs,
     });
 
-    const emails: BounceEmail[] = [];
+    /**
+     * 🔴 WITHOUT THIS LISTENER A DROPPED TLS SESSION KILLS THE WHOLE PROCESS.
+     *
+     * Once imapflow has connected it reports later socket errors by EMITTING
+     * `error` (`imap-flow.js` `emitError`), and Node throws on an unhandled
+     * `error` event — from inside a socket handler, where the `try/catch` around
+     * the awaits below cannot see it. jedd has no `uncaughtException` handler, so
+     * a mid-fetch disconnect would take the daemon down. The `try/catch` still
+     * handles the rejected await; this listener only has to EXIST.
+     */
+    client.on('error', () => {});
+
+    const collected: BounceEmail[] = [];
     const folders: string[] = [];
     const skipped: string[] = [];
+    let connected = false;
     try {
       await withTimeout(client.connect(), timeoutMs, 'IMAP connect');
-      const boxes = await client.list();
-      const paths = ['INBOX'];
-      for (const box of boxes) {
-        const use = (box as { specialUse?: string }).specialUse;
-        if (use && (WANTED_SPECIAL_USE as readonly string[]).includes(use)) paths.push(box.path);
-      }
+      connected = true;
+      const boxes = await withTimeout(client.list(), timeoutMs, 'IMAP LIST');
+
+      /**
+       * 🔴 A FLAG THAT NEVER TURNED UP IS RECORDED AS UNSEARCHED.
+       *
+       * The first version only recorded folders whose LOCK threw. A folder the
+       * server never advertised was recorded nowhere at all — so a session where
+       * SPECIAL-USE was missing or matched by locale-dependent name silently
+       * narrowed the sweep to INBOX, returned `ok`, and the controls could not
+       * catch it: the pinned control notice lives in All Mail, so it passes on a
+       * narrow sweep, and a real refusal sitting in SPAM comes back clean.
+       *
+       * That is the same defect the header of this file is about — a read that
+       * did not happen looking like a mailbox with nothing in it — one branch
+       * along from where it was already fixed.
+       */
+      const plan = planFolders(boxes as { path: string; specialUse?: string }[]);
+      const paths = plan.paths;
+      skipped.push(...plan.unadvertised);
 
       /**
        * 🔴 IMAP `SINCE` HAS DAY GRANULARITY, SO IT IS WIDENED BY A DAY AND THE
@@ -140,12 +189,16 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
        * the shape of the himalaya `after <D>` defect. Over-fetch, then filter
        * precisely on the timestamp we actually have.
        */
-      const searchSince = new Date(since.getTime() - 24 * 60 * 60 * 1000);
+      const earliest = windows.reduce((a, w) => Math.min(a, w.since.getTime()), Infinity);
+      const searchSince = new Date(earliest - 24 * 60 * 60 * 1000);
 
       for (const path of paths) {
         let lock;
         try {
-          lock = await client.getMailboxLock(path);
+          // 🔴 EXAMINE, not SELECT. This reads someone's mailbox and must not be
+          // able to change it — by construction, not by trusting that the
+          // library happens to use BODY.PEEK.
+          lock = await withTimeout(client.getMailboxLock(path, { readOnly: true }), timeoutMs, `open ${path}`);
         } catch (e) {
           // Recorded, never swallowed — see `skipped` on MailboxRead.
           skipped.push(`${path} (${(e as Error).message ?? 'could not open'})`);
@@ -155,15 +208,24 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
           folders.push(path);
           for await (const msg of client.fetch(
             { from: AMAZON_NOTIFY, since: searchSince },
-            { envelope: true, source: true },
+            /**
+             * 🔴 `internalDate` IS THE SERVER'S ARRIVAL STAMP; `envelope.date` IS
+             * WHATEVER THE SENDER WROTE.
+             *
+             * Using the sender's header meant Amazon's clock running seconds
+             * ahead of ours pushed a real refusal past the upper bound and it
+             * came back clean — and a notice with NO parsable Date became epoch,
+             * failed the lower bound, and vanished with no trace anywhere. Both
+             * are a real bounce dropped for a timekeeping reason.
+             */
+            { envelope: true, internalDate: true, source: true },
           )) {
-            const receivedAt = (msg.envelope?.date ?? new Date(0)).toISOString();
-            emails.push({
-              from: addressOf(msg.envelope?.from) || AMAZON_NOTIFY,
-              subject: msg.envelope?.subject ?? '',
-              body: extractText(msg.source ? msg.source.toString('binary') : ''),
-              receivedAt,
-            });
+            const converted = toBounceEmail(msg);
+            if ('unplaceable' in converted) {
+              skipped.push(`a message in ${path} with no usable timestamp`);
+              continue;
+            }
+            collected.push(converted);
           }
         } finally {
           lock.release();
@@ -172,26 +234,120 @@ export function imapMailboxReader(settings: ImapSettings, timeoutMs = 45_000): M
     } catch (e) {
       return { ok: false, reason: `${(e as Error).message ?? String(e)}`.slice(0, 200) };
     } finally {
+      /**
+       * `logout()` is a protocol round trip and needs a live connection; on the
+       * timeout path there is none, and awaiting it leaked the socket. `close()`
+       * is the synchronous teardown that always applies.
+       */
       try {
-        await client.logout();
+        if (connected) await withTimeout(client.logout(), 5_000, 'IMAP logout');
+        else client.close();
       } catch {
-        /* the read already happened; a failed logout must not void it */
+        try {
+          client.close();
+        } catch {
+          /* the read already happened; a failed teardown must not void it */
+        }
       }
     }
 
     if (folders.length === 0) {
       return { ok: false, reason: 'no mail folders could be opened, so nothing was searched' };
     }
-    const upper = until?.getTime() ?? Number.POSITIVE_INFINITY;
     return {
       ok: true,
       folders,
       skipped,
-      emails: emails.filter((e) => {
-        const at = Date.parse(e.receivedAt);
-        return Number.isFinite(at) && at >= since.getTime() && at <= upper;
+      windows: windows.map((w) => {
+        const upper = w.until?.getTime() ?? Number.POSITIVE_INFINITY;
+        return collected.filter((e) => {
+          const at = Date.parse(e.receivedAt);
+          return Number.isFinite(at) && at >= w.since.getTime() && at <= upper;
+        });
       }),
     };
+  };
+}
+
+/**
+ * Which folders to search, and which wanted ones are NOT going to be searched.
+ *
+ * 🔴 SPLIT OUT SO IT CAN BE TESTED WITHOUT A SERVER, because the defect it
+ * guards is invisible from the outside: a session where SPECIAL-USE is missing
+ * (or matched by locale-dependent NAME, which is imapflow's fallback) narrows
+ * the sweep to INBOX, returns `ok`, and the controls cannot catch it — the pinned
+ * control notice lives in All Mail, so it passes on a narrow sweep, and a real
+ * refusal sitting in SPAM comes back clean.
+ */
+export function planFolders(
+  boxes: { path: string; specialUse?: string }[],
+): { paths: string[]; unadvertised: string[] } {
+  const paths = ['INBOX'];
+  const found = new Set<string>();
+  for (const box of boxes) {
+    const use = box.specialUse;
+    if (use && (WANTED_SPECIAL_USE as readonly string[]).includes(use)) {
+      paths.push(box.path);
+      found.add(use);
+    }
+  }
+  return {
+    paths,
+    unadvertised: WANTED_SPECIAL_USE.filter((u) => !found.has(u)).map(
+      (u) => `${u} (not advertised by the server)`,
+    ),
+  };
+}
+
+/**
+ * When the server says the message ARRIVED — not when its sender says it was written.
+ *
+ * 🔴 `envelope.date` IS THE SENDER'S HEADER AND USING IT LOSES REAL BOUNCES.
+ * Amazon's clock running seconds ahead of ours pushed a refusal past the upper
+ * bound and it came back clean; a notice with no parsable Date became epoch,
+ * failed the lower bound, and vanished with no trace anywhere. `NaN` here means
+ * "cannot be placed in time", and the caller records it as unsearched rather
+ * than dropping it.
+ */
+export function arrivalTime(msg: {
+  /** imapflow types this as `string | Date`, and both really occur. */
+  internalDate?: string | Date;
+  envelope?: { date?: string | Date };
+}): number {
+  for (const stamp of [msg.internalDate, msg.envelope?.date]) {
+    if (stamp instanceof Date) {
+      const at = stamp.getTime();
+      if (Number.isFinite(at)) return at;
+    } else if (typeof stamp === 'string') {
+      const at = Date.parse(stamp);
+      if (Number.isFinite(at)) return at;
+    }
+  }
+  return Number.NaN;
+}
+
+/**
+ * Turn one fetched message into something the classifier can read — or say it
+ * cannot be placed in time.
+ *
+ * 🔴 `unplaceable` IS NOT "NOT THERE". A message we cannot timestamp used to
+ * become epoch, fail the lower bound, and disappear with no trace in `skipped`
+ * or anywhere else: a real bounce lost for a timekeeping reason, reported as a
+ * clean mailbox. Split out from the fetch loop so it can be tested — the loop
+ * itself needs a server.
+ */
+export function toBounceEmail(msg: {
+  internalDate?: string | Date;
+  envelope?: { date?: string | Date; subject?: string; from?: unknown };
+  source?: Buffer;
+}): BounceEmail | { unplaceable: true } {
+  const at = arrivalTime(msg);
+  if (!Number.isFinite(at)) return { unplaceable: true };
+  return {
+    from: addressOf(msg.envelope?.from) || AMAZON_NOTIFY,
+    subject: msg.envelope?.subject ?? '',
+    body: extractText(msg.source ? msg.source.toString('binary') : ''),
+    receivedAt: new Date(at).toISOString(),
   };
 }
 
@@ -234,7 +390,17 @@ export function extractText(raw: string): string {
   if (!raw) return '';
   const parts = splitParts(raw);
   const plain = parts.find((p) => /text\/plain/i.test(p.headers));
-  const chosen = plain ?? parts.find((p) => /text\/html/i.test(p.headers)) ?? parts[0];
+  /**
+   * ⚠️ NOT `parts[0]` — for any multipart message that is the PREAMBLE ("This is
+   * a multipart message in MIME format."), which is the one part guaranteed to
+   * contain nothing. Fall back to the last part carrying a content type at all,
+   * then to the raw source.
+   */
+  const chosen =
+    plain ??
+    parts.find((p) => /text\/html/i.test(p.headers)) ??
+    [...parts].reverse().find((p) => /content-type:/i.test(p.headers)) ??
+    parts[parts.length - 1];
   if (!chosen) return raw;
   let text = decodeBody(chosen.headers, chosen.body);
   if (!plain) text = text.replace(/<[^>]+>/g, ' ');
@@ -251,7 +417,11 @@ function splitParts(raw: string): MimePart[] {
   if (headerEnd < 0) return [{ headers: '', body: raw }];
   const headers = raw.slice(0, headerEnd);
   const body = raw.slice(headerEnd).replace(/^\r?\n\r?\n/, '');
-  const boundary = /boundary="?([^";\r\n]+)"?/i.exec(unfold(headers))?.[1];
+  // Anchored on whitespace as well as `;` — `unfold()` joins folded headers with
+  // a space, so `[^";\r\n]+` would swallow the NEXT parameter into the boundary
+  // and then split on nothing, returning the whole undecoded body.
+  const m = /boundary=(?:"([^"]+)"|([^\s";]+))/i.exec(unfold(headers));
+  const boundary = m?.[1] ?? m?.[2];
   if (!boundary) return [{ headers, body }];
 
   const out: MimePart[] = [];
@@ -285,7 +455,11 @@ function decodeBody(headers: string, body: string): string {
 }
 
 function decodeQuotedPrintable(input: string): string {
-  const joined = input.replace(/=\r?\n/g, '');
+  // 🔴 `=\r\n` is not the only soft break. RFC 2045 explicitly permits transport
+  // padding — `=  \r\n` — and a relay that adds a space defeats a bare `=\r?\n`,
+  // leaving `E014 = \n- Unapproved` and degrading the code to UNKNOWN. That is
+  // the exact defect this decoder exists to prevent, one space to the left.
+  const joined = input.replace(/=[ \t]*\r?\n/g, '');
   const bytes: number[] = [];
   for (let i = 0; i < joined.length; i += 1) {
     const ch = joined[i]!;

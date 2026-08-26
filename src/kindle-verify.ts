@@ -1,4 +1,4 @@
-import { findDeliveryFailure, type KindleDeliveryVerdict } from './kindle-delivery.js';
+import { findDeliveryFailure, type BounceEmail, type KindleDeliveryVerdict } from './kindle-delivery.js';
 import type { MailboxReader } from './kindle-mailbox.js';
 
 /**
@@ -40,8 +40,15 @@ import type { MailboxReader } from './kindle-mailbox.js';
  */
 
 export type VerificationResult =
-  /** Amazon refused it, and said why. */
+  /** Amazon refused THIS send, and said why. */
   | { state: 'failed'; code: string; reason: string; detail: string; folders: string[] }
+  /**
+   * A refusal is present in the window and cannot be tied to this send — several
+   * were refused and none names this file. **Something failed; possibly not
+   * this.** Kept apart from `failed` because telling someone their book was
+   * thrown away when it was someone else's is its own harm.
+   */
+  | { state: 'failed-unattributed'; code: string; reason: string; detail: string; folders: string[] }
   /**
    * The controls passed and no refusal was found for this send. **NOT delivery.**
    */
@@ -95,43 +102,6 @@ export interface ControlReport {
   quiet: { passed: boolean; got: string };
 }
 
-/** Run both controls. Exported so the live harness can report them on their own. */
-export async function runControls(read: MailboxReader): Promise<ControlReport> {
-  const a = await read(CONTROL_BOUNCE.since, CONTROL_BOUNCE.until);
-  const bounceVerdict: KindleDeliveryVerdict | { state: 'unreadable'; detail: string } = a.ok
-    ? findDeliveryFailure(a.emails, CONTROL_BOUNCE.since)
-    : { state: 'unreadable', detail: a.reason };
-  const bouncePassed =
-    bounceVerdict.state === 'failed' && bounceVerdict.code === CONTROL_BOUNCE.expectCode;
-
-  const b = await read(CONTROL_QUIET.since, CONTROL_QUIET.until);
-  const quietVerdict: KindleDeliveryVerdict | { state: 'unreadable'; detail: string } = b.ok
-    ? findDeliveryFailure(b.emails, CONTROL_QUIET.since)
-    : { state: 'unreadable', detail: b.reason };
-  const quietPassed = quietVerdict.state === 'no-failure-seen';
-
-  return {
-    bounce: {
-      passed: bouncePassed,
-      got:
-        bounceVerdict.state === 'failed'
-          ? `failed/${bounceVerdict.code}`
-          : bounceVerdict.state === 'unreadable'
-            ? `unreadable: ${bounceVerdict.detail}`
-            : bounceVerdict.state,
-    },
-    quiet: {
-      passed: quietPassed,
-      got:
-        quietVerdict.state === 'failed'
-          ? `failed/${quietVerdict.code}`
-          : quietVerdict.state === 'unreadable'
-            ? `unreadable: ${quietVerdict.detail}`
-            : quietVerdict.state,
-    },
-  };
-}
-
 export interface VerifyInput {
   /** When the SMTP hand-off happened. Nothing before this can be about it. */
   sentAt: Date;
@@ -140,74 +110,154 @@ export interface VerifyInput {
 }
 
 /**
+ * 🔴 HOW WIDE THE QUESTION IS ALLOWED TO GET.
+ *
+ * The upper bound is `min(now, sentAt + this)`, not `now`. A runner that was
+ * down for three hours would otherwise ask "has ANYTHING been refused since
+ * 21:44" — and the harness proved what that does: run unbounded against the
+ * Mistborn sends it reported `failed / E009` from a bounce twenty hours later
+ * belonging to somebody else's probe. **An unbounded window turns "did THIS send
+ * fail" into "has anything failed since", and the second question eventually
+ * always answers yes.**
+ */
+export const VERIFY_WINDOW_MS = 60 * 60 * 1000;
+
+function describeVerdict(v: KindleDeliveryVerdict | { state: 'unreadable'; detail: string }): string {
+  if (v.state === 'failed') return `failed/${v.code}`;
+  if (v.state === 'unreadable') return `unreadable: ${v.detail}`;
+  return v.state;
+}
+
+/**
  * Ask whether Amazon refused a specific send — and refuse to answer unless the
  * controls just demonstrated the question is answerable.
+ *
+ * 🔴 ALL THREE QUESTIONS GO DOWN ONE MAILBOX SESSION. Not an optimisation: it
+ * means a control cannot pass against a folder sweep the real question never
+ * got, and it removes the loop where hitting Gmail's login limit produced
+ * `blind`, which scheduled a retry, which opened three more connections.
  */
 export async function verifyKindleDelivery(
   read: MailboxReader,
   input: VerifyInput,
   now: Date = new Date(),
 ): Promise<VerificationResult> {
-  const controls = await runControls(read);
-  if (!controls.bounce.passed || !controls.quiet.passed) {
-    return {
-      state: 'blind',
-      detail: describeBlindness(controls),
-    };
-  }
+  const until = new Date(Math.min(now.getTime(), input.sentAt.getTime() + VERIFY_WINDOW_MS));
+  const got = await read([
+    { since: CONTROL_BOUNCE.since, until: CONTROL_BOUNCE.until },
+    { since: CONTROL_QUIET.since, until: CONTROL_QUIET.until },
+    { since: input.sentAt, until },
+  ]);
 
-  const read2 = await read(input.sentAt, now);
-  if (!read2.ok) {
+  if (!got.ok) {
     return {
       state: 'blind',
       detail:
-        `The controls passed but the read for this send failed: ${read2.reason}. No verdict — ` +
-        'a mailbox that could not be searched is not a mailbox with no bounces in it.',
+        `No verdict: the mailbox could not be read, so nothing was searched and the controls could ` +
+        `not run (${got.reason}). This is a connectivity or credentials problem, NOT a report that ` +
+        'the mailbox is clean.',
     };
+  }
+
+  const [bounceWindow, quietWindow, sendWindow] = got.windows as [
+    BounceEmail[],
+    BounceEmail[],
+    BounceEmail[],
+  ];
+  const bounceVerdict = findDeliveryFailure(bounceWindow, CONTROL_BOUNCE.since);
+  const quietVerdict = findDeliveryFailure(quietWindow, CONTROL_QUIET.since);
+  const controls: ControlReport = {
+    bounce: {
+      passed: bounceVerdict.state === 'failed' && bounceVerdict.code === CONTROL_BOUNCE.expectCode,
+      got: describeVerdict(bounceVerdict),
+    },
+    quiet: { passed: quietVerdict.state === 'no-failure-seen', got: describeVerdict(quietVerdict) },
+  };
+  if (!controls.bounce.passed || !controls.quiet.passed) {
+    return { state: 'blind', detail: describeBlindness(controls) };
   }
 
   /**
-   * 🔴 A FOLDER THAT COULD NOT BE OPENED IS NOT A FOLDER WITH NO BOUNCES IN IT.
+   * 🔴 A FOLDER THAT COULD NOT BE SEARCHED IS NOT A FOLDER WITH NO BOUNCES IN IT.
    *
    * Amazon's notices land in Spam, and Gmail's All Mail excludes Spam and Trash
-   * — so a Spam folder that failed to open turns a real refusal into a clean
-   * result, in the one direction that matters. Partial coverage is blindness,
-   * not a smaller answer.
+   * — so an unsearched Spam folder turns a real refusal into a clean result, in
+   * the one direction that matters. Partial coverage is blindness, not a smaller
+   * answer.
+   *
+   * Checked AFTER the controls so the message names the more specific fault when
+   * both are wrong.
    */
-  if (read2.skipped.length > 0) {
+  if (got.skipped.length > 0) {
     return {
       state: 'blind',
       detail:
-        `The controls passed but ${read2.skipped.length} folder(s) could not be searched ` +
-        `(${read2.skipped.join('; ')}). No verdict — Amazon's notices land in Spam, and Gmail's ` +
+        `The controls passed but ${got.skipped.length} folder(s)/message(s) could not be searched ` +
+        `(${got.skipped.join('; ')}). No verdict — Amazon's notices land in Spam, and Gmail's ` +
         'All Mail excludes Spam and Trash, so an unsearched folder can hide the whole answer.',
     };
   }
 
-  const verdict = findDeliveryFailure(read2.emails, input.sentAt, input.filename);
+  const verdict = findDeliveryFailure(sendWindow, input.sentAt, input.filename);
   if (verdict.state === 'failed') {
-    return { ...verdict, folders: read2.folders };
+    /**
+     * Several refusals in the window and none names this file: something was
+     * refused and it may belong to another send. Reported as its own state so
+     * the message can hedge and the log can say which it was — rather than the
+     * old behaviour of picking the first array element and asserting it.
+     */
+    if (verdict.attribution === 'ambiguous') {
+      return {
+        state: 'failed-unattributed',
+        code: verdict.code,
+        reason: verdict.reason,
+        detail: verdict.detail,
+        folders: got.folders,
+      };
+    }
+    return {
+      state: 'failed',
+      code: verdict.code,
+      reason: verdict.reason,
+      detail: verdict.detail,
+      folders: got.folders,
+    };
   }
   return {
     state: 'no-failure-seen',
-    folders: read2.folders,
+    folders: got.folders,
     detail:
-      `${verdict.detail} Searched ${read2.folders.join(', ')} since the send; the controls ` +
-      `confirmed in this same run that a real refusal in this mailbox IS detected ` +
-      `(${controls.bounce.got}) and that an out-of-window one is NOT (${controls.quiet.got}).`,
+      `${verdict.detail} Searched ${got.folders.join(', ')} from the send until ` +
+      `${until.toISOString()}; the controls confirmed in this same session that a real refusal in ` +
+      `this mailbox IS detected (${controls.bounce.got}) and that an out-of-window one is NOT ` +
+      `(${controls.quiet.got}).`,
   };
 }
 
-/**
- * 🔴 SAY WHICH WAY THE INSTRUMENT IS BROKEN, BECAUSE THEY NEED DIFFERENT FIXES.
- *
- * The first version of this reported an unreadable mailbox as *"the known-quiet
- * control DID report a failure … so this check is attributing bounces outside
- * its window"* — a confident diagnosis of over-attribution when the truth was
- * that nothing had been read at all. **A wrong reason recorded next to a right
- * verdict is worse than no reason**: it sends the next reader to the wrong file.
- * `unreadable` is now its own branch.
- */
+/** Run just the controls. Exported so the live harness can report them alone. */
+export async function runControls(read: MailboxReader): Promise<ControlReport> {
+  const got = await read([
+    { since: CONTROL_BOUNCE.since, until: CONTROL_BOUNCE.until },
+    { since: CONTROL_QUIET.since, until: CONTROL_QUIET.until },
+  ]);
+  if (!got.ok) {
+    const unreadable = { state: 'unreadable' as const, detail: got.reason };
+    return {
+      bounce: { passed: false, got: describeVerdict(unreadable) },
+      quiet: { passed: false, got: describeVerdict(unreadable) },
+    };
+  }
+  const bounceVerdict = findDeliveryFailure(got.windows[0] ?? [], CONTROL_BOUNCE.since);
+  const quietVerdict = findDeliveryFailure(got.windows[1] ?? [], CONTROL_QUIET.since);
+  return {
+    bounce: {
+      passed: bounceVerdict.state === 'failed' && bounceVerdict.code === CONTROL_BOUNCE.expectCode,
+      got: describeVerdict(bounceVerdict),
+    },
+    quiet: { passed: quietVerdict.state === 'no-failure-seen', got: describeVerdict(quietVerdict) },
+  };
+}
+
 function describeBlindness(controls: ControlReport): string {
   const unreadable = controls.bounce.got.startsWith('unreadable') || controls.quiet.got.startsWith('unreadable');
   if (unreadable) {

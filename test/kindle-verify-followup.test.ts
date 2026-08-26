@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import type { BounceEmail } from '../src/kindle-delivery.js';
 import type { MailboxReader } from '../src/kindle-mailbox.js';
 import { FollowupStore, MAX_ATTEMPTS } from '../src/followups.js';
-import { runDueFollowups, VERIFY_RETRY_MS } from '../src/followup-runner.js';
+import { LATE_RECHECK_MS, runDueFollowups, VERIFY_RETRY_MS } from '../src/followup-runner.js';
 import { testConfig } from './helpers.js';
 
 /**
@@ -38,14 +38,16 @@ const CONTROL_E014 = bounce(
 );
 
 function fakeMailbox(emails: BounceEmail[], skipped: string[] = []): MailboxReader {
-  return async (since, until) => ({
+  return async (windows) => ({
     ok: true,
     folders: ['INBOX', '[Gmail]/All Mail', '[Gmail]/Spam', '[Gmail]/Trash'],
     skipped,
-    emails: emails.filter((e) => {
-      const at = Date.parse(e.receivedAt);
-      return at >= since.getTime() && at <= (until?.getTime() ?? Number.POSITIVE_INFINITY);
-    }),
+    windows: windows.map((w) =>
+      emails.filter((e) => {
+        const at = Date.parse(e.receivedAt);
+        return at >= w.since.getTime() && at <= (w.until?.getTime() ?? Number.POSITIVE_INFINITY);
+      }),
+    ),
   });
 }
 
@@ -53,6 +55,11 @@ function store(): FollowupStore {
   return new FollowupStore(join(mkdtempSync(join(tmpdir(), 'jedd-kv-')), 'f.jsonl'));
 }
 
+/**
+ * Run the follow-up until it stops deferring, advancing the clock the way real
+ * time would. A clean first look now DEFERS for one confirming second look, so a
+ * single tick is no longer the whole story.
+ */
 async function run(mailbox: MailboxReader | undefined, handle = GUEST) {
   const s = store();
   s.schedule({
@@ -64,15 +71,26 @@ async function run(mailbox: MailboxReader | undefined, handle = GUEST) {
     verify: { filename: 'Tress.epub', title: 'Tress of the Emerald Sea', sentAt: SENT_AT },
   });
   const sent: { to: string; text: string }[] = [];
-  const out = await runDueFollowups(s, {
+  let clock = NOW.getTime();
+  const deps: Parameters<typeof runDueFollowups>[1] = {
     config: testConfig({ ownerHandle: OWNER }),
     send: async (to, text) => {
       sent.push({ to, text });
     },
     ...(mailbox ? { mailbox } : {}),
-    now: () => NOW,
-  });
-  return { out, sent, s };
+    now: () => new Date(clock),
+  };
+  let out = await runDueFollowups(s, deps);
+  let ticks = 1;
+  const deferrals: string[] = [];
+  while (out[0]?.action === 'deferred' && ticks < 8) {
+    deferrals.push(out[0].detail);
+    assert.equal(sent.length, 0, 'nothing is said while it is still looking');
+    clock += LATE_RECHECK_MS + VERIFY_RETRY_MS;
+    out = await runDueFollowups(s, deps);
+    ticks += 1;
+  }
+  return { out, sent, s, ticks, deferrals };
 }
 
 // ── 🔴 IT SPEAKS WHEN AMAZON REFUSES. THIS IS THE WHOLE FEATURE. ─────────────
@@ -106,6 +124,17 @@ test('🔴 no refusal found sends NOTHING and claims nothing', async () => {
   const { out, sent } = await run(fakeMailbox([CONTROL_E014]));
   assert.equal(out[0]?.action, 'no-failure-seen');
   assert.equal(sent.length, 0, 'an unprompted "I found nothing, which proves nothing" is noise');
+});
+
+test('🔴 a clean first look takes ONE more before closing, then stops', async () => {
+  // The 12-minute delay is drawn from a handful of observed Amazon latencies and
+  // says nothing about the tail. A refusal landing at minute 20 against a single
+  // check at minute 12 restores the exact silence this feature exists to end —
+  // and a checker that never stops looking never reports either.
+  const { ticks, deferrals, out } = await run(fakeMailbox([CONTROL_E014]));
+  assert.equal(ticks, 2, 'exactly one confirming look');
+  assert.match(deferrals[0] ?? '', /looking once more/i);
+  assert.equal(out[0]?.action, 'no-failure-seen');
 });
 
 test('🔴 the recorded outcome for silence never reads as delivered', async () => {
@@ -165,14 +194,20 @@ test('🔴 a blind check retries, then tells the OWNER — not the requester', a
   assert.match(sent[0]!.text, /going undetected/i);
 });
 
-test('🔴 a deployment with no mailbox reader SAYS the promise cannot be kept', async () => {
-  // The send already told them "I will come back if Amazon refuses it". Quietly
-  // resolving would leave that promise standing and unkept.
-  const { out, sent } = await run(undefined);
-  assert.equal(out[0]?.action, 'abandoned');
+test('🔴 a runner with no mailbox reader DEFERS — it must not destroy the check', async () => {
+  // `src/index.ts` ticks the SAME followups.jsonl as the daemon and may have no
+  // reader. Resolving here let a chat session permanently close a check the
+  // daemon had scheduled, which the daemon would then never look at again.
+  // When it finally does run out, the OWNER hears — a deployment with no IMAP
+  // credentials is an operator problem, and a guest can do nothing with it.
+  const { out, sent, ticks } = await run(undefined);
+  assert.ok(ticks > 1, 'it deferred before giving up');
+  // Labelled `blind`, not the generic `abandoned` — the operator log line has to
+  // say that this check stopped because it could not SEE.
+  assert.equal(out[0]?.action, 'blind');
   assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.to, OWNER);
   assert.match(sent[0]!.text, /cannot read the mailbox/i);
-  assert.match(sent[0]!.text, /do not know either way/i);
 });
 
 // ── attribution: the reason the send instant is stored ──────────────────────

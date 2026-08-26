@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { BounceEmail } from '../src/kindle-delivery.js';
-import { extractText, WANTED_SPECIAL_USE, type MailboxReader } from '../src/kindle-mailbox.js';
+import {
+  arrivalTime,
+  extractText,
+  planFolders,
+  toBounceEmail,
+  WANTED_SPECIAL_USE,
+  type MailboxReader,
+} from '../src/kindle-mailbox.js';
 import {
   CONTROL_BOUNCE,
   CONTROL_QUIET,
@@ -38,14 +45,16 @@ const CONTROL_E014 = bounce(
 
 /** An in-memory mailbox that honours the window, like the real reader does. */
 function fakeMailbox(emails: BounceEmail[], skipped: string[] = []): MailboxReader {
-  return async (since, until) => ({
+  return async (windows) => ({
     ok: true,
     folders: ['INBOX', '[Gmail]/All Mail', '[Gmail]/Spam', '[Gmail]/Trash'],
     skipped,
-    emails: emails.filter((e) => {
-      const at = Date.parse(e.receivedAt);
-      return at >= since.getTime() && at <= (until?.getTime() ?? Number.POSITIVE_INFINITY);
-    }),
+    windows: windows.map((w) =>
+      emails.filter((e) => {
+        const at = Date.parse(e.receivedAt);
+        return at >= w.since.getTime() && at <= (w.until?.getTime() ?? Number.POSITIVE_INFINITY);
+      }),
+    ),
   });
 }
 
@@ -119,19 +128,59 @@ test('🔴 an UNREADABLE mailbox is blind, and says so as a connectivity problem
   assert.doesNotMatch(v.detail, /attributing bounces/i);
 });
 
-test('🔴 controls pass but the REAL read fails -> blind, not clean', async () => {
-  // The controls read history; the real question reads a live window. A reader
-  // that can serve the first and not the second must not have its silence on the
-  // second read as an answer.
-  let call = 0;
-  const flaky: MailboxReader = async (since, until) => {
-    call += 1;
-    if (call <= 2) return fakeMailbox([CONTROL_E014])(since, until);
-    return { ok: false, reason: 'connection reset' };
-  };
-  const v = await verifyKindleDelivery(flaky, { sentAt: SENT_AT }, NOW);
+test('🔴 a refusal that cannot be tied to THIS send is not reported as this send failing', async () => {
+  // Two books twelve minutes apart is the ordinary case. The version before this
+  // fell through to `candidates[0]` — ARRAY order, which is FOLDER order, not
+  // time — and told the wrong person their book had been thrown away.
+  const someoneElses = bounce(
+    'Your Send to Kindle request could not be processed due to E014 - Unapproved sender email address.',
+    '2026-08-26T21:46:00Z',
+  );
+  const v = await verifyKindleDelivery(
+    fakeMailbox([CONTROL_E014, someoneElses, TONIGHTS_BOUNCE]),
+    { sentAt: SENT_AT, filename: 'A Completely Different Book.epub' },
+    NOW,
+  );
+  assert.equal(v.state, 'failed-unattributed');
+  if (v.state !== 'failed-unattributed') throw new Error('unreachable');
+  assert.match(v.detail, /cannot be sure it was this book/i);
+});
+
+test('🔴 a SOLE refusal in the window is attributed even with no filename in it', async () => {
+  // E009 and E014 carry no filename at all, and E014 is the failure that matters
+  // most. Requiring a name match would miss every one of them.
+  const noFilename = bounce(
+    'Your Send to Kindle request could not be processed due to E014 - Unapproved sender email address.',
+    '2026-08-26T21:46:00Z',
+  );
+  const v = await verifyKindleDelivery(
+    fakeMailbox([CONTROL_E014, noFilename]),
+    { sentAt: SENT_AT, filename: 'Tress.epub' },
+    NOW,
+  );
+  assert.equal(v.state, 'failed');
+});
+
+test('🔴 the window is bounded to the send, not to "everything since"', async () => {
+  // Run unbounded against the Mistborn sends the live harness reported
+  // failed/E009 — from a bounce twenty hours later belonging to another probe.
+  const muchLater = bounce(
+    'could not be processed due to E009 - No Attachment.',
+    '2026-08-27T18:00:00Z',
+  );
+  const v = await verifyKindleDelivery(
+    fakeMailbox([CONTROL_E014, muchLater]),
+    { sentAt: SENT_AT },
+    new Date('2026-08-28T00:00:00Z'),
+  );
+  assert.equal(v.state, 'no-failure-seen');
+});
+
+test('🔴 a mailbox that cannot be read is blind, and the controls cannot have passed', async () => {
+  const broken: MailboxReader = async () => ({ ok: false, reason: 'connection reset' });
+  const v = await verifyKindleDelivery(broken, { sentAt: SENT_AT }, NOW);
   assert.equal(v.state, 'blind');
-  assert.match(v.detail, /controls passed but the read for this send failed/i);
+  assert.match(v.detail, /nothing was searched/i);
 });
 
 // ── 🔴 silence is never upgraded ─────────────────────────────────────────────
@@ -229,4 +278,92 @@ test('an HTML-only notice still yields readable text', () => {
     '--B\r\nContent-Type: text/html\r\n\r\n<p>due to E999 - Send to Kindle Internal Error</p>\r\n' +
     '--B--\r\n';
   assert.match(extractText(raw), /E999 - Send to Kindle Internal Error/);
+});
+
+// ── the two reader guards that no end-to-end test can reach ──────────────────
+
+test('🔴 a wanted folder the server never ADVERTISED is recorded as unsearched', () => {
+  // The failure this closes is invisible from outside: if SPECIAL-USE is absent
+  // on a session, the sweep silently narrows to INBOX and returns ok. The
+  // controls cannot catch it — the pinned control notice lives in All Mail, so
+  // it passes on a narrow sweep, and a real refusal sitting in SPAM comes back
+  // clean. Only `skipped` makes that visible, and only then does the verifier
+  // go blind on it.
+  const plan = planFolders([
+    { path: '[Gmail]/All Mail', specialUse: '\\All' },
+    { path: '[Gmail]/Sent Mail', specialUse: '\\Sent' },
+  ]);
+  assert.deepEqual(plan.paths, ['INBOX', '[Gmail]/All Mail']);
+  assert.equal(plan.unadvertised.length, 2, 'Junk and Trash were never offered');
+  assert.match(plan.unadvertised.join(' '), /Junk/);
+  assert.match(plan.unadvertised.join(' '), /Trash/);
+});
+
+test('a full Gmail listing leaves nothing unsearched', () => {
+  const plan = planFolders([
+    { path: '[Gmail]/All Mail', specialUse: '\\All' },
+    { path: '[Gmail]/Spam', specialUse: '\\Junk' },
+    { path: '[Gmail]/Trash', specialUse: '\\Trash' },
+  ]);
+  assert.equal(plan.paths.length, 4);
+  assert.deepEqual(plan.unadvertised, []);
+});
+
+test('🔴 a message with no usable timestamp is NaN, so it cannot be silently dropped', () => {
+  // It used to become epoch, fail the lower bound, and vanish with no trace in
+  // `skipped` or anywhere else — a real bounce lost for a timekeeping reason.
+  assert.ok(Number.isNaN(arrivalTime({})));
+  assert.ok(Number.isNaN(arrivalTime({ envelope: { date: 'not a date' } })));
+});
+
+test('🔴 the SERVER arrival stamp wins over the sender-written Date header', () => {
+  // Amazon's clock running seconds ahead of ours pushed a real refusal past the
+  // upper bound, and it came back clean.
+  const at = arrivalTime({
+    internalDate: new Date('2026-08-26T21:47:00Z'),
+    envelope: { date: new Date('2026-08-26T23:00:00Z') },
+  });
+  assert.equal(new Date(at).toISOString(), '2026-08-26T21:47:00.000Z');
+  // …and a string internalDate, which imapflow's types also allow, is parsed.
+  assert.equal(arrivalTime({ internalDate: '2026-08-26T21:47:00Z' }), Date.parse('2026-08-26T21:47:00Z'));
+});
+
+test('🔴 a quoted-printable soft break with TRANSPORT PADDING is still joined', () => {
+  // RFC 2045 permits `=  \r\n`. A relay that adds a space defeated the bare
+  // `=\r?\n` join, leaving `E014 = \n- Unapproved` and degrading the code to
+  // UNKNOWN — one space to the left of the test that already pinned this.
+  const raw =
+    'Content-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n' +
+    'could not be processed due to E014 =  \r\n- Unapproved sender email address.';
+  assert.match(extractText(raw), /E014 - Unapproved sender email address/);
+});
+
+test('an unquoted boundary followed by another parameter still splits', () => {
+  // `[^";\r\n]+` ran past the space `unfold()` inserts, swallowing the next
+  // parameter into the boundary and splitting on nothing — returning the whole
+  // raw body undecoded, which hides a base64 part entirely.
+  const raw =
+    'Content-Type: multipart/alternative; boundary=B charset=utf-8\r\n\r\n' +
+    '--B\r\nContent-Type: text/plain\r\n\r\ndue to E009 - No Attachment\r\n' +
+    '--B--\r\n';
+  assert.match(extractText(raw), /E009 - No Attachment/);
+});
+
+test('🔴 an untimestampable message is UNPLACEABLE, not absent', () => {
+  // The distinction is the whole file: a message we could not place in time is
+  // recorded as unsearched, which makes the run blind. Silently dropping it
+  // reports a clean mailbox for a mailbox with a refusal in it.
+  const out = toBounceEmail({ envelope: { subject: 'There was a problem' } });
+  assert.deepEqual(out, { unplaceable: true });
+
+  const placed = toBounceEmail({
+    internalDate: new Date('2026-08-26T21:47:00Z'),
+    envelope: { subject: 'There was a problem', from: [{ address: 'do-not-reply@amazon.com' }] },
+    source: Buffer.from('Content-Type: text/plain\r\n\r\ndue to E014 - Unapproved sender email address'),
+  });
+  assert.ok(!('unplaceable' in placed));
+  if ('unplaceable' in placed) throw new Error('unreachable');
+  assert.equal(placed.receivedAt, '2026-08-26T21:47:00.000Z');
+  assert.equal(placed.from, 'do-not-reply@amazon.com');
+  assert.match(placed.body, /E014 - Unapproved sender email address/);
 });

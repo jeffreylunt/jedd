@@ -33,7 +33,32 @@
  */
 
 export type KindleDeliveryVerdict =
-  | { state: 'failed'; code: string; reason: string; detail: string }
+  | {
+      state: 'failed';
+      code: string;
+      reason: string;
+      detail: string;
+      /**
+       * 🔴 HOW CONFIDENT THE ATTRIBUTION IS — because "a refusal happened" and
+       * "YOUR book was refused" are different claims.
+       *
+       * `document`   the notice names this file. Certain.
+       * `sole`       exactly one refusal in the window. Certain enough to report.
+       * `ambiguous`  several refusals in the window and none names this file, so
+       *              SOMETHING was refused and it may not be this send.
+       *
+       * The version without this field picked `candidates[0]` when the filename
+       * hint missed — array order, which is FOLDER order, not time — and told
+       * the wrong person their book had been thrown away. Two sends twelve
+       * minutes apart is the ordinary case, not a corner.
+       *
+       * ⚠️ The hint cannot simply be made mandatory: `E009 - No Attachment` and
+       * `E014 - Unapproved sender email address` carry NO filename at all, and
+       * E014 is the failure that matters most. Requiring a name match would miss
+       * every one of them.
+       */
+      attribution: 'document' | 'sole' | 'ambiguous';
+    }
   /**
    * No failure notice found. **NOT a success.** Either it arrived, or the
    * address does not exist and Amazon discarded it silently.
@@ -87,10 +112,12 @@ export function findDeliveryFailure(
 
   // Prefer one that names the document, when we have a name to match. Several
   // bounces can share a window, and attributing the wrong one is a false report.
-  const matched =
-    (documentHint
-      ? candidates.find((e) => e.body.toLowerCase().includes(documentHint.toLowerCase()))
-      : undefined) ?? candidates[0];
+  const named = documentHint
+    ? candidates.filter((e) => e.body.toLowerCase().includes(documentHint.toLowerCase()))
+    : [];
+  const matched = named[0] ?? candidates[0];
+  const attribution: 'document' | 'sole' | 'ambiguous' =
+    named.length === 1 ? 'document' : candidates.length === 1 ? 'sole' : 'ambiguous';
 
   if (!matched) {
     return {
@@ -108,6 +135,21 @@ export function findDeliveryFailure(
     state: 'failed',
     code,
     reason,
-    detail: `Amazon refused it: ${code} — ${reason}. ${ADVICE[code] ?? 'Retrying may not help until that is resolved.'}`,
+    attribution,
+    /**
+     * 🔴 `detail` REACHES A USER, SO IT CARRIES THE CODE AND OUR OWN WORDS —
+     * NEVER `reason`, WHICH IS CAPTURED OUT OF THE MESSAGE BODY.
+     *
+     * On today's E014 the capture stops before the offending sender address
+     * because it sits on its own line. It is one Amazon rewording away from
+     * mailing the owner's private sending address to a guest. `reason` stays on
+     * the verdict for the log; the sentence a person reads does not include it.
+     */
+    detail:
+      (attribution === 'ambiguous'
+        ? `Amazon refused a document sent around the same time (${code}) and the notice does not ` +
+          'say which one, so I cannot be sure it was this book. '
+        : `Amazon refused it (${code}). `) +
+      (ADVICE[code] ?? 'Amazon reported a problem, and retrying may not help until it is resolved.'),
   };
 }
