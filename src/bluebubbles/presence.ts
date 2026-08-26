@@ -1,3 +1,5 @@
+import { MAX_STEPS } from '../agent.js';
+import { TURN_TIMEOUT_MS } from '../llm.js';
 import { chatGuidFor, type PrivateApiResult } from './client.js';
 
 /**
@@ -101,7 +103,36 @@ export const REFRESH_MS = 30_000;
  * running, which is the safe direction — Jedd looks slow rather than looking
  * like it is about to speak forever.
  */
-export const CEILING_MS = 360_000;
+/**
+ * ── 🔴 THE CEILING IS DERIVED FROM THE TURN BUDGET. DO NOT RETYPE A NUMBER. ──
+ *
+ * RAISED 2026-08-26 at Jeff's explicit instruction: *"Let's keep the typing
+ * indicator going until we fully time out."*
+ *
+ * It was a flat `360_000` sitting beside a `900_000` turn budget it had no
+ * relationship to, and the two drifted exactly as you would expect: on
+ * 2026-08-26 the indicator died at **6 minutes** on a turn that ran **787
+ * seconds and completed successfully**. Jeff watched the "…" vanish and then
+ * got an answer seven minutes later, which is the precise experience the
+ * indicator exists to prevent.
+ *
+ * ⚠️ `TURN_TIMEOUT_MS` IS PER MODEL CALL, NOT PER TURN. A turn makes up to
+ * `MAX_STEPS` of them — today's 787s turn used all 8 — so a turn's worst-case
+ * wall clock is the PRODUCT. Ceiling-as-900_000 would have been another number
+ * that merely *looked* related and would have cut a slow multi-step turn off
+ * early, reproducing this same complaint. Multiplying is what makes "until we
+ * fully time out" literally true.
+ *
+ * This ceiling is a backstop for a `finally` that never runs, so widening it
+ * widens how long a LEAKED indicator could sit — bounded, and only reachable
+ * while the process is alive but buggy. A dead process cannot send a stop at
+ * any ceiling, so nothing is lost there. Jeff's instruction is explicit and the
+ * failure it prevents is one he actually hit.
+ *
+ * 🔴 The derivation is the point. Two magic numbers that happen to be
+ * compatible is how they separate again.
+ */
+export const CEILING_MS = TURN_TIMEOUT_MS * MAX_STEPS;
 
 export interface PresenceOptions {
   client: PresenceCapableClient;

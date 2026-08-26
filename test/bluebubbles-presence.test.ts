@@ -7,7 +7,9 @@ import {
   type FetchImpl,
   type PrivateApiResult,
 } from '../src/bluebubbles/client.js';
-import { Presence, type PresenceCapableClient, type TimerSeam } from '../src/bluebubbles/presence.js';
+import { CEILING_MS, Presence, type PresenceCapableClient, type TimerSeam } from '../src/bluebubbles/presence.js';
+import { MAX_STEPS } from '../src/agent.js';
+import { TURN_TIMEOUT_MS } from '../src/llm.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, ShadowConnector } from '../src/bluebubbles/receiver.js';
 import { presenceToken, withPresence, type PresenceRecord } from '../src/connector.js';
 
@@ -1217,4 +1219,55 @@ test('🔴 ShadowConnector cannot signal presence, and holds nothing that could'
     0,
     'the shadow is holding something that can type',
   );
+});
+
+// ── 🔴 the ceiling is DERIVED, not retyped (2026-08-26, Jeff's instruction) ──
+
+test('🔴 the typing ceiling is derived from the turn budget, not a magic number', () => {
+  // Jeff: "Let's keep the typing indicator going until we fully time out."
+  //
+  // It was a flat 360_000 beside a 900_000 turn budget it had no relationship
+  // to, and they drifted: the indicator died at 6 minutes on a turn that ran
+  // 787s and completed fine.
+  assert.equal(CEILING_MS, TURN_TIMEOUT_MS * MAX_STEPS);
+});
+
+test('🔴 the ceiling covers a turn that uses EVERY step at the full per-call budget', () => {
+  // TURN_TIMEOUT_MS is per model CALL. A turn makes up to MAX_STEPS of them —
+  // the 787s turn used all 8 — so a ceiling equal to the per-call budget would
+  // cut a slow multi-step turn off early and reproduce the same complaint.
+  assert.ok(CEILING_MS >= TURN_TIMEOUT_MS * MAX_STEPS, 'must cover the worst-case turn, not one call');
+  assert.ok(CEILING_MS > 787_000, 'must cover the real turn that triggered this change');
+});
+
+test('🔴 the refresh loop keeps re-arming right up to the ceiling', async () => {
+  // Raising the number is only sufficient if nothing ELSE disarms first.
+  // `arm()` re-arms every refreshMs and its only exits are `stopped` — set
+  // solely by `finish()` — and the ceiling test itself. This walks a turn well
+  // past the OLD 360s ceiling and asserts the indicator is still being kept
+  // alive, which is the behaviour Jeff asked for.
+  const { impl, calls } = stubClient();
+  const clock = fakeTimers();
+  const presence = new Presence({
+    client: impl,
+    log: () => {},
+    timers: clock.timers,
+    now: clock.now,
+    refreshMs: 30_000,
+    ceilingMs: CEILING_MS,
+  });
+  presence.withTyping(OWNER, () => new Promise<string>(() => {})).catch(() => {});
+  await flush();
+
+  // 787s is the real turn that triggered this change; walk past it to 900s.
+  for (let i = 0; i < 30; i += 1) clock.advance(30_000);
+  await flush();
+
+  assert.ok(
+    !calls.includes(`stop ${chatGuidFor(OWNER)}`),
+    'the indicator must still be alive 900s in — the old 360s ceiling killed it at 6 minutes',
+  );
+  assert.ok(clock.pending() > 0, 'the refresh loop must still be armed');
+  const starts = calls.filter((c) => c === `start ${chatGuidFor(OWNER)}`).length;
+  assert.ok(starts >= 30, `expected continuous refreshes, saw ${starts}`);
 });

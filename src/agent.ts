@@ -9,7 +9,12 @@ import { roleFor, roleSatisfies, type Role } from './permissions.js';
 import { ALL_TOOLS } from './tools/index.js';
 import type { Tool, ToolContext } from './tools/types.js';
 
-const MAX_STEPS = 8;
+/**
+ * ⚠️ EXPORTED because `presence.ts` needs it to bound a turn's worst-case wall
+ * clock: one turn makes up to this many model calls, each capped by
+ * `TURN_TIMEOUT_MS`. The typing ceiling is the product.
+ */
+export const MAX_STEPS = 8;
 
 /**
  * The head of a tool result, for the durable record.

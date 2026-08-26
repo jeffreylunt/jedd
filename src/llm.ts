@@ -65,6 +65,18 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
  *    `tool_choice:"required"` on a message needing no tool returned no call).
  *    Sending it would imply a guarantee that does not exist.
  */
+/**
+ * Wall clock for ONE MODEL CALL — not one turn. See `MAX_STEPS` in `agent.ts`:
+ * a single turn makes up to that many of these, so a turn's worst case is the
+ * product, not this number.
+ *
+ * ⚠️ EXPORTED because `presence.ts` derives the typing-indicator ceiling from
+ * it. They were two independent magic numbers (900_000 and 360_000) and the
+ * indicator died at 6 minutes on a turn that ran 787 seconds and completed
+ * fine. Changing one now forces you past the other.
+ */
+export const TURN_TIMEOUT_MS = 900_000;
+
 export class OllamaClient implements LlmClient {
   readonly label: string;
 
@@ -89,7 +101,7 @@ export class OllamaClient implements LlmClient {
     // that never arrived look identical to whoever sent it. Raising the ceiling
     // makes the failure rarer, not visible. A "still working" signal is the
     // real fix and is tracked separately.
-    const TURN_TIMEOUT_MS = 900_000;
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
     let res: Response;
