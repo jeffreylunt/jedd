@@ -463,7 +463,7 @@ test('🔴 MUTATION TARGET: disabling a FAILING indexer warns that it mutes the 
   assert.match(r.content, /is now DISABLED/, 'it still does what was asked');
   assert.match(r.content, /removes the signal that would tell us if it comes back/);
   assert.match(r.content, /LEAVE IT ENABLED and report once/);
-  assert.match(r.content, /decision for Jeff/);
+  assert.match(r.content, /the OWNER'S decision/, 'the ROLE, never the name — see owner-config-fail-closed');
 });
 
 test('CONTROL: disabling a HEALTHY indexer gets no such warning', async () => {

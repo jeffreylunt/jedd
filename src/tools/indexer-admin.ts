@@ -311,8 +311,8 @@ async function runToggle(client: IndexerAdminClient, rawId: unknown, enable: boo
         "if it comes back. Prowlarr's own backoff already handles the retry, so leaving a broken " +
         'indexer enabled costs nothing and keeps the recovery visible. The standing decision here ' +
         '(2026-08-10, after 1337x had been 403 for four days with the others green) was to LEAVE IT ' +
-        'ENABLED and report once. Adding or removing indexer coverage is a decision for Jeff, so if ' +
-        'he did not explicitly ask for this, say what you did and offer to put it back.',
+        'ENABLED and report once. Adding or removing indexer coverage is the OWNER\'S decision, so ' +
+        'unless they explicitly asked for this, say what you did and offer to put it back.',
     );
   }
   if (enable) {
