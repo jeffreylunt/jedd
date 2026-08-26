@@ -137,6 +137,7 @@ export class IrcEbooks {
   private lastError = '';
   private pending: PendingTransfer | null = null;
   private nextPendingId = 1;
+  private nickSuffix = 0;
   /** Live DCC sockets, so `stop()` can actually close a stalled transfer. */
   private transfers = new Set<IrcSocketLike>();
   private stopped = false;
@@ -308,6 +309,20 @@ export class IrcEbooks {
     if (code === '366') {
       this.joined = true;
       onJoined();
+      return;
+    }
+    /**
+     * ⚠️ NICK ALREADY IN USE. Take a variant rather than sit unregistered.
+     *
+     * A stable nick is polite, but it is not ours to reserve — we do not register
+     * with NickServ. Without this the registration never completes and every
+     * search reports "IRC is not available" for a reason nothing explains.
+     */
+    if (code === '433') {
+      this.nickSuffix += 1;
+      const alt = `${this.o.nick}${this.nickSuffix}`;
+      this.o.log(`[irc] nick in use, trying ${alt}`);
+      this.send(`NICK ${alt}`);
       return;
     }
     if (code === '474' || code === '473' || code === '475' || code === '471' || code === '465') {
@@ -551,6 +566,33 @@ export class IrcEbooks {
         const un = unzipSingleTextEntry(file.bytes);
         if (un.state !== 'ok') return { state: 'unknown', detail: un.detail };
 
+        /**
+         * 🔴 THE LISTING MUST ANSWER THE QUERY WE ASKED. MEASURED, LIVE.
+         *
+         * 2026-08-26: a search for "project hail mary" returned nine EPUBs of
+         * **"The Loch" by Steve Alten** — a real, well-formed results file for a
+         * completely different query. SearchBot queues searches and DCCs them to
+         * the requesting NICK, and we had taken a stable nick that something had
+         * a pending search against. Everything downstream was working perfectly;
+         * the results simply were not ours.
+         *
+         * This is the search-direction twin of the bot-nick check on a fetch:
+         * "a DCC arrived while we were waiting" is NOT "this DCC answers us".
+         * The header states the query verbatim, so it is checkable, and a
+         * mismatch is UNKNOWN — we learned nothing about this book — never
+         * "none", which would be a false absence built from someone else's
+         * search.
+         */
+        const answered = un.text.match(/for\s+"([^"]*)"/i)?.[1];
+        if (answered !== undefined && !sameQuery(answered, query)) {
+          return {
+            state: 'unknown',
+            detail:
+              `the #ebooks search bot sent results for "${answered}", not "${query}" — that is ` +
+              'somebody else\'s search, so it says nothing about this book. Nothing was used from it.',
+          };
+        }
+
         const parsed = parseSearchResults(un.text);
         // Only offer books whose bot is actually here. A request to an absent
         // bot returns no reply and no error — the exact silent failure that
@@ -673,4 +715,14 @@ function defaultDial(host: string, port: number, onConnect: () => void): IrcSock
   const s = netConnect({ host, port }, onConnect);
   s.setTimeout?.(0);
   return s as unknown as IrcSocketLike;
+}
+
+/**
+ * Loose comparison for the results header, which normalises spacing and case but
+ * is otherwise exact. Deliberately not fuzzy: the failure being caught is a
+ * COMPLETELY different query, and a fuzzy match would let it through.
+ */
+function sameQuery(a: string, b: string): boolean {
+  const norm = (x: string) => x.trim().toLowerCase().replace(/\s+/g, ' ');
+  return norm(a) === norm(b);
 }

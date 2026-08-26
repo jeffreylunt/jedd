@@ -551,3 +551,65 @@ test('🔴 a COMPLETED request\'s stale timer must not clear the NEXT request\'s
   if (rb.state === 'ok') assert.equal(rb.bytes.toString(), 'BBB');
   irc.stop();
 });
+
+test('🔴 a results file answering SOMEONE ELSE\'S query is refused, not used', async () => {
+  /**
+   * MEASURED LIVE 2026-08-26: a search for "project hail mary" came back with
+   * nine real EPUBs of "The Loch" by Steve Alten. SearchBot queues searches and
+   * DCCs them to the requesting NICK; we had taken a stable nick that something
+   * had a pending search against. Every layer below was working — the results
+   * were simply not ours.
+   */
+  const { irc, sockets } = harness();
+  const p = irc.search('project hail mary');
+  const s = await bringUp(sockets);
+  const foreign = [
+    'Searched 15 lists for "the loch" , found 27 matches. Enjoy!',
+    '!Bsk Steve Alten - [Loch 01] - The Loch.epub ::INFO:: 612KB',
+  ].join('\n');
+  const zip = makeZip('results.txt', foreign);
+  s.line(dccOffer('SearchOok_results_for__the_loch.txt.zip', 8000, zip.length, 'SearchOok'));
+  await tick();
+  sockets[1]!.emit('data', zip);
+  sockets[1]!.emit('close');
+
+  const r = await p;
+  // UNKNOWN, never 'none': we learned nothing about the book we asked about.
+  assert.equal(r.state, 'unknown');
+  assert.match(r.detail, /the loch/i);
+  assert.match(r.detail, /somebody else/i);
+  irc.stop();
+});
+
+test('a results file for OUR query is accepted despite spacing and case', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.search('Project  Hail Mary');
+  const s = await bringUp(sockets);
+  const mine = [
+    'Searched 15 lists for "project hail mary" , found 2 matches.',
+    '!Bsk Project Hail Mary - Andy Weir.epub ::INFO:: 2.5MB',
+  ].join('\n');
+  const zip = makeZip('results.txt', mine);
+  s.line(dccOffer('r.txt.zip', 8001, zip.length, 'SearchOok'));
+  await tick();
+  sockets[1]!.emit('data', zip);
+  sockets[1]!.emit('close');
+  const r = await p;
+  assert.equal(r.state, 'ok');
+  irc.stop();
+});
+
+test('a nick collision takes a variant instead of never registering', async () => {
+  const { irc, sockets } = harness();
+  const p = irc.search('x');
+  await tick();
+  const s = sockets[0]!;
+  s.line(':srv 433 * jeddtest :Nickname is already in use');
+  await tick();
+  assert.ok(
+    s.written.some((w) => /^NICK jeddtest1/.test(w)),
+    'must try another nick rather than sit unregistered forever',
+  );
+  irc.stop();
+  await p;
+});
