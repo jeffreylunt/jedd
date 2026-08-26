@@ -131,6 +131,39 @@ export const REFRESH_MS = 30_000;
  *
  * 🔴 The derivation is the point. Two magic numbers that happen to be
  * compatible is how they separate again.
+ *
+ * ── ⚠️ RAISED KNOWING THIS, NOT IN IGNORANCE OF IT ─────────────────────────
+ *
+ * There is a pre-existing hazard here and widening the ceiling interacts with
+ * it, so this is recorded at the change rather than only on a task.
+ *
+ * `finish()` sets `stopped`, clears the timer and never re-arms — it is
+ * idempotent and permanently disarming. If the stop packet it enqueues is
+ * DROPPED on a cold path, our local flag says stopped while the recipient never
+ * received "stopped typing", and **nothing is left running that would ever
+ * retry**. A stale "…" on a real person's phone, claiming a reply is coming.
+ *
+ * 🔴 HOW LONG THAT STALE INDICATOR LASTS IS AN OPEN QUESTION, DELIBERATELY NOT
+ * ANSWERED WITH A NUMBER HERE.
+ *
+ * The intuitive answer is "as long as the ceiling", which would make this change
+ * much worse — 120 minutes rather than 6. But after `finish()` we also stop
+ * sending REFRESHES, and a measured keepalive re-assert at **59.8s** implies
+ * IMCore clears the local typing flag on roughly a one-minute timer; if the
+ * recipient's client behaves the same way, a dropped stop should expire on its
+ * own in about a minute REGARDLESS of the ceiling. On that reading the ceiling
+ * governs how long the indicator is *deliberately* kept alive, not how long a
+ * stale one lingers, and this change does not lengthen the hazard at all.
+ *
+ * ⚠️ That 59.8s figure is **n=1 and warm-path only** — the cold-window run
+ * emitted nothing at +60s or +90s, so the auto-clear may not rescue a cold path,
+ * which is precisely the path a dropped packet is on. **Do not treat either
+ * duration as established.** The discriminator is a measurement nobody has
+ * taken: after a dropped stop, is the recipient's indicator bounded by their own
+ * client-side expiry, or does something keep it alive?
+ *
+ * The hazard is pre-existing and is NOT fixed here — the restart carrying this
+ * was deliberately kept small. It is tracked on the concurrency/typing task.
  */
 export const CEILING_MS = TURN_TIMEOUT_MS * MAX_STEPS;
 
