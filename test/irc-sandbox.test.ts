@@ -613,3 +613,71 @@ test('a nick collision takes a variant instead of never registering', async () =
   irc.stop();
   await p;
 });
+
+test('🔴 a dropped connection reconnects on its own, backing off', async () => {
+  /**
+   * Without this, recovery happens inside a USER'S TURN: connect() is lazy and a
+   * cold join costs ~70s, so the first person to ask for a book after any drop
+   * pays the whole reconnect out of their own wait.
+   */
+  const sockets: FakeSocket[] = [];
+  const dial: Dialer = (_h, _p, onConnect) => {
+    const sk = new FakeSocket();
+    sockets.push(sk);
+    queueMicrotask(onConnect);
+    return sk;
+  };
+  const irc = new IrcEbooks({ dial, joinDelayMs: 0, connectTimeoutMs: 100, reconnectBaseMs: 10, nick: 'jeddtest' });
+  const p = irc.search('x');
+  await tick();
+  sockets[0]!.emit('close');
+  await p;
+  // The client dials again WITHOUT anyone asking.
+  await tick(60);
+  assert.ok(sockets.length >= 2, 'must reconnect unprompted rather than wait for the next user');
+  irc.stop();
+});
+
+test('🔴 an ops refusal is NOT reconnected against — that would be evading a ban', async () => {
+  const sockets: FakeSocket[] = [];
+  const dial: Dialer = (_h, _p, onConnect) => {
+    const sk = new FakeSocket();
+    sockets.push(sk);
+    queueMicrotask(onConnect);
+    return sk;
+  };
+  const irc = new IrcEbooks({ dial, joinDelayMs: 0, connectTimeoutMs: 100, reconnectBaseMs: 10, nick: 'jeddtest' });
+  const p = irc.search('x');
+  await tick();
+  const s = sockets[0]!;
+  s.line(':srv 001 jeddtest :Welcome');
+  await tick();
+  s.line(':srv 474 jeddtest #ebooks :Cannot join channel (+b)');
+  await tick();
+  s.emit('close');
+  const before = sockets.length;
+  await tick(80);
+  assert.equal(sockets.length, before, 'a ban is a decision a person made; retrying politely still evades it');
+  assert.match(irc.status().detail, /No reconnect will be attempted/);
+  await p;
+  irc.stop();
+});
+
+test('stop() cancels a pending reconnect', async () => {
+  const sockets: FakeSocket[] = [];
+  const dial: Dialer = (_h, _p, onConnect) => {
+    const sk = new FakeSocket();
+    sockets.push(sk);
+    queueMicrotask(onConnect);
+    return sk;
+  };
+  const irc = new IrcEbooks({ dial, joinDelayMs: 0, connectTimeoutMs: 100, reconnectBaseMs: 30, nick: 'jeddtest' });
+  const p = irc.search('x');
+  await tick();
+  sockets[0]!.emit('close');
+  await p;
+  irc.stop();
+  const before = sockets.length;
+  await tick(90);
+  assert.equal(sockets.length, before, 'a stopped client must not come back to life');
+});

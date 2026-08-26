@@ -33,11 +33,14 @@ import { unzipSingleTextEntry } from './irc-unzip.js';
  * no NickServ registration, and no nick cycling — **if ops throttle or ban us
  * that is a stop-and-report, never something to route around.**
  *
- * ⚠️ THERE IS NO AUTOMATIC RECONNECT. A dropped connection is re-established
- * lazily, by the next `search`/`fetch` calling `connect()` — which pays the ~70s
- * cold join inside that caller's wait. Said plainly because an earlier version
- * of this comment claimed "exponential backoff on reconnect" and no such code
- * existed; a reader would have assumed warm-up was self-healing.
+ * A dropped connection reconnects on its own with exponential backoff (30s
+ * doubling to a 15-minute cap, reset on a successful join), so recovery does not
+ * happen inside some user's turn — a cold join costs ~70s and the first person
+ * to ask after a drop would otherwise pay all of it.
+ *
+ * 🔴 **A refusal by channel ops is NOT reconnected against.** A ban or throttle
+ * is a decision a person made; retrying it politely is still evading it. See
+ * `refusedByOps`.
  *
  * ── 🔴 ONE CONNECTION, ONE OPERATION AT A TIME ──────────────────────────────
  *
@@ -84,6 +87,8 @@ export interface IrcOptions {
   connectTimeoutMs?: number;
   /** Deadline on a single DCC transfer once it has started. */
   transferTimeoutMs?: number;
+  /** First reconnect delay; doubles per attempt up to a 15-minute cap. */
+  reconnectBaseMs?: number;
   dial?: Dialer;
   now?: () => number;
   log?: (msg: string) => void;
@@ -100,6 +105,7 @@ const DEFAULTS = {
   maxBytes: 25 * 1024 * 1024,
   connectTimeoutMs: 110_000,
   transferTimeoutMs: 5 * 60_000,
+  reconnectBaseMs: 30_000,
 };
 
 export type IrcSearchOutcome =
@@ -141,6 +147,17 @@ export class IrcEbooks {
   /** Live DCC sockets, so `stop()` can actually close a stalled transfer. */
   private transfers = new Set<IrcSocketLike>();
   private stopped = false;
+  /**
+   * 🔴 SET WHEN CHANNEL OPS REFUSE US. SUPPRESSES RECONNECT PERMANENTLY.
+   *
+   * A ban, a throttle or a +i/+k refusal is an ACCESS DECISION BY A PERSON.
+   * Reconnecting against it — even politely, even slowly — is evading a limit
+   * somebody set deliberately, which is exactly what "no nick-cycling to evade a
+   * throttle" rules out. It stops and it gets reported.
+   */
+  private refusedByOps = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: IrcOptions = {}) {
     this.o = {
@@ -154,6 +171,7 @@ export class IrcEbooks {
       maxBytes: opts.maxBytes ?? DEFAULTS.maxBytes,
       connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULTS.connectTimeoutMs,
       transferTimeoutMs: opts.transferTimeoutMs ?? DEFAULTS.transferTimeoutMs,
+      reconnectBaseMs: opts.reconnectBaseMs ?? DEFAULTS.reconnectBaseMs,
       dial: opts.dial ?? defaultDial,
       now: opts.now ?? Date.now,
       log: opts.log ?? (() => {}),
@@ -217,7 +235,17 @@ export class IrcEbooks {
       const done = (v: boolean, why: string) => {
         if (settled) return;
         settled = true;
-        if (!v) this.lastError = why;
+        /**
+         * 🔴 AN OPS REFUSAL MUST SURVIVE THE DISCONNECT THAT FOLLOWS IT.
+         *
+         * A ban arrives as `474`, and the server then closes the socket — whose
+         * handler used to overwrite `lastError` with "the IRC connection closed
+         * before we joined." The refusal was suppressed correctly and the REASON
+         * was lost, so `status()` reported a generic network problem and nobody
+         * would ever learn we had been banned. Half of "stop and report" is the
+         * report.
+         */
+        if (!v && !this.refusedByOps) this.lastError = why;
         resolve(v);
       };
 
@@ -252,6 +280,7 @@ export class IrcEbooks {
         if (!stillOurs()) return;
         this.failPending(`the IRC connection dropped: ${e?.message}`);
         this.teardown();
+        this.scheduleReconnect();
         done(false, `socket error: ${e?.message}`);
       }) as never);
 
@@ -259,6 +288,7 @@ export class IrcEbooks {
         if (!stillOurs()) return;
         this.failPending('the IRC connection closed mid-transfer.');
         this.teardown();
+        this.scheduleReconnect();
         done(false, 'the IRC connection closed before we joined.');
       }) as never);
 
@@ -308,6 +338,7 @@ export class IrcEbooks {
     }
     if (code === '366') {
       this.joined = true;
+      this.reconnectAttempt = 0; // a good connection clears the backoff
       onJoined();
       return;
     }
@@ -327,9 +358,10 @@ export class IrcEbooks {
     }
     if (code === '474' || code === '473' || code === '475' || code === '471' || code === '465') {
       // Banned / throttled / limited. STOP AND REPORT — never cycle nicks.
+      this.refusedByOps = true;
       this.lastError =
         `the server refused the channel (${code}). This is an access decision by channel ops ` +
-        'and must be reported, not worked around.';
+        'and must be reported, not worked around. No reconnect will be attempted.';
       this.o.log(`[irc] ${this.lastError}`);
       return;
     }
@@ -673,6 +705,31 @@ export class IrcEbooks {
     }
   }
 
+  /**
+   * Re-establish the connection after an unexpected drop, backing off.
+   *
+   * ⚠️ WITHOUT THIS, RECOVERY HAPPENS INSIDE A USER'S TURN. `connect()` is
+   * called lazily by the next `search`/`fetch`, and a cold join costs ~70s — so
+   * the first person to ask for a book after any drop pays the whole reconnect
+   * out of their own wait. Warming back up in the background is the difference
+   * between a slow search and a search that looks broken.
+   *
+   * 30s, 60s, 120s, 240s, capped at 15 minutes. We are a guest on someone else's
+   * server; a tight retry loop is how a client becomes a problem.
+   */
+  private scheduleReconnect(): void {
+    if (this.stopped || this.refusedByOps || this.reconnectTimer) return;
+    const delay = Math.min(this.o.reconnectBaseMs * 2 ** this.reconnectAttempt, 15 * 60_000);
+    this.reconnectAttempt += 1;
+    this.o.log(`[irc] reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempt})`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.stopped || this.refusedByOps) return;
+      void this.connect();
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
   private teardown(): void {
     this.joined = false;
     this.registered = false;
@@ -682,6 +739,10 @@ export class IrcEbooks {
 
   stop(): void {
     this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.failPending('shutting down.');
     // A stalled DCC socket is not reachable from the IRC socket; close it here
     // or it survives shutdown.
