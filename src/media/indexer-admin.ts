@@ -151,6 +151,25 @@ export interface TestOutcome {
   errors: string[];
 }
 
+/** One catalogue definition, projected. Never the raw 5.75 MB entry. */
+export interface SchemaMatch {
+  /** The identifier `add` takes. There is NO numeric id on a definition. */
+  definitionName: string;
+  name: string;
+  /**
+   * 🔴 `public` | `semiPrivate` | `private`. THE FIELD THAT DECIDES WHETHER IT
+   * CAN BE ADDED AT ALL. Measured: 475 private, 63 semiPrivate, 87 public of
+   * 625. A private tracker needs an account we do not have, and the standing
+   * rule in the knowledge file is not to register for one unprompted.
+   */
+  privacy: string;
+  protocol: string;
+  language: string;
+  description: string;
+  /** How many matched in total, so a capped list never reads as the whole answer. */
+  totalMatched?: number;
+}
+
 export type Fetched<T> = { state: 'ok'; value: T } | { state: 'unknown'; detail: string };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +336,17 @@ export interface IndexerAdminOptions {
 
 /** A single force-test is a live tracker hit; `testAll` is one per enabled indexer. */
 const READ_TIMEOUT_MS = 20_000;
+/**
+ * 🔴 THE DEFINITION CATALOGUE IS 5.75 MB. MEASURED, TODAY.
+ *
+ * `GET /api/v1/indexer/schema` returns **625 definitions in 5,748,818 bytes**.
+ * That is why `homelab_read` cannot be the producer for `add`: its ceiling is
+ * 4 MB and it would (correctly) refuse. This path gets its own, larger ceiling
+ * and its own filter, and **only the matches are ever rendered**.
+ */
+const SCHEMA_TIMEOUT_MS = 60_000;
+/** Every other response here is a few tens of KB; the schema is the outlier. */
+const MAX_BODY_BYTES = 16_000_000;
 const TEST_ONE_TIMEOUT_MS = 90_000;
 /** Measured: Prowlarr's testall took 22.8 s for 5 indexers. Leave real headroom. */
 const TEST_ALL_TIMEOUT_MS = 180_000;
@@ -390,7 +420,9 @@ export class IndexerAdminClient {
         headers: this.headers(!!init.body),
         signal: AbortSignal.timeout(timeoutMs),
       });
-      return { status: res.status, text: await res.text() };
+      const read = await readBounded(res, MAX_BODY_BYTES);
+      if ('error' in read) return { error: `${this.spec.label} ${url}: ${read.error}` };
+      return { status: res.status, text: read.text };
     } catch (e) {
       return {
         error:
@@ -440,6 +472,215 @@ export class IndexerAdminClient {
    * asserted separately, because relying on the renderer alone puts the whole
    * guarantee one `JSON.stringify(row)` away from a leak.
    */
+  /**
+   * The app profile every new indexer must reference.
+   *
+   * 🔴 NOT HARDCODED TO 1, AND NOT TAKEN FROM THE SCHEMA. The schema hands back
+   * `appProfileId: 0` on every definition, and Prowlarr rejects that outright —
+   * see `addFromSchema`. Read the real profile list instead: measured, this
+   * instance has exactly one, `{id: 1, name: "Standard"}`. Hardcoding the 1
+   * would work today and break silently on an instance with a different
+   * profile, which is a fact about THIS box rather than about the API.
+   */
+  async defaultAppProfileId(): Promise<Fetched<number>> {
+    const r = await this.getJson('/appprofile');
+    if (r.state !== 'ok') return r;
+    if (!Array.isArray(r.value) || r.value.length === 0) {
+      return {
+        state: 'unknown',
+        detail:
+          `${this.spec.label} reports NO app profiles, and every indexer must reference one. ` +
+          'Nothing can be added until a profile exists.',
+      };
+    }
+    const ids = (r.value as Record<string, unknown>[])
+      .map((p) => Number(p['id']))
+      .filter((n) => Number.isInteger(n) && n > 0)
+      .sort((a, b) => a - b);
+    if (!ids.length) {
+      return { state: 'unknown', detail: `${this.spec.label} returned app profiles with no usable id.` };
+    }
+    return { state: 'ok', value: ids[0]! };
+  }
+
+  /**
+   * Search the definition catalogue. **This is the producer for `add`.**
+   *
+   * ── 🔴 IT IS ALSO THE ANSWER TO "DOES INDEXER X EXIST?" ──────────────────
+   *
+   * The knowledge file records this as a META-LESSON, because it has already
+   * gone wrong twice: the orchestrator asserted from memory that Prowlarr ships
+   * an Audiobook Bay definition, told the owner so, and it was FALSE — it had
+   * been disproven ten days earlier. **Never claim a definition exists without
+   * asking the live instance.** This is the call that asks.
+   *
+   * ⚠️ Filtering happens HERE, not in the caller, because the thing being
+   * filtered is 5.75 MB and must never reach a rendered answer.
+   */
+  async searchSchema(query: string, limit: number): Promise<Fetched<SchemaMatch[]>> {
+    const r = await this.call('/indexer/schema', { method: 'GET' }, SCHEMA_TIMEOUT_MS);
+    if ('error' in r) return { state: 'unknown', detail: r.error };
+    if (r.status >= 400) {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema → HTTP ${r.status}.` };
+    }
+    let rows: unknown;
+    try {
+      rows = JSON.parse(r.text);
+    } catch {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema did not return JSON.` };
+    }
+    if (!Array.isArray(rows)) {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema returned an unexpected shape.` };
+    }
+
+    const needle = query.trim().toLowerCase();
+    const all = (rows as Record<string, unknown>[]).map(toSchemaMatch);
+    const matched = needle
+      ? all.filter(
+          (m) =>
+            m.definitionName.toLowerCase().includes(needle) ||
+            m.name.toLowerCase().includes(needle) ||
+            m.description.toLowerCase().includes(needle),
+        )
+      : all;
+    /**
+     * Exact name first, then public before private — the ordering that puts the
+     * usable answer at the top. 475 of the 625 definitions are private trackers
+     * we have no account for, so a relevance sort that ignores privacy buries
+     * the only ones anybody can actually add.
+     */
+    matched.sort((a, b) => {
+      const exact = (m: SchemaMatch) => (m.definitionName.toLowerCase() === needle || m.name.toLowerCase() === needle ? 0 : 1);
+      if (exact(a) !== exact(b)) return exact(a) - exact(b);
+      const open = (m: SchemaMatch) => (m.privacy === 'public' ? 0 : 1);
+      if (open(a) !== open(b)) return open(a) - open(b);
+      return a.name.localeCompare(b.name);
+    });
+    return { state: 'ok', value: matched.slice(0, limit).map((m) => ({ ...m, totalMatched: matched.length })) };
+  }
+
+  /** One definition by its exact name, for `add`. `null` when there is no such thing. */
+  async findDefinition(name: string): Promise<Fetched<Record<string, unknown> | null>> {
+    const r = await this.call('/indexer/schema', { method: 'GET' }, SCHEMA_TIMEOUT_MS);
+    if ('error' in r) return { state: 'unknown', detail: r.error };
+    if (r.status >= 400) {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema → HTTP ${r.status}.` };
+    }
+    let rows: unknown;
+    try {
+      rows = JSON.parse(r.text);
+    } catch {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema did not return JSON.` };
+    }
+    if (!Array.isArray(rows)) {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema returned an unexpected shape.` };
+    }
+    const needle = name.trim().toLowerCase();
+    const hit = (rows as Record<string, unknown>[]).find(
+      (x) =>
+        String(x['definitionName'] ?? '').toLowerCase() === needle ||
+        String(x['name'] ?? '').toLowerCase() === needle,
+    );
+    return { state: 'ok', value: hit ?? null };
+  }
+
+  /**
+   * Create an indexer from a catalogue definition.
+   *
+   * ── 🔴 `appProfileId` IS THE TRAP, AND THE OBVIOUS IMPLEMENTATION ALWAYS FAILS ──
+   *
+   * MEASURED: POSTing the schema entry **exactly as handed to us** returns
+   * `HTTP 400 — "'App Profile Id' must be greater than '0'"`, every single time,
+   * because the schema sets `appProfileId: 0` and the create endpoint requires
+   * a real one. "Fetch the definition, post the definition" is the natural way
+   * to write this and it has a 100% failure rate.
+   *
+   * ⚠️ Like `PUT`, the create **live-tests before saving** — measured 25.3 s for
+   * a working public tracker. A definition whose site is down cannot be added at
+   * all by this path, and that is the honest outcome: it is reporting that the
+   * site did not answer, not that the request was malformed.
+   */
+  async addFromSchema(
+    definition: Record<string, unknown>,
+    appProfileId: number,
+  ): Promise<Fetched<{ id: number; name: string }>> {
+    const body = { ...definition, appProfileId, enable: true };
+    const r = await this.call(
+      '/indexer',
+      { method: 'POST', body: JSON.stringify(body) },
+      TEST_ONE_TIMEOUT_MS,
+    );
+    if ('error' in r) return { state: 'unknown', detail: r.error };
+    if (r.status === 201 || r.status === 200) {
+      let created: Record<string, unknown> = {};
+      try {
+        created = JSON.parse(r.text) as Record<string, unknown>;
+      } catch {
+        /* created, but we cannot read back which id — handled below */
+      }
+      const id = Number(created['id']);
+      if (!Number.isInteger(id)) {
+        return {
+          state: 'unknown',
+          detail:
+            `${this.spec.label} accepted the new indexer (HTTP ${r.status}) but did not return a ` +
+            'usable id, so it exists and I cannot tell you its id. Run action "list" to find it.',
+        };
+      }
+      return { state: 'ok', value: { id, name: String(created['name'] ?? definition['name'] ?? '?') } };
+    }
+    if (r.status === 400) {
+      const why = collectFailures(safeParse(r.text));
+      return {
+        state: 'unknown',
+        detail:
+          `${this.spec.label} REFUSED to create it (HTTP 400) and nothing was added. ` +
+          (why.length ? why.join(' / ') : scrubBody(r.text, 300)),
+      };
+    }
+    return {
+      state: 'unknown',
+      detail:
+        `${this.spec.label} POST /indexer → HTTP ${r.status}. Whether it was created is UNKNOWN — ` +
+        `run action "list" before retrying, or you may add it twice. ${scrubBody(r.text, 200)}`,
+    };
+  }
+
+  /**
+   * The FULL resource, verbatim, for capture before a delete.
+   *
+   * 🔴 THE ONLY METHOD ON THIS CLASS THAT RETURNS AN UNREDACTED BODY, and the
+   * caller must write it straight to a file and never render it. It exists so a
+   * delete is RECOVERABLE — Prowlarr will not tell you afterwards what the
+   * indexer was configured with.
+   */
+  async fetchRaw(id: number): Promise<Fetched<string>> {
+    const r = await this.call(`/indexer/${id}`, { method: 'GET' }, READ_TIMEOUT_MS);
+    if ('error' in r) return { state: 'unknown', detail: r.error };
+    if (r.status === 404) {
+      return { state: 'unknown', detail: `${this.spec.label} has no indexer with id ${id}.` };
+    }
+    if (r.status >= 400) {
+      return { state: 'unknown', detail: `${this.spec.label} /indexer/${id} → HTTP ${r.status}.` };
+    }
+    return { state: 'ok', value: r.text };
+  }
+
+  /** DELETE. Measured: HTTP 200 with an empty `{}` body. */
+  async remove(id: number): Promise<Fetched<true>> {
+    const r = await this.call(`/indexer/${id}`, { method: 'DELETE' }, READ_TIMEOUT_MS);
+    if ('error' in r) return { state: 'unknown', detail: r.error };
+    if (r.status >= 400) {
+      return {
+        state: 'unknown',
+        detail:
+          `${this.spec.label} DELETE /indexer/${id} → HTTP ${r.status}. It may or may not have been ` +
+          `removed — run action "list" to find out. ${scrubBody(r.text, 200)}`,
+      };
+    }
+    return { state: 'ok', value: true };
+  }
+
   async list(): Promise<Fetched<IndexerRow[]>> {
     const r = await this.getJson('/indexer');
     if (r.state !== 'ok') return r;
@@ -692,6 +933,68 @@ function describeNonJson(text: string): string {
       ? 'it is not JSON and does not start with "<"'
       : 'it is empty';
   return `${kind}; ${text.length} characters, not shown`;
+}
+
+function toSchemaMatch(raw: Record<string, unknown>): SchemaMatch {
+  return {
+    definitionName: String(raw['definitionName'] ?? ''),
+    name: String(raw['name'] ?? ''),
+    privacy: String(raw['privacy'] ?? '?'),
+    protocol: String(raw['protocol'] ?? '?'),
+    language: String(raw['language'] ?? '?'),
+    // Trimmed here rather than at render time: these run to a paragraph and
+    // there are 625 of them.
+    description: String(raw['description'] ?? '').slice(0, 160),
+  };
+}
+
+function safeParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a response body, stopping once it passes `ceiling`.
+ *
+ * ⚠️ Deliberately a small local copy of the same guard in
+ * `src/tools/homelab-read.ts`, rather than an import: that one lives in the
+ * TOOL layer and importing it here would invert the layering. The reason it
+ * exists at all is recorded there — an unbounded `res.text()` on a chunked
+ * endpoint buffered 93 MB before the size check it was supposed to trip.
+ *
+ * Returns an ERROR rather than a partial string. Half a body is invalid JSON
+ * that looks like data.
+ */
+async function readBounded(res: Response, ceiling: number): Promise<{ text: string } | { error: string }> {
+  const body = res.body;
+  if (!body || typeof body.getReader !== 'function') return { text: await res.text() };
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > ceiling) {
+        await reader.cancel().catch(() => undefined);
+        return {
+          error:
+            `the response passed ${ceiling.toLocaleString()} bytes and was abandoned. Nothing is ` +
+            'shown rather than part of it.',
+        };
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+  return { text: chunks.join('') };
 }
 
 function asIso(v: unknown): string | null {

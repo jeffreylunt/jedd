@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Config } from '../src/config.js';
 
 /**
@@ -53,6 +56,10 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       validityHours: 24,
     },
     readOnly: true,
+    // ⚠️ A TEMP PATH, NEVER the real backup directory. A test that exercised
+    // `remove` against the default would write captured indexer definitions —
+    // credentials included — into the user's real ~/.superbot2 backups.
+    indexerBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-indexer-backup-')), 'captures'),
     ...overrides,
   };
 }

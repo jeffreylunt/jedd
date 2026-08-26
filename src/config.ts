@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 /**
  * All configuration in one place, read once at boot.
@@ -169,6 +171,23 @@ export interface Config {
    * an absent tool is better than one that always errors.
    */
   runbookPath?: string;
+  /**
+   * Where `indexer_admin` writes an indexer's full configuration BEFORE deleting
+   * it.
+   *
+   * 🔴 REQUIRED, WITH A DEFAULT — deliberately not optional, unlike
+   * `runbookPath`. The pattern elsewhere in this file is "no path, no tool",
+   * because a tool that always errors is worse than an absent one. That is the
+   * right call for a READ like the runbook and the wrong one here: making this
+   * optional would mean `remove` either vanishes or, far worse, runs without a
+   * capture. **The capture is what makes deletion reversible**, so there must
+   * always be somewhere to put it.
+   *
+   * ⚠️ The files hold tracker credentials and are written 0600. It lives under
+   * `~/.superbot2/` rather than the repo so a checkout, a branch switch or a
+   * clean does not take the only copy of a deleted indexer's config with it.
+   */
+  indexerBackupDir: string;
 }
 
 function required(name: string): string {
@@ -290,6 +309,8 @@ export function loadConfig(): Config {
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',
     runbookPath: process.env.RUNBOOK_PATH,
+    indexerBackupDir:
+      process.env.INDEXER_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'prowlarr-indexers'),
   };
 }
 

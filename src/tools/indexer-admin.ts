@@ -10,6 +10,10 @@ import {
   type IndexerService,
   type TestOutcome,
 } from '../media/indexer-admin.js';
+import { stripCredentials } from '../homelab-read.js';
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import type { Config } from '../config.js';
+import { join } from 'node:path';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -56,9 +60,29 @@ import { fail, ok, type Tool } from './types.js';
  * the resource to four scalars so no credential is in the answer.
  */
 
-type Action = 'list' | 'test' | 'test_all' | 'enable' | 'disable';
+type Action =
+  | 'list'
+  | 'search_available'
+  | 'test'
+  | 'test_all'
+  | 'enable'
+  | 'disable'
+  | 'add'
+  | 'remove';
 
-const ACTIONS: Action[] = ['list', 'test', 'test_all', 'enable', 'disable'];
+const ACTIONS: Action[] = [
+  'list',
+  'search_available',
+  'test',
+  'test_all',
+  'enable',
+  'disable',
+  'add',
+  'remove',
+];
+
+/** Catalogue matches shown at once. 625 definitions exist; a list is not an answer. */
+const SEARCH_LIMIT = 12;
 
 /** Past this, the standing rule says report once and stop retrying. */
 const REPORT_ONCE_HOURS = 72;
@@ -67,34 +91,47 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'indexer_admin',
     description:
-      'Force-test, enable or disable the torrent indexers on Prowlarr, Sonarr or Radarr, and read ' +
-      'back what actually happened. This is the only write path to an indexer; homelab_read can see ' +
-      'their health and can never change it.\n' +
+      'Manage the torrent indexers on Prowlarr, Sonarr and Radarr — force-test, enable, disable, ' +
+      'add and remove — and read back what actually happened. This is the only write path to an ' +
+      'indexer; homelab_read can see their health and can never change it.\n' +
       'PICK THE RIGHT SERVICE — this is the part that decides whether anything is fixed:\n' +
       '• "searches find nothing / nothing is downloading / Sonarr says no results" → the stale ' +
       'backoff is on the ARR. Run test_all against "sonarr" AND "radarr". Sonarr and Radarr each ' +
       "keep their OWN indexer failure state, separate from Prowlarr's, and it survives the network " +
       'recovering: Prowlarr can read perfectly healthy and return hundreds of results while every ' +
       'arr search returns 0. A force-test that PASSES resets that timer, and nothing needs ' +
-      'restarting.\n' +
-      '• "the indexers are down / an indexer is red in Prowlarr" → run test_all against "prowlarr".\n' +
-      "• Not sure → do prowlarr first (it is the upstream and it can be READ), then both arrs.\n" +
-      'ACTIONS: list — every indexer with its id and whether it is on, plus its backoff on Prowlarr ' +
+      'restarting. This is the highest-value thing this tool does.\n' +
+      '• "the indexers are down / an indexer is red in Prowlarr" → test_all against "prowlarr".\n' +
+      '• Adding or removing a tracker → "prowlarr" only. Every arr indexer is a Prowlarr proxy, so ' +
+      'Prowlarr decides which trackers exist and pushes them out.\n' +
+      'ACTIONS. list — every indexer with its id and whether it is on, plus its backoff on Prowlarr ' +
       '(the arrs do not expose backoff at all, so do not promise a figure for those). Run this ' +
-      'FIRST; ids are per-service and do NOT match between Prowlarr, Sonarr and Radarr. test — force-test ' +
-      'one id; this is the backoff reset. test_all — force-test every ENABLED indexer on that ' +
-      'service in one call (a disabled one is skipped, so a missing id is not a missing result); ' +
-      'takes 20-40s. enable / disable — turn one indexer on or off; PROWLARR ONLY, because a Sonarr ' +
-      'or Radarr indexer has no such switch (measured) and the arr ones are all Prowlarr proxies ' +
-      'anyway, so the real switch is upstream.\n' +
+      'FIRST; ids are per-service and do NOT match between Prowlarr, Sonarr and Radarr. ' +
+      'search_available — search the 625 definitions Prowlarr ships, by `query`. This is where ' +
+      '`add` gets its definition name, AND it is the only way to answer "is there an indexer for ' +
+      'X?" — never assert from memory that a tracker is or is not supported, ask this. ' +
+      'test — force-test one id; this is the backoff reset. test_all — force-test every ENABLED ' +
+      'indexer on that service in one call (a disabled one is skipped, so a missing id is not a ' +
+      'missing result); takes 20-40s. enable / disable — turn one indexer on or off. ' +
+      'add — install a definition by name; takes ~25s because Prowlarr live-tests it before saving. ' +
+      'remove — delete an indexer.\n' +
+      '🔴 REMOVE IS RECOVERABLE AND YOU SHOULD SAY SO. The full configuration is saved to a file ' +
+      'before anything is deleted, and the result gives you the path — report it, because it is how ' +
+      'the change gets undone. If that file cannot be written, nothing is deleted. The saved file ' +
+      'may hold tracker credentials: say the file contains them and where it is, and NEVER read ' +
+      'them out or offer to.\n' +
+      '🔴 ONLY "public" DEFINITIONS CAN BE ADDED. Of the 625, 475 are private and 63 semiPrivate — ' +
+      'those need an account or API key this house does not have, and REGISTERING for a tracker is ' +
+      "the owner's decision, never something you do because it would solve the problem. add refuses " +
+      'them and says so.\n' +
       '🔴 A 403 IS NOT FIXABLE FROM HERE AND YOU MUST NOT IMPLY IT WAS FIXED. If a test fails with ' +
       'Forbidden, the tracker refused us — a backoff reset cannot change that, and the failed test ' +
       'pushes the backoff a further 24h out. Say "tested, still 403 — that is the site refusing us, ' +
       'not something wrong on our side." Never say re-enabled, refreshed or fixed. A 403 lasting ' +
       'over 3 days while the other indexers are green is reported ONCE and then left alone.\n' +
-      'WHAT THIS CANNOT DO: it cannot make a dead tracker answer, it cannot add or configure an ' +
-      'indexer, and it never restarts a container. If a test fails with a timeout or a network error ' +
-      'rather than a 403, the VPN tunnel is the likely cause and that is a separate problem — say so ' +
+      'WHAT THIS CANNOT DO: it cannot make a dead tracker answer, it cannot register an account, ' +
+      'and it never restarts a container. If a test fails with a timeout or a network error rather ' +
+      'than a 403, the VPN tunnel is the likely cause and that is a separate problem — say so ' +
       'instead of retrying.\n' +
       'Every call tries to re-read the live state afterwards and print it. When that re-read ' +
       'SUCCEEDS the printed state is what IS; when it fails the tool says so, and then nothing ' +
@@ -146,8 +183,20 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
         id: {
           type: 'number',
           description:
-            'The indexer id, for test / enable / disable. Comes from this tool\'s own "list" action ' +
-            'on the SAME service — ids are not shared between services.',
+            'The indexer id, for test / enable / disable / remove. Comes from this tool\'s own ' +
+            '"list" action on the SAME service — ids are not shared between services.',
+        },
+        query: {
+          type: 'string',
+          description:
+            'For search_available: what to look for in the catalogue of 625 definitions, matched ' +
+            'against the name and the description. Omit to see the first few, which is rarely useful.',
+        },
+        definition: {
+          type: 'string',
+          description:
+            'For add: the definition NAME from search_available, e.g. "BTdirectory". A definition ' +
+            'has no numeric id — the name IS the identifier.',
         },
       },
       required: ['service', 'action'],
@@ -175,6 +224,12 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
       switch (action as Action) {
         case 'list':
           return runList(client);
+        case 'search_available':
+          return runSearchAvailable(client, args['query']);
+        case 'add':
+          return runAdd(client, args['definition']);
+        case 'remove':
+          return runRemove(client, args['id'], ctx.config);
         case 'test':
           return runTest(client, args['id']);
         case 'test_all':
@@ -197,6 +252,334 @@ async function runList(client: IndexerAdminClient) {
   const snap = await snapshot(client);
   if ('error' in snap) return fail(snap.error);
   return ok(`${client.label} indexers — nothing was changed.\n\n${renderSnapshot(client, snap)}`);
+}
+
+/**
+ * 🔴 ADD, REMOVE AND THE TOGGLES ARE PROWLARR-ONLY, AND FOR THE SAME REASON.
+ *
+ * Every Sonarr and Radarr indexer here is a Prowlarr proxy — their names end
+ * "(Prowlarr)" and their URLs point at `localhost:9696/{prowlarrId}/api`.
+ * Prowlarr PUSHES them; an indexer added directly to an arr is not managed by
+ * anything and one removed there comes back on the next sync. So the arrs get
+ * the operation that is genuinely theirs — force-testing, which resets THEIR
+ * backoff — and coverage changes happen upstream where they mean something.
+ */
+function prowlarrOnly(client: IndexerAdminClient, verb: string): string | null {
+  if (client.service === 'prowlarr') return null;
+  return (
+    `${verb} is a PROWLARR operation and this call named "${client.service}". Every ${client.label} ` +
+    'indexer here is a Prowlarr proxy (their names end "(Prowlarr)"), so Prowlarr is what decides ' +
+    `which trackers exist — one ${verb}d on ${client.label} directly is either unmanaged or undone ` +
+    `by the next sync. Re-run with service "prowlarr". Force-testing ${client.label} still works and ` +
+    'is the operation that resets ITS backoff.'
+  );
+}
+
+/**
+ * THE PRODUCER FOR `add`.
+ *
+ * ── 🔴 IT IS ALSO THE ONLY HONEST ANSWER TO "IS THERE AN INDEXER FOR X?" ────
+ *
+ * Recorded in the knowledge file as a META-LESSON, because it has gone wrong
+ * twice: an Audiobook Bay definition was asserted from memory, relayed to the
+ * owner as fact, and was FALSE — having already been disproven ten days
+ * earlier. The catalogue is 5.75 MB and lives on the server; the only way to
+ * know is to ask it.
+ */
+async function runSearchAvailable(client: IndexerAdminClient, rawQuery: unknown) {
+  const refusal = prowlarrOnly(client, 'Searching the definition catalogue');
+  if (refusal) return fail(refusal);
+
+  const query = typeof rawQuery === 'string' ? rawQuery.trim() : '';
+  const result = await client.searchSchema(query, SEARCH_LIMIT);
+  if (result.state !== 'ok') return fail(`Could not read the definition catalogue.\n${result.detail}`);
+
+  const matches = result.value;
+  const total = matches[0]?.totalMatched ?? matches.length;
+  if (!matches.length) {
+    return ok(
+      `Prowlarr's catalogue has NO definition matching ${JSON.stringify(query)}.\n` +
+        '🔴 That is a real answer from the live instance, not a gap in what I know — say plainly ' +
+        'that Prowlarr does not ship one, rather than guessing at a name. Prowlarr will not index a ' +
+        'site it has no definition for; building a custom one is a separate project and a decision ' +
+        'for the owner.',
+    );
+  }
+
+  // Already-installed definitions are marked, so `add` is not offered for
+  // something that is already there.
+  const installed = await client.list();
+  const have = new Set(
+    installed.state === 'ok' ? installed.value.map((i) => i.name.toLowerCase()) : [],
+  );
+
+  const lines = [
+    `Prowlarr catalogue: ${total} definition(s) match ${JSON.stringify(query)}` +
+      (total > matches.length ? `, showing the first ${matches.length}` : '') +
+      '. NOTHING was added.',
+    '',
+  ];
+  for (const m of matches) {
+    const already = have.has(m.name.toLowerCase()) ? '  ⚠️ ALREADY INSTALLED' : '';
+    lines.push(`  ${m.name}  [definition: ${m.definitionName}]  ${m.privacy}/${m.protocol}${already}`);
+    if (m.description) lines.push(`      ${m.description}`);
+  }
+  lines.push(
+    '',
+    '🔴 ONLY A "public" DEFINITION CAN BE ADDED HERE. A private or semiPrivate tracker needs an ' +
+      'account, an invite or an API key that this house does not have, so adding one fails at the ' +
+      'validation step — and REGISTERING for a tracker is the owner\'s decision, never something to ' +
+      'do unprompted. Of the 625 definitions Prowlarr ships, 475 are private and 63 semiPrivate; ' +
+      'only 87 are public.',
+    'To install one: action "add" with `definition` set to the bracketed definition name above.',
+  );
+  return ok(lines.join('\n'));
+}
+
+/**
+ * Install a definition from the catalogue.
+ *
+ * ⚠️ SLOW ON PURPOSE: the create endpoint live-tests before saving (measured
+ * 25.3 s for a working public tracker), so this genuinely reaches the site.
+ */
+async function runAdd(client: IndexerAdminClient, rawDefinition: unknown) {
+  const refusal = prowlarrOnly(client, 'Adding an indexer');
+  if (refusal) return fail(refusal);
+
+  const wanted = typeof rawDefinition === 'string' ? rawDefinition.trim() : '';
+  if (!wanted) {
+    return fail(
+      'No `definition` supplied, so nothing was added. Run action "search_available" with a `query` ' +
+        'first — that is where definition names come from, and a definition has no numeric id.',
+    );
+  }
+
+  const found = await client.findDefinition(wanted);
+  if (found.state !== 'ok') return fail(`Could not read the definition catalogue.\n${found.detail}`);
+  if (!found.value) {
+    return fail(
+      `Prowlarr has NO definition called ${JSON.stringify(wanted)}, so nothing was added.\n` +
+        '🔴 This is the live instance answering, so do not guess at a near-miss name or assert that ' +
+        'the tracker is supported. Run action "search_available" with a shorter query to see what ' +
+        'actually exists.',
+    );
+  }
+  const def = found.value;
+  const defName = String(def['name'] ?? wanted);
+
+  /**
+   * 🔴 PRIVACY IS CHECKED BEFORE ANYTHING IS SENT.
+   *
+   * A private tracker's definition needs credentials we do not hold, so the
+   * create would fail its validation 25 seconds later with a confusing message
+   * about a missing field. Worse, the fix for that message is "go and register
+   * an account", which the knowledge file explicitly says not to do unprompted.
+   * Refuse first, and say which of the two it is.
+   */
+  const privacy = String(def['privacy'] ?? '?');
+  if (privacy !== 'public') {
+    return fail(
+      `${defName} is a ${privacy} tracker, so it was NOT added and nothing was sent.\n` +
+        'It needs an account, invite or API key that this house does not have — the create would ' +
+        'fail its validation, and the only way to make it succeed is to REGISTER for the tracker, ' +
+        'which is the owner\'s decision and is never done unprompted. Say that plainly and offer a ' +
+        'public alternative from action "search_available" instead.',
+    );
+  }
+
+  const before = await snapshot(client);
+  if ('error' in before) return fail(before.error);
+  const existing = before.indexers.find((i) => i.name.toLowerCase() === defName.toLowerCase());
+  if (existing) {
+    return ok(
+      `Prowlarr ALREADY has ${defName} as id ${existing.id} — nothing was added and there is now no ` +
+        'duplicate. Say it was already there rather than reporting a new install.\n\n' +
+        renderSnapshot(client, before),
+    );
+  }
+
+  /**
+   * 🔴 THE `appProfileId` TRAP. The obvious implementation fails 100% of the
+   * time: the catalogue hands back `appProfileId: 0` and the create endpoint
+   * requires a real one — MEASURED, `HTTP 400 "'App Profile Id' must be greater
+   * than '0'"`. Read the profile list rather than hardcoding the 1 this box
+   * happens to use.
+   */
+  const profile = await client.defaultAppProfileId();
+  if (profile.state !== 'ok') return fail(`Nothing was added.\n${profile.detail}`);
+
+  const created = await client.addFromSchema(def, profile.value);
+  if (created.state !== 'ok') {
+    return fail(
+      `${defName} was NOT added.\n${created.detail}\n` +
+        '⚠️ Prowlarr live-tests a new indexer before saving it, so a refusal here usually means the ' +
+        'site did not answer — not that the request was wrong. That is the same "the site is ' +
+        'refusing us" case as a 403 on an existing indexer, and it is not something we can fix.',
+    );
+  }
+
+  const after = await snapshot(client);
+  return ok(
+    finish(
+      [
+        `Added ${created.value.name} to Prowlarr as id ${created.value.id}, enabled.`,
+        '',
+        'Prowlarr live-tested it before saving, so it answered — but that is one probe, not a ' +
+          'guarantee. Run action "test" on this id if you want the current verdict.',
+        '⚠️ Prowlarr pushes its indexer list to Sonarr and Radarr on its own sync cycle, so this ' +
+          'will appear there shortly rather than immediately. Do not report it as missing on the ' +
+          'arrs until a sync has had time to run.',
+      ],
+      client,
+      after,
+      'The indexer was added',
+    ),
+  );
+}
+
+/**
+ * Remove an indexer — CAPTURING ITS FULL CONFIGURATION FIRST.
+ *
+ * ── 🔴 RECOVERABILITY IS THE DESIGN, NOT AN APPROVAL PROMPT ─────────────────
+ *
+ * Delete is the only destructive verb here: it discards the URL, the categories,
+ * the priority, any hand-tuned settings and any credentials, and **Prowlarr will
+ * not tell you afterwards what was there**. The obvious answer is to gate it
+ * behind a confirmation, and that is the wrong answer — a manufactured approval
+ * step is friction that teaches people to click through it, and the owner has
+ * been explicit about not wanting them.
+ *
+ * So the destructive action is made REVERSIBLE instead: the exact definition is
+ * written to a file before anything is deleted, and the reply says where it is.
+ *
+ * ── 🔴 THE FILE IS WRITTEN FIRST, AND A FAILED WRITE ABORTS THE DELETE ──────
+ *
+ * That ordering IS the guarantee. Deleting first and capturing afterwards is
+ * capturing nothing, and capturing "best effort" alongside a delete that
+ * proceeds regardless is a promise of recoverability that is void exactly when
+ * it is needed.
+ *
+ * ── 🔴 AND THE FILE IS NOT THE REPLY ────────────────────────────────────────
+ *
+ * The captured definition may carry a tracker's API key or password. The
+ * standing rule outranks recoverability and does not bend for convenience: a
+ * credential quoted into a reply is copied into the message thread, the replayed
+ * history and the log file. So the REPLY gets a redacted summary and a path; the
+ * FILE gets the secret, at 0600.
+ */
+async function runRemove(client: IndexerAdminClient, rawId: unknown, config: Config) {
+  const refusal = prowlarrOnly(client, 'Removing an indexer');
+  if (refusal) return fail(refusal);
+
+  const id = asId(rawId, client);
+  if (typeof id === 'string') return fail(`Nothing was removed. ${id}`);
+
+  const before = await snapshot(client);
+  if ('error' in before) return fail(before.error);
+  const row = before.indexers.find((i) => i.id === id);
+  if (!row) {
+    return fail(
+      `Prowlarr has no indexer with id ${id}, so nothing was removed. Run action "list" to see the ` +
+        'ids it actually has.',
+    );
+  }
+
+  // 1. CAPTURE — the full resource, unredacted, straight to disk.
+  const raw = await client.fetchRaw(id);
+  if (raw.state !== 'ok') {
+    return fail(
+      `NOTHING WAS REMOVED. I could not read ${row.name}'s configuration first, and removing it ` +
+        `without a copy would be irreversible.\n${raw.detail}`,
+    );
+  }
+
+  let savedTo: string;
+  try {
+    savedTo = captureDefinition(config.indexerBackupDir, id, row.name, raw.value);
+  } catch (e) {
+    return fail(
+      `NOTHING WAS REMOVED. The configuration backup could not be written (${(e as Error).message}), ` +
+        'and a delete is only safe because that file exists. Fix the path or the permissions and ' +
+        'try again — this is a refusal, not a failure of the removal itself.',
+    );
+  }
+
+  // 2. DELETE — only now.
+  const removed = await client.remove(id);
+  if (removed.state !== 'ok') {
+    return fail(
+      `${row.name} was NOT removed.\n${removed.detail}\n` +
+        `Its configuration was saved to ${savedTo} anyway, which is harmless — nothing was lost.`,
+    );
+  }
+
+  const after = await snapshot(client);
+  return ok(
+    finish(
+      [
+        `Removed ${row.name} (was id ${id}) from Prowlarr.`,
+        '',
+        `🔴 THIS IS RECOVERABLE. Its complete configuration was saved to:\n  ${savedTo}`,
+        'To put it back, re-add it from that file — or, for a stock definition, action "add" with ' +
+          `\`definition\` set to its catalogue name.`,
+        summariseCaptured(raw.value),
+        '⚠️ Re-adding does NOT restore the id. A new indexer gets a NEW id (measured: a removed id 8 ' +
+          'came back as 10), and Sonarr and Radarr reference Prowlarr indexers BY id — so Prowlarr ' +
+          'will re-sync them rather than the old link resuming. Say that if anyone asks why the arrs ' +
+          'look different afterwards.',
+      ],
+      client,
+      after,
+      'The indexer was removed',
+    ),
+  );
+}
+
+/**
+ * Write the captured definition, 0600, and return the path.
+ *
+ * ⚠️ Throws rather than returning an error value, so a caller CANNOT proceed to
+ * the delete by ignoring a return value. This repo has already shipped a defect
+ * where a discarded return value gated a success flag.
+ */
+function captureDefinition(dir: string, id: number, name: string, body: string): string {
+  mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'indexer';
+  const path = join(dir, `prowlarr-${slug}-id${id}-${stamp}.json`);
+  writeFileSync(path, body, { encoding: 'utf8', mode: 0o600 });
+  // Explicit, because `mode` on writeFileSync is masked by the process umask and
+  // is a no-op when the file already exists. This file may hold a tracker
+  // credential; 0600 is not decoration.
+  chmodSync(path, 0o600);
+  return path;
+}
+
+/**
+ * What the reply is allowed to say about the captured definition.
+ *
+ * 🔴 NAMES THE CREDENTIAL FIELDS, QUOTES NONE OF THEM. Saying "3 credential
+ * fields were saved and withheld" is the useful, safe half — it tells the reader
+ * the file matters and why, without putting the secret anywhere it will be
+ * copied.
+ */
+function summariseCaptured(body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return `The saved copy is ${body.length} characters. Its contents are not shown here.`;
+  }
+  const stripped = stripCredentials(parsed);
+  const secrets = stripped.redacted;
+  const summary = `The saved copy is the complete definition (${body.length} characters).`;
+  if (!secrets.length) return `${summary} It contains no credential fields.`;
+  return (
+    `${summary}\n🔴 It contains ${secrets.length} CREDENTIAL field(s) — ${secrets.join(', ')} — which ` +
+    'are in the file and are deliberately NOT repeated here. A secret quoted into a reply is copied ' +
+    'into the message thread, the history and the log file. Tell the user the file holds them and ' +
+    'where it is; do not read them out, and do not offer to.'
+  );
 }
 
 async function runTest(client: IndexerAdminClient, rawId: unknown) {
