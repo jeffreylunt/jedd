@@ -1,4 +1,5 @@
 import { type Config } from '../config.js';
+import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IdentityVerdict } from '../identity-probe.js';
 import { InviteLedger } from '../invite-ledger.js';
 import { JfagoClient } from '../jfago.js';
@@ -153,6 +154,19 @@ export interface ToolDeps {
    * "It works" and "it is reachable" were both true, of different objects.
    */
   ebook?: SendEbookDeps;
+  /**
+   * The IRC #ebooks source, when this deployment has one.
+   *
+   * 🔴 UNLIKE `invite` AND `ebook`, THIS IS **NOT** A REGISTRATION GATE.
+   *
+   * Those gate registration because without them the tool would offer a
+   * capability that cannot complete — an invite with no jfa-go, a send with no
+   * SMTP. IRC is different in kind: it is a SECOND SOURCE for a tool that works
+   * perfectly well with one. Gating on it would take `search_ebook` down
+   * whenever IRC was unreachable, which is the opposite of what a second source
+   * is for. Absent, or sick, it degrades to Prowlarr-only and says so.
+   */
+  irc?: IrcEbooks;
 }
 
 /**
@@ -291,7 +305,12 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
    * user finding it. A producer whose only consumer is absent is not a
    * capability either.
    */
-  if (deps.ebook && config.kindle.smtpPassword) tools.push(makeSendEbook(deps.ebook), makeSearchEbook());
+  if (deps.ebook && config.kindle.smtpPassword) {
+    tools.push(
+      makeSendEbook(deps.irc ? { ...deps.ebook, irc: deps.irc } : deps.ebook),
+      makeSearchEbook(undefined, deps.irc),
+    );
+  }
   // Same rule again: no TMDB token, no tool. A registered whats_popular with no
   // credential would answer every "what's good right now" with a failure, after
   // the model has already offered to look.

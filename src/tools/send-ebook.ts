@@ -1,6 +1,7 @@
-import { fetchFileFromHp, resolveBookPath } from '../media/fetch-file.js';
-import { grabStatus, grabTorrent, toHostPath, type MountMap } from '../media/grab.js';
-import { sendToKindle, type MailSender } from '../media/kindle-send.js';
+import { deliverEbook } from '../media/ebook-deliver.js';
+import { grabTorrent, type MountMap } from '../media/grab.js';
+import type { IrcEbooks } from '../media/irc-ebooks.js';
+import type { MailSender } from '../media/kindle-send.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
 
 /**
@@ -41,6 +42,8 @@ export interface SendEbookDeps {
    * build is a DIFFERENT OBJECT, not the same object in a different mood.
    */
   onlySendTo?: string;
+  /** The IRC source, when this deployment has one. */
+  irc?: IrcEbooks;
 }
 
 export function makeSendEbook(deps: SendEbookDeps): Tool {
@@ -81,74 +84,128 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
         );
       }
 
-      // ── which book ───────────────────────────────────────────────────────
+      // ── which book, and FROM WHERE ───────────────────────────────────────
       const picked = ctx.choices.resolve(ctx.senderHandle, n);
       if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
-      const infoHash = String(picked.option.value['infoHash'] ?? '');
-      const title = String(picked.option.value['title'] ?? picked.option.label);
+      const value = picked.option.value;
+      const title = String(value['title'] ?? picked.option.label);
 
-      // ── grab ─────────────────────────────────────────────────────────────
-      const grab = await grabTorrent({
-        adminSshHost: ctx.config.adminSshHost,
-        qbitBaseUrl: ctx.config.qbittorrent.baseUrl,
-        infoHash,
-        title,
-        category: 'ebooks',
-        exec: ctx.exec,
-      });
-      if (grab.state === 'failed') return fail(`FAILED — ${grab.detail}`);
-      if (grab.state === 'unknown') return fail(`UNKNOWN — ${grab.detail}`);
+      /**
+       * 🔴 ABSENT `source` MEANS PROWLARR, EXPLICITLY.
+       *
+       * `choices.jsonl` is durable and every option written before IRC existed
+       * has no `source` key at all. A pending list that survives a restart would
+       * otherwise arrive here with `undefined` and match neither branch — the
+       * first pick after this deploy would break. Defaulting is a MIGRATION,
+       * not a convenience, which is why it is spelled out rather than relying on
+       * a falsy check somewhere below.
+       */
+      const source = value['source'] === 'irc' ? 'irc' : 'prowlarr';
 
-      // ── is it here yet? ──────────────────────────────────────────────────
-      const status = await grabStatus({
-        adminSshHost: ctx.config.adminSshHost,
-        qbitBaseUrl: ctx.config.qbittorrent.baseUrl,
-        infoHash,
-        exec: ctx.exec,
-      });
-      if (status.state === 'unknown') return fail(`UNKNOWN — ${status.detail}`);
-      if (status.state === 'missing') return fail(`FAILED — ${status.detail}`);
-      if (status.state === 'downloading') {
-        // Not an error. The turn is not finished, so say what will finish it.
-        return ok(
-          `DOWNLOADING — ${status.detail} Nothing has been sent yet. Tell them it is downloading ` +
-            'and that you will send it once it lands.',
-        );
-      }
-
-      // ── move the bytes, verified ─────────────────────────────────────────
-      const hostPath = toHostPath(status.contentPath, deps.mounts ?? DEFAULT_MOUNTS);
-      if (!hostPath) {
+      /**
+       * 🔴 `.mobi` IS REFUSED BEFORE ANYTHING IS FETCHED, AND NAMES A WAY OUT.
+       *
+       * Amazon has rejected `.mobi` since 2022 and does it SILENTLY — the send
+       * looks fine here and the book never arrives. Declining beats a bounce
+       * nobody can see. `ebook-validate.ts` catches this again on the bytes;
+       * this earlier check exists so the person is told *now*, and told which
+       * numbered option to pick instead, rather than after a pointless download.
+       */
+      if (/\.mobi\b/i.test(title)) {
+        const alt = picked.choice.options.find((o) => /\.epub\b/i.test(String(o.value['title'] ?? o.label)));
         return fail(
-          `FAILED — qBittorrent reports "${status.contentPath}", which is a path inside its own ` +
-            'container and maps to no known mount. This is a configuration problem, not a missing book.',
+          `REFUSED — "${title}" is a .mobi. Amazon stopped accepting that format in 2022 and ` +
+            'rejects it silently, so it would look sent and never arrive. Nothing was fetched. ' +
+            (alt
+              ? `Option ${alt.n} is an EPUB — offer them that one instead.`
+              : 'None of the other options is an EPUB; offer to search again.'),
         );
       }
-      // content_path is a DIRECTORY for a multi-file torrent, which is the
-      // common case for ebooks. Choose the book before reading anything.
-      const book = await resolveBookPath({
-        adminSshHost: ctx.config.adminSshHost,
-        hostPath,
-        exec: ctx.exec,
-      });
-      if (book.state !== 'ok') return fail(`${book.state.toUpperCase()} — ${book.detail}`);
 
-      const file = await fetchFileFromHp({
-        adminSshHost: ctx.config.adminSshHost,
-        hostPath: book.path,
-        exec: ctx.exec,
-      });
-      if (file.state !== 'ok') {
-        return fail(`${file.state.toUpperCase()} — ${file.detail}`);
+      // ── start the fetch ──────────────────────────────────────────────────
+      if (source === 'prowlarr') {
+        const infoHash = String(value['infoHash'] ?? '');
+        const grab = await grabTorrent({
+          adminSshHost: ctx.config.adminSshHost,
+          qbitBaseUrl: ctx.config.qbittorrent.baseUrl,
+          infoHash,
+          title,
+          category: 'ebooks',
+          exec: ctx.exec,
+        });
+        if (grab.state === 'failed') return fail(`FAILED — ${grab.detail}`);
+        if (grab.state === 'unknown') return fail(`UNKNOWN — ${grab.detail}`);
       }
 
-      // ── send ─────────────────────────────────────────────────────────────
-      const sent = await sendToKindle(
-        { config: ctx.config, toAddress: record.address, filename: file.name, bytes: file.bytes },
-        deps.send,
+      const subject = {
+        source,
+        title,
+        ...(source === 'prowlarr'
+          ? { infoHash: String(value['infoHash'] ?? '') }
+          : { command: String(value['command'] ?? ''), bot: String(value['bot'] ?? '') }),
+      } as const;
+
+      /**
+       * One attempt now, in case the torrent is already on disk — the fast path
+       * that was there before and is worth keeping. IRC never blocks a turn:
+       * a bot can queue a request for ten minutes or more.
+       */
+      const attempt = await deliverEbook(
+        subject,
+        ctx.senderHandle,
+        {
+          config: ctx.config,
+          kindle: ctx.kindle,
+          mail: deps.send,
+          ...(ctx.exec ? { exec: ctx.exec } : {}),
+          ...(deps.irc ? { irc: deps.irc } : {}),
+          mounts: deps.mounts ?? DEFAULT_MOUNTS,
+        },
+        { mayBlock: false },
       );
-      if (sent.state === 'accepted') return ok(`SENT — ${sent.detail}`);
-      return fail(`${sent.state.toUpperCase()} — ${sent.detail}`);
+
+      if (attempt.state === 'delivered') return ok(`SENT — ${attempt.detail}`);
+      if (attempt.state === 'failed') return fail(`FAILED — ${attempt.detail}`);
+
+      /**
+       * 🔴 NOT HERE YET — AND THIS IS WHERE THE OLD BUG LIVED.
+       *
+       * This branch used to return *"DOWNLOADING — ... you will send it once it
+       * lands"* and schedule NOTHING. No code path anywhere ever delivered the
+       * book or told the person otherwise. That is the Peppa Pig defect in the
+       * ebook flow: the grab succeeding is not the outcome, the person learning
+       * what happened is.
+       *
+       * A follow-up is scheduled HERE, and the wording below is contingent on it
+       * actually being scheduled — if there is no store, the tool says plainly
+       * that it cannot come back, rather than promising on behalf of a mechanism
+       * it does not have.
+       */
+      if (!ctx.followups) {
+        return ok(
+          `STARTED — ${attempt.detail} I have NOT sent anything, and I cannot check back on my ` +
+            'own here. Tell them to ask again in a few minutes.',
+        );
+      }
+
+      const already = ctx.followups.pendingEbook(ctx.senderHandle, title);
+      if (!already) {
+        ctx.followups.schedule({
+          kind: 'ebook-deliver',
+          senderHandle: ctx.senderHandle,
+          // Due immediately: the runner's next tick starts the real work. For
+          // IRC that tick is where the request is actually sent.
+          dueAt: new Date(),
+          reason: `started fetching "${title}" for them`,
+          observed: attempt.detail,
+          ebook: subject,
+        });
+      }
+
+      return ok(
+        `STARTED — ${attempt.detail} NOTHING HAS BEEN SENT YET. Tell them it is on the way and ` +
+          'that you will message them when it actually lands — do not say it has been sent.',
+      );
     },
   };
 }

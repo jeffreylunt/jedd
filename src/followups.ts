@@ -29,7 +29,7 @@ import { dirname } from 'node:path';
  */
 
 /** Code-owned. The model cannot introduce a new kind of follow-up. */
-export type FollowupKind = 'restore-qbit-throttle' | 'media-add';
+export type FollowupKind = 'restore-qbit-throttle' | 'media-add' | 'ebook-deliver';
 
 /**
  * What a `media-add` follow-up is about.
@@ -53,6 +53,40 @@ export interface MediaAddSubject {
   seasons: number[];
 }
 
+/**
+ * What an `ebook-deliver` follow-up is about.
+ *
+ * ── 🔴 THE DEFECT THIS FIXES, WHICH PREDATES IRC ────────────────────────────
+ *
+ * `send_ebook` grabbed a torrent and, if it had not finished, returned
+ * *"DOWNLOADING — ... Tell them it is downloading and that you will send it once
+ * it lands."* **Nothing ever followed up.** No scheduler, no job, no second
+ * look. The user was told a book was coming and the process that would deliver
+ * it did not exist.
+ *
+ * That is the Peppa Pig defect exactly, one flow over: *the add succeeding is
+ * not the outcome — the user learning what happened is.* It was live on the
+ * shipping torrent path, not something the IRC work introduced.
+ *
+ * ── 🔴 THE DELIVERY ADDRESS IS DELIBERATELY NOT STORED HERE ─────────────────
+ *
+ * Only the `senderHandle` is. The address is re-read from `KindleRegistry` at
+ * FIRE time, for the same reason `roleFor()` is re-derived rather than trusted
+ * from the record: a stored address is a delivery target travelling through
+ * time, and this is the one path where getting that wrong means **a stranger
+ * receives someone's book** — which has happened here once already.
+ */
+export interface EbookDeliverSubject {
+  /** Which fetcher completes this. The model never supplies it. */
+  source: 'prowlarr' | 'irc';
+  title: string;
+  /** Prowlarr only: the torrent to watch for. */
+  infoHash?: string;
+  /** IRC only: the exact channel command, and the bot that must still be present. */
+  command?: string;
+  bot?: string;
+}
+
 export interface Followup {
   id: string;
   kind: FollowupKind;
@@ -65,6 +99,8 @@ export interface Followup {
   observed: string;
   /** Set for `media-add`: what to go and check when this comes due. */
   subject?: MediaAddSubject;
+  /** Set for `ebook-deliver`: the book to finish delivering. */
+  ebook?: EbookDeliverSubject;
   /** How many times this has come due and been deferred. Bounded — see MAX_ATTEMPTS. */
   attempts: number;
   status: 'pending' | 'done' | 'abandoned';
@@ -138,6 +174,7 @@ export class FollowupStore {
     reason: string;
     observed: string;
     subject?: MediaAddSubject;
+    ebook?: EbookDeliverSubject;
     now?: Date;
   }): Followup {
     const now = input.now ?? new Date();
@@ -150,6 +187,7 @@ export class FollowupStore {
       reason: input.reason,
       observed: input.observed,
       ...(input.subject ? { subject: input.subject } : {}),
+      ...(input.ebook ? { ebook: input.ebook } : {}),
       attempts: 0,
       status: 'pending',
     };
@@ -175,6 +213,23 @@ export class FollowupStore {
    * messages about one event — the same reason `pendingOfKind` exists, but a
    * media add is per-title rather than one-at-a-time, so the key is finer.
    */
+  /**
+   * Is this person already waiting on this exact book?
+   *
+   * Same reason as `pendingForSubject`: a second follow-up for one request would
+   * produce two unprompted messages about one book, and — worse here than for a
+   * media add — could deliver it to their Kindle twice.
+   */
+  pendingEbook(senderHandle: string, title: string): Followup | undefined {
+    return [...this.items.values()].find(
+      (f) =>
+        f.status === 'pending' &&
+        f.kind === 'ebook-deliver' &&
+        f.senderHandle === senderHandle &&
+        f.ebook?.title === title,
+    );
+  }
+
   pendingForSubject(senderHandle: string, arr: string, id: number): Followup | undefined {
     return [...this.items.values()].find(
       (f) =>

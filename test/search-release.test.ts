@@ -74,6 +74,10 @@ test('🔴 the stored option is EXACTLY the shape add_audiobook already reads', 
   const picked = new ChoiceStore(path).resolve('+18015550123', 1);
   assert.ok(picked.ok);
   assert.deepEqual(picked.option.value, {
+    // `source` was added when IRC became a second source. It is the discriminant
+    // `send_ebook` switches on, so the consumer never has to guess which fetcher
+    // a pick belongs to.
+    source: 'prowlarr',
     infoHash: HASH_A,
     title: 'Project Hail Mary',
     magnetUri: `magnet:?xt=urn:btih:${HASH_A}&tr=x`,

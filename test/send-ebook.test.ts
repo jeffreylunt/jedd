@@ -12,7 +12,24 @@ import type { MailSender } from '../src/media/kindle-send.js';
 import { testConfig } from './helpers.js';
 
 const HASH = 'abcdef0123456789abcdef0123456789abcdef01';
-const BOOK = Buffer.from('epub bytes here');
+/**
+ * 🔴 A REAL EPUB, not a placeholder string.
+ *
+ * This fixture used to be `Buffer.from('epub bytes here')`. When magic-byte
+ * validation landed in front of `sendToKindle`, these tests began FAILING —
+ * correctly. The old fixture was a renamed nothing, which is precisely the shape
+ * the validator exists to stop, and a test asserting it got mailed was asserting
+ * the bug. The header is the one measured from a live #ebooks bot; see
+ * `test/ebook-validate.test.ts`.
+ */
+const BOOK = Buffer.concat([
+  Buffer.from(
+    '504b03041400160800004' + '7b9a3526f61ab2c140000001400000008000000' + '6d696d6574797065' +
+      Buffer.from('application/epub+zip', 'latin1').toString('hex'),
+    'hex',
+  ),
+  Buffer.alloc(512, 0x41),
+]);
 const SHA = createHash('sha256').update(BOOK).digest('hex');
 const JEFF = '+18015550123';
 const OTHER = '+13855550168';
@@ -74,7 +91,7 @@ test('🔴 a picked book is grabbed, verified and sent to the STORED address', a
   assert.equal(r.ok, true);
   assert.match(r.content, /^SENT/);
   assert.equal(sent[0]?.to, 'a_b@kindle.com', 'the address came from the store, not from the model');
-  assert.equal(sent[0]?.attachments[0]?.content.toString(), 'epub bytes here');
+  assert.ok(sent[0]?.attachments[0]?.content.equals(BOOK), 'the exact bytes read off hp are what got attached');
 });
 
 test('🔴 the tool takes NO address parameter', () => {
@@ -120,8 +137,11 @@ test('still downloading is reported as progress, not as failure', async () => {
   const exec = hp({ 3: { stdout: JSON.stringify([{ name: 'book', progress: 0.3, content_path: '/downloads/x' }]) } });
   const r = await makeSendEbook({ send }).run({ choice: 1 }, { ...ctx(JEFF), exec });
   assert.equal(r.ok, true, 'not an error — the turn simply is not finished');
-  assert.match(r.content, /DOWNLOADING/);
-  assert.match(r.content, /Nothing has been sent yet/);
+  // Reworded from DOWNLOADING to STARTED when the follow-up leg landed: the old
+  // string was paired with scheduling NOTHING, so "you will send it once it
+  // lands" was a promise no code could keep.
+  assert.match(r.content, /STARTED/);
+  assert.match(r.content, /NOT sent|NOTHING HAS BEEN SENT/);
   assert.equal(sent.length, 0);
 });
 
@@ -138,7 +158,10 @@ test('🔴 a corrupt transfer is caught BEFORE the send', async () => {
   const exec = hp({ 6: { stdout: BOOK.toString('base64').slice(0, 8) } });
   const r = await makeSendEbook({ send }).run({ choice: 1 }, { ...ctx(JEFF), exec });
   assert.equal(r.ok, false);
-  assert.match(r.content, /CORRUPT/);
+  // The specific cause stays in the detail; the outer category is FAILED now
+  // that both sources share one delivery path.
+  assert.match(r.content, /FAILED/);
+  assert.match(r.content, /TRUNCATED/);
   assert.equal(sent.length, 0, 'a truncated file must never be mailed');
 });
 

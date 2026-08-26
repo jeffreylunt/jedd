@@ -1,6 +1,11 @@
 import type { Config } from './config.js';
 import { ArrClient } from './media/arr.js';
+import { deliverEbook } from './media/ebook-deliver.js';
 import type { FollowupStore, Followup } from './followups.js';
+import type { IrcEbooks } from './media/irc-ebooks.js';
+import type { MailSender } from './media/kindle-send.js';
+import type { MountMap } from './media/grab.js';
+import type { KindleRegistry } from './kindle.js';
 import { jellyfinGet, type JellyfinResponse } from './jellyfin.js';
 import type { ExecImpl } from './hp.js';
 import { roleFor } from './permissions.js';
@@ -33,10 +38,22 @@ export const RESTORE_CHECK_DELAY_MS = 30 * 60 * 1000;
 export const RETRY_DELAY_MS = 15 * 60 * 1000;
 /** How long between checks on a media add. Downloads take hours, not minutes. */
 export const MEDIA_RECHECK_MS = 60 * 60 * 1000;
+/**
+ * How long between attempts at an ebook delivery. Deliberately far shorter than
+ * a media add: a book is megabytes, and an IRC bot either answers within its
+ * queue or never does. With MAX_ATTEMPTS that gives roughly 40 minutes before it
+ * gives up and SAYS so.
+ */
+export const EBOOK_RECHECK_MS = 10 * 60 * 1000;
 
 export interface FollowupDeps {
   config: Config;
   send: (to: string, text: string) => Promise<void>;
+  /** Needed to finish an `ebook-deliver`. Absent means it fails honestly. */
+  kindle?: KindleRegistry;
+  mail?: MailSender;
+  irc?: IrcEbooks;
+  mounts?: MountMap[];
   exec?: ExecImpl;
   sleep?: (ms: number) => Promise<void>;
   jellyfin?: (config: Config, path: string) => Promise<JellyfinResponse>;
@@ -110,7 +127,12 @@ async function runOne(
    * media writes. They are told about their own request; they are still told
    * nothing about the homelab.
    */
-  const maySpeak = followup.kind === 'media-add' ? true : role === 'owner';
+  /**
+   * `ebook-deliver` speaks to anyone for the same reason `media-add` does: it is
+   * the requester's OWN book, they were already told it was coming, and staying
+   * silent would reproduce the exact defect this kind exists to fix.
+   */
+  const maySpeak = followup.kind === 'media-add' || followup.kind === 'ebook-deliver' ? true : role === 'owner';
   const speak = async (text: string): Promise<boolean> => {
     if (!maySpeak) return false;
     await deps.send(followup.senderHandle, text);
@@ -123,6 +145,10 @@ async function runOne(
 
   if (followup.kind === 'media-add') {
     return runMediaAdd(followup, store, deps, now, speak, why);
+  }
+
+  if (followup.kind === 'ebook-deliver') {
+    return runEbookDeliver(followup, store, deps, now, speak, why);
   }
 
   // ── What is actually in force right now? ───────────────────────────────────
@@ -287,8 +313,10 @@ async function deferOrGiveUp(
   now: Date,
   note: string,
   giveUpMessage: () => Promise<boolean>,
+  /** Defaults to the generic retry gap; ebook deliveries come back sooner. */
+  delayMs: number = RETRY_DELAY_MS,
 ): Promise<FollowupOutcome> {
-  const deferred = store.defer(followup.id, new Date(now.getTime() + RETRY_DELAY_MS), note, now);
+  const deferred = store.defer(followup.id, new Date(now.getTime() + delayMs), note, now);
   if (deferred) {
     return { id: followup.id, action: 'deferred', sent: false, detail: note };
   }
@@ -386,4 +414,83 @@ async function runMediaAdd(
   );
   store.resolve(followup.id, 'abandoned', `nothing arrived: ${p.detail}`, now);
   return { id: followup.id, action: 'abandoned', sent, detail: p.detail };
+}
+
+/**
+ * 🔴 THE BRANCH THAT CLOSES A LIVE DEFECT.
+ *
+ * Before this existed, `send_ebook` told people their book was downloading and
+ * then nothing on any path ever delivered it or told them otherwise. This is the
+ * code that makes that promise true — or, when it cannot, says so out loud
+ * instead of going quiet.
+ *
+ * Both sources land here. The torrent path polls qBittorrent; the IRC path makes
+ * its request HERE rather than in the turn, because a bot may queue for ten
+ * minutes and a turn cannot wait that long.
+ */
+async function runEbookDeliver(
+  followup: Followup,
+  store: FollowupStore,
+  deps: FollowupDeps,
+  now: Date,
+  speak: (text: string) => Promise<boolean>,
+  why: string,
+): Promise<FollowupOutcome> {
+  const subject = followup.ebook;
+  if (!subject) {
+    store.resolve(followup.id, 'abandoned', 'no ebook subject recorded', now);
+    return { id: followup.id, action: 'abandoned', sent: false, detail: 'no ebook subject' };
+  }
+
+  // Missing plumbing is reported to the PERSON, not just logged. They were told
+  // a book was coming; a deployment gap must not become their silence.
+  if (!deps.kindle || !deps.mail) {
+    const detail = 'this deployment cannot send books (no address store or no mail sender)';
+    const sent = await speak(
+      `${why}\n\nI could not finish sending "${subject.title}" — ${detail}. ` +
+        'Nothing was sent, and I have stopped trying rather than leave you waiting.',
+    );
+    store.resolve(followup.id, 'abandoned', detail, now);
+    return { id: followup.id, action: sent ? 'abandoned' : 'not-delivered', sent, detail };
+  }
+
+  const r = await deliverEbook(
+    subject,
+    followup.senderHandle,
+    {
+      config: deps.config,
+      kindle: deps.kindle,
+      mail: deps.mail,
+      ...(deps.exec ? { exec: deps.exec } : {}),
+      ...(deps.irc ? { irc: deps.irc } : {}),
+      ...(deps.mounts ? { mounts: deps.mounts } : {}),
+    },
+    { mayBlock: true },
+  );
+
+  if (r.state === 'delivered') {
+    const sent = await speak(`${why}\n\nGood news — ${r.detail}`);
+    store.resolve(followup.id, 'done', r.detail, now);
+    return { id: followup.id, action: 'restored', sent, detail: r.detail };
+  }
+
+  if (r.state === 'failed') {
+    // Terminal and bad. This ALWAYS speaks: a book that is never coming is
+    // precisely what the person needs to hear.
+    const sent = await speak(
+      `${why}\n\nI could not send "${subject.title}" — ${r.detail} I have stopped trying.`,
+    );
+    store.resolve(followup.id, 'abandoned', r.detail, now);
+    return { id: followup.id, action: sent ? 'abandoned' : 'not-delivered', sent, detail: r.detail };
+  }
+
+  // `waiting` and `unknown` both mean "no verdict yet". Defer, and when the
+  // deferrals run out say plainly that we stopped — never just fall silent.
+  return await deferOrGiveUp(followup, store, now, `"${subject.title}": ${r.detail}`, () =>
+    speak(
+      `${why}\n\nI have stopped waiting for "${subject.title}" — ${r.detail} ` +
+        'It has not been sent. Ask me and I will try again.',
+    ),
+    EBOOK_RECHECK_MS,
+  );
 }

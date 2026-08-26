@@ -14,6 +14,8 @@ import { JfagoClient } from './jfago.js';
 import { runDueFollowups } from './followup-runner.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { KindleRegistry } from './kindle.js';
+import { IrcEbooks } from './media/irc-ebooks.js';
+import { DEFAULT_MOUNTS } from './tools/send-ebook.js';
 import { realMailSender } from './media/kindle-send.js';
 import { createLlmClient } from './llm.js';
 import { HistoryStore } from './store.js';
@@ -195,7 +197,27 @@ async function main(): Promise<void> {
    * direction: annoying beats an unrecallable email.
    */
   const ebook = { send: await realMailSender(config), onlySendTo: config.ownerHandle };
-  const tools = buildTools(config, shellIdentity, { invite, ebook });
+
+  /**
+   * The IRC #ebooks source.
+   *
+   * ⚠️ OFF UNLESS `IRC_EBOOKS=1`. It opens a long-lived socket to a third-party
+   * network from inside this process, so it is opt-in rather than something a
+   * deploy acquires by accident.
+   *
+   * 🔴 NOT AWAITED, AND THAT IS DELIBERATE. `connect()` costs ~70 SECONDS —
+   * irchighway refuses `JOIN #ebooks` until roughly 65s after the TCP connect.
+   * Blocking startup on it would delay every OTHER capability behind a network
+   * this process does not control. It warms in the background; a search that
+   * arrives before it is ready gets an honest "IRC is not available" and the
+   * Prowlarr results, rather than a hang.
+   */
+  const irc = process.env.IRC_EBOOKS === '1' ? new IrcEbooks({ log: (m) => console.error(m) }) : undefined;
+  if (irc) {
+    void irc.connect().then((up) => console.error(`[jedd] irc #ebooks ${up ? 'joined' : 'UNAVAILABLE'}`));
+  }
+
+  const tools = buildTools(config, shellIdentity, { invite, ebook, ...(irc ? { irc } : {}) });
   const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, kindle);
 
   console.error(
@@ -241,6 +263,14 @@ async function main(): Promise<void> {
           `[jedd] 🔴 DELETE ${config.bluebubbles.publicUrl} BY HAND before starting anything else.`,
       );
     }
+    // Leave the channel properly rather than dropping the socket. We are a guest
+    // there, and a client that vanishes without QUIT is the kind that gets
+    // noticed by ops. Both SIGINT and SIGTERM reach here; pm2 sends SIGINT.
+    try {
+      irc?.stop();
+    } catch {
+      /* never let a courtesy step block shutdown */
+    }
     await receiver.stop().catch(() => {});
     process.exit(0);
   };
@@ -254,6 +284,13 @@ async function main(): Promise<void> {
     void runDueFollowups(followups, {
       config,
       send: (to, text) => connector.send(to, text),
+      // An `ebook-deliver` follow-up finishes the job the turn could not: it
+      // needs the same address store and mail sender the tool used, and the IRC
+      // client, because for IRC the REQUEST itself happens out here.
+      kindle,
+      mail: ebook.send,
+      mounts: DEFAULT_MOUNTS,
+      ...(irc ? { irc } : {}),
     });
   }, TICK_MS);
   timer.unref();
