@@ -1,0 +1,126 @@
+# Jedd V2 — container definition for the Mac that runs BlueBubbles.
+#
+# Jedd is unusually host-coupled for a container: it reaches a LAN homelab, a
+# model server on this Mac's loopback, an IRC network on the public internet,
+# two SSH identities on another box, and it must be REACHED BACK by BlueBubbles.
+# Every one of those is solved explicitly below, and each was measured on this
+# machine rather than assumed.
+#
+# ── EVERY OUTBOUND DEPENDENCY AND HOW IT IS REACHED ─────────────────────────
+#
+#   BlueBubbles REST  host.docker.internal:1234   (this Mac's loopback)
+#   Model (Ollama)    host.docker.internal:11434  (this Mac; binds 0.0.0.0)
+#   Sonarr/Radarr/Prowlarr/qBittorrent/Jellyfin/Dispatcharr
+#                     192.168.1.7:{8989,7878,9696,8080,8096,9191}  (LAN, direct)
+#   ssh hp / hp-jedd-shell
+#                     192.168.1.7:22   (keys + config mounted below)
+#   IRC ebooks        irc.irchighway.net:6667 outbound, plus outbound DCC to
+#                     arbitrary third-party peer IPs. Jedd NEVER listens for
+#                     DCC — passive/reverse offers (port 0) are refused in
+#                     irc-protocol.ts — so no inbound port is needed for it.
+#   IMAP (Kindle)     imap.gmail.com:993 outbound
+#   TMDB / ESPN       public HTTPS
+#
+# All of the above were probed from inside a node:24-alpine container on this
+# host and every one connected. Bridge networking is sufficient; `network_mode:
+# host` is NOT needed and on macOS would not behave like it does on Linux
+# anyway (Docker Desktop runs a Linux VM, so "host" means the VM, not the Mac —
+# it would break both the loopback services AND the inbound webhook).
+
+services:
+  jedd:
+    build:
+      context: .
+    image: jedd-v2:local
+    container_name: jedd-v2
+    restart: unless-stopped
+
+    # 🔴 uid 501:20 = jeff:staff. Not cosmetic — see the Dockerfile comment.
+    # It is what makes the 0600 SSH keys readable and what stops the bind-mounted
+    # data/ from drifting to another owner (which would break a pm2 rollback).
+    user: "501:20"
+
+    # Real config first, container-specific overrides second. Compose applies
+    # these in order and LATER WINS, so .env stays the single source of truth for
+    # credentials and only the handful of host-relative addresses get rewritten.
+    # This is deliberately not a copy of .env: two files holding the same secrets
+    # drift, and the copy is the one that gets stale.
+    env_file:
+      - .env
+      - .env.docker
+
+    ports:
+      # ── 🔴 THIS PORT MAPPING IS PART OF THE CONTRACT, NOT A PREFERENCE ─────
+      #
+      # BlueBubbles dedups webhook registrations by EXACT URL STRING. The live
+      # pm2 process registers http://127.0.0.1:18796/webhook. If the container
+      # registered anything even slightly different, BlueBubbles would not
+      # UPDATE the row — it would ADD a second one, and then fan out to BOTH.
+      # It dispatches fire-and-forget and only logs a failed POST at DEBUG, so
+      # the dead row is silent: inbound messages go to a black hole with no
+      # error anywhere. (This exact orphan bit V1 once already.)
+      #
+      # Binding the published port to 127.0.0.1 on the host means the registered
+      # URL can stay byte-identical to the pm2 one, so the cutover REPLACES the
+      # row instead of racing a second one. Verified on this host: a POST from
+      # the Mac to 127.0.0.1:<published> arrives inside the container.
+      # It also keeps the webhook off the LAN, which is the right default.
+      - "127.0.0.1:18796:18796"
+
+    volumes:
+      # ── 🔴 STATE: BIND MOUNT THE REAL DIRECTORY, NOT A NAMED VOLUME ────────
+      #
+      # A named volume would start EMPTY, and empty is not a clean slate here:
+      # seen.jsonl carries the BlueBubbles replay watermark, and a virgin store
+      # reads as watermark 0, which receiver.ts fails CLOSED on — it skips
+      # replay entirely, silently dropping anything that arrived during the
+      # pm2→container gap. followups.jsonl carries scheduled kindle-verify and
+      # ebook-deliver jobs that would simply cease to exist. Sharing the real
+      # directory also makes rollback to pm2 instant and lossless: both
+      # supervisors read and write the same state. (Never run both at once.)
+      - ./data:/app/data
+
+      # ── SSH: two identities, deliberately unequal ──────────────────────────
+      #
+      # `hp` is the privileged admin identity (docker group) used only by
+      # structured tools whose command text is a literal in the repo.
+      # `hp-jedd-shell` is unprivileged and is the ONLY identity the free-form,
+      # model-composed hp_shell tool may use. config.ts refuses to register
+      # hp_shell at all if the two resolve to the same account, and
+      # identity-probe.ts proves the split at boot by running `id` over both.
+      # Mounting both read-only preserves that separation inside the container.
+      # This grants the container no access the pm2 process did not already have.
+      - ${HOME}/.ssh/id_ed25519:/home/jedd/.ssh/id_ed25519:ro
+      - ${HOME}/.ssh/jedd_shell_ed25519:/home/jedd/.ssh/jedd_shell_ed25519:ro
+      # Generated for the container: resolves the bare hostname `hp` by IP.
+      # On the Mac `hp` resolves through the LAN DNS search domain, which is NOT
+      # available inside the container's network namespace — without this file
+      # every admin-side tool would fail on name resolution alone.
+      - ./docker/ssh-config:/home/jedd/.ssh/config:ro
+      - ./docker/ssh-known-hosts:/home/jedd/.ssh/known_hosts:ro
+
+      # read_runbook reads this exact absolute path from the host filesystem.
+      # config.ts leaves the tool UNREGISTERED if the path is missing, so a
+      # forgotten mount here silently costs Jedd a tool rather than erroring.
+      # Mounted at the identical path so RUNBOOK_PATH needs no override.
+      - /Users/jeff/.superbot2/spaces/jedd-v2/knowledge/homelab-access-inventory.md:/Users/jeff/.superbot2/spaces/jedd-v2/knowledge/homelab-access-inventory.md:ro
+
+      # indexer_admin and stuck_downloads capture a backup BEFORE any
+      # destructive change; these are the reversibility guarantee those tools
+      # advertise, so they must outlive the container.
+      - ./data/backups:/home/jedd/.superbot2/backups
+
+    # main.ts deregisters its webhook on SIGINT and SIGTERM. Docker sends
+    # SIGTERM, which is handled — but the handler makes an HTTP round trip to
+    # BlueBubbles, and the default 10s grace can be tight if BlueBubbles is
+    # slow. pm2 uses kill_timeout 10000 for exactly this reason. A SIGKILL
+    # part-way through leaves an orphaned registration that must then be deleted
+    # by hand before anything else starts.
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

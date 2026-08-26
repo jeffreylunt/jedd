@@ -1,0 +1,44 @@
+# SSH client config mounted at /home/jedd/.ssh/config inside the container.
+#
+# WHY THIS FILE HAS TO EXIST AT ALL
+#
+# On the Mac, `hp` is not an alias in ~/.ssh/config — it resolves as a bare
+# hostname through the LAN's DNS search domain (nameserver 192.168.1.1). That
+# search domain is NOT present inside the container's network namespace, so a
+# bare `ssh hp` there fails at name resolution before it ever reaches the
+# network. src/hp.ts passes `-o BatchMode=yes`, so every such failure is silent
+# and non-interactive: the tool just returns an error. Pinning HostName to the
+# IP removes the dependency on LAN DNS entirely.
+#
+# 🔴 THE TWO IDENTITIES ARE A SECURITY BOUNDARY, NOT DUPLICATION.
+#
+# `hp` is privileged (docker group). Only structured tools whose command text is
+# a literal in the repo may use it.
+# `hp-jedd-shell` is unprivileged — no docker group, no sudo — and is the only
+# identity the free-form, model-composed `hp_shell` tool is allowed to use.
+# config.ts refuses to register hp_shell if the two resolve to the same account,
+# and identity-probe.ts proves the split at boot by actually running `id` over
+# both and cross-checking `docker ps`. Do not "simplify" these into one Host
+# block and do not let both point at the same User.
+
+Host hp
+    HostName 192.168.1.7
+    User jeff
+    IdentityFile /home/jedd/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+Host hp-jedd-shell
+    HostName 192.168.1.7
+    User jedd-shell
+    IdentityFile /home/jedd/.ssh/jedd_shell_ed25519
+    IdentitiesOnly yes
+
+Host *
+    # known_hosts is mounted alongside this file and carries the real ed25519
+    # key for 192.168.1.7 (verified identical to the one the Mac already
+    # trusts), so strict checking succeeds rather than prompting — which
+    # matters because BatchMode turns any prompt into a hard failure.
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /home/jedd/.ssh/known_hosts
+    ServerAliveInterval 15
+    ServerAliveCountMax 3

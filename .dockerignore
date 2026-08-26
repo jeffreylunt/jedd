@@ -1,0 +1,29 @@
+# 🔴 SECRETS AND PERSONAL DATA MUST NOT ENTER AN IMAGE LAYER.
+#
+# A layer is not a file you can take back: `docker history` and any registry
+# push carry it forever, exactly like a git commit. .env holds live *arr API
+# keys, an SMTP app password and a JFA-GO password; data/ holds real message
+# history, real phone-number-keyed conversation state and Kindle addresses.
+# Neither is needed to BUILD, and both are supplied at RUN time (env_file and a
+# bind mount). Keep them out.
+.env
+.env.*
+!.env.example
+data/
+*.log
+
+node_modules/
+.git/
+.gitignore
+
+# Tests are not shipped in the runtime image (scripts/ IS — it carries
+# kindle-verify-live.ts, the delivery-check harness we run inside the container
+# to prove the negative control still discriminates after a cutover).
+test/
+
+# Host-side supervision and tooling that a container replaces or cannot use.
+ecosystem.config.cjs
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
