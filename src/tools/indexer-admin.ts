@@ -11,7 +11,7 @@ import {
   type TestOutcome,
 } from '../media/indexer-admin.js';
 import { stripCredentials } from '../homelab-read.js';
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import type { Config } from '../config.js';
 import { join } from 'node:path';
 import { fail, ok, type Tool } from './types.js';
@@ -115,6 +115,11 @@ export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
       'missing result); takes 20-40s. enable / disable — turn one indexer on or off. ' +
       'add — install a definition by name; takes ~25s because Prowlarr live-tests it before saving. ' +
       'remove — delete an indexer.\n' +
+      '🔴 FIVE OF THESE ARE PROWLARR-ONLY: search_available, enable, disable, add and remove. A ' +
+      'Sonarr or Radarr indexer has no on/off switch at all (measured), and every one of them is a ' +
+      'Prowlarr proxy that Prowlarr re-pushes on its own sync — so a coverage change only means ' +
+      'something upstream. list, test and test_all work on all three, and force-testing an ARR is ' +
+      'the operation that resets ITS backoff.\n' +
       '🔴 REMOVE IS RECOVERABLE AND YOU SHOULD SAY SO. The full configuration is saved to a file ' +
       'before anything is deleted, and the result gives you the path — report it, because it is how ' +
       'the change gets undone. If that file cannot be written, nothing is deleted. The saved file ' +
@@ -295,8 +300,7 @@ async function runSearchAvailable(client: IndexerAdminClient, rawQuery: unknown)
   const result = await client.searchSchema(query, SEARCH_LIMIT);
   if (result.state !== 'ok') return fail(`Could not read the definition catalogue.\n${result.detail}`);
 
-  const matches = result.value;
-  const total = matches[0]?.totalMatched ?? matches.length;
+  const { matches, totalMatched: total, census } = result.value;
   if (!matches.length) {
     return ok(
       `Prowlarr's catalogue has NO definition matching ${JSON.stringify(query)}.\n` +
@@ -307,8 +311,15 @@ async function runSearchAvailable(client: IndexerAdminClient, rawQuery: unknown)
     );
   }
 
-  // Already-installed definitions are marked, so `add` is not offered for
-  // something that is already there.
+  /**
+   * Already-installed definitions are marked, so `add` is not offered for
+   * something that is already there.
+   *
+   * 🔴 AND WHEN THAT READ FAILS, SAY SO. Falling back to an empty set renders
+   * every definition as not-installed — a false zero on the exact question,
+   * indistinguishable from a clean answer. `add` does its own real dedupe so no
+   * duplicate is created, but this OUTPUT is what the model reasons from.
+   */
   const installed = await client.list();
   const have = new Set(
     installed.state === 'ok' ? installed.value.map((i) => i.name.toLowerCase()) : [],
@@ -325,13 +336,25 @@ async function runSearchAvailable(client: IndexerAdminClient, rawQuery: unknown)
     lines.push(`  ${m.name}  [definition: ${m.definitionName}]  ${m.privacy}/${m.protocol}${already}`);
     if (m.description) lines.push(`      ${m.description}`);
   }
+  if (installed.state !== 'ok') {
+    lines.push(
+      '',
+      `⚠️ I could NOT read what is already installed (${installed.detail}), so nothing above is ` +
+        'marked as installed — and that is a gap in the check, NOT a finding that none of them are. ' +
+        'Run action "list" before adding anything.',
+    );
+  }
   lines.push(
     '',
     '🔴 ONLY A "public" DEFINITION CAN BE ADDED HERE. A private or semiPrivate tracker needs an ' +
       'account, an invite or an API key that this house does not have, so adding one fails at the ' +
       'validation step — and REGISTERING for a tracker is the owner\'s decision, never something to ' +
-      'do unprompted. Of the 625 definitions Prowlarr ships, 475 are private and 63 semiPrivate; ' +
-      'only 87 are public.',
+      // The census is COUNTED on this call. It used to be a frozen "625 / 475 /
+      // 63 / 87" presented as measured fact, and the catalogue moved 28 KB
+      // inside a single day.
+      `do unprompted. Of the ${census.total} definitions this Prowlarr ships right now, ` +
+      `${census.private} are private and ${census.semiPrivate} semiPrivate; only ${census.public} ` +
+      'are public.',
     'To install one: action "add" with `definition` set to the bracketed definition name above.',
   );
   return ok(lines.join('\n'));
@@ -357,7 +380,7 @@ async function runAdd(client: IndexerAdminClient, rawDefinition: unknown) {
 
   const found = await client.findDefinition(wanted);
   if (found.state !== 'ok') return fail(`Could not read the definition catalogue.\n${found.detail}`);
-  if (!found.value) {
+  if (found.value.kind === 'none') {
     return fail(
       `Prowlarr has NO definition called ${JSON.stringify(wanted)}, so nothing was added.\n` +
         '🔴 This is the live instance answering, so do not guess at a near-miss name or assert that ' +
@@ -365,7 +388,39 @@ async function runAdd(client: IndexerAdminClient, rawDefinition: unknown) {
         'actually exists.',
     );
   }
-  const def = found.value;
+  if (found.value.kind === 'ambiguous') {
+    /**
+     * 🔴 REFUSE, DO NOT PICK. Measured on the live catalogue: `showRSS` and
+     * `Torrent RSS Feed` are both public and share the definitionName "Torrent
+     * RSS Feed", so resolving to the first match installed **a different
+     * indexer than the one named** and called it a success.
+     */
+    const names = new Set(found.value.candidates.map((c) => c.definitionName.toLowerCase()));
+    const distinguishable = found.value.candidates
+      .filter((c) => c.name.toLowerCase() !== wanted.toLowerCase())
+      .map((c) => c.name);
+    return fail(
+      `${JSON.stringify(wanted)} matches ${found.value.candidates.length} different Prowlarr ` +
+        'definitions, so NOTHING was added — installing whichever came first would install an ' +
+        'indexer nobody asked for, and it would look like a success.\n' +
+        found.value.candidates
+          .map((c) => `  ${c.name}  [definition: ${c.definitionName}]  ${c.privacy}/${c.implementation}`)
+          .join('\n') +
+        '\n' +
+        (names.size > 1
+          ? 'Ask which one is wanted, then pass the exact bracketed definition name — they differ.'
+          : '🔴 These share the SAME definition name, so there is no argument I can be given that ' +
+            'picks between them — this is an ambiguity in Prowlarr\'s own catalogue, not something ' +
+            'you can phrase your way past. ' +
+            (distinguishable.length
+              ? `Adding ${distinguishable.map((n) => JSON.stringify(n)).join(' or ')} by that name ` +
+                'works if that is the one wanted; otherwise it has to be added from Prowlarr\'s web ' +
+                'UI. Say that plainly rather than trying another spelling.'
+              : 'It has to be added from Prowlarr\'s web UI. Say that plainly rather than trying ' +
+                'another spelling.')),
+    );
+  }
+  const def = found.value.definition;
   const defName = String(def['name'] ?? wanted);
 
   /**
@@ -411,6 +466,27 @@ async function runAdd(client: IndexerAdminClient, rawDefinition: unknown) {
 
   const created = await client.addFromSchema(def, profile.value);
   if (created.state !== 'ok') {
+    /**
+     * 🔴 THE HEADLINE MUST NOT OVERRULE THE CLIENT'S OWN UNCERTAINTY.
+     *
+     * This used to read "X was NOT added" for every non-ok result, including the
+     * one where Prowlarr answered 201 and the indexer DEMONSTRABLY EXISTS. A
+     * model relaying that tells the owner it failed and adds it again.
+     */
+    if (created.acted === 'yes') {
+      return ok(
+        `${defName} WAS added — but I cannot tell you its id.\n${created.detail}\n` +
+          '⚠️ Do not add it again. Run action "list" to see it.',
+      );
+    }
+    if (created.acted === 'maybe') {
+      return fail(
+        `Whether ${defName} was added is UNKNOWN — this is not a verdict either way.\n` +
+          `${created.detail}\n` +
+          '🔴 Prowlarr live-tests a new indexer before saving, so a request that times out can ' +
+          'still have landed. Run action "list" and look BEFORE retrying, or you will add it twice.',
+      );
+    }
     return fail(
       `${defName} was NOT added.\n${created.detail}\n` +
         '⚠️ Prowlarr live-tests a new indexer before saving it, so a refusal here usually means the ' +
@@ -508,10 +584,27 @@ async function runRemove(client: IndexerAdminClient, rawId: unknown, config: Con
   // 2. DELETE — only now.
   const removed = await client.remove(id);
   if (removed.state !== 'ok') {
-    return fail(
-      `${row.name} was NOT removed.\n${removed.detail}\n` +
-        `Its configuration was saved to ${savedTo} anyway, which is harmless — nothing was lost.`,
-    );
+    /**
+     * ⚠️ THE CAPTURE IS DELETED WHEN THE REMOVAL DID NOT HAPPEN.
+     *
+     * It is a credential-bearing file describing an indexer that still exists,
+     * and nothing else ever cleans these up. It was previously left behind and
+     * described as "harmless — nothing was lost", which is true of the data and
+     * false of the secret.
+     */
+    let cleanup = '';
+    try {
+      unlinkSync(savedTo);
+    } catch {
+      cleanup =
+        `\n⚠️ Its configuration backup is still at ${savedTo} and could not be cleaned up. It may ` +
+        'hold a tracker credential and describes an indexer that still exists — delete it.';
+    }
+    const headline =
+      removed.acted === 'maybe'
+        ? `Whether ${row.name} was removed is UNKNOWN — this is not a verdict either way.`
+        : `${row.name} was NOT removed.`;
+    return fail(`${headline}\n${removed.detail}${cleanup}`);
   }
 
   const after = await snapshot(client);
@@ -545,15 +638,33 @@ async function runRemove(client: IndexerAdminClient, rawId: unknown, config: Con
  * where a discarded return value gated a success flag.
  */
 function captureDefinition(dir: string, id: number, name: string, body: string): string {
-  mkdirSync(dir, { recursive: true });
+  // 🔴 0700 on the DIRECTORY too. The files are 0600, but the filenames say
+  // which indexer was removed and when, and a 0755 directory lists them to
+  // anyone on the machine.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // Traversal is structurally impossible: everything outside [a-z0-9] becomes a
+  // hyphen, so no separator, no dot-segment, no absolute path can survive. The
+  // name also comes from Prowlarr's own list rather than from the caller.
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'indexer';
   const path = join(dir, `prowlarr-${slug}-id${id}-${stamp}.json`);
-  writeFileSync(path, body, { encoding: 'utf8', mode: 0o600 });
-  // Explicit, because `mode` on writeFileSync is masked by the process umask and
-  // is a no-op when the file already exists. This file may hold a tracker
-  // credential; 0600 is not decoration.
-  chmodSync(path, 0o600);
+  /**
+   * 🔴 `wx` + mode, NOT `writeFileSync` THEN `chmod`.
+   *
+   * `writeFileSync`'s `mode` is IGNORED when the file already exists, so the
+   * previous version could write a credential into a pre-existing world-readable
+   * file and only narrow it a syscall later — a window, and one an attacker
+   * chooses the timing of by creating the path first. `wx` fails outright if the
+   * path exists and refuses to follow a symlink into somewhere else, and the
+   * mode is applied at creation. The timestamp makes a collision a real signal
+   * rather than something to paper over.
+   */
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(fd, body, null, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
   return path;
 }
 

@@ -61,14 +61,22 @@ interface Stub {
 
 type Handler = (call: Call, nth: number) => { status: number; body: unknown };
 
-const response = (status: number, body: unknown): Response =>
-  ({
-    status,
-    ok: status < 400,
-    async text() {
-      return typeof body === 'string' ? body : JSON.stringify(body);
-    },
-  }) as Response;
+/**
+ * 🔴 A REAL `Response` WITH A REAL STREAM BODY, NOT A `{status, text()}` OBJECT.
+ *
+ * This used to be a plain object with no `body`. The client reads through a
+ * bounded reader that falls back when `res.body` is absent — so **every test
+ * took the fallback and none exercised the byte ceiling**. Proven by the
+ * reviewer: setting `MAX_BODY_BYTES = 1` left all 58 tests green. The guard was
+ * a comment, not a behaviour.
+ *
+ * The stub now streams, so the tests take the same path production does, and
+ * the ceiling is reachable from a test.
+ */
+const response = (status: number, body: unknown): Response => {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return new Response(text, { status });
+};
 
 /** Route on `METHOD /path`. An unrouted request THROWS — a silent 404 would hide it. */
 function stub(routes: Record<string, Handler>): Stub {
@@ -1098,6 +1106,14 @@ test('the capture file is 0600 — it can hold a tracker credential', async () =
   await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
   const file = join(dir, readdirSync(dir)[0]!);
   assert.equal(statSync(file).mode & 0o777, 0o600, 'a file holding a credential is not world-readable');
+  /**
+   * 🔴 AND THE DIRECTORY, WHICH THE MUTATION SWEEP FOUND UNTESTED.
+   *
+   * The files are 0600, but the FILENAMES say which indexer was removed and
+   * when. A 0755 directory lists that to anyone on the machine — a smaller leak
+   * than the contents, and still one nobody chose to make.
+   */
+  assert.equal(statSync(dir).mode & 0o777, 0o700, 'the capture directory is not world-listable');
 });
 
 test('remove says the id will NOT come back the same', async () => {
@@ -1117,7 +1133,18 @@ test('remove says the id will NOT come back the same', async () => {
   assert.match(r.content, /reference Prowlarr indexers BY id/);
 });
 
-test('a failed DELETE does not claim the removal happened', async () => {
+test('🔴 a failed DELETE is UNKNOWN, not "was NOT removed" — and the capture is cleaned up', async () => {
+  /**
+   * 🔴 THE HEADLINE MUST NOT OVERRULE THE CLIENT'S UNCERTAINTY.
+   *
+   * This test used to assert BOTH "was NOT removed" AND "may or may not have
+   * been removed" — enshrining a self-contradiction as intended behaviour. A
+   * DELETE that 500s may well have deleted; saying it did not is a verdict we
+   * do not have, and it is the verdict that makes someone act on a wrong state.
+   *
+   * The capture is unlinked too: it is a credential-bearing file describing an
+   * indexer that still exists, and nothing else ever cleans these up.
+   */
   const dir = captureDir();
   const s = stub({
     [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
@@ -1129,9 +1156,203 @@ test('a failed DELETE does not claim the removal happened', async () => {
   const r = await run(s, { service: 'prowlarr', action: 'remove', id: 6 }, removeCtx(dir));
 
   assert.equal(r.ok, false);
-  assert.match(r.content, /was NOT removed/);
+  assert.match(r.content, /Whether 1337x was removed is UNKNOWN/);
+  assert.ok(!/was NOT removed/.test(r.content), 'a verdict we do not have must not be stated');
   assert.match(r.content, /may or may not have been removed/);
   assert.ok(!r.content.includes(SECRET), 'and the echoed body is still scrubbed');
+  assert.deepEqual(readdirSync(dir), [], 'the orphaned credential file must be cleaned up');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 AN UNKNOWN WRITE IS NOT A FAILED WRITE
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 MUTATION TARGET: a 201 with no id says the indexer EXISTS, not that it failed', async () => {
+  /**
+   * Prowlarr accepted it — the indexer is there. Reporting "BTdirectory was NOT
+   * added" makes a model retry and create a duplicate. The client already said
+   * `acted: 'yes'`; the headline used to overwrite it.
+   */
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 1 }] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer`]: () => ({ status: 201, body: { name: 'BTdirectory' } }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'BTdirectory' });
+
+  assert.match(r.content, /BTdirectory WAS added/);
+  assert.match(r.content, /Do not add it again/);
+  assert.ok(!/was NOT added/.test(r.content), '🔴 it exists; saying otherwise creates a duplicate');
+});
+
+test('🔴 a create that never answered is UNKNOWN — go and look before retrying', async () => {
+  // The create takes ~25s because Prowlarr live-tests before saving, so a
+  // timeout can land AFTER the write.
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 1 }] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer`]: () => {
+      throw new Error('The operation was aborted due to timeout');
+    },
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'BTdirectory' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /Whether BTdirectory was added is UNKNOWN/);
+  assert.match(r.content, /look BEFORE retrying, or you will add it twice/);
+  assert.ok(!/was NOT added/.test(r.content));
+});
+
+test('CONTROL: a real 400 refusal IS reported as "was NOT added"', () => {
+  // Without this, the two assertions above are equally consistent with the
+  // definite-failure wording having been deleted entirely.
+  return (async () => {
+    const s = stub({
+      [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+      [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 1 }] }),
+      [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+      [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+      [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+      [`POST ${P}/indexer`]: () => ({ status: 400, body: [{ errorMessage: FORBIDDEN }] }),
+    });
+    const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'BTdirectory' });
+    assert.match(r.content, /BTdirectory was NOT added/);
+  })();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 AMBIGUITY, FALSE ZEROS AND THE BYTE CEILING
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 MUTATION TARGET: an AMBIGUOUS definition name is refused, not resolved', async () => {
+  /**
+   * Measured on the live catalogue: `showRSS` and `Torrent RSS Feed` are BOTH
+   * public and share the definitionName "Torrent RSS Feed". Resolving to the
+   * first match installed a different indexer than the one named and reported a
+   * clean success — the worst possible combination.
+   */
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [
+        schemaEntry({ name: 'showRSS', definitionName: 'Torrent RSS Feed', implementation: 'TorrentRssIndexer' }),
+        schemaEntry({ name: 'Torrent RSS Feed', definitionName: 'Torrent RSS Feed', implementation: 'TorrentRssIndexer' }),
+      ],
+    }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'Torrent RSS Feed' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /matches 2 different Prowlarr definitions/);
+  assert.match(r.content, /would install an indexer nobody asked for/);
+  assert.match(r.content, /showRSS/);
+  /**
+   * 🔴 AND THE ADVICE MUST ACTUALLY WORK. Both live rows carry definitionName
+   * "Torrent RSS Feed", so "pass the exact bracketed name" resolves to the same
+   * two rows and sends the reader round a loop. When the candidates are not
+   * distinguishable by any argument, say so.
+   */
+  assert.match(r.content, /share the SAME definition name/);
+  assert.match(r.content, /no argument I can be given that picks between them/);
+  assert.match(r.content, /"showRSS"/, 'and it names the one that IS reachable');
+  assert.ok(!/pass the exact bracketed definition name/.test(r.content), 'advice that cannot work');
+  assert.deepEqual(s.calls.filter((c) => c.method === 'POST'), [], 'nothing may be installed');
+});
+
+test('CONTROL: candidates with DIFFERENT definition names get the advice that does work', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [
+        schemaEntry({ name: 'Shared Display', definitionName: 'variant-a' }),
+        schemaEntry({ name: 'Shared Display', definitionName: 'variant-b' }),
+      ],
+    }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'Shared Display' });
+  assert.match(r.content, /pass the exact bracketed definition name — they differ/);
+  assert.ok(!/share the SAME definition name/.test(r.content));
+});
+
+test('CONTROL: an UNambiguous name still installs', async () => {
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/appprofile`]: () => ({ status: 200, body: [{ id: 1 }] }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+    [`POST ${P}/indexer`]: () => ({ status: 201, body: { id: 11, name: 'BTdirectory' } }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'add', definition: 'btdirectory' });
+  assert.match(r.content, /Added BTdirectory to Prowlarr as id 11/);
+});
+
+test('🔴 search_available SAYS when it could not check what is installed', async () => {
+  // Falling back to an empty set renders every definition as not-installed — a
+  // false zero on the exact question, indistinguishable from a clean answer.
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({ status: 200, body: [schemaEntry()] }),
+    [`GET ${P}/indexer`]: () => ({ status: 500, body: 'boom' }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: 'bt' });
+
+  assert.match(r.content, /could NOT read what is already installed/);
+  assert.match(r.content, /a gap in the check, NOT a finding that none of them are/);
+});
+
+test('🔴 the census is COUNTED on this call, not remembered', async () => {
+  // The frozen "625 definitions, 87 public" drifted 28 KB inside a single day.
+  const s = stub({
+    [`GET ${P}/indexer/schema`]: () => ({
+      status: 200,
+      body: [
+        schemaEntry(),
+        schemaEntry({ name: 'P1', definitionName: 'p1', privacy: 'private' }),
+        schemaEntry({ name: 'S1', definitionName: 's1', privacy: 'semiPrivate' }),
+      ],
+    }),
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'search_available', query: 'BT' });
+
+  assert.match(r.content, /Of the 3 definitions this Prowlarr ships right now, 1 are private and 1 semiPrivate; only 1 are public/);
+  assert.ok(!/625/.test(r.content), 'no frozen census may survive in the output');
+});
+
+test('🔴 MUTATION TARGET: an oversized response is REFUSED, not read', async () => {
+  /**
+   * The ceiling existed and was completely untested: the old stub returned a
+   * bodiless object, the bounded reader fell back to an unbounded `res.text()`,
+   * and setting the limit to 1 byte left all 58 tests green. A guard nothing can
+   * fail is a comment.
+   */
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: 'x'.repeat(16_000_050) }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'list' });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /passed 16,000,000 bytes and was abandoned/);
+  assert.match(r.content, /Nothing is shown rather than part of it/);
+});
+
+test('CONTROL: a body just UNDER the ceiling is read normally', async () => {
+  // Without this, "refused" is equally consistent with the reader being broken
+  // for every response.
+  const s = stub({
+    [`GET ${P}/indexer`]: () => ({ status: 200, body: [prowlarrIndexer()] }),
+    [`GET ${P}/indexerstatus`]: () => ({ status: 200, body: [] }),
+    [`GET ${P}/health`]: () => ({ status: 200, body: [] }),
+  });
+  const r = await run(s, { service: 'prowlarr', action: 'list' });
+  assert.equal(r.ok, true);
+  assert.match(r.content, /id 6  1337x/);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1355,6 +1576,23 @@ test('🔴 add and remove are REFUSED on an arr, and issue no write', async () =
     assert.match(r.content, /a coverage change made on Sonarr directly/);
     assert.deepEqual(s.calls, [], `${action} must not reach Sonarr at all`);
   }
+});
+
+test('🔴 the description NAMES every Prowlarr-only action, so a refusal is not a discovery', () => {
+  /**
+   * A constraint the tool enforces but the description does not state makes the
+   * model spend a turn learning it by being refused. The description is prompt
+   * text; it ships every turn either way.
+   */
+  const desc = makeIndexerAdmin().description;
+  for (const action of ['search_available', 'enable', 'disable', 'add', 'remove']) {
+    assert.ok(
+      new RegExp(`PROWLARR-ONLY[^\\n]*${action}`).test(desc),
+      `${action} is refused on an arr and the description must say so`,
+    );
+  }
+  // CONTROL: the three that DO work everywhere are not swept up in that claim.
+  assert.match(desc, /list, test and test_all work on all three/);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

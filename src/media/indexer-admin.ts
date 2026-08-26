@@ -151,7 +151,34 @@ export interface TestOutcome {
   errors: string[];
 }
 
-/** One catalogue definition, projected. Never the raw 5.75 MB entry. */
+/** What `findDefinition` found. Ambiguity is a RESULT, not an error. */
+export type DefinitionLookup =
+  | { kind: 'none' }
+  | { kind: 'one'; definition: Record<string, unknown> }
+  | { kind: 'ambiguous'; candidates: DefinitionCandidate[] };
+
+export interface DefinitionCandidate {
+  definitionName: string;
+  name: string;
+  privacy: string;
+  implementation: string;
+}
+
+/** Counted live on every search. Never a remembered figure — the catalogue moves. */
+export interface SchemaCensus {
+  total: number;
+  public: number;
+  private: number;
+  semiPrivate: number;
+}
+
+export interface SchemaSearch {
+  matches: SchemaMatch[];
+  totalMatched: number;
+  census: SchemaCensus;
+}
+
+/** One catalogue definition, projected. Never the raw multi-megabyte entry. */
 export interface SchemaMatch {
   /** The identifier `add` takes. There is NO numeric id on a definition. */
   definitionName: string;
@@ -165,12 +192,33 @@ export interface SchemaMatch {
   privacy: string;
   protocol: string;
   language: string;
+  /** Truncated for rendering. Search matches against `fullDescription`. */
   description: string;
-  /** How many matched in total, so a capped list never reads as the whole answer. */
-  totalMatched?: number;
+  /** ⚠️ Not rendered. Exists so the search does not filter on a truncation. */
+  fullDescription: string;
 }
 
-export type Fetched<T> = { state: 'ok'; value: T } | { state: 'unknown'; detail: string };
+/**
+ * 🔴 AN UNKNOWN THAT SAYS WHETHER THE WRITE HAPPENED.
+ *
+ * Found in review. `unknown` used to mean only "I could not tell you the
+ * result", and the tool layer rendered every one of them under the headline
+ * "X was NOT added" / "X was NOT removed". That is a VERDICT, and for a write it
+ * was sometimes the opposite of the truth: Prowlarr answering `201` with no id
+ * in the body means the indexer **exists**, and we reported it as a failure —
+ * which makes a model retry and create a duplicate.
+ *
+ * `acted` is the missing axis, and it is deliberately not defaulted at the call
+ * sites that matter:
+ *  - `'no'`    — the server refused; nothing changed. Safe to retry.
+ *  - `'maybe'` — the request may have landed. **Do not retry blind; go and look.**
+ *  - `'yes'`   — it definitely happened; only the detail is unknown.
+ */
+export type Acted = 'no' | 'maybe' | 'yes';
+
+export type Fetched<T> =
+  | { state: 'ok'; value: T }
+  | { state: 'unknown'; detail: string; acted?: Acted };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PURE HELPERS — no I/O, so a test can assert on them directly
@@ -517,30 +565,39 @@ export class IndexerAdminClient {
    * ⚠️ Filtering happens HERE, not in the caller, because the thing being
    * filtered is 5.75 MB and must never reach a rendered answer.
    */
-  async searchSchema(query: string, limit: number): Promise<Fetched<SchemaMatch[]>> {
-    const r = await this.call('/indexer/schema', { method: 'GET' }, SCHEMA_TIMEOUT_MS);
-    if ('error' in r) return { state: 'unknown', detail: r.error };
-    if (r.status >= 400) {
-      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema → HTTP ${r.status}.` };
-    }
-    let rows: unknown;
-    try {
-      rows = JSON.parse(r.text);
-    } catch {
-      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema did not return JSON.` };
-    }
-    if (!Array.isArray(rows)) {
-      return { state: 'unknown', detail: `${this.spec.label} /indexer/schema returned an unexpected shape.` };
-    }
+  async searchSchema(query: string, limit: number): Promise<Fetched<SchemaSearch>> {
+    const rowsResult = await this.schemaRows();
+    if (rowsResult.state !== 'ok') return rowsResult;
+    const rows = rowsResult.value;
 
     const needle = query.trim().toLowerCase();
-    const all = (rows as Record<string, unknown>[]).map(toSchemaMatch);
+    const all = rows.map(toSchemaMatch);
+    /**
+     * 🔴 THE CENSUS IS COUNTED, NOT REMEMBERED.
+     *
+     * "625 definitions, 87 public" was written into eight places as measured
+     * fact. It IS measured — and the catalogue moved 28 KB inside a single day,
+     * because Prowlarr ships definition updates with every release. A frozen
+     * number presented as a live measurement is the exact shape this repo
+     * refuses everywhere else, and it was sitting in prompt text.
+     */
+    const census: SchemaCensus = { total: all.length, public: 0, private: 0, semiPrivate: 0 };
+    for (const m of all) {
+      if (m.privacy === 'public') census.public += 1;
+      else if (m.privacy === 'semiPrivate') census.semiPrivate += 1;
+      else census.private += 1;
+    }
+
     const matched = needle
       ? all.filter(
           (m) =>
             m.definitionName.toLowerCase().includes(needle) ||
             m.name.toLowerCase().includes(needle) ||
-            m.description.toLowerCase().includes(needle),
+            // ⚠️ The FULL description, not the truncated one. `toSchemaMatch`
+            // slices for rendering; filtering on the slice would silently make
+            // "no definition matches X" a statement about the first 160
+            // characters while the output presents it as one about the server.
+            m.fullDescription.toLowerCase().includes(needle),
         )
       : all;
     /**
@@ -550,17 +607,29 @@ export class IndexerAdminClient {
      * the only ones anybody can actually add.
      */
     matched.sort((a, b) => {
-      const exact = (m: SchemaMatch) => (m.definitionName.toLowerCase() === needle || m.name.toLowerCase() === needle ? 0 : 1);
+      // ⚠️ `needle` may be empty. Without this guard an empty query makes every
+      // nameless row an "exact match" and sorts it to the top.
+      const exact = (m: SchemaMatch) =>
+        needle && (m.definitionName.toLowerCase() === needle || m.name.toLowerCase() === needle) ? 0 : 1;
       if (exact(a) !== exact(b)) return exact(a) - exact(b);
       const open = (m: SchemaMatch) => (m.privacy === 'public' ? 0 : 1);
       if (open(a) !== open(b)) return open(a) - open(b);
       return a.name.localeCompare(b.name);
     });
-    return { state: 'ok', value: matched.slice(0, limit).map((m) => ({ ...m, totalMatched: matched.length })) };
+    return {
+      state: 'ok',
+      value: { matches: matched.slice(0, limit), totalMatched: matched.length, census },
+    };
   }
 
-  /** One definition by its exact name, for `add`. `null` when there is no such thing. */
-  async findDefinition(name: string): Promise<Fetched<Record<string, unknown> | null>> {
+  /**
+   * The catalogue, fetched and validated once.
+   *
+   * ⚠️ Extracted because `searchSchema` and `findDefinition` had fifteen
+   * identical lines and four identical error strings between them — two copies
+   * of one fact, which is how they drift.
+   */
+  private async schemaRows(): Promise<Fetched<Record<string, unknown>[]>> {
     const r = await this.call('/indexer/schema', { method: 'GET' }, SCHEMA_TIMEOUT_MS);
     if ('error' in r) return { state: 'unknown', detail: r.error };
     if (r.status >= 400) {
@@ -575,13 +644,54 @@ export class IndexerAdminClient {
     if (!Array.isArray(rows)) {
       return { state: 'unknown', detail: `${this.spec.label} /indexer/schema returned an unexpected shape.` };
     }
+    return { state: 'ok', value: rows as Record<string, unknown>[] };
+  }
+
+  /**
+   * One definition by its exact name, for `add`.
+   *
+   * ── 🔴 THE NAME IS NOT UNIQUE, AND PICKING THE FIRST MATCH IS WRONG ────────
+   *
+   * Found in review and confirmed against the live catalogue: `definitionName`
+   * repeats — `newznab` ×19, `torznab` ×4 — and `name` repeats too. Most
+   * collisions are private trackers that the privacy gate stops anyway, but
+   * **`showRSS` and `Torrent RSS Feed` are both public and collide with each
+   * other**: asking for "Torrent RSS Feed" matched the showRSS row and would
+   * have installed **a different indexer than the one named**, reported as a
+   * clean success.
+   *
+   * So: `definitionName` is tried first because that is the identifier
+   * `search_available` renders and tells the caller to use; `name` is only a
+   * fallback for a person typing the display name. **Either way, more than one
+   * match is an ambiguity, and an ambiguity is refused rather than resolved.**
+   * Guessing which one they meant is the failure mode; asking is cheap.
+   */
+  async findDefinition(name: string): Promise<Fetched<DefinitionLookup>> {
+    const rowsResult = await this.schemaRows();
+    if (rowsResult.state !== 'ok') return rowsResult;
     const needle = name.trim().toLowerCase();
-    const hit = (rows as Record<string, unknown>[]).find(
-      (x) =>
-        String(x['definitionName'] ?? '').toLowerCase() === needle ||
-        String(x['name'] ?? '').toLowerCase() === needle,
+
+    const byDefinition = rowsResult.value.filter(
+      (x) => String(x['definitionName'] ?? '').toLowerCase() === needle,
     );
-    return { state: 'ok', value: hit ?? null };
+    const hits = byDefinition.length
+      ? byDefinition
+      : rowsResult.value.filter((x) => String(x['name'] ?? '').toLowerCase() === needle);
+
+    if (hits.length === 0) return { state: 'ok', value: { kind: 'none' } };
+    if (hits.length === 1) return { state: 'ok', value: { kind: 'one', definition: hits[0]! } };
+    return {
+      state: 'ok',
+      value: {
+        kind: 'ambiguous',
+        candidates: hits.map((x) => ({
+          definitionName: String(x['definitionName'] ?? ''),
+          name: String(x['name'] ?? ''),
+          privacy: String(x['privacy'] ?? '?'),
+          implementation: String(x['implementation'] ?? '?'),
+        })),
+      },
+    };
   }
 
   /**
@@ -610,7 +720,14 @@ export class IndexerAdminClient {
       { method: 'POST', body: JSON.stringify(body) },
       TEST_ONE_TIMEOUT_MS,
     );
-    if ('error' in r) return { state: 'unknown', detail: r.error };
+    /**
+     * 🔴 A TRANSPORT FAILURE ON A WRITE IS `maybe`, NEVER `no`.
+     *
+     * The create takes ~25 s because Prowlarr live-tests before saving, against
+     * a 90 s ceiling — so a timeout or a dropped connection can land AFTER the
+     * indexer was written. "It failed" is the answer that produces a duplicate.
+     */
+    if ('error' in r) return { state: 'unknown', acted: 'maybe', detail: r.error };
     if (r.status === 201 || r.status === 200) {
       let created: Record<string, unknown> = {};
       try {
@@ -622,9 +739,13 @@ export class IndexerAdminClient {
       if (!Number.isInteger(id)) {
         return {
           state: 'unknown',
+          // 🔴 `yes`. Prowlarr ACCEPTED it — the indexer exists. Only its id is
+          // unknown. Reporting this as a failure is how a duplicate gets made.
+          acted: 'yes',
           detail:
             `${this.spec.label} accepted the new indexer (HTTP ${r.status}) but did not return a ` +
-            'usable id, so it exists and I cannot tell you its id. Run action "list" to find it.',
+            'usable id, so it EXISTS and I cannot tell you its id. Run action "list" to find it. ' +
+            'Do NOT add it again.',
         };
       }
       return { state: 'ok', value: { id, name: String(created['name'] ?? definition['name'] ?? '?') } };
@@ -633,13 +754,18 @@ export class IndexerAdminClient {
       const why = collectFailures(safeParse(r.text));
       return {
         state: 'unknown',
+        // The server refused outright. Nothing changed, and a retry is safe.
+        acted: 'no',
         detail:
           `${this.spec.label} REFUSED to create it (HTTP 400) and nothing was added. ` +
-          (why.length ? why.join(' / ') : scrubBody(r.text, 300)),
+          // ⚠️ `scrubBody`, not `scrubMessage`: this is a BODY. The only new
+          // render path that was still behind the URL-only redactor.
+          (why.length ? why.map((m) => scrubBody(m, 300)).join(' / ') : scrubBody(r.text, 300)),
       };
     }
     return {
       state: 'unknown',
+      acted: 'maybe',
       detail:
         `${this.spec.label} POST /indexer → HTTP ${r.status}. Whether it was created is UNKNOWN — ` +
         `run action "list" before retrying, or you may add it twice. ${scrubBody(r.text, 200)}`,
@@ -669,10 +795,13 @@ export class IndexerAdminClient {
   /** DELETE. Measured: HTTP 200 with an empty `{}` body. */
   async remove(id: number): Promise<Fetched<true>> {
     const r = await this.call(`/indexer/${id}`, { method: 'DELETE' }, READ_TIMEOUT_MS);
-    if ('error' in r) return { state: 'unknown', detail: r.error };
+    // Same rule as the create: a write we could not get an answer about MAY have
+    // happened, and saying it did not is a verdict we do not have.
+    if ('error' in r) return { state: 'unknown', acted: 'maybe', detail: r.error };
     if (r.status >= 400) {
       return {
         state: 'unknown',
+        acted: 'maybe',
         detail:
           `${this.spec.label} DELETE /indexer/${id} → HTTP ${r.status}. It may or may not have been ` +
           `removed — run action "list" to find out. ${scrubBody(r.text, 200)}`,
@@ -942,9 +1071,8 @@ function toSchemaMatch(raw: Record<string, unknown>): SchemaMatch {
     privacy: String(raw['privacy'] ?? '?'),
     protocol: String(raw['protocol'] ?? '?'),
     language: String(raw['language'] ?? '?'),
-    // Trimmed here rather than at render time: these run to a paragraph and
-    // there are 625 of them.
     description: String(raw['description'] ?? '').slice(0, 160),
+    fullDescription: String(raw['description'] ?? ''),
   };
 }
 
@@ -970,7 +1098,20 @@ function safeParse(text: string): unknown {
  */
 async function readBounded(res: Response, ceiling: number): Promise<{ text: string } | { error: string }> {
   const body = res.body;
-  if (!body || typeof body.getReader !== 'function') return { text: await res.text() };
+  /**
+   * 🔴 A BODILESS RESPONSE IS `''`, NOT "READ IT WITHOUT A LIMIT".
+   *
+   * This branch used to `return { text: await res.text() }` — precisely the
+   * unbounded read the whole function exists to prevent, reached by the one path
+   * that skips the meter. The sibling in `src/tools/homelab-read.ts` gets this
+   * right and documents why: `res.body` is null only for a genuinely bodiless
+   * response (204, 304, HEAD), where `text()` is `''` and no ceiling can apply.
+   *
+   * ⚠️ It also made the ceiling untestable, which is how it survived review the
+   * first time: the test harness builds plain objects with no `body`, so all 58
+   * tests took this path. `MAX_BODY_BYTES = 1` left the suite entirely green.
+   */
+  if (!body || typeof body.getReader !== 'function') return { text: '' };
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const chunks: string[] = [];
