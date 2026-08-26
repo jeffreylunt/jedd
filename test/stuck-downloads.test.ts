@@ -518,3 +518,23 @@ test('🔴 promote REFUSES a stalled torrent — promotion is not the remedy for
   assert.equal(out.ok, false);
   assert.deepEqual(r.calls.filter((c) => c.url.includes('topPrio')), []);
 });
+
+test('🔴 MUTATION TARGET: a refusal answers the question that was ASKED', async () => {
+  /**
+   * Caught on a live run, not by a test. Asking to PROMOTE a recently-started
+   * torrent came back *"has not had long enough to be called stalled"* — a true
+   * sentence about the item and an answer to a question nobody asked. A model
+   * reading that learns the wrong reason and retries the wrong way.
+   */
+  const r = recorder({ torrents: () => [torrent({ hash: HASH, state: 'metaDL', timeActiveSeconds: 2 * 3600 })] });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+
+  assert.equal(out.ok, false);
+  assert.match(out.content, /"promote" needs an item whose state is WAITING in the queue and never started/);
+  assert.match(out.content, /this one is recently started/);
+
+  // CONTROL: the same item asked to UNSTICK names the OTHER requirement.
+  const r2 = recorder({ torrents: () => [torrent({ hash: HASH, state: 'metaDL', timeActiveSeconds: 2 * 3600 })] });
+  const out2 = await makeStuckDownloads(r2.fetchImpl).run({ action: 'unstick', hash: HASH }, ctx());
+  assert.match(out2.content, /"unstick" needs an item whose state is STALLED/);
+});

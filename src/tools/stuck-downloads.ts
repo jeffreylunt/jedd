@@ -138,7 +138,12 @@ export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
  * measured at 39%, and a confirm step asks an unreliable selector the same
  * question twice, then treats the second correlated answer as corroboration.
  */
-function gate(items: Item[], hash: string, need: QbitVerdict['kind']): { item: Item } | { refusal: string } {
+function gate(
+  items: Item[],
+  hash: string,
+  need: QbitVerdict['kind'],
+  action: string,
+): { item: Item } | { refusal: string } {
   const wanted = hash.trim().toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(wanted)) {
     return {
@@ -152,7 +157,36 @@ function gate(items: Item[], hash: string, need: QbitVerdict['kind']): { item: I
     return { refusal: `Nothing in the queue has infohash ${wanted}. Run action "list" for the current set — and note the queue changes between reads, so a hash from an old listing may simply be gone.` };
   }
   if (item.verdict.kind === need) return { item };
-  return { refusal: `${refusalFor(item)}\nNothing was done.` };
+  /**
+   * 🔴 THE REFUSAL MUST ANSWER THE QUESTION THAT WAS ASKED.
+   *
+   * Caught on a live run: asking to PROMOTE a torrent came back *"has not had
+   * long enough to be called stalled"* — a true sentence about the item, and an
+   * answer to a question nobody asked. A model reading that learns the wrong
+   * thing about why its request failed and retries the wrong way. So the
+   * mismatch is named explicitly alongside the state.
+   */
+  return {
+    refusal:
+      `${refusalFor(item)}\n"${action}" needs an item whose state is ${describeNeed(need)}; this ` +
+      `one is ${describeNeed(item.verdict.kind)}. Nothing was done.`,
+  };
+}
+
+/** The verdict in words, for a refusal that has to name both sides of a mismatch. */
+function describeNeed(kind: string): string {
+  return (
+    {
+      stalled: 'STALLED (active for a day or more with nothing moving)',
+      'not-started': 'WAITING in the queue and never started',
+      held: 'STOPPED by someone',
+      finished: 'FINISHED and seeding',
+      progressing: 'DOWNLOADING',
+      starting: 'recently started',
+      unmanaged: 'not arr-managed',
+      unseen: 'absent from qBittorrent',
+    }[kind] ?? kind
+  );
 }
 
 /** Why this item is not actionable, in the words that matter to the person. */
@@ -215,7 +249,7 @@ async function runUnstick(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchI
   const state = await collect(ctx, fetchImpl);
   if ('error' in state) return fail(state.error);
 
-  const found = gate(state.items, hash, 'stalled');
+  const found = gate(state.items, hash, 'stalled', 'unstick');
   if ('refusal' in found) return fail(found.refusal);
   const { item } = found;
   if (!item.release) {
@@ -303,7 +337,7 @@ async function runPromote(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchI
   const state = await collect(ctx, fetchImpl);
   if ('error' in state) return fail(state.error);
 
-  const found = gate(state.items, hash, 'not-started');
+  const found = gate(state.items, hash, 'not-started', 'promote');
   if ('refusal' in found) return fail(found.refusal);
   const torrent = found.item.torrent!;
   if (torrent.numComplete <= 0) {
