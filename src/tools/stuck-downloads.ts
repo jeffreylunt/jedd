@@ -328,9 +328,16 @@ async function runUnstick(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchI
  * ⚠️ Gated on `not-started` WITH A LIVE SWARM. Promoting a dead torrent moves it
  * up a queue it will fail at anyway, and promoting one nothing is waiting behind
  * achieves nothing. The case this exists for is real and documented:
- * `dont_count_slow_torrents=False`, so dead torrents hold active slots
- * indefinitely and qBit promotes by ADD ORDER rather than by health — which is
- * how the client moved zero bytes for 24 h while looking fully busy.
+ * dead torrents holding active slots while qBit promotes by ADD ORDER rather
+ * than by health — which is how the client moved zero bytes for 24 h while
+ * looking fully busy.
+ *
+ * ⚠️ NARROWER THAN IT WAS. `dont_count_slow_torrents` is now `true` (measured
+ * 2026-08-26; the runbook still records the old `false`), with a 2 KB/s
+ * threshold over 60 s, so qBit now sheds dead weight from the active set on its
+ * own — `queuedDL` 8 → 0 while `metaDL` 3 → 8 inside one 15-minute window.
+ * This verb is for the remaining case: something healthy waiting behind a full
+ * active set.
  */
 async function runPromote(ctx: ToolContext, rawHash: unknown, fetchImpl?: FetchImpl) {
   const hash = typeof rawHash === 'string' ? rawHash : '';
