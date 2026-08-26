@@ -2,6 +2,15 @@
 /**
  * Poke Messages.app so it never idles past the typing-indicator boundary.
  *
+ * 🔴 REFUTED AS A REMEDY, 2026-08-26, the same day it was built. Matched pair
+ * on the production path: poke ON, 10m50s gap, 6/6 firings confirmed → no
+ * indicator; a 30s-gap message minutes later, same poke state → indicator.
+ * The gap is the variable; this poke is not. Messages answered the Apple
+ * event in 108ms after 43 poke-free minutes, so the scripting surface was
+ * never the dormant component. Kept ONLY because the log labels idle gaps.
+ * Do not re-derive this as a fix. Full record:
+ * spaces/jedd-v2/knowledge/messages-poke-workaround.md.
+ *
  * WHY THIS EXISTS — upstream bluebubbles-server issue #750 (open since
  * 2025-06-24, reproduced by a third party on macOS 15.7.5, our exact version):
  * after ~10–15 minutes of complete inactivity Messages.app stops delivering

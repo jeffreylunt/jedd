@@ -4,6 +4,17 @@
     <dict>
         <key>Label</key>
         <string>com.jedd.messages-poke</string>
+        <!-- 🔴 THIS DOES NOT FIX THE TYPING INDICATOR — REFUTED 2026-08-26 by a
+             matched pair on the production path: poke ON, 10m50s gap, 6/6
+             firings confirmed at exact cadence → indicator still failed (and a
+             30s-gap message minutes later succeeded, poke state constant, so
+             the gap is the variable and the poke is not). Messages answered
+             `count of chats` in 108ms after 43 poke-free minutes — the
+             scripting surface was never the dormant component. Kept installed
+             ONLY because its log labels idle gaps for the ongoing
+             investigation. Do not re-derive this as a remedy; the full record
+             is in spaces/jedd-v2/knowledge/messages-poke-workaround.md. -->
+
         <!-- 🔴 MUST be this exact node binary: it is the launchd job root and
              therefore the TCC responsible process, and this path already holds
              the Automation grant for com.apple.MobileSMS. A different node, a
