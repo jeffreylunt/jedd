@@ -5,7 +5,7 @@ import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
-import { withPresence } from './connector.js';
+import { presenceToken, withPresence, type PresenceRecord } from './connector.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
@@ -250,15 +250,41 @@ async function main(): Promise<void> {
        * the "…" runs for exactly as long as Jedd owes this person a reply, and
        * it is transparent: it rethrows whatever `agent.handle` or `send` throws
        * into the catch below, stopping the indicator on the way past either way.
+       *
+       * ⚠️ 2026-08-26: THIS ORDERING WAS SUSPECTED OF CAUSING A FLICKER AND WAS
+       * CLEARED. Jeff saw "…" reappear for a beat after every reply, which looks
+       * exactly like a stop landing late — and it was not. The stop was landing
+       * 4ms after the message and STARTING the indicator, because BlueBubbles'
+       * `DELETE /chat/{guid}/typing` calls `startTyping` (see
+       * `client.stopTyping`). Covering the send stays right: BlueBubbles clears
+       * its own `typingCache` and stops typing INSIDE its send path before the
+       * message is dispatched, which is tighter ordering than anything callable
+       * from out here. Ending the region before the send would also mean AWAITING
+       * a presence call on the reply path — the one rule `presence.ts` exists to
+       * enforce. Do not swap these.
        */
-      const record = await withPresence(connector, message, async () => {
-        const r = await agent.handle(message.senderHandle, message.text);
-        await connector.send(message.senderHandle, r.replyText);
-        return r;
-      });
+      const signals: PresenceRecord = { signalled: [] };
+      const record = await withPresence(
+        connector,
+        message,
+        async () => {
+          const r = await agent.handle(message.senderHandle, message.text);
+          await connector.send(message.senderHandle, r.replyText);
+          return r;
+        },
+        signals,
+      );
+      /**
+       * 🔴 `presence=` DISTINGUISHES A SIGNAL THAT WENT OUT FROM ONE THAT WAS
+       * NEVER SENT. `Presence.report()` returns early on success, so those two
+       * states used to log identically — and when Jeff said he got no read
+       * receipt, the log could not say whether the call had been made. The token
+       * is written by the gate itself, not re-derived here.
+       */
       console.error(
         `[jedd] turn ${turns} from ${message.senderHandle}: ` +
-          `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ${Date.now() - started}ms`,
+          `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
+          `presence=${presenceToken(signals)} ${Date.now() - started}ms`,
       );
     } catch (e) {
       // A failing turn must not stop the next message arriving.

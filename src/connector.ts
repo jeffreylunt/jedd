@@ -28,13 +28,31 @@ export interface Connector {
    * forgetting. A transport that cannot show typing writes the no-op and says so
    * — which is a decision — rather than silently inheriting one.
    *
-   * ⚠️ Both are contractually incapable of breaking a turn. `markRead` returns
-   * `void`, so there is no promise to await and nothing to reject. `withTyping`
-   * is transparent: it returns exactly what `fn` returns and rethrows exactly
-   * what `fn` throws, and any failure of its own is swallowed inside.
+   * ⚠️ Both are contractually incapable of breaking a turn. `markRead` hands
+   * back a plain boolean — NOT a promise, so there is still nothing to await
+   * and nothing to reject. `withTyping` is transparent: it returns exactly what
+   * `fn` returns and rethrows exactly what `fn` throws, and any failure of its
+   * own is swallowed inside.
+   *
+   * 🔴 THE RETURN VALUE AND `onTyping` ARE THE ONLY HONEST WITNESS THAT A
+   * SIGNAL WENT OUT. `Presence.report()` returns early on success, so a
+   * successful call and a call that was never made are byte-identical in the
+   * log — that is how a turn silently lost its read receipt and nobody could
+   * tell. These report from INSIDE the gate that makes the decision, rather
+   * than from a predicate somewhere else that re-derives it and drifts.
    */
-  markRead(toHandle: string): void;
-  withTyping<T>(toHandle: string, fn: () => Promise<T>): Promise<T>;
+  markRead(toHandle: string): boolean;
+  withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T>;
+}
+
+/** What a turn actually put on the wire, for the per-turn log line. */
+export interface PresenceRecord {
+  signalled: ('read' | 'typing')[];
+}
+
+/** How `PresenceRecord` reads in a log line. `none` is a real answer, not a gap. */
+export function presenceToken(record: PresenceRecord): string {
+  return record.signalled.length ? record.signalled.join('+') : 'none';
 }
 
 /**
@@ -58,11 +76,13 @@ export async function withPresence<T>(
   connector: Connector,
   message: IncomingMessage,
   turn: () => Promise<T>,
+  record?: PresenceRecord,
 ): Promise<T> {
-  // Not awaited, and it returns `void` so it cannot be. The read receipt goes
-  // out as Jedd picks the message up, not after it has thought about it.
-  connector.markRead(message.senderHandle);
-  return connector.withTyping(message.senderHandle, turn);
+  // Not awaited, and it hands back a boolean rather than a promise so it cannot
+  // be. The read receipt goes out as Jedd picks the message up, not after it has
+  // thought about it.
+  if (connector.markRead(message.senderHandle)) record?.signalled.push('read');
+  return connector.withTyping(message.senderHandle, turn, () => record?.signalled.push('typing'));
 }
 
 /**
@@ -85,7 +105,9 @@ export class StdoutConnector implements Connector {
   }
 
   /** A terminal has no read receipts. Nothing to do, said out loud. */
-  markRead(_toHandle: string): void {}
+  markRead(_toHandle: string): boolean {
+    return false;
+  }
 
   /**
    * A terminal has no typing indicator either — but it DOES have the long wait,
@@ -93,8 +115,9 @@ export class StdoutConnector implements Connector {
    * started. It is deliberately transparent, so `fn`'s value and its exceptions
    * are untouched.
    */
-  async withTyping<T>(_toHandle: string, fn: () => Promise<T>): Promise<T> {
+  async withTyping<T>(_toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T> {
     process.stdout.write('(thinking…)\n');
+    onTyping?.();
     return fn();
   }
 
@@ -131,12 +154,14 @@ export class TestConnector implements Connector {
     this.sent.push({ to: toHandle, text });
   }
 
-  markRead(toHandle: string): void {
+  markRead(toHandle: string): boolean {
     this.presence.push({ event: 'read', to: toHandle });
+    return true;
   }
 
-  async withTyping<T>(toHandle: string, fn: () => Promise<T>): Promise<T> {
+  async withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T> {
     this.presence.push({ event: 'typing-start', to: toHandle });
+    onTyping?.();
     try {
       return await fn();
     } finally {

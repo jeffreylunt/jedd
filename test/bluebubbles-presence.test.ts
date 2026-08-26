@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BlueBubblesClient, chatGuidFor, type FetchImpl } from '../src/bluebubbles/client.js';
+import {
+  BlueBubblesClient,
+  chatGuidFor,
+  type FetchImpl,
+  type PrivateApiResult,
+} from '../src/bluebubbles/client.js';
 import { Presence, type PresenceCapableClient, type TimerSeam } from '../src/bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, ShadowConnector } from '../src/bluebubbles/receiver.js';
-import { withPresence } from '../src/connector.js';
+import { presenceToken, withPresence, type PresenceRecord } from '../src/connector.js';
 
 /**
  * Typing indicators and read receipts.
@@ -54,26 +59,74 @@ interface Call {
   method: string;
   body: unknown;
   hasSignal: boolean;
+  /** The request body exactly as it went out. Engine.IO frames are not JSON. */
+  raw: string | undefined;
 }
 
 function scripted(reply: (c: Call) => { status?: number; body: unknown }) {
   const calls: Call[] = [];
   const impl: FetchImpl = async (url, init) => {
+    const raw = init?.body === undefined ? undefined : String(init.body);
+    let parsed: unknown;
+    // ⚠️ Defensive: the socket transport puts Engine.IO frames (`40`, `42[…]`)
+    // on the wire, and those are not JSON objects. A harness that assumed JSON
+    // would throw inside the fake fetch and report as a client bug.
+    try {
+      parsed = raw === undefined ? undefined : JSON.parse(raw);
+    } catch {
+      parsed = undefined;
+    }
     const call: Call = {
       url: String(url),
       method: init?.method ?? 'GET',
-      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      body: parsed,
       hasSignal: Boolean(init?.signal),
+      raw,
     };
     calls.push(call);
     const r = reply(call);
+    const payload = r.body;
     return {
       ok: (r.status ?? 200) < 400,
       status: r.status ?? 200,
-      json: async () => r.body,
+      json: async () => payload,
+      text: async () => (typeof payload === 'string' ? payload : JSON.stringify(payload)),
     } as Response;
   };
   return { impl, calls };
+}
+
+/** Engine.IO's packet separator (0x1e), named so it is not an invisible byte. */
+const RS = '\u001e';
+
+/**
+ * A BlueBubbles that speaks Engine.IO polling the way the real one does.
+ *
+ * The shapes are copied off the live `127.0.0.1:1234` on 2026-08-25, not
+ * invented: the handshake answers a `0{…}` packet carrying the session id, and
+ * ONE poll returns both the namespace ack and the server-emitted event,
+ * separated by the record separator.
+ */
+function socketServer(
+  opts: { channel?: (event: string) => string; data?: unknown; sid?: string | null } = {},
+) {
+  let emitted: [string, unknown] | null = null;
+  const handle = (c: Call): { status?: number; body: unknown } | null => {
+    if (!c.url.includes('/socket.io/')) return null;
+    if (c.method === 'GET' && !c.url.includes('sid=')) {
+      const sid = opts.sid === undefined ? 'FAKESID' : opts.sid;
+      return { body: sid === null ? '0{"upgrades":[]}' : `0{"sid":"${sid}","upgrades":[]}` };
+    }
+    if (c.method === 'POST') {
+      if (c.raw?.startsWith('42')) emitted = JSON.parse(c.raw.slice(2)) as [string, unknown];
+      return { body: 'ok' };
+    }
+    const event = emitted?.[0] ?? 'nothing-was-emitted';
+    const channel = opts.channel ? opts.channel(event) : `${event}-sent`;
+    const data = opts.data ?? { status: 200, message: 'Success', data: null, encrypted: false };
+    return { body: `40{"sid":"FAKESID"}${RS}42${JSON.stringify([channel, data])}` };
+  };
+  return { handle, emitted: () => emitted };
 }
 
 function client(impl: FetchImpl): BlueBubblesClient {
@@ -130,20 +183,120 @@ function stubClient(behaviour: 'ok' | 'helper-absent' | 'throw' = 'ok') {
 // CALL CONSTRUCTION — the right verb at the right URL
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('startTyping POSTs to the chat typing route, stopTyping DELETEs the same one', async () => {
-  const { impl, calls } = scripted(() => ({ body: { status: 200, message: 'Success' } }));
+/**
+ * ── 🔴 THE STOP DOES NOT GO OVER HTTP, AND THESE TESTS ARE WHY ────────────────
+ *
+ * `DELETE /api/v1/chat/{guid}/typing` on BlueBubbles 1.9.9 calls
+ * `ChatInterface.startTyping` and answers HTTP 200 "Successfully stopped
+ * typing!" — read out of the shipped `dist/main.js`, still on upstream `master`,
+ * and confirmed live: BlueBubbles logs `Executing Action: Change Typing Status`
+ * for the socket route and NOTHING for the DELETE.
+ *
+ * ⚠️ THE TEST THAT USED TO LIVE HERE ASSERTED THE BUG. It read
+ * "startTyping POSTs to the chat typing route, stopTyping DELETEs the same one",
+ * it was green for every one of the DELETEs that turned Jeff's indicator back on
+ * after every reply, and it would have gone RED against the fix. A test that
+ * pins the call to the route rather than to the OUTCOME cannot tell a stop from
+ * a start.
+ */
+
+test('🔴 stopTyping issues NO DELETE to the typing route — that route starts typing', async () => {
+  const socket = socketServer();
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  const deletes = calls.filter((k) => k.method === 'DELETE');
+  assert.deepEqual(
+    deletes.map((k) => k.url),
+    [],
+    'a DELETE went out — on BlueBubbles 1.9.9 that STARTS the indicator and reports success',
+  );
+});
+
+test('🔴 stopTyping emits the socket.io stopped-typing event for the right chat', async () => {
+  const socket = socketServer();
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.deepEqual(socket.emitted(), ['stopped-typing', { chatGuid: chatGuidFor(OWNER) }]);
+  assert.equal(r.ok, true);
+  assert.ok(
+    calls.every((k) => k.url.includes('/socket.io/')),
+    'stopTyping touched something other than the socket transport',
+  );
+});
+
+test('🔴 startTyping STAYS on the HTTP POST — it is what arms BlueBubbles stop-on-send', async () => {
+  // `ChatInterface.startTyping` is the only thing that pushes the guid into
+  // `Server().typingCache`, and that cache is the sole trigger for BlueBubbles'
+  // own stopTyping inside its send path. Move start onto the socket for symmetry
+  // and the indicator still appears, every test still passes, and the last
+  // independent stop this design has is silently gone.
+  const socket = socketServer();
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200, message: 'Success' } });
+  await client(impl).startTyping(chatGuidFor(OWNER));
+
+  const path = '/api/v1/chat/iMessage%3B-%3B%2B18015550123/typing';
+  assert.equal(calls.length, 1, 'startTyping should be one plain HTTP call');
+  assert.equal(calls[0]?.method, 'POST');
+  assert.ok(calls[0]?.url.startsWith(`http://bb.invalid:1234${path}?`), calls[0]?.url);
+  assert.equal(socket.emitted(), null, 'startTyping went over the socket — stop-on-send is now unarmed');
+});
+
+test('start and stop address the SAME conversation, over two different transports', async () => {
+  const socket = socketServer();
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200, message: 'Success' } });
   const c = client(impl);
   await c.startTyping(chatGuidFor(OWNER));
   await c.stopTyping(chatGuidFor(OWNER));
 
-  const path = '/api/v1/chat/iMessage%3B-%3B%2B18015550123/typing';
-  assert.equal(calls[0]?.method, 'POST');
-  assert.ok(calls[0]?.url.startsWith(`http://bb.invalid:1234${path}?`), calls[0]?.url);
-  assert.equal(calls[1]?.method, 'DELETE');
-  assert.ok(calls[1]?.url.startsWith(`http://bb.invalid:1234${path}?`), calls[1]?.url);
-  // Start and stop must address the SAME conversation; a mismatch is a stuck
-  // indicator on one thread and a silent one on another.
-  assert.equal(calls[0]?.url, calls[1]?.url);
+  // Read the guid the START actually put on the wire rather than restating the
+  // literal: a mismatch is a stuck indicator on one thread and a silent one on
+  // another, and each call looks right on its own.
+  const started = decodeURIComponent(String(calls[0]?.url.split('/chat/')[1]?.split('/typing')[0]));
+  assert.equal((socket.emitted()?.[1] as { chatGuid?: string })?.chatGuid, started);
+});
+
+test('🔴 a socket error answer is NOT laundered into a success', async () => {
+  const socket = socketServer({
+    channel: (e) => `${e}-error`,
+    data: { status: 500, message: 'Failed to stop typing!' },
+  });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 500);
+  assert.match(r.detail, /stopped-typing-error/);
+});
+
+test('a handshake that yields no session id is a reported failure, not a throw', async () => {
+  const socket = socketServer({ sid: null });
+  const { impl } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  const r = await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /no session id/);
+});
+
+test('the socket session is CLOSED, not left for BlueBubbles to time out', async () => {
+  const socket = socketServer();
+  const { impl, calls } = scripted((c) => socket.handle(c) ?? { body: { status: 200 } });
+  await client(impl).stopTyping(chatGuidFor(OWNER));
+
+  assert.ok(
+    calls.some((k) => k.method === 'POST' && k.raw === '41'),
+    'no Engine.IO disconnect frame — every stop would leak a session until ping timeout',
+  );
+});
+
+test('🔴 CONTROL: a transport failure still THROWS out of stopTyping', async () => {
+  // The swallow belongs in `Presence`, not here. If this could not throw, every
+  // "the turn still delivers" test above would be proving nothing.
+  const impl: FetchImpl = async () => {
+    throw new Error('ECONNREFUSED 127.0.0.1:1234');
+  };
+  await assert.rejects(() => client(impl).stopTyping(chatGuidFor(OWNER)), /ECONNREFUSED/);
 });
 
 test('markChatRead POSTs to the chat read route', async () => {
@@ -247,10 +400,22 @@ test('🔴 CONTROL: the client itself still THROWS on transport failure', async 
 // ─────────────────────────────────────────────────────────────────────────────
 
 test('🔴 with the helper ABSENT, a turn returns its reply exactly as it would have', async () => {
-  const { impl, calls } = scripted((c) =>
-    c.url.includes('/message/text')
-      ? { body: { status: 200, data: { guid: 'sent-1' } } }
-      : { status: 500, body: HELPER_ABSENT_BODY },
+  // ⚠️ The socket leg is scripted the way a real helper-absent server answers
+  // it, NOT as another 500. `/socket.io/` is not behind the Private API
+  // middleware, so the handshake succeeds and the failure comes back as
+  // `stopped-typing-error` with BlueBubbles' fixed wording — which is exactly
+  // why the stop cannot identify itself as helper-absent. Scripting a 500 there
+  // would have tested a server that does not exist.
+  const socket = socketServer({
+    channel: (e) => `${e}-error`,
+    data: { status: 500, message: 'Failed to stop typing!' },
+  });
+  const { impl, calls } = scripted(
+    (c) =>
+      socket.handle(c) ??
+      (c.url.includes('/message/text')
+        ? { body: { status: 200, data: { guid: 'sent-1' } } }
+        : { status: 500, body: HELPER_ABSENT_BODY }),
   );
   const bb = client(impl);
   const lines: string[] = [];
@@ -303,6 +468,74 @@ test('the helper-absent notice is said ONCE, not on every turn for the rest of t
     await flush();
   }
   assert.equal(lines.length, 1, `expected one notice across five turns, got:\n${lines.join('\n')}`);
+});
+
+/**
+ * A hand-built presence client whose next answer can be set per call, so the
+ * two halves of the suppression rule can be asserted separately. Each half gets
+ * its own test: an assertion that dies first hides the one after it.
+ */
+function switchableClient() {
+  let next: PrivateApiResult = { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+  const impl: PresenceCapableClient = {
+    startTyping: async () => next,
+    stopTyping: async () => next,
+    markChatRead: async () => next,
+  };
+  return { impl, set: (r: PrivateApiResult) => { next = r; } };
+}
+
+const HELPER_ABSENT: PrivateApiResult = {
+  ok: false, status: 500, helperAbsent: true, detail: 'Private API helper is not connected (http 500).',
+};
+/** BlueBubbles' socket handler discards the helper's wording and says only this. */
+const SOCKET_STOP_ERROR: PrivateApiResult = {
+  ok: false, status: 500, helperAbsent: false, detail: 'stopped-typing-error: Failed to stop typing!',
+};
+
+test('a failure arriving while the helper is KNOWN absent adds no second line', async () => {
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set(HELPER_ABSENT);
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+  const afterNotice = lines.length;
+
+  // The stop cannot say "helper absent" — BlueBubbles' socket handler answers a
+  // fixed string. Unsuppressed, this is one red line per turn, forever.
+  set(SOCKET_STOP_ERROR);
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  assert.equal(afterNotice, 1, lines.join('\n'));
+  assert.equal(lines.length, 1, `a consequence of an already-stated cause was reported:\n${lines.join('\n')}`);
+});
+
+test('🔴 a SUCCESS re-arms reporting — the suppression must not outlive its cause', async () => {
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set(HELPER_ABSENT);
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  // The helper comes back...
+  set({ ok: true, status: 200, helperAbsent: false, detail: 'http 200' });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  // ...and a genuine fault after that is news again, not old news.
+  set({ ok: false, status: 503, helperAbsent: false, detail: 'http 503: upstream gone' });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  assert.ok(
+    lines.some((l) => l.includes('upstream gone')),
+    `a real fault was muted for the life of the process:\n${lines.join('\n')}`,
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -498,6 +731,50 @@ test('a connector built with NO Presence still runs the turn', async () => {
   const connector = connectorWith('everyone');
   connector.markRead(OWNER);
   assert.equal(await connector.withTyping(OWNER, async () => 'ok'), 'ok');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 OBSERVABILITY — a successful signal and a signal that was never sent used
+// to look identical in the log. Each property below gets its OWN test: an
+// assertion that dies first hides every assertion after it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const turnOf = async (connector: BlueBubblesConnector): Promise<PresenceRecord> => {
+  const signals: PresenceRecord = { signalled: [] };
+  await withPresence(connector, { senderHandle: OWNER, text: 'hi' }, async () => 'reply', signals);
+  await flush();
+  return signals;
+};
+
+test('🔴 a wired connector records BOTH signals — read and typing', async () => {
+  const { impl } = stubClient();
+  const record = await turnOf(connectorWith('everyone', new Presence({ client: impl, log: () => {} })));
+  assert.equal(presenceToken(record), 'read+typing');
+});
+
+test('🔴 CONTROL: a connector built with presence UNDEFINED records none', async () => {
+  // This is the mutation the log line has to survive: remove the wiring and the
+  // token must change. A token that reads the same either way is decoration.
+  const record = await turnOf(connectorWith('everyone'));
+  assert.equal(presenceToken(record), 'none');
+});
+
+test('🔴 a handle outside the send audience records none, even though presence is wired', async () => {
+  const { impl } = stubClient();
+  const connector = connectorWith(['+15550001111'], new Presence({ client: impl, log: () => {} }));
+  assert.equal(presenceToken(await turnOf(connector)), 'none');
+});
+
+test('the turn still returns its reply while nothing is signalled', async () => {
+  const connector = connectorWith('everyone');
+  const signals: PresenceRecord = { signalled: [] };
+  const reply = await withPresence(
+    connector,
+    { senderHandle: OWNER, text: 'hi' },
+    async () => 'the answer',
+    signals,
+  );
+  assert.equal(reply, 'the answer');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

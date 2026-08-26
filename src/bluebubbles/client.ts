@@ -148,6 +148,14 @@ export interface ReplayResult {
 export const MAX_REPLAY_PAGES = 20;
 const PAGE_SIZE = 100;
 
+/**
+ * Engine.IO v4 packs several packets into one polling response and separates
+ * them with an ASCII record separator (0x1e). Named because that byte written
+ * literally into a `split` is invisible on screen and reads as a typo.
+ * See `socketEmit`.
+ */
+const SOCKET_IO_RECORD_SEPARATOR = '\u001e';
+
 export class BlueBubblesClient {
   private readonly fetchImpl: FetchImpl;
 
@@ -491,14 +499,148 @@ export class BlueBubblesClient {
    * on send. Whatever hides the indicator afterwards is Apple's, on the
    * RECIPIENT'S device, and is not a number this codebase can see. So the stop
    * is ours to guarantee: see `Presence`.
+   *
+   * 🔴 START STAYS ON THIS HTTP ROUTE ON PURPOSE, EVEN THOUGH ITS PARTNER DOES
+   * NOT — because `ChatInterface.startTyping` is the ONLY thing in BlueBubbles
+   * that pushes the guid into `Server().typingCache`, and that cache is the sole
+   * trigger for BlueBubbles' own stop-on-send. Moving start onto the socket
+   * (`started-typing` → `ActionHandler.startOrStopTypingInChat`, which never
+   * touches the cache) would look tidier, work in a demo, and silently delete
+   * the last independent stop this design has. See `stopTyping` below.
    */
   async startTyping(chatGuid: string): Promise<PrivateApiResult> {
     return this.presenceCall(`/chat/${encodeURIComponent(chatGuid)}/typing`, 'POST');
   }
 
-  /** Hide the "…". Must always run — see `Presence.withTyping`. */
+  /**
+   * Hide the "…". Must always run — see `Presence.withTyping`.
+   *
+   * ── 🔴 THIS DOES NOT USE `DELETE /chat/{guid}/typing`. THAT ROUTE STARTS ────
+   * ── TYPING. ────────────────────────────────────────────────────────────────
+   *
+   * Measured in the shipped bundle on 2026-08-25, BlueBubbles server 1.9.9
+   * (`app.asar` → `dist/main.js`, i.e. the code that is actually running, and
+   * still present on upstream `master` the same day):
+   *
+   * ```js
+   * static async stopTyping(e,t){const{guid:a}=e.params;
+   *   return await Fu.startTyping(a),                    // Fu = ChatInterface
+   *     new Rh(e,{message:"Successfully stopped typing!"}).send()}
+   * ```
+   *
+   * The DELETE controller calls `startTyping` and answers **HTTP 200
+   * "Successfully stopped typing!"**. So the call reports success, `ok` is true,
+   * `Presence.report()` returns early, and NOTHING IS LOGGED — while the
+   * indicator is switched back on. That is not a theory: Jeff watched "…"
+   * reappear for a beat after every reply, and BlueBubbles' own log shows our
+   * DELETE landing 4ms after the message was written.
+   *
+   * ⚠️ `ChatInterface.stopTyping` exists and is correct. It is simply not
+   * reachable from any HTTP route. The ONE reachable path to it is the socket.io
+   * event below (`stopped-typing` → `ActionHandler.startOrStopTypingInChat(guid,
+   * false)`), confirmed live against `127.0.0.1:1234` by BlueBubbles' own debug
+   * log printing `Executing Action: Change Typing Status` for the socket call
+   * and nothing at all for the DELETE.
+   *
+   * ⚠️ Do NOT "simplify" this back to a one-line DELETE because the verb reads
+   * right. The verb is the whole trap: it is the correct-looking call that does
+   * the opposite, and it reports success while doing it.
+   */
   async stopTyping(chatGuid: string): Promise<PrivateApiResult> {
-    return this.presenceCall(`/chat/${encodeURIComponent(chatGuid)}/typing`, 'DELETE');
+    return this.socketEmit('stopped-typing', { chatGuid });
+  }
+
+  /**
+   * Emit ONE socket.io event and read the server's answer, over the Engine.IO
+   * **polling** transport — which is plain HTTP, so it needs no socket.io client
+   * and no dependency.
+   *
+   * ⚠️ A FRESH SESSION PER CALL, DELIBERATELY. A long-lived socket would be a
+   * second connection to keep alive, reconnect, and reason about at shutdown,
+   * and it would receive every server event as a bonus. This runs about a dozen
+   * times a day, off the reply path, entirely over loopback: four small requests
+   * are cheaper than a lifecycle. The session is closed explicitly so BlueBubbles
+   * does not have to time it out.
+   *
+   * Returns a RESULT for a protocol or HTTP failure and THROWS for a transport
+   * failure, exactly like `presenceCall` — the swallow stays in `Presence`.
+   *
+   * ⚠️ `helperAbsent` is always false here. `ActionHandler` checks only the
+   * `enable_private_api` SETTING and never the helper, so a disconnected helper
+   * comes back as a generic error rather than the recognisable 500. That is
+   * acceptable because the helper-absent notice is raised by `startTyping`,
+   * which runs first on every turn and does go through the middleware.
+   */
+  private async socketEmit(event: string, payload: unknown): Promise<PrivateApiResult> {
+    const q =
+      `EIO=4&transport=polling&password=${encodeURIComponent(this.opts.password)}`;
+    const at = (sid?: string): string =>
+      `${this.opts.baseUrl}/socket.io/?${q}${sid ? `&sid=${encodeURIComponent(sid)}` : ''}`;
+    const fail = (status: number, detail: string): PrivateApiResult => ({
+      ok: false,
+      status,
+      helperAbsent: false,
+      detail,
+    });
+
+    const get = async (url: string): Promise<{ status: number; text: string }> => {
+      const res = await this.fetchImpl(url, {
+        signal: AbortSignal.timeout(BlueBubblesClient.PRESENCE_TIMEOUT_MS),
+      });
+      return { status: res.status, text: await res.text() };
+    };
+    const post = async (url: string, body: string): Promise<{ status: number; text: string }> => {
+      const res = await this.fetchImpl(url, {
+        method: 'POST',
+        body,
+        signal: AbortSignal.timeout(BlueBubblesClient.PRESENCE_TIMEOUT_MS),
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      });
+      return { status: res.status, text: await res.text() };
+    };
+
+    // 1. Handshake. The reply is an Engine.IO `0` packet carrying the session id.
+    const hs = await get(at());
+    if (hs.status >= 400) return fail(hs.status, `socket handshake refused (http ${hs.status})`);
+    const brace = hs.text.indexOf('{');
+    let sid = '';
+    try {
+      sid = String((JSON.parse(hs.text.slice(brace, hs.text.indexOf('}', brace) + 1)) as { sid?: string })?.sid ?? '');
+    } catch {
+      sid = '';
+    }
+    if (!sid) return fail(hs.status, `socket handshake returned no session id: ${hs.text.slice(0, 80)}`);
+
+    // 2. Join the default namespace, 3. emit, 4. read what came back.
+    await post(at(sid), '40');
+    await post(at(sid), `42${JSON.stringify([event, payload])}`);
+    const back = await get(at(sid));
+    // Best effort: tell BlueBubbles the session is done rather than leaving it
+    // to expire. A failure here changes nothing that matters.
+    await post(at(sid), '41').catch(() => undefined);
+
+    // Engine.IO packs several packets into one polling response, separated by
+    // the record separator. `42[...]` is a server-emitted event.
+    const packets = back.text.split(SOCKET_IO_RECORD_SEPARATOR);
+    const emitted = packets.find((p) => p.startsWith('42'));
+    if (!emitted) return fail(back.status, `no answer to ${event}: ${back.text.slice(0, 120)}`);
+    let channel = '';
+    let data: { status?: unknown; message?: unknown } = {};
+    try {
+      const [c, d] = JSON.parse(emitted.slice(2)) as [string, { status?: unknown; message?: unknown }];
+      channel = c;
+      data = d ?? {};
+    } catch {
+      return fail(back.status, `unparseable answer to ${event}: ${emitted.slice(0, 120)}`);
+    }
+    const status = typeof data.status === 'number' ? data.status : back.status;
+    // 🔴 The CHANNEL is the verdict, not the HTTP status. Every polling response
+    // is a 200; BlueBubbles reports the outcome by answering on `${event}-sent`
+    // or `${event}-error`.
+    if (channel !== `${event}-sent`) {
+      return fail(status, `${event} answered on "${channel}": ${String(data.message ?? 'no message')}`);
+    }
+    return { ok: true, status, helperAbsent: false, detail: `socket ${channel} (${status})` };
   }
 
   /**

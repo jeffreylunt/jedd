@@ -240,9 +240,30 @@ export class Presence {
     this.logLine(line);
   }
 
-  /** @internal — called by a session when an operation returns. */
+  /**
+   * @internal — called by a session when an operation returns.
+   *
+   * 🔴 ONE NOTICE COVERS EVERY CONSEQUENCE OF THE SAME CAUSE.
+   *
+   * `stopTyping` goes over BlueBubbles' socket API (see `client.stopTyping` for
+   * why it cannot go over HTTP), and BlueBubbles' socket handler catches the
+   * helper error and answers a fixed `"Failed to stop typing!"`. The helper's
+   * own wording never reaches us, so a stop CANNOT identify itself as
+   * helper-absent the way the HTTP start can. Reported plainly, a disconnected
+   * helper would print a red line per turn, forever, about a condition already
+   * stated once — which is how a log gets ignored.
+   *
+   * So a failure that ARRIVES while the helper is already known absent is
+   * treated as the same known condition and says nothing further. ⚠️ The first
+   * SUCCESS clears that, because once the helper is back a failure is news
+   * again — without the reset this would mute real faults for the life of the
+   * process.
+   */
   report(what: string, handle: string, r: PrivateApiResult): void {
-    if (r.ok) return;
+    if (r.ok) {
+      this.saidHelperAbsent = false;
+      return;
+    }
     if (r.helperAbsent) {
       if (this.saidHelperAbsent) return;
       this.saidHelperAbsent = true;
@@ -252,6 +273,7 @@ export class Presence {
       );
       return;
     }
+    if (this.saidHelperAbsent) return;
     this.logLine(`[presence] ${what} for ${handle} failed — ${r.detail} (ignored; a reply is unaffected)`);
   }
 

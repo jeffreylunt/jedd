@@ -356,13 +356,15 @@ export class BlueBubblesConnector implements Connector {
    * suppressed handle — the turn is not the thing being suppressed, only the
    * announcement of it.
    */
-  markRead(toHandle: string): void {
-    if (!this.allowed(toHandle)) return;
-    this.presence?.markRead(toHandle);
+  markRead(toHandle: string): boolean {
+    if (!this.presence || !this.allowed(toHandle)) return false;
+    this.presence.markRead(toHandle);
+    return true;
   }
 
-  async withTyping<T>(toHandle: string, fn: () => Promise<T>): Promise<T> {
+  async withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T> {
     if (!this.presence || !this.allowed(toHandle)) return fn();
+    onTyping?.();
     return this.presence.withTyping(toHandle, fn);
   }
 
@@ -407,7 +409,9 @@ export class ShadowConnector implements Connector {
    * these do not throw — a shadow turn is *expected* to reach them, and a throw
    * would turn a correct no-op into a logged fault every message.
    */
-  markRead(_toHandle: string): void {}
+  markRead(_toHandle: string): boolean {
+    return false;
+  }
 
   async withTyping<T>(_toHandle: string, fn: () => Promise<T>): Promise<T> {
     return fn();
