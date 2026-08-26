@@ -29,6 +29,7 @@ import { makeRunbookTool } from './runbook.js';
 import { makeSearchAudiobook, makeSearchEbook } from './search-release.js';
 import { makeSendEbook, type SendEbookDeps } from './send-ebook.js';
 import { makeSportsFixture } from './sports-fixture.js';
+import { makeStuckDownloads } from './stuck-downloads.js';
 import { makeTitleDetails } from './title-details.js';
 import { makeTrending } from './trending.js';
 import type { Tool } from './types.js';
@@ -235,6 +236,22 @@ const OWNER_WRITE_TOOLS: Tool[] = [
    * guest content, and disabling an indexer degrades searching for the house.
    */
   makeIndexerAdmin(),
+  /**
+   * 🔴 THE VERB JEDD HONESTLY DID NOT HAVE.
+   *
+   * Jeff, 2026-08-26: *"Can you just try to get the downloads cleared"* → *"I
+   * can't clear them — I have no tool to delete or remove releases from
+   * qBittorrent or the arrs."* Unlike the Prowlarr denial twenty minutes
+   * earlier, **that one was true**, and the `stalled-download-fix` job has been
+   * doing this work on a schedule the whole time — the procedure was specified
+   * and battle-tested; only Jedd's access was missing.
+   *
+   * ⚠️ Owner-only and `writes: true` while it still only READS, because the
+   * destructive actions land in this same tool rather than a second one. See
+   * the file for why the guards are verdict-gated in code instead of a
+   * confirmation prompt.
+   */
+  makeStuckDownloads(),
 ];
 
 /**
