@@ -17,6 +17,7 @@ import { KindleRegistry } from './kindle.js';
 import { IrcEbooks } from './media/irc-ebooks.js';
 import { DEFAULT_MOUNTS } from './tools/send-ebook.js';
 import { realMailSender } from './media/kindle-send.js';
+import { imapMailboxReader, imapSettingsFrom } from './kindle-mailbox.js';
 import { createLlmClient } from './llm.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
@@ -199,6 +200,21 @@ async function main(): Promise<void> {
   const ebook = { send: await realMailSender(config), onlySendTo: config.ownerHandle };
 
   /**
+   * Reads Amazon's refusal notices out of the sending account.
+   *
+   * Built once at start-up so a missing credential is visible HERE, in the boot
+   * log, rather than surfacing four minutes after somebody's book went out.
+   */
+  const imap = imapSettingsFrom(config);
+  const mailbox = 'missing' in imap ? undefined : imapMailboxReader(imap);
+  if (!mailbox) {
+    console.warn(
+      `[kindle] delivery verification is OFF: ${(imap as { missing: string }).missing} is not set. ` +
+        'Books can still be sent; a refusal by Amazon will go undetected.',
+    );
+  }
+
+  /**
    * The IRC #ebooks source.
    *
    * ⚠️ OFF UNLESS `IRC_EBOOKS=1`. It opens a long-lived socket to a third-party
@@ -318,6 +334,12 @@ async function main(): Promise<void> {
       // client, because for IRC the REQUEST itself happens out here.
       kindle,
       mail: ebook.send,
+      // 🔴 The leg that closes the loop: Amazon reports a refusal by EMAIL,
+      // minutes after the send has already returned a clean 250, so the only
+      // place that evidence exists is the sending account's mailbox. Absent
+      // credentials leave `mailbox` undefined, and the check then reports
+      // `blind` rather than silence — see `runKindleVerify`.
+      ...(mailbox ? { mailbox } : {}),
       mounts: DEFAULT_MOUNTS,
       onlySendTo: ebook.onlySendTo,
       ...(irc ? { irc } : {}),

@@ -4,6 +4,8 @@ import { deliverEbook } from './media/ebook-deliver.js';
 import type { FollowupStore, Followup } from './followups.js';
 import type { IrcEbooks } from './media/irc-ebooks.js';
 import type { MailSender } from './media/kindle-send.js';
+import type { MailboxReader } from './kindle-mailbox.js';
+import { verifyKindleDelivery } from './kindle-verify.js';
 import type { MountMap } from './media/grab.js';
 import type { KindleRegistry } from './kindle.js';
 import { jellyfinGet, type JellyfinResponse } from './jellyfin.js';
@@ -45,6 +47,12 @@ export const MEDIA_RECHECK_MS = 60 * 60 * 1000;
  * gives up and SAYS so.
  */
 export const EBOOK_RECHECK_MS = 10 * 60 * 1000;
+/**
+ * How long between attempts when the delivery check cannot prove it can see.
+ * Blindness is usually transient (a network blip, an IMAP hiccup), so this
+ * retries a few times before it gives up — and when it gives up it SAYS so.
+ */
+export const VERIFY_RETRY_MS = 5 * 60 * 1000;
 
 export interface FollowupDeps {
   config: Config;
@@ -57,6 +65,11 @@ export interface FollowupDeps {
   /** Same live-test restriction the tool carries; see `DeliverDeps`. */
   onlySendTo?: string;
   exec?: ExecImpl;
+  /**
+   * Reads Amazon's refusal notices. Absent means the delivery check is not
+   * deployed — which is reported as `blind`, never as "nothing went wrong".
+   */
+  mailbox?: MailboxReader;
   sleep?: (ms: number) => Promise<void>;
   jellyfin?: (config: Config, path: string) => Promise<JellyfinResponse>;
   now?: () => Date;
@@ -64,7 +77,19 @@ export interface FollowupDeps {
 
 export interface FollowupOutcome {
   id: string;
-  action: 'restored' | 'held' | 'deferred' | 'abandoned' | 'nothing-to-do' | 'not-delivered';
+  action:
+    | 'restored'
+    | 'held'
+    | 'deferred'
+    | 'abandoned'
+    | 'nothing-to-do'
+    | 'not-delivered'
+    /** Amazon refused the book and the person has been told which code and why. */
+    | 'refusal-reported'
+    /** Checked, no refusal found. NOT a delivery confirmation. */
+    | 'no-failure-seen'
+    /** The check could not prove it can see failures, so it said nothing. */
+    | 'blind';
   sent: boolean;
   detail: string;
 }
@@ -167,7 +192,18 @@ async function runOne(
    * the requester's OWN book, they were already told it was coming, and staying
    * silent would reproduce the exact defect this kind exists to fix.
    */
-  const maySpeak = followup.kind === 'media-add' || followup.kind === 'ebook-deliver' ? true : role === 'owner';
+  const maySpeak =
+    followup.kind === 'media-add' ||
+    followup.kind === 'ebook-deliver' ||
+    /**
+     * A refused book is the requester's own bad news and the fix (`E014`: add
+     * the sender in Amazon) is something only THEY can do. Withholding it from a
+     * guest would leave them waiting on a book that was thrown away — the exact
+     * silence this whole area exists to end.
+     */
+    followup.kind === 'kindle-verify'
+      ? true
+      : role === 'owner';
   const speak = async (text: string): Promise<boolean> => {
     if (!maySpeak) return false;
     await deps.send(followup.senderHandle, text);
@@ -184,6 +220,10 @@ async function runOne(
 
   if (followup.kind === 'ebook-deliver') {
     return runEbookDeliver(followup, store, deps, now, speak, why);
+  }
+
+  if (followup.kind === 'kindle-verify') {
+    return runKindleVerify(followup, store, deps, now, speak, why);
   }
 
   // ── What is actually in force right now? ───────────────────────────────────
@@ -499,6 +539,7 @@ async function runEbookDeliver(
       ...(deps.exec ? { exec: deps.exec } : {}),
       ...(deps.irc ? { irc: deps.irc } : {}),
       ...(deps.mounts ? { mounts: deps.mounts } : {}),
+      followups: store,
       ...(deps.onlySendTo ? { onlySendTo: deps.onlySendTo } : {}),
     },
     { mayBlock: true },
@@ -529,4 +570,104 @@ async function runEbookDeliver(
     ),
     EBOOK_RECHECK_MS,
   );
+}
+
+/**
+ * 🔴 THE BRANCH THIS WHOLE INSTRUMENT EXISTS FOR.
+ *
+ * Amazon accepts the SMTP transaction and THEN, minutes later, emails a refusal
+ * to the sending account. Jedd never saw those. So after every send the standing
+ * state was: *"it has been sent and I cannot tell you whether it arrived, and I
+ * never will."* This is the code that goes and looks.
+ *
+ * ── WHAT IT WILL AND WILL NOT SAY ────────────────────────────────────────────
+ *
+ * It reports REFUSAL. It never reports delivery, because Amazon sends no
+ * acceptance notice and discards mail to a nonexistent address in silence —
+ * there is no positive signal in this channel to wait for.
+ *
+ * `no-failure-seen` is therefore DELIBERATELY SILENT. The person has already
+ * been told the book was sent and that this is not confirmation; an unprompted
+ * *"I checked and found nothing, which proves nothing"* is precisely the noise
+ * that teaches people to ignore this channel.
+ *
+ * `blind` goes to the OWNER, not the requester. A check that cannot see is an
+ * operator problem: nothing has changed for the person who asked for the book,
+ * who was told the true thing at send time and is still owed no correction.
+ */
+async function runKindleVerify(
+  followup: Followup,
+  store: FollowupStore,
+  deps: FollowupDeps,
+  now: Date,
+  speak: (text: string) => Promise<boolean>,
+  why: string,
+): Promise<FollowupOutcome> {
+  const subject = followup.verify;
+  if (!subject) {
+    store.resolve(followup.id, 'abandoned', 'no verify subject recorded', now);
+    return { id: followup.id, action: 'abandoned', sent: false, detail: 'no verify subject' };
+  }
+
+  /**
+   * The send already promised *"I will come back if Amazon refuses it"*. A
+   * deployment with no mailbox reader cannot keep that promise, so it says so
+   * rather than resolving quietly and leaving the promise standing.
+   */
+  if (!deps.mailbox) {
+    const detail = 'this deployment cannot read the mailbox Amazon replies to';
+    const sent = await speak(
+      `${why}\n\nI said I would check whether Amazon refused "${subject.title}", and I cannot — ` +
+        `${detail}. So I do not know either way. If it has not appeared, the usual cause is that ` +
+        'my sending address is not on your Amazon approved-senders list.',
+    );
+    store.resolve(followup.id, 'abandoned', detail, now);
+    return { id: followup.id, action: sent ? 'abandoned' : 'not-delivered', sent, detail };
+  }
+
+  const result = await verifyKindleDelivery(
+    deps.mailbox,
+    { sentAt: new Date(subject.sentAt), filename: subject.filename },
+    now,
+  );
+
+  if (result.state === 'failed') {
+    const sent = await speak(
+      `${why}\n\n🔴 It did NOT go through. ${result.detail}\n` +
+        `Nothing arrived on your Kindle, and it will not arrive on its own.`,
+    );
+    store.resolve(followup.id, 'done', `refused: ${result.code} — ${result.reason}`, now);
+    return {
+      id: followup.id,
+      action: sent ? 'refusal-reported' : 'not-delivered',
+      sent,
+      detail: `${result.code} — ${result.reason}`,
+    };
+  }
+
+  if (result.state === 'no-failure-seen') {
+    store.resolve(followup.id, 'done', `no refusal found: ${result.detail}`, now);
+    return { id: followup.id, action: 'no-failure-seen', sent: false, detail: result.detail };
+  }
+
+  // ── blind: defer, and when the deferrals run out tell the OWNER ────────────
+  const deferred = store.defer(followup.id, new Date(now.getTime() + VERIFY_RETRY_MS), result.detail, now);
+  if (deferred) {
+    return { id: followup.id, action: 'deferred', sent: false, detail: result.detail };
+  }
+  store.resolve(followup.id, 'abandoned', `blind: ${result.detail}`, now);
+  let sent = false;
+  try {
+    await deps.send(
+      deps.config.ownerHandle,
+      `Heads up: my Kindle delivery check is BLIND and I have stopped retrying it for ` +
+        `"${subject.title}" (sent ${subject.sentAt}).\n${result.detail}\n` +
+        'Nobody has been told anything wrong — the requester was told it was sent, which is true. ' +
+        'But refusals are going undetected until this is fixed.',
+    );
+    sent = true;
+  } catch {
+    /* the outcome is recorded either way; a failed alert must not throw here */
+  }
+  return { id: followup.id, action: 'blind', sent, detail: result.detail };
 }

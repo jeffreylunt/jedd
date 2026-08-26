@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
+    "imapflow": "^1.7.6",
     "nodemailer": "^9.0.5"
   },
   "devDependencies": {

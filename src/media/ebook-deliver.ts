@@ -23,8 +23,15 @@ import { sendToKindle, type MailSender } from './kindle-send.js';
  */
 
 export type DeliverOutcome =
-  /** Handed to the mail server. Terminal, and the user should be told. */
-  | { state: 'delivered'; detail: string }
+  /**
+   * Handed to the mail server. Terminal, and the user should be told.
+   *
+   * ⚠️ The NAME is historical and the state does not mean what it says: it means
+   * SMTP accepted the bytes. Amazon may still refuse them minutes later, which
+   * is what `kindle-verify` goes looking for — see `filename`/`sentAt`, which
+   * exist so that check can be aimed at this exact send.
+   */
+  | { state: 'delivered'; detail: string; filename: string; sentAt: string }
   /** Not here yet, no error. Come back later; do NOT tell the user it arrived. */
   | { state: 'waiting'; detail: string }
   /** Terminal and bad. The user must be told plainly. */
@@ -36,6 +43,20 @@ export interface DeliverDeps {
   config: Config;
   kindle: KindleRegistry;
   mail: MailSender;
+  /**
+   * 🔴 WHERE THE DELIVERY CHECK IS SCHEDULED, AND WHY IT IS SCHEDULED HERE.
+   *
+   * The same argument the `onlySendTo` note below makes: this is the shared leg.
+   * `send_ebook` and the follow-up runner BOTH reach the SMTP hand-off through
+   * this function, so putting the scheduling at either call site means one of
+   * them can be added later without it — and the missing one would be the path
+   * that sends a book and never checks whether Amazon threw it away.
+   *
+   * Optional because a deployment without a follow-up store must still be able
+   * to send. When it is absent the outcome SAYS the send is unchecked, rather
+   * than reading identically to a checked one.
+   */
+  followups?: FollowupScheduler;
   exec?: ExecImpl;
   irc?: IrcEbooks;
   mounts?: MountMap[];
@@ -100,12 +121,40 @@ export async function deliverEbook(
     };
   }
 
+  /**
+   * 🔴 TAKEN BEFORE THE HAND-OFF, NOT AFTER IT.
+   *
+   * This instant is the lower bound of the window the delivery check searches,
+   * and every Amazon refusal notice carries the same subject line — so it is the
+   * only thing separating "a bounce for this book" from "a bounce for a book in
+   * April". Reading the clock AFTER the await meant the SMTP round trip sat
+   * inside the blind spot: a refusal that landed during it would fall before the
+   * bound and be filtered out as somebody else's.
+   *
+   * An instant slightly too EARLY costs nothing — the check may consider one
+   * extra old notice and reject it by document name. An instant too LATE drops a
+   * real refusal on the floor. When a bound can only be wrong in one direction,
+   * take the harmless one.
+   */
+  const sentAt = new Date();
   const sent = await sendToKindle(
     { config: deps.config, toAddress: record.address, filename: got.filename, bytes: got.bytes },
     deps.mail,
   );
   if (sent.state === 'accepted') {
-    return { state: 'delivered', detail: `"${got.filename}" is on its way to your Kindle.` };
+    const scheduled = scheduleVerification(deps, senderHandle, got.filename, subject.title, sentAt);
+    return {
+      state: 'delivered',
+      filename: got.filename,
+      sentAt: sentAt.toISOString(),
+      detail:
+        `"${got.filename}" is on its way to your Kindle.` +
+        (scheduled
+          ? ' The mail server accepted it — I have NOT confirmed it reached the device, and I will ' +
+            'come back if Amazon refuses it.'
+          : ' The mail server accepted it. I cannot check whether Amazon accepts it on this ' +
+            'deployment, so nothing will tell you if it is refused.'),
+    };
   }
   if (sent.state === 'rejected') return { state: 'failed', detail: sent.detail };
   /**
@@ -127,6 +176,58 @@ export async function deliverEbook(
       `${sent.detail} I have NOT tried again, because it may already have gone and you would ` +
       'get it twice. Check your Kindle, and ask me if it never turns up.',
   };
+}
+
+/**
+ * How long to wait before looking for a refusal.
+ *
+ * Amazon's notices are minutes behind the send, not seconds — the ones in the
+ * mailbox arrive 1-4 minutes after their stated send time. Twelve minutes is
+ * comfortably past that without leaving somebody waiting a long time to be told
+ * their book was thrown away.
+ */
+export const VERIFY_DELAY_MS = 12 * 60 * 1000;
+
+/** Only what this module needs from the follow-up store. */
+export interface FollowupScheduler {
+  schedule(input: {
+    kind: 'kindle-verify';
+    senderHandle: string;
+    dueAt: Date;
+    reason: string;
+    observed: string;
+    verify: { filename: string; title: string; sentAt: string };
+  }): unknown;
+}
+
+function scheduleVerification(
+  deps: DeliverDeps,
+  senderHandle: string,
+  filename: string,
+  title: string,
+  sentAt: Date,
+): boolean {
+  if (!deps.followups) return false;
+  try {
+    deps.followups.schedule({
+      kind: 'kindle-verify',
+      senderHandle,
+      dueAt: new Date(sentAt.getTime() + VERIFY_DELAY_MS),
+      reason: `sent "${title}" to their Kindle`,
+      observed: `the mail server accepted "${filename}" at ${sentAt.toISOString()}`,
+      verify: { filename, title, sentAt: sentAt.toISOString() },
+    });
+    return true;
+  } catch {
+    /**
+     * 🔴 A FAILED SCHEDULE MUST NOT LOOK LIKE A SUCCESSFUL ONE.
+     *
+     * The book HAS gone; losing the check is bad but undoing the send is
+     * impossible. Returning false makes the outcome text say the send is
+     * unchecked, which is the honest half of a bad situation.
+     */
+    return false;
+  }
 }
 
 type Got =

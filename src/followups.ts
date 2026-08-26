@@ -29,7 +29,11 @@ import { dirname } from 'node:path';
  */
 
 /** Code-owned. The model cannot introduce a new kind of follow-up. */
-export type FollowupKind = 'restore-qbit-throttle' | 'media-add' | 'ebook-deliver';
+export type FollowupKind =
+  | 'restore-qbit-throttle'
+  | 'media-add'
+  | 'ebook-deliver'
+  | 'kindle-verify';
 
 /**
  * What a `media-add` follow-up is about.
@@ -87,6 +91,35 @@ export interface EbookDeliverSubject {
   bot?: string;
 }
 
+/**
+ * What a `kindle-verify` follow-up is about.
+ *
+ * ── 🔴 THE ASYMMETRY THIS EXISTS FOR ─────────────────────────────────────────
+ *
+ * **Amazon's success is silent and its failure is out-of-band.** A refusal —
+ * `E014 - Unapproved sender email address` is the one a new recipient actually
+ * hits — arrives as email to the SENDING account minutes after the SMTP hand-off
+ * has already returned a clean 250. Nothing inside the turn can see it, so the
+ * person is told their book was sent and then nothing ever contradicts it.
+ *
+ * That is why the check is a follow-up rather than a step in the send: **the
+ * evidence does not exist yet when the send finishes.**
+ *
+ * 🔴 `sentAt` IS THE LOAD-BEARING FIELD. Every one of Amazon's notices carries
+ * the identical subject line, and the mailbox holds years of them. Without a
+ * lower bound taken at the moment of the hand-off, a bounce from April is
+ * indistinguishable from a bounce for tonight's book — the check would
+ * manufacture failures for good sends.
+ */
+export interface KindleVerifySubject {
+  /** The attached filename, which Amazon quotes back in most refusals. */
+  filename: string;
+  /** Human-facing name of the book, for the message this may end up sending. */
+  title: string;
+  /** ISO instant of the SMTP hand-off. Nothing before this can be about it. */
+  sentAt: string;
+}
+
 export interface Followup {
   id: string;
   kind: FollowupKind;
@@ -101,6 +134,8 @@ export interface Followup {
   subject?: MediaAddSubject;
   /** Set for `ebook-deliver`: the book to finish delivering. */
   ebook?: EbookDeliverSubject;
+  /** Set for `kindle-verify`: the send to go looking for a refusal of. */
+  verify?: KindleVerifySubject;
   /** How many times this has come due and been deferred. Bounded — see MAX_ATTEMPTS. */
   attempts: number;
   status: 'pending' | 'done' | 'abandoned';
@@ -175,6 +210,7 @@ export class FollowupStore {
     observed: string;
     subject?: MediaAddSubject;
     ebook?: EbookDeliverSubject;
+    verify?: KindleVerifySubject;
     now?: Date;
   }): Followup {
     const now = input.now ?? new Date();
@@ -188,6 +224,7 @@ export class FollowupStore {
       observed: input.observed,
       ...(input.subject ? { subject: input.subject } : {}),
       ...(input.ebook ? { ebook: input.ebook } : {}),
+      ...(input.verify ? { verify: input.verify } : {}),
       attempts: 0,
       status: 'pending',
     };

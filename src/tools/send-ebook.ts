@@ -160,6 +160,10 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
           ...(ctx.exec ? { exec: ctx.exec } : {}),
           ...(deps.irc ? { irc: deps.irc } : {}),
           mounts: deps.mounts ?? DEFAULT_MOUNTS,
+          // So a send that completes INSIDE the turn is checked too. Omitting it
+          // here would leave the fast path — the one that fires when the torrent
+          // is already on disk — as the single unverified way to send a book.
+          ...(ctx.followups ? { followups: ctx.followups } : {}),
           ...(deps.onlySendTo ? { onlySendTo: deps.onlySendTo } : {}),
         },
         { mayBlock: false },
