@@ -177,6 +177,24 @@ function required(name: string): string {
   return v;
 }
 
+/**
+ * 🔴 REQUIRED IN `.env`, AND `.env` IS NOT IN GIT.
+ *
+ * These have NO default and the process refuses to start without them. The list
+ * exists because the failure is loud but the RECOVERY is not: if `.env` is ever
+ * lost, whoever rebuilds it needs to know which values are mandatory, and a
+ * refusal names only the first one it hits.
+ *
+ *   OWNER_HANDLE           — who the owner is. `loadConfig` throws without it.
+ *   BLUEBUBBLES_IDENTITY   — which Apple ID this deployment may text from.
+ *                            `assertIdentity` throws without it: both servers on
+ *                            this host share a password and an API shape, so an
+ *                            unset value would connect SUCCESSFULLY to the wrong
+ *                            account.
+ *
+ * ⚠️ NAMES ONLY, NEVER VALUES. This file is committed. A secret written here to
+ * be helpful is a secret in the repository, in every clone, forever.
+ */
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
   const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'hp';
