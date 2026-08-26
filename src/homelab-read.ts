@@ -30,7 +30,7 @@ import type { Role } from './permissions.js';
  * are deliberately not building.
  */
 
-export type ReadService = 'jellyfin' | 'sonarr' | 'radarr' | 'prowlarr';
+export type ReadService = 'jellyfin' | 'sonarr' | 'radarr' | 'prowlarr' | 'qbittorrent';
 
 /**
  * 🔴 WHY THIS ENUM IS FOUR AND NOT SEVEN. Measured 2026-08-25, not assumed.
@@ -39,14 +39,15 @@ export type ReadService = 'jellyfin' | 'sonarr' | 'radarr' | 'prowlarr';
  * honest"*. Two homelab services are neither, and half-adding them would ship a
  * capability that fails after the model has offered it:
  *
- *  - **qBittorrent is EXCLUDED because its configured base URL is an hp-SIDE
- *    address.** `config.qbittorrent.baseUrl` is `172.20.0.1:8080`, the docker
- *    bridge gateway, and every existing qbit tool reaches it by `curl` running
- *    ON hp. V2 runs on the Mac: measured today, a direct fetch to the bridge
- *    address times out (000) while `192.168.1.7:8080` answers 200 in 261 bytes.
- *    So this needs a SECOND url for a second transport, and inventing one gives
- *    the same host two sources of truth. `diagnose_host_contention` already
- *    reads what matters there. Raise it as a decision; do not guess it here.
+ *  - **qBittorrent WAS excluded and is now INCLUDED (2026-08-26).** The original
+ *    reason was that `config.qbittorrent.baseUrl` is `172.20.0.1:8080`, the
+ *    docker bridge gateway, reachable only from hp — so this needed "a SECOND
+ *    url for a second transport", which was left as a decision rather than
+ *    guessed. That decision has now been taken: `config.qbittorrent.lanUrl`
+ *    exists, the two fields are named for their TRANSPORT (hp-side vs Mac-side)
+ *    rather than competing for one truth, and the LAN address is measured
+ *    working unauthenticated — `/torrents/info` returns all 121 torrents in
+ *    7 ms. It needs no credential at all: `bypass_local_auth=true`.
  *  - **Dispatcharr is EXCLUDED because its API is closed to us.** Everything
  *    except `/api/core/version/` (37 B, already reported by `livetv_status`)
  *    returns 401, and the one open read, `/output/epg`, is 10.3 MB of XML.
@@ -362,6 +363,71 @@ const SERVICES: Record<ReadService, ServiceSpec> = {
     person: [],
     operational: [{ prefix: '/release', why: INDEXER_WHY }],
   },
+  /**
+   * 🔴 NO CREDENTIAL, AND THAT IS NOT AN OVERSIGHT. qBittorrent has
+   * `bypass_local_auth=true` with `bypass_auth_subnet_whitelist=0.0.0.0/0`, so
+   * it accepts unauthenticated reads from the LAN. There is no header to send.
+   *
+   * ⚠️ That is also a standing security finding in the homelab space, not a
+   * property to rely on. This tool adds a READER to an endpoint that was already
+   * open; it does not widen the exposure. If auth is ever turned on, this spec
+   * needs a credential and will start returning 403 until it gets one.
+   */
+  qbittorrent: {
+    label: 'qBittorrent',
+    baseUrl: (c) => c.qbittorrent.lanUrl,
+    auth: () => ({}),
+    unconfigured: (c) => (c.qbittorrent.lanUrl ? null : 'QBITTORRENT_LAN_URL is not configured'),
+    secret: [
+      {
+        /**
+         * MEASURED 2026-08-26: 223 preference keys, 17 credential-shaped —
+         * `proxy_password`, `dyndns_password`, `mail_notification_password`,
+         * `web_ui_api_key`, `web_ui_https_key_path`, plus `web_ui_username`
+         * ("admin") and the auth posture itself (`bypass_local_auth`,
+         * `bypass_auth_subnet_whitelist`).
+         *
+         * 🔴 EVERY PASSWORD FIELD IS EMPTY TODAY, AND THAT IS EXACTLY WHY IT IS
+         * DENIED. That is a fact about the current configuration, not about the
+         * endpoint — the same reasoning that denies Prowlarr's `/indexer` while
+         * its trackers happen to be public. And the credential stripper does NOT
+         * cover it: it skips empty values by design, and `web_ui_username` and
+         * the whitelist are not credential-NAMED at all.
+         */
+        prefix: '/api/v2/app/preferences',
+        why:
+          'it returns the whole configuration including proxy, dyndns and mail credentials, the ' +
+          'WebUI username and API key, and the authentication posture — MEASURED: 17 ' +
+          'credential-shaped keys of 223. They are empty today; that is a fact about this box ' +
+          'right now, not about the endpoint.',
+      },
+      {
+        /**
+         * The classic passkey carrier for a private tracker. Public trackers
+         * today, same "fact about today" argument as above. The stripper's
+         * `scrubUrl` is the backstop for tracker URLs that appear in
+         * `/torrents/info`, which is allowed because that field is the same data
+         * — denying one and allowing the other would be theatre.
+         */
+        prefix: '/api/v2/rss',
+        why:
+          'RSS feed URLs are where a private tracker puts its passkey. Nothing else here needs ' +
+          'them.',
+      },
+    ],
+    // A torrent client knows what is being downloaded. It does not know WHO
+    // asked for it — there is no per-user field anywhere in the 66 a torrent
+    // carries. Content, not people.
+    person: [],
+    /**
+     * ⚠️ EMPTY, AND THE REASON IS STRUCTURAL. qBittorrent's v2 API does every
+     * mutating action over POST — `torrents/delete`, `torrents/pause`,
+     * `app/setPreferences`, `torrents/topPrio`. The method here is a GET
+     * literal, so none of them is reachable and none needs denying. Unlike the
+     * arrs, there is no cheap-looking GET with a side effect to guard against.
+     */
+    operational: [],
+  },
   prowlarr: {
     label: 'Prowlarr',
     baseUrl: (c) => c.prowlarr.baseUrl,
@@ -476,7 +542,9 @@ export function planRead(
       allowed: false,
       reason:
         `"${String(service)}" is not a service I can read. Choose one of: ${READ_SERVICES.join(', ')}. ` +
-        'qBittorrent and Dispatcharr are deliberately not on this list — see homelab-read.ts.',
+        'Dispatcharr is deliberately not on this list: its HTTP API answers 401 on everything ' +
+        'useful, and the data lives behind `psql` inside the container — a different transport, not ' +
+        'a missing URL. Use channel_health for channel and stream data.',
     };
   }
   const spec = SERVICES[service as ReadService];

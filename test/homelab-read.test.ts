@@ -170,9 +170,51 @@ test('a path with a querystring in it is refused, and says to use `query`', () =
 });
 
 test('an unknown service is refused and names the ones that exist', () => {
-  const plan = planRead('qbittorrent', '/api/v2/transfer/info', {}, config, 'owner');
+  /**
+   * ⚠️ This used to use `qbittorrent` as the unknown service. It was admitted on
+   * 2026-08-26 once its LAN transport was measured, so the test's example became
+   * false and the suite caught it — which is the test doing its job.
+   *
+   * `dispatcharr` is the remaining exclusion and the reason is different: its
+   * HTTP API answers 401 on everything the jobs need, and they reach its data by
+   * `psql` inside the container. That is a different transport, not a missing
+   * URL, so it does not belong behind a tool whose method is a GET literal.
+   */
+  const plan = planRead('dispatcharr', '/api/core/version/', {}, config, 'owner');
   assert.equal(plan.allowed, false);
-  assert.match(plan.allowed === false ? plan.reason : '', /jellyfin, sonarr, radarr, prowlarr/);
+  const reason = plan.allowed === false ? plan.reason : '';
+  // ⚠️ Assert MEMBERSHIP, not a joined string — the previous version pinned the
+  // order and broke when a service was inserted mid-list, which says nothing
+  // about the behaviour under test.
+  for (const svc of ['jellyfin', 'sonarr', 'radarr', 'prowlarr', 'qbittorrent']) {
+    assert.match(reason, new RegExp(svc), `the refusal must name ${svc}`);
+  }
+  /**
+   * 🔴 AND THE REFUSAL MUST NOT STILL CALL qBITTORRENT EXCLUDED. That sentence
+   * survived qBittorrent being admitted — the service map and the header comment
+   * were updated and this user-facing copy was not. A correction has to reach
+   * every copy, and the one a person READS is the one that matters.
+   */
+  assert.ok(!/qBittorrent and Dispatcharr are deliberately not/.test(reason));
+  assert.match(reason, /Dispatcharr is deliberately not on this list/);
+  assert.match(reason, /psql/, 'and it says WHY — a transport difference, not a missing URL');
+});
+
+test('🔴 qBittorrent is now a READABLE service, and its config is still SECRET', () => {
+  const ok = planRead('qbittorrent', '/api/v2/torrents/info', {}, config, 'guest');
+  assert.equal(ok.allowed, true, 'torrent state is CONTENT — what is downloading, not who asked');
+  assert.equal(ok.allowed === true ? ok.headers['X-Api-Key'] : 'x', undefined, 'it takes no credential');
+
+  // Denied to the OWNER too — 17 credential-shaped keys of 223, all empty today,
+  // which is a fact about this box rather than about the endpoint.
+  for (const role of ['owner', 'guest'] as const) {
+    const denied = planRead('qbittorrent', '/api/v2/app/preferences', {}, config, role);
+    assert.equal(denied.allowed, false, role);
+    assert.match(denied.allowed === false ? denied.reason : '', /REFUSED — SECRET/, role);
+  }
+  // RSS feed URLs are where a private tracker puts its passkey.
+  const rss = planRead('qbittorrent', '/api/v2/rss/items', {}, config, 'owner');
+  assert.equal(rss.allowed, false);
 });
 
 test('a service whose credential is missing refuses BEFORE any request', async () => {

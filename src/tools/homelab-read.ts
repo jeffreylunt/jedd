@@ -264,9 +264,32 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
          * and reports it as data. "Your URL is wrong" and "the homelab is down"
          * lead to completely different actions, so they are reported apart.
          */
+        /**
+         * 🔴 DECIDE FROM THE BODY, NOT FROM THE STATUS ALONE — THERE ARE TWO
+         * CAUSES AND THEY LEAD TO OPPOSITE ACTIONS.
+         *
+         * This branch used to report EVERY non-JSON 200 as "the signature of a
+         * wrong base URL — the SPA served HTML". Measured 2026-08-26 the moment
+         * qBittorrent was admitted: `GET /api/v2/app/version` returns the plain
+         * string `v5.2.2`, and the tool called a perfectly correct URL a
+         * misconfiguration. Several qBit endpoints are plain-text scalars by
+         * design.
+         *
+         * HTML starts with `<`. A short scalar does not. That is the whole
+         * discriminator, and it is a property of the body rather than a guess
+         * about the service.
+         */
+        const head = text.trimStart();
+        if (!head.startsWith('<') && head.length <= 200) {
+          return ok(
+            `GET ${plan.url}\n(read at ${new Date().toISOString()})\n` +
+              `${plan.label} returned a PLAIN-TEXT value rather than JSON, which several endpoints ` +
+              `do by design:\n${scrubPlainText(head)}`,
+          );
+        }
         return fail(
           `${plan.label} ${plan.url} returned HTTP ${res.status} but the body is NOT JSON (starts ` +
-            `"${text.slice(0, 60).replace(/\s+/g, ' ')}"). That is the signature of a wrong base URL — ` +
+            `"${head.slice(0, 60).replace(/\s+/g, ' ')}"). That is the signature of a wrong base URL — ` +
             'the SPA served HTML with a 200 — not of an unreachable service. The data is UNKNOWN.',
         );
       }
@@ -314,6 +337,16 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
       );
     },
   };
+}
+
+/**
+ * A plain-text scalar still goes through the credential stripper — a bare string
+ * is exactly the shape `scrubUrl` handles, and a one-line body could be a URL
+ * carrying a passkey.
+ */
+function scrubPlainText(text: string): string {
+  const stripped = stripCredentials(text);
+  return typeof stripped.value === 'string' ? stripped.value : text;
 }
 
 /**
