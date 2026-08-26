@@ -167,9 +167,21 @@ export interface Config {
      * belief that there was no second transport is why `homelab-read.ts`
      * excluded qBittorrent entirely.
      *
-     * ⚠️ Verified for READS only. Whether a POST (e.g. `topPrio`,
-     * `setPreferences`) is accepted unauthenticated from the LAN is NOT
-     * measured — do not assume the read result covers writes.
+     * ⚠️ WRITES: auth is NOT refused over the LAN either. Measured with a hash
+     * that cannot exist, so nothing real could change:
+     *
+     *   POST http://192.168.1.7:8080/api/v2/torrents/topPrio hashes=ffff…  -> 200
+     *   (control, the known-good hp path, same bogus hash)                 -> 200
+     *
+     * A 403 would have settled it the other way; a 200 means the request was
+     * accepted rather than rejected for credentials.
+     *
+     * 🔴 BUT THAT 200 IS NOT EVIDENCE THE OPERATION DID ANYTHING, and the probe
+     * demonstrates exactly why: it returned 200 for a torrent that does not
+     * exist. The spec records the same trap for real hashes — a BATCHED
+     * `topPrio` returns 200 with every priority unchanged, while per-hash calls
+     * work. So any write here must assert the state BEFORE and AFTER, per hash.
+     * The status code is not the outcome.
      */
     baseUrl: string;
     /**
