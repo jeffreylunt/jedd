@@ -40,9 +40,19 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
  * unreadable half is never rendered as an empty one.
  */
 
-type Action = 'list';
+type Action = 'list' | 'unstick' | 'promote';
 
-const ACTIONS: Action[] = ['list'];
+/**
+ * 🔴 THIS LINE WAS THE LAST EDIT, AND DELIBERATELY SO.
+ *
+ * `jedd-v2` transpiles from DISK with `autorestart: true`, so any crash — not
+ * any deploy, any crash — loads whatever is on disk and registers this
+ * write-capable tool in whatever state it happens to be in. Nobody chooses that
+ * window and nobody is told about it. `runUnstick` and `runPromote` were written
+ * and committed while unreachable, because an unreferenced function cannot be
+ * invoked no matter what loads it. Adding them here is what makes them live.
+ */
+const ACTIONS: Action[] = ['list', 'unstick', 'promote'];
 
 export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
   return {
@@ -61,8 +71,9 @@ export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
     description:
       'Find downloads that are actually stuck and say what would fix each one. Reads the Sonarr and ' +
       'Radarr queues and joins them against qBittorrent, which is the only thing that knows whether ' +
-      'a torrent is really dead. Use this for "what is stuck", "downloads are not moving", "clear ' +
-      'the queue", "nothing is downloading".',
+      'a torrent is really dead. Then remove the dead ones and blocklist them, or push a healthy ' +
+      'one that is waiting to the front of the queue. Use this for "what is stuck", "downloads are ' +
+      'not moving", "clear the queue", "nothing is downloading", "get the downloads unstuck".',
     minRole: 'owner',
     /**
      * TRUE even though only `list` exists today. Write-ness is a property of the
@@ -74,7 +85,19 @@ export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ACTIONS, description: 'Only "list" so far.' },
+        action: {
+          type: 'string',
+          enum: ACTIONS,
+          description:
+            'list — what is stuck and why. unstick — remove a stalled release and blocklist it. ' +
+            'promote — move a healthy waiting torrent to the top of the queue.',
+        },
+        hash: {
+          type: 'string',
+          description:
+            'The 40-character infohash, for unstick and promote. Comes from "list", which prints ' +
+            'one per item. Only items "list" calls STALLED can be unstuck.',
+        },
       },
       required: ['action'],
     },
@@ -84,7 +107,16 @@ export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
       if (typeof action !== 'string' || !(ACTIONS as string[]).includes(action)) {
         return fail(`"${String(action)}" is not an action. Choose one of: ${ACTIONS.join(', ')}.`);
       }
-      return runList(ctx, fetchImpl);
+      switch (action as Action) {
+        case 'list':
+          return runList(ctx, fetchImpl);
+        case 'unstick':
+          return runUnstick(ctx, args['hash'], fetchImpl);
+        case 'promote':
+          return runPromote(ctx, args['hash'], fetchImpl);
+        default:
+          return fail(`Unhandled action "${action}". Nothing was done.`);
+      }
     },
   };
 }

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { qbitVerdict, byHash, type QbitTorrent } from '../src/media/qbit-torrents.js';
 import { makeStuckDownloads } from '../src/tools/stuck-downloads.js';
@@ -272,4 +275,246 @@ test('an unknown action is refused', async () => {
   const r = await makeStuckDownloads(stub(() => json([]), emptyArr)).run({ action: 'delete' }, ctx());
   assert.equal(r.ok, false);
   assert.match(r.content, /not an action/);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 THE DESTRUCTIVE HALF — the gate, and what it refuses
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HASH = 'a'.repeat(40);
+const captureDir = () => join(mkdtempSync(join(tmpdir(), 'jedd-removed-')), 'captures');
+
+interface Call {
+  method: string;
+  url: string;
+  body?: string;
+}
+
+/**
+ * A recording transport. Every request is captured so a test can assert on what
+ * was NOT sent — which is the whole claim a gate makes.
+ */
+function recorder(opts: {
+  torrents: (nth: number) => QbitTorrent[];
+  sonarrRows?: Record<string, unknown>[];
+  arrDelete?: (rowId: number) => number;
+  capturedAt?: (calls: Call[]) => void;
+}) {
+  const calls: Call[] = [];
+  let qbitReads = 0;
+  const fetchImpl = async (url: string, init?: RequestInit) => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    calls.push({ method, url, body: init?.body as string | undefined });
+    if (url.includes('qbit-lan')) {
+      if (url.includes('topPrio')) return json('');
+      opts.capturedAt?.(calls);
+      return json(opts.torrents(++qbitReads).map(wire));
+    }
+    if (method === 'DELETE') {
+      opts.capturedAt?.(calls);
+      return json('', opts.arrDelete ? opts.arrDelete(Number(url.match(/queue\/(\d+)/)?.[1] ?? 0)) : 200);
+    }
+    if (url.includes('sonarr')) {
+      return json({ records: opts.sonarrRows ?? [], totalRecords: (opts.sonarrRows ?? []).length });
+    }
+    return json({ records: [], totalRecords: 0 });
+  };
+  return { fetchImpl, calls };
+}
+
+const sonarrRow = (over: Record<string, unknown> = {}) => ({
+  id: 501,
+  downloadId: HASH.toUpperCase(),
+  title: 'Fringe.S02E18.720p.HDTV.X264-DIMENSION',
+  series: { title: 'Fringe' },
+  size: 1_000_000,
+  sizeleft: 1_000_000,
+  status: 'queued',
+  added: new Date(Date.now() - 49 * 3600_000).toISOString(),
+  ...over,
+});
+
+const removeCtx = (dir: string) => ({ config: testConfig({ readOnly: false, downloadBackupDir: dir }) });
+
+test('🔴 MUTATION TARGET: unstick REFUSES every non-stalled verdict and issues NO delete', async () => {
+  /**
+   * The whole safety model in one test. Each of these reads 0 seeds / 0 speed /
+   * 0 progress and each must be refused for its OWN reason — a generic refusal
+   * would be indistinguishable from the tool being broken.
+   */
+  for (const [state, extra, expect] of [
+    ['stoppedDL', { numComplete: 17 }, /STOPPED, not stalled.*route around their decision/s],
+    ['stalledUP', { progress: 1 }, /FINISHED and seeding.*poison the release/s],
+    ['queuedDL', { timeActiveSeconds: 47 * 3600 }, /NEVER STARTED.*absence of any observation/s],
+    ['missingFiles', {}, /not arr-managed/],
+    ['downloading', { dlspeed: 900_000 }, /DOWNLOADING right now/],
+    ['stalledDL', { timeActiveSeconds: 2 * 3600 }, /has not had long enough/],
+  ] as const) {
+    const dir = captureDir();
+    const r = recorder({
+      torrents: () => [torrent({ hash: HASH, state, ...extra })],
+      sonarrRows: [sonarrRow()],
+    });
+    const out = await makeStuckDownloads(r.fetchImpl).run(
+      { action: 'unstick', hash: HASH },
+      ctx(removeCtx(dir)),
+    );
+    assert.equal(out.ok, false, state);
+    assert.match(out.content, expect, state);
+    assert.deepEqual(r.calls.filter((c) => c.method === 'DELETE'), [], `${state}: no delete may be issued`);
+    assert.equal(existsSync(dir), false, `${state}: nothing may even be captured`);
+  }
+});
+
+test('🔴 MUTATION TARGET: unstick CAPTURES before deleting, and deletes EVERY row of a pack', async () => {
+  /**
+   * Two claims at once, both load-bearing:
+   *  - the capture file exists BEFORE the first DELETE goes out. Checked from
+   *    inside the transport, because checking afterwards cannot tell "captured
+   *    first" from "captured second".
+   *  - a season pack is ONE torrent across N arr rows. Deleting one removes the
+   *    torrent and strands the other N-1 pointing at a download that is gone.
+   */
+  const dir = captureDir();
+  let fileExistedAtFirstDelete: boolean | null = null;
+  const r = recorder({
+    // Gone from qBit on the second read — the removal confirmed.
+    torrents: (nth) => (nth === 1 ? [torrent({ hash: HASH, state: 'stalledDL' })] : []),
+    sonarrRows: [sonarrRow({ id: 501 }), sonarrRow({ id: 502 }), sonarrRow({ id: 503 })],
+    capturedAt: (calls) => {
+      if (fileExistedAtFirstDelete === null && calls[calls.length - 1]?.method === 'DELETE') {
+        fileExistedAtFirstDelete = existsSync(dir) && readdirSync(dir).length === 1;
+      }
+    },
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'unstick', hash: HASH }, ctx(removeCtx(dir)));
+
+  assert.equal(out.ok, true, out.content);
+  assert.equal(fileExistedAtFirstDelete, true, '🔴 the capture must exist BEFORE the first DELETE');
+
+  const deletes = r.calls.filter((c) => c.method === 'DELETE');
+  assert.equal(deletes.length, 3, 'every row of the pack, not the first');
+  for (const d of deletes) {
+    assert.match(d.url, /removeFromClient=true/);
+    assert.match(d.url, /blocklist=true/);
+  }
+  assert.match(out.content, /Confirmed GONE from qBittorrent/);
+  assert.match(out.content, new RegExp(`DELETED INFOHASH: ${HASH}`));
+  assert.match(out.content, /blocklist keys on release and indexer identity, NOT on infohash/);
+
+  const saved = JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]!), 'utf8'));
+  assert.equal(saved.infohash, HASH);
+  assert.deepEqual(saved.arrRowIds, [501, 502, 503]);
+  assert.equal(statSync(join(dir, readdirSync(dir)[0]!)).mode & 0o777, 0o600);
+});
+
+test('🔴 MUTATION TARGET: a capture that cannot be written ABORTS the delete', async () => {
+  const blocked = join(mkdtempSync(join(tmpdir(), 'jedd-blocked-')), 'not-a-dir');
+  writeFileSync(blocked, 'i am a file');
+  const r = recorder({
+    torrents: () => [torrent({ hash: HASH, state: 'stalledDL' })],
+    sonarrRows: [sonarrRow()],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run(
+    { action: 'unstick', hash: HASH },
+    ctx(removeCtx(join(blocked, 'captures'))),
+  );
+  assert.equal(out.ok, false);
+  assert.match(out.content, /NOTHING WAS REMOVED/);
+  assert.match(out.content, /refusal, not a failed removal/);
+  assert.deepEqual(r.calls.filter((c) => c.method === 'DELETE'), [], '🔴 no delete without a record of it');
+});
+
+test('🔴 a torrent STILL in qBittorrent afterwards is reported, not called a success', async () => {
+  // The spec's rule: confirm the hash is actually gone rather than trusting the
+  // 200. A removal that the arr accepted and the client ignored is a real state.
+  const dir = captureDir();
+  const r = recorder({
+    torrents: () => [torrent({ hash: HASH, state: 'stalledDL' })], // still there on BOTH reads
+    sonarrRows: [sonarrRow()],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'unstick', hash: HASH }, ctx(removeCtx(dir)));
+  assert.match(out.content, /STILL IN qBittorrent/);
+  assert.ok(!/Confirmed GONE/.test(out.content));
+});
+
+test('unstick does not re-grab, and says to check hasFile first', async () => {
+  const dir = captureDir();
+  const r = recorder({
+    torrents: (nth) => (nth === 1 ? [torrent({ hash: HASH, state: 'stalledDL' })] : []),
+    sonarrRows: [sonarrRow()],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'unstick', hash: HASH }, ctx(removeCtx(dir)));
+  assert.match(out.content, /did NOT search for a replacement/);
+  assert.match(out.content, /read hasFile first/);
+  assert.deepEqual(r.calls.filter((c) => c.method === 'POST'), [], 'nothing may be grabbed');
+});
+
+test('a bogus hash is refused before anything is read or sent', async () => {
+  const r = recorder({ torrents: () => [torrent({ hash: HASH, state: 'stalledDL' })] });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'unstick', hash: 'nope' }, ctx());
+  assert.equal(out.ok, false);
+  assert.match(out.content, /not a 40-character infohash/);
+  assert.deepEqual(r.calls.filter((c) => c.method !== 'GET'), []);
+});
+
+// ── promote ─────────────────────────────────────────────────────────────────
+
+test('🔴 MUTATION TARGET: promote reports DID NOT MOVE when the priority is unchanged', async () => {
+  /**
+   * Measured twice: a BATCHED topPrio returns 200 with every priority unchanged,
+   * and a topPrio for a hash that cannot exist ALSO returns 200. There is no
+   * success signal in the response, so the comparison IS the result.
+   */
+  const r = recorder({
+    torrents: () => [torrent({ hash: HASH, state: 'queuedDL', numComplete: 13, priority: 9 })],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+
+  assert.equal(out.ok, false, 'an unchanged priority is not a success');
+  assert.match(out.content, /did NOT move/);
+  assert.match(out.content, /the status code is not the outcome/);
+  assert.match(out.content, /Do not report this as done/);
+});
+
+test('CONTROL: promote reports the move when the priority really changed', async () => {
+  // Without this, "did not move" is equally consistent with the tool never
+  // reporting a success at all.
+  const r = recorder({
+    torrents: (nth) => [
+      torrent({ hash: HASH, state: 'queuedDL', numComplete: 13, priority: nth === 1 ? 9 : 1 }),
+    ],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+  assert.equal(out.ok, true, out.content);
+  assert.match(out.content, /moved to priority 1 \(was 9\)/);
+  assert.match(out.content, /verified by re-reading/);
+});
+
+test('🔴 promote sends ONE hash, never a batch', async () => {
+  const r = recorder({
+    torrents: (nth) => [torrent({ hash: HASH, state: 'queuedDL', numComplete: 5, priority: nth === 1 ? 9 : 1 })],
+  });
+  await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+  const post = r.calls.find((c) => c.url.includes('topPrio'));
+  assert.ok(post, 'a topPrio must have been sent');
+  assert.equal(post.body, `hashes=${HASH}`, 'one hash, no `|` batch');
+});
+
+test('🔴 promote REFUSES a torrent whose swarm is dead — a slot to fail in is not a fix', async () => {
+  const r = recorder({
+    torrents: () => [torrent({ hash: HASH, state: 'queuedDL', numComplete: 0 })],
+  });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+  assert.equal(out.ok, false);
+  assert.match(out.content, /swarm has 0 seeds/);
+  assert.match(out.content, /only gives it a slot to fail in/);
+  assert.deepEqual(r.calls.filter((c) => c.url.includes('topPrio')), []);
+});
+
+test('🔴 promote REFUSES a stalled torrent — promotion is not the remedy for a dead swarm', async () => {
+  const r = recorder({ torrents: () => [torrent({ hash: HASH, state: 'stalledDL' })] });
+  const out = await makeStuckDownloads(r.fetchImpl).run({ action: 'promote', hash: HASH }, ctx());
+  assert.equal(out.ok, false);
+  assert.deepEqual(r.calls.filter((c) => c.url.includes('topPrio')), []);
 });
