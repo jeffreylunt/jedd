@@ -69,7 +69,14 @@ export interface Config {
      */
     baseUrl: string;
     password: string;
-    expectedIdentity: string;
+    /**
+     * 🔴 OPTIONAL IN THE TYPE, REQUIRED IN PRACTICE. There is no default: the
+     * owner's Apple ID is configuration, not source. `assertIdentity` refuses to
+     * start when this is absent, so the type says "may be unset" and the boot
+     * says "then you do not start" — rather than a literal in the tree quietly
+     * standing in for a value nobody configured.
+     */
+    expectedIdentity: string | undefined;
     /** Where WE listen. Loopback is correct: BlueBubbles runs on this same Mac. */
     host: string;
     port: number;
@@ -215,7 +222,15 @@ export function loadConfig(): Config {
     bluebubbles: {
       baseUrl: process.env.BLUEBUBBLES_URL ?? 'http://127.0.0.1:1234',
       password: process.env.BLUEBUBBLES_PASSWORD ?? 'password',
-      expectedIdentity: process.env.BLUEBUBBLES_IDENTITY ?? 'jeffreylunt@outlook.com',
+      /**
+       * 🔴 NO DEFAULT, ON PURPOSE. The owner's Apple ID is configuration, not
+       * source — and an absent value must not become a permissive one.
+       * `assertIdentity` REFUSES to start when this is unset, because ports 1234
+       * and 1235 share a password and an API shape, so an unconfigured
+       * deployment connects *successfully* to the wrong identity and texts from
+       * the wrong person. Set BLUEBUBBLES_IDENTITY in .env.
+       */
+      expectedIdentity: process.env.BLUEBUBBLES_IDENTITY,
       host: process.env.BLUEBUBBLES_WEBHOOK_HOST ?? '127.0.0.1',
       port: Number(process.env.BLUEBUBBLES_WEBHOOK_PORT ?? 18796),
       path: process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook',
@@ -228,7 +243,10 @@ export function loadConfig(): Config {
     kindle: {
       smtpHost: process.env.KINDLE_SMTP_HOST ?? 'smtp.gmail.com',
       smtpPort: Number(process.env.KINDLE_SMTP_PORT ?? 587),
-      fromEmail: process.env.KINDLE_FROM_EMAIL ?? 'jeffreylunt@gmail.com',
+      // ⚠️ The default here was a real address AND was already dead: .env has
+      // set KINDLE_FROM_EMAIL all along, so env won and editing the literal
+      // would have changed nothing. An empty value is refused by send_ebook.
+      fromEmail: process.env.KINDLE_FROM_EMAIL ?? '',
       smtpPassword: process.env.KINDLE_SMTP_PASSWORD ?? '',
     },
     dispatcharr: {

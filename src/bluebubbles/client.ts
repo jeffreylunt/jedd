@@ -224,7 +224,26 @@ export class BlueBubblesClient {
   async assertIdentity(): Promise<ServerInfo> {
     const info = await this.serverInfo();
     const want = this.opts.expectedIdentity;
-    if (want && info.detectedIMessage.toLowerCase() !== want.toLowerCase()) {
+    /**
+     * 🔴 AN UNCONFIGURED IDENTITY IS A REFUSAL, NOT A PASS.
+     *
+     * This read `if (want && ...)`, so an absent value SKIPPED the check
+     * entirely — and it went unnoticed because a hardcoded default was standing
+     * in for the config. Removing that default (the owner's address does not
+     * belong in source) would have turned a cosmetic fix into a silent safety
+     * regression: both servers on this host accept the same password and expose
+     * the same API, so with no expectation Jedd would connect happily to the
+     * personal account and text from the wrong Apple ID.
+     */
+    if (!want) {
+      throw new Error(
+        `NO EXPECTED IMESSAGE IDENTITY CONFIGURED, and ${this.opts.baseUrl} is bridging ` +
+          `"${info.detectedIMessage}". Both BlueBubbles servers on this host accept the same ` +
+          'password and expose the same API, so an unset expectation connects SUCCESSFULLY to the ' +
+          'wrong Apple ID. Set BLUEBUBBLES_IDENTITY. Refusing to start.',
+      );
+    }
+    if (info.detectedIMessage.toLowerCase() !== want.toLowerCase()) {
       throw new Error(
         `WRONG BLUEBUBBLES SERVER: ${this.opts.baseUrl} is bridging "${info.detectedIMessage}", ` +
           `but this deployment expects "${want}". Both servers on this host accept the same ` +

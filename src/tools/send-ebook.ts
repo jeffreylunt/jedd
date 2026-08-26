@@ -22,7 +22,9 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
 
 /** Where qBittorrent's paths map to on hp. Container view → host view. */
 export const DEFAULT_MOUNTS: MountMap[] = [
-  { containerPrefix: '/downloads', hostPrefix: '/home/jeff/gluetun/downloads' },
+  // ⚠️ A real path on a real machine, so it is configuration. Empty rather than
+  // guessed: a wrong host prefix produces a file-not-found, not a wrong file.
+  { containerPrefix: '/downloads', hostPrefix: process.env.EBOOK_HOST_DOWNLOAD_PREFIX ?? '' },
 ];
 
 export interface SendEbookDeps {

@@ -85,6 +85,26 @@ test('an unreadable server/info is UNKNOWN and still refuses — it is not "prob
   );
 });
 
+test('🔴 NO CONFIGURED IDENTITY IS A REFUSAL — an unset expectation must not pass', async () => {
+  // Found 2026-08-26 while removing the owner's Apple ID from source. The check
+  // read `if (want && ...)`, so an absent value SKIPPED it — invisible for as
+  // long as a hardcoded default stood in for the config. Deleting that default
+  // without this guard would have turned "his name is not in the tree" into
+  // "Jedd will happily text from whichever account answers".
+  const { impl } = scripted(() => ({
+    body: { status: 200, data: { detected_imessage: 'someone.else@invalid', server_version: '1.9.9' } },
+  }));
+  await assert.rejects(() => client(impl).assertIdentity(), /NO EXPECTED IMESSAGE IDENTITY/);
+});
+
+test('CONTROL: a MATCHING configured identity still boots', async () => {
+  const { impl } = scripted(() => ({
+    body: { status: 200, data: { detected_imessage: 'jedd@invalid', server_version: '1.9.9' } },
+  }));
+  const info = await client(impl, 'jedd@invalid').assertIdentity();
+  assert.equal(info.detectedIMessage, 'jedd@invalid');
+});
+
 test('🔴 an unreadable server/info refuses even with NO expected identity configured', async () => {
   // `expectedIdentity` is optional, so this is the path where the equality check
   // cannot stand in for the unreadable check. Without it, a server that answers

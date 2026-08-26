@@ -195,12 +195,12 @@ test('🔴 the owner\'s name is not hardcoded in any model-facing or user-facing
    * would quietly cover the next occurrence too. If this list is not empty and
    * nobody is working on it, that is the finding.
    */
-  const notYetMigrated = new Set([
-    'src/config.ts:218',
-    'src/config.ts:231',
-    'src/tools/kindle.ts:55',
-    'src/tools/send-ebook.ts:25',
-  ]);
+  /**
+   * ⚠️ EMPTY, AND IT MUST STAY EMPTY. Every occurrence moved to `.env` on
+   * 2026-08-26. Adding an entry here is adding the owner's name back to the
+   * tree — if you are about to, put the value in `.env` instead.
+   */
+  const notYetMigrated = new Set<string>([]);
 
   const files = execFileSync('git', ['ls-files', '-z', 'src'], { cwd: root, encoding: 'buffer' })
     .toString('utf8')

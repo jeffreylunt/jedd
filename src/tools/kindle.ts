@@ -52,8 +52,8 @@ export const saveKindleEmail: Tool = {
 
     return ok(
       `SAVED — ${result.record.address} is stored for this person, taken from their own message. ` +
-        'Remind them once that they must add jeffreylunt@gmail.com to their Amazon approved-senders ' +
-        'list, or delivery will silently fail on Amazon’s side.',
+        `Remind them once that they must add ${ctx.config.kindle.fromEmail} to their Amazon ` +
+        'approved-senders list, or delivery will silently fail on Amazon’s side.',
     );
   },
 };
