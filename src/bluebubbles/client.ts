@@ -542,9 +542,23 @@ export class BlueBubblesClient {
    * log printing `Executing Action: Change Typing Status` for the socket call
    * and nothing at all for the DELETE.
    *
+   * 🔴 THIS WORKAROUND IS PERMANENT. IT IS NOT WAITING FOR A RELEASE.
+   *
+   * The inverted line is on BlueBubbles' `master` as well as in 1.9.9, and the
+   * bug was reported to nobody — Jeff was asked and declined, which is his call.
+   * So there is no version to upgrade to that fixes this, and **an upgrade could
+   * change the socket API out from under us while leaving the DELETE route just
+   * as broken.** If the socket path ever stops working, re-measure the DELETE
+   * route before assuming it was fixed: `POST` a typing indicator, `DELETE` it,
+   * and look for `Executing Action: Change Typing Status` in
+   * `~/Library/Logs/bluebubbles-server/main.log`. If that line is absent, the
+   * DELETE is still a start.
+   *
    * ⚠️ Do NOT "simplify" this back to a one-line DELETE because the verb reads
-   * right. The verb is the whole trap: it is the correct-looking call that does
-   * the opposite, and it reports success while doing it.
+   * right, and do NOT move `startTyping` onto the socket to match. The
+   * asymmetry looks like sloppiness and is load-bearing in both directions: the
+   * verb is the trap on this side, and `typingCache` is the reason on the
+   * other. Tidying either one silently removes a guarantee.
    */
   async stopTyping(chatGuid: string): Promise<PrivateApiResult> {
     return this.socketEmit('stopped-typing', { chatGuid });

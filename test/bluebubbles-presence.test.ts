@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
   BlueBubblesClient,
@@ -610,22 +611,101 @@ const SOCKET_STOP_ERROR: PrivateApiResult = {
   ok: false, status: 500, helperAbsent: false, detail: 'stopped-typing-error: Failed to stop typing!',
 };
 
-test('🔴 the stop\'s standing failure is said ONCE, not once per turn', async () => {
+/**
+ * ⚠️ A TEST THAT SAID THE OPPOSITE USED TO LIVE HERE. It asserted that a
+ * repeated stop failure was said ONCE, which was right before a failing stop
+ * was understood to mean a stranded indicator and wrong after. It is replaced
+ * by the loud-stop tests below plus this one, which keeps the quiet rule where
+ * it still belongs: the signals nobody can see.
+ */
+test('a standing failure on an INVISIBLE signal is said once, not once per turn', async () => {
+  // A read receipt that does not go out costs nothing anybody is looking at, so
+  // a per-turn red line about a standing cause is pure noise.
   const { impl, set } = switchableClient();
   const lines: string[] = [];
   const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
 
-  // Only the STOP fails, and it fails with BlueBubbles' fixed wording, which
-  // carries no hint that the helper is the cause. Start and read are fine, so
-  // nothing else can account for the quiet.
+  set({ read: { ok: false, status: 503, helperAbsent: false, detail: 'http 503: upstream gone' } });
+  for (let turn = 0; turn < 4; turn += 1) {
+    presence.markRead(OWNER);
+    await flush();
+  }
+
+  const about = lines.filter((l) => l.includes('upstream gone'));
+  assert.equal(about.length, 1, `four turns, ${about.length} lines about one standing condition:\n${lines.join('\n')}`);
+});
+
+test('🔴 a failed STOP is LOUD — every occurrence, no deduplication', async () => {
+  // The entire reason the inverted-DELETE bug survived is that a failing stop
+  // reported success. A stop that does not land leaves a "…" on a real person's
+  // phone, and each occurrence is a different person at a different moment —
+  // quieting a repeat would be quieting a second stranded indicator.
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
   set({ stop: SOCKET_STOP_ERROR });
   for (let turn = 0; turn < 4; turn += 1) {
     await presence.withTyping(OWNER, async () => 'ok');
     await flush();
   }
 
-  const about = lines.filter((l) => l.includes('Failed to stop typing'));
-  assert.equal(about.length, 1, `four turns, ${about.length} lines about one standing condition:\n${lines.join('\n')}`);
+  const stranded = lines.filter((l) => l.includes('STOP FAILED'));
+  assert.equal(stranded.length, 4, `four failed stops, ${stranded.length} lines:\n${lines.join('\n')}`);
+});
+
+test('🔴 the loud stop names the consequence, not just the error', async () => {
+  // Its own test: the count above can pass while the line says nothing a reader
+  // can act on. Somebody reading this at 2am needs to know a real person is
+  // looking at a "…" that will never resolve.
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set({ stop: SOCKET_STOP_ERROR });
+  await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  assert.match(lines.join('\n'), /STRANDED/);
+  assert.match(lines.join('\n'), new RegExp(OWNER.replace('+', '\\+')));
+});
+
+test('🔴 a failed stop stays loud even while the helper-absent notice stands', async () => {
+  // The suppression that quiets everything else must not reach this one. With
+  // the helper absent EVERY call fails, and that is exactly when a blanket rule
+  // is most tempting.
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set({ read: HELPER_ABSENT, stop: SOCKET_STOP_ERROR });
+  presence.markRead(OWNER);
+  await flush();
+  for (let turn = 0; turn < 3; turn += 1) {
+    await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+  }
+
+  assert.equal(lines.filter((l) => l.includes('once per process')).length, 1, lines.join('\n'));
+  assert.equal(lines.filter((l) => l.includes('STOP FAILED')).length, 3, lines.join('\n'));
+});
+
+test('🔴 CONTROL: a failed stop is QUIET when no start ever landed — nothing can be stranded', async () => {
+  // The asymmetry is the whole point. If the start never landed there is no
+  // indicator showing, so a failed stop has no visible cost and is a
+  // consequence of the same cause. Without this the helper being absent would
+  // print a red STRANDED line every turn about an indicator that never existed.
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+
+  set({ start: HELPER_ABSENT, stop: SOCKET_STOP_ERROR });
+  for (let turn = 0; turn < 3; turn += 1) {
+    await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+  }
+
+  assert.equal(lines.filter((l) => l.includes('STOP FAILED')).length, 0, lines.join('\n'));
 });
 
 test('🔴 a DIFFERENT failure is still reported while the first one stands', async () => {
@@ -825,6 +905,79 @@ test('🔴 shutdown stops a live indicator — a pm2 restart lands mid-turn soon
   assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`]);
   await presence.stopAll();
   assert.deepEqual(calls, [`start ${chatGuidFor(OWNER)}`, `stop ${chatGuidFor(OWNER)}`]);
+});
+
+/**
+ * ── 🔴 THE SIGTERM PATH HAS NEVER ONCE DONE ITS JOB ───────────────────────────
+ *
+ * Follows from the inverted-DELETE finding: every SIGTERM this process has ever
+ * received *started* indicators instead of clearing them. So this path is not
+ * "well covered because it is simple" — it is entirely unexercised, and it runs
+ * on EVERY deploy. Each property below is its own test.
+ */
+
+test('🔴 SIGTERM stops EVERY live indicator, not just the first', async () => {
+  // `stopAll` iterates a map. A break, an early return, or a `find` instead of a
+  // loop leaves the second person watching a "…" forever, and with one handle in
+  // the test nothing would ever notice.
+  const { impl, calls } = stubClient();
+  const presence = new Presence({ client: impl, log: () => {} });
+  const held: (() => void)[] = [];
+  for (const handle of ['+15550001111', '+15550002222', '+15550003333']) {
+    void presence.withTyping(handle, () => new Promise<string>((r) => held.push(() => r('ok'))));
+  }
+  await flush();
+  await presence.stopAll();
+
+  for (const handle of ['+15550001111', '+15550002222', '+15550003333']) {
+    assert.ok(calls.includes(`stop ${chatGuidFor(handle)}`), `no stop for ${handle}: ${calls.join(', ')}`);
+  }
+  for (const release of held) release();
+});
+
+test('🔴 SIGTERM stops an indicator whose turn is still running', async () => {
+  // The whole point. A pm2 restart lands mid-turn sooner or later, and that is
+  // the only moment at which there is a live indicator left to strand.
+  const { impl, calls } = stubClient();
+  const presence = new Presence({ client: impl, log: () => {} });
+  let endTurn = (): void => {};
+  void presence.withTyping(OWNER, () => new Promise<string>((r) => { endTurn = () => r('ok'); }));
+  await flush();
+  await presence.stopAll();
+
+  assert.ok(calls.includes(`stop ${chatGuidFor(OWNER)}`), calls.join(', '));
+  endTurn();
+});
+
+test('🔴 a stop that fails during SIGTERM is LOUD — that is a stranded indicator on a deploy', async () => {
+  const { impl, set } = switchableClient();
+  const lines: string[] = [];
+  const presence = new Presence({ client: impl, log: (l) => lines.push(l) });
+  let endTurn = (): void => {};
+  void presence.withTyping(OWNER, () => new Promise<string>((r) => { endTurn = () => r('ok'); }));
+  await flush();
+
+  set({ stop: SOCKET_STOP_ERROR });
+  await presence.stopAll();
+
+  assert.match(lines.join('\n'), /STOP FAILED/, `shutdown swallowed a failed stop:\n${lines.join('\n')}`);
+  endTurn();
+});
+
+test('🔴 the shipped SIGTERM handler still calls stopAll, and does it BEFORE exiting', async () => {
+  // A source scan, because the wiring is what the tests above cannot reach: they
+  // prove `stopAll` works, not that anything calls it. Deleting the call, or
+  // moving it after `process.exit`, leaves every test above green.
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const shutdown = main.slice(main.indexOf('const shutdown ='), main.indexOf("process.on('SIGINT'"));
+
+  assert.ok(shutdown.includes('presence.stopAll()'), 'the SIGTERM handler no longer stops live indicators');
+  assert.ok(
+    shutdown.indexOf('presence.stopAll()') < shutdown.indexOf('process.exit'),
+    'stopAll runs after process.exit — it would never run at all',
+  );
+  assert.match(main, /process\.on\('SIGTERM'/, 'nothing is listening for SIGTERM');
+  assert.match(main, /process\.on\('SIGINT'/, 'nothing is listening for SIGINT');
 });
 
 test('stopAll is bounded — an unreachable BlueBubbles cannot stop the process dying', async () => {

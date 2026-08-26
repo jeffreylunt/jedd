@@ -156,10 +156,24 @@ class TypingSession {
   ) {}
 
   /** Queue an operation. Never throws, never delays the caller. */
-  private enqueue(what: string, op: () => Promise<PrivateApiResult>): void {
+  /**
+   * 🔴 DID A START EVER SUCCEED FOR THIS SESSION?
+   *
+   * This is the difference between "a stop failed" and "an indicator is
+   * STRANDED ON SOMEBODY'S PHONE". If no start ever landed there is nothing
+   * showing, so a failed stop is a harmless consequence of the same cause. If a
+   * start DID land, a failed stop is the one presence failure with a visible,
+   * persistent cost to a real person — and it gets said every single time, with
+   * no deduplication. See `Presence.report`.
+   */
+  private startedOk = false;
+
+  private enqueue(what: string, op: () => Promise<PrivateApiResult>, loud = false): void {
     this.chain = this.chain.then(async () => {
       try {
-        this.owner.report(what, this.handle, await op());
+        const r = await op();
+        this.owner.report(what, this.handle, r, loud && this.startedOk);
+        if (what !== 'stop typing') this.startedOk = r.ok;
       } catch (e) {
         this.owner.reportThrow(what, this.handle, e);
       }
@@ -202,7 +216,11 @@ class TypingSession {
     this.owner.timers.clear(this.timer);
     this.timer = null;
     this.owner.forget(this);
-    this.enqueue('stop typing', () => this.owner.client.stopTyping(chatGuidFor(this.handle)));
+    // 🔴 `loud`: a stop that does not land leaves a "…" on a real person's
+    // phone claiming a reply is coming. THE ENTIRE REASON THIS BUG SURVIVED IS
+    // THAT A FAILING STOP REPORTED SUCCESS — so this one failure is exempt from
+    // every quieting rule in `report`, and is said on every occurrence.
+    this.enqueue('stop typing', () => this.owner.client.stopTyping(chatGuidFor(this.handle)), true);
   }
 
   /** Everything queued so far. Only shutdown waits on this. */
@@ -270,6 +288,13 @@ export class Presence {
    * helper would print that same red line every turn, forever, about a condition
    * already stated once — which is how a log gets ignored.
    *
+   * 🔴 A FAILED **STOP** IS EXEMPT FROM ALL OF IT. Pass `loud` and it is said on
+   * every occurrence, with no deduplication and no helper-absent suppression —
+   * because a stop that does not land leaves a "…" on a real person's phone,
+   * and **the entire reason the inverted-DELETE bug survived is that a failing
+   * stop reported success.** Never route the stop back through the quiet path
+   * to tidy the log up.
+   *
    * ⚠️ THE RULE IS PER OPERATION AND PER MESSAGE, NOT A BLANKET MUTE. An earlier version muted
    * every failure once the helper was known absent, and the helper being absent
    * is a STANDING condition here — so no call would ever return `ok`, the mute
@@ -278,7 +303,7 @@ export class Presence {
    * something else. Deduplicating on the detail says each thing once and still
    * says every NEW thing.
    */
-  report(what: string, handle: string, r: PrivateApiResult): void {
+  report(what: string, handle: string, r: PrivateApiResult, loud = false): void {
     if (r.ok) {
       // Whatever was wrong with THIS operation is over, so the next occurrence
       // is news again. ⚠️ Per operation, not global: `startTyping` succeeding
@@ -294,6 +319,18 @@ export class Presence {
       this.logLine(
         `[presence] typing indicators and read receipts are OFF: ${r.detail} Everything else works ` +
           'normally; this notice is printed once per process and will not repeat.',
+      );
+      return;
+    }
+    if (loud) {
+      // 🔴 NO DEDUPLICATION, NO HELPER-ABSENT SUPPRESSION, EVERY OCCURRENCE.
+      // Each one is a different turn and a different moment at which somebody
+      // is looking at a "…" that will never resolve. Quieting a repeat here
+      // would be quieting a second stranded indicator, not a second mention of
+      // the first.
+      this.logLine(
+        `[presence] 🔴 STOP FAILED for ${handle} — ${r.detail} A typing indicator may be STRANDED on ` +
+          'their phone, claiming a reply is coming. The reply itself is unaffected.',
       );
       return;
     }
