@@ -73,9 +73,25 @@ export class OllamaClient implements LlmClient {
   }
 
   async chat(messages: LlmMessage[], tools: Tool[]): Promise<LlmReply> {
-    // A cold load of ~18 GB plus a slow turn genuinely exceeds shorter timeouts.
+    // Wall clock for ONE model turn, including a cold model load.
+    //
+    // RAISED 240s -> 900s on 2026-08-26 at Jeff's explicit request, after this
+    // timeout silently killed the same real request TWICE in twenty minutes.
+    // Measured both times: "Give me the other 14" (a 14-item list) aborted at
+    // ~240s. The first failure ALSO involved a cold load -- the ollama runner
+    // started the same second the message arrived and took ~10 min -- but the
+    // SECOND failed on a model that was already resident and demonstrably
+    // generating (runner CPU climbing 2.2 -> 11.6%). So a cold load is NOT
+    // required to blow this budget: a long enough generation does it alone.
+    //
+    // WHAT THIS DOES NOT FIX, and it is the worse half: an abort here is
+    // SILENT. There is no user-facing message, so a killed turn and a message
+    // that never arrived look identical to whoever sent it. Raising the ceiling
+    // makes the failure rarer, not visible. A "still working" signal is the
+    // real fix and is tracked separately.
+    const TURN_TIMEOUT_MS = 900_000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 240_000);
+    const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
     let res: Response;
     try {
       res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
