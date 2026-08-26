@@ -427,14 +427,36 @@ export class BlueBubblesConnector implements Connector {
   ): Promise<SendOutcome> {
     this.threading?.answered(toHandle, inReplyTo);
     const already = await this.client.recentlySent(toHandle, text);
-    if (already !== false) {
+
+    /**
+     * 🔴 "THE SEND REPORTED FAILURE" AND "THE PERSON DID NOT GET IT" ARE
+     * DIFFERENT FACTS, AND THIS IS THE ONE PLACE THEY COME APART.
+     *
+     * `already === true` means BlueBubbles' own history already holds this text:
+     * the message LANDED and all we lost was the answer to our request. Calling
+     * that `failed` would make `send()` throw, and the turn would be logged as
+     * having thrown while Jeff sat there reading the reply. So it reports
+     * `accepted` — which is what actually happened — with `delivered: null`,
+     * because an entry in the sent history is still not a delivery receipt.
+     */
+    if (already === true) {
+      return {
+        state: 'accepted',
+        delivered: null,
+        detail:
+          `the anchored (reply-quoted) send reported failure — ${why} — but the text is ALREADY IN the sent ` +
+          'history, so it went out and only the reply-quote is in doubt. NOT re-sent.',
+      };
+    }
+    if (already === null) {
       return {
         state: 'failed',
         delivered: null,
         detail:
-          `🔴 the anchored (reply-quoted) send failed — ${why} — and it is ${
-            already === true ? 'ALREADY IN the sent history' : 'UNKNOWN whether it went out (history unreadable)'
-          }, so it was NOT re-sent. A duplicate message is worse than a missing reply-quote.`,
+          `🔴 the anchored (reply-quoted) send failed — ${why} — and it is UNKNOWN whether it went out ` +
+          '(BlueBubbles\' history was unreadable), so it was NOT re-sent. `null` is not `false`: an ' +
+          'unreadable history is exactly when a duplicate would be invisible to us and obvious to the ' +
+          'person holding the phone.',
       };
     }
     const plain = await this.client.sendText(toHandle, text);

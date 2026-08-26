@@ -26,14 +26,17 @@ function tempFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'jedd-thread-')), 'seen.jsonl');
 }
 
-const JEFF = '+18018396586';
+// The reserved +1555 range, like every other test here: a real-looking number
+// in the committed tree is caught by `owner-config-fail-closed.test.ts`.
+const OWNER = '+15550001001';
+const SOMEONE_ELSE = '+15550001002';
 
 // ── the rule itself, with no transport anywhere near it ─────────────────────
 
 test('one message in play sends PLAIN — the ordinary exchange is left alone', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  const d = t.decide(JEFF, 'G-1');
+  t.arrived(OWNER, 'G-1');
+  const d = t.decide(OWNER, 'G-1');
   assert.equal(d.replyTo, null);
   assert.equal(d.burstSize, 1);
   assert.match(d.detail, /noise/);
@@ -49,64 +52,64 @@ test('one message in play sends PLAIN — the ordinary exchange is left alone', 
  */
 test('🔴 two messages in play: BOTH replies are anchored to the message they answer', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
+  t.arrived(OWNER, 'G-1');
   // ⚠️ The second message arrives while the first turn is still thinking. That
   // is the whole scenario — turns run concurrently (`void this.ingest(...)`), so
   // the reply to G-1 lands after G-2 is already on Jeff's screen.
-  t.arrived(JEFF, 'G-2');
+  t.arrived(OWNER, 'G-2');
 
-  const first = t.decide(JEFF, 'G-1');
+  const first = t.decide(OWNER, 'G-1');
   assert.equal(first.replyTo, 'G-1', 'the late reply must quote the message it actually answers');
   assert.equal(first.burstSize, 2);
-  t.answered(JEFF, 'G-1');
+  t.answered(OWNER, 'G-1');
 
   // And the reply to the NEWEST message is anchored too. It is the newest, so a
   // "is this their latest message" rule would send it plain — and it would still
   // be ambiguous, because Jeff is looking at two messages and one bare reply.
-  const second = t.decide(JEFF, 'G-2');
+  const second = t.decide(OWNER, 'G-2');
   assert.equal(second.replyTo, 'G-2');
   assert.equal(second.burstSize, 2);
 });
 
 test('a reply anchors to ITS OWN message, never to the newest one', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  t.arrived(JEFF, 'G-2');
-  t.arrived(JEFF, 'G-3');
+  t.arrived(OWNER, 'G-1');
+  t.arrived(OWNER, 'G-2');
+  t.arrived(OWNER, 'G-3');
   // The point of the whole feature: the answer to the first question quotes the
   // first question, so it cannot be mistaken for an answer to the third.
-  assert.equal(t.decide(JEFF, 'G-1').replyTo, 'G-1');
-  assert.equal(t.decide(JEFF, 'G-2').replyTo, 'G-2');
+  assert.equal(t.decide(OWNER, 'G-1').replyTo, 'G-1');
+  assert.equal(t.decide(OWNER, 'G-2').replyTo, 'G-2');
 });
 
 test('once the burst is answered, the next lone message goes back to plain', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  t.arrived(JEFF, 'G-2');
-  t.answered(JEFF, 'G-1');
-  t.answered(JEFF, 'G-2');
-  assert.equal(t.inPlay(JEFF), 0, 'a fully answered burst must not linger');
+  t.arrived(OWNER, 'G-1');
+  t.arrived(OWNER, 'G-2');
+  t.answered(OWNER, 'G-1');
+  t.answered(OWNER, 'G-2');
+  assert.equal(t.inPlay(OWNER), 0, 'a fully answered burst must not linger');
 
-  t.arrived(JEFF, 'G-3');
-  assert.equal(t.decide(JEFF, 'G-3').replyTo, null);
+  t.arrived(OWNER, 'G-3');
+  assert.equal(t.decide(OWNER, 'G-3').replyTo, null);
 });
 
 test('a half-answered burst still counts — the other reply is still owed', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  t.arrived(JEFF, 'G-2');
-  t.answered(JEFF, 'G-1');
-  assert.equal(t.inPlay(JEFF), 2);
-  assert.equal(t.decide(JEFF, 'G-2').replyTo, 'G-2');
+  t.arrived(OWNER, 'G-1');
+  t.arrived(OWNER, 'G-2');
+  t.answered(OWNER, 'G-1');
+  assert.equal(t.inPlay(OWNER), 2);
+  assert.equal(t.decide(OWNER, 'G-2').replyTo, 'G-2');
 });
 
 test('bursts are per person: someone else texting does not anchor Jeff\'s reply', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  t.arrived('+13854346068', 'G-2');
-  t.arrived('+13854346068', 'G-3');
-  assert.equal(t.decide(JEFF, 'G-1').replyTo, null);
-  assert.equal(t.decide('+13854346068', 'G-2').replyTo, 'G-2');
+  t.arrived(OWNER, 'G-1');
+  t.arrived(SOMEONE_ELSE, 'G-2');
+  t.arrived(SOMEONE_ELSE, 'G-3');
+  assert.equal(t.decide(OWNER, 'G-1').replyTo, null);
+  assert.equal(t.decide(SOMEONE_ELSE, 'G-2').replyTo, 'G-2');
 });
 
 test('BlueBubbles double-firing the same message does not fake a burst', () => {
@@ -114,10 +117,10 @@ test('BlueBubbles double-firing the same message does not fake a burst', () => {
   // counted as two messages, EVERY reply would be anchored and the "only in that
   // case" half of the request would be silently dead.
   const t = new ReplyThreading();
-  t.arrived(JEFF, 'G-1');
-  t.arrived(JEFF, 'G-1');
-  assert.equal(t.inPlay(JEFF), 1);
-  assert.equal(t.decide(JEFF, 'G-1').replyTo, null);
+  t.arrived(OWNER, 'G-1');
+  t.arrived(OWNER, 'G-1');
+  assert.equal(t.inPlay(OWNER), 1);
+  assert.equal(t.decide(OWNER, 'G-1').replyTo, null);
 });
 
 test('🔴 a turn that never sends cannot anchor every later reply forever', () => {
@@ -126,18 +129,18 @@ test('🔴 a turn that never sends cannot anchor every later reply forever', () 
   // the burst for the life of the process and everything afterwards is quoted.
   const t = new ReplyThreading();
   const t0 = 1_000_000;
-  t.arrived(JEFF, 'G-lost', t0);
-  t.arrived(JEFF, 'G-next', t0 + BURST_TTL_MS + 1);
-  assert.equal(t.inPlay(JEFF, t0 + BURST_TTL_MS + 1), 1, 'the abandoned message must have aged out');
-  assert.equal(t.decide(JEFF, 'G-next', t0 + BURST_TTL_MS + 1).replyTo, null);
+  t.arrived(OWNER, 'G-lost', t0);
+  t.arrived(OWNER, 'G-next', t0 + BURST_TTL_MS + 1);
+  assert.equal(t.inPlay(OWNER, t0 + BURST_TTL_MS + 1), 1, 'the abandoned message must have aged out');
+  assert.equal(t.decide(OWNER, 'G-next', t0 + BURST_TTL_MS + 1).replyTo, null);
 });
 
 test('a message with no guid can never be anchored, and never inflates a burst', () => {
   const t = new ReplyThreading();
-  t.arrived(JEFF, null);
-  t.arrived(JEFF, 'G-1');
-  assert.equal(t.inPlay(JEFF), 1);
-  assert.equal(t.decide(JEFF, undefined).replyTo, null);
+  t.arrived(OWNER, null);
+  t.arrived(OWNER, 'G-1');
+  assert.equal(t.inPlay(OWNER), 1);
+  assert.equal(t.decide(OWNER, undefined).replyTo, null);
 });
 
 // ── the guid has to survive the trip from the webhook payload ───────────────
@@ -150,7 +153,7 @@ test('classifyPayload carries the message guid, or the anchor has nothing to poi
       guid: 'ABC-123',
       text: 'do you have dune?',
       isFromMe: false,
-      handle: { address: JEFF },
+      handle: { address: OWNER },
     },
   });
   assert.equal(v.action, 'deliver');
@@ -181,7 +184,7 @@ test('an anchored send puts selectedMessageGuid + partIndex on the wire', async 
   // in the shipped BlueBubbles 1.9.9 `app.asar`, and a live send with them came
   // back with `threadOriginatorGuid` set to the anchor.
   const { client, bodies } = capturingClient(() => ({ status: 200, data: { guid: 'sent-1' } }));
-  await client.sendText(JEFF, 'here you go', 'ANCHOR-1');
+  await client.sendText(OWNER, 'here you go', 'ANCHOR-1');
   const sent = bodies.find((b) => String(b['__url']).includes('/message/text'));
   assert.equal(sent?.['selectedMessageGuid'], 'ANCHOR-1');
   assert.equal(sent?.['partIndex'], 0);
@@ -192,7 +195,7 @@ test('a plain send does NOT — the field alone reroutes BlueBubbles to the Priv
   // Sending the key with a null value would put every ordinary reply through a
   // path that needs the helper bundle connected, which was dead two days ago.
   const { client, bodies } = capturingClient(() => ({ status: 200, data: { guid: 'sent-1' } }));
-  await client.sendText(JEFF, 'here you go');
+  await client.sendText(OWNER, 'here you go');
   const sent = bodies.find((b) => String(b['__url']).includes('/message/text'));
   assert.ok(sent && !('selectedMessageGuid' in sent), 'the key must be absent, not null');
   assert.ok(sent && !('partIndex' in sent));
@@ -223,13 +226,13 @@ test('end to end: a lone reply is plain, a reply from a burst is anchored', asyn
   const threading = new ReplyThreading();
   const { connector, bodies } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
 
-  threading.arrived(JEFF, 'G-1');
-  await connector.send(JEFF, 'one', 'G-1');
+  threading.arrived(OWNER, 'G-1');
+  await connector.send(OWNER, 'one', 'G-1');
   assert.ok(!('selectedMessageGuid' in bodies[0]!), 'the ordinary exchange must not be quoted');
 
-  threading.arrived(JEFF, 'G-2');
-  threading.arrived(JEFF, 'G-3');
-  await connector.send(JEFF, 'two', 'G-2');
+  threading.arrived(OWNER, 'G-2');
+  threading.arrived(OWNER, 'G-3');
+  await connector.send(OWNER, 'two', 'G-2');
   assert.equal(bodies[1]?.['selectedMessageGuid'], 'G-2');
 });
 
@@ -238,9 +241,9 @@ test('a follow-up sends plain even mid-burst — it answers no incoming message'
   // to whatever happened to be outstanding would quote an unrelated message.
   const threading = new ReplyThreading();
   const { connector, bodies } = connectorWith(threading, () => ({ status: 200, data: { guid: 'sent' } }));
-  threading.arrived(JEFF, 'G-1');
-  threading.arrived(JEFF, 'G-2');
-  await connector.send(JEFF, 'your download finished');
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
+  await connector.send(OWNER, 'your download finished');
   assert.ok(!('selectedMessageGuid' in bodies[0]!));
 });
 
@@ -254,10 +257,10 @@ test('🔴 a failed anchored send is downgraded to a plain one, not lost', async
     if ('selectedMessageGuid' in body) return { status: 500, data: null };
     return { status: 200, data: { guid: 'sent-plain' } };
   });
-  threading.arrived(JEFF, 'G-1');
-  threading.arrived(JEFF, 'G-2');
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
 
-  const out = await connector.sendReporting(JEFF, 'the answer', 'G-1');
+  const out = await connector.sendReporting(OWNER, 'the answer', 'G-1');
   assert.equal(out.state, 'accepted');
   assert.match(out.detail, /sent PLAIN/);
   const texts = bodies.filter((b) => String(b['__url']).includes('/message/text'));
@@ -275,12 +278,16 @@ test('🔴 the retry does NOT fire when the first send already landed', async ()
     if ('selectedMessageGuid' in body) return { status: 500, data: null };
     return { status: 200, data: { guid: 'sent-plain' } };
   });
-  threading.arrived(JEFF, 'G-1');
-  threading.arrived(JEFF, 'G-2');
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
 
-  const out = await connector.sendReporting(JEFF, 'the answer', 'G-1');
+  const out = await connector.sendReporting(OWNER, 'the answer', 'G-1');
   assert.equal(bodies.filter((b) => String(b['__url']).includes('/message/text')).length, 1);
   assert.match(out.detail, /ALREADY IN the sent history/);
+  // 🔴 And it reports ACCEPTED, not failed. The message landed; only our answer
+  // was lost. `failed` would make `send()` throw and the turn would be logged as
+  // having thrown while the person was reading the reply.
+  assert.equal(out.state, 'accepted');
 });
 
 test('🔴 an UNREADABLE history is not a licence to resend', async () => {
@@ -292,10 +299,10 @@ test('🔴 an UNREADABLE history is not a licence to resend', async () => {
     if ('selectedMessageGuid' in body) return { status: 500, data: null };
     return { status: 200, data: { guid: 'sent-plain' } };
   });
-  threading.arrived(JEFF, 'G-1');
-  threading.arrived(JEFF, 'G-2');
+  threading.arrived(OWNER, 'G-1');
+  threading.arrived(OWNER, 'G-2');
 
-  const out = await connector.sendReporting(JEFF, 'the answer', 'G-1');
+  const out = await connector.sendReporting(OWNER, 'the answer', 'G-1');
   assert.equal(bodies.filter((b) => String(b['__url']).includes('/message/text')).length, 1);
   assert.equal(out.delivered, null, 'UNKNOWN is not "failed" and is not "sent"');
   assert.match(out.detail, /UNKNOWN whether it went out/);
@@ -304,6 +311,6 @@ test('🔴 an UNREADABLE history is not a licence to resend', async () => {
 test('a plain send that fails is still a throw — the fallback did not swallow it', async () => {
   const threading = new ReplyThreading();
   const { connector } = connectorWith(threading, () => ({ status: 500, data: null }));
-  threading.arrived(JEFF, 'G-1');
-  await assert.rejects(() => connector.send(JEFF, 'the answer', 'G-1'), /send failed/);
+  threading.arrived(OWNER, 'G-1');
+  await assert.rejects(() => connector.send(OWNER, 'the answer', 'G-1'), /send failed/);
 });
