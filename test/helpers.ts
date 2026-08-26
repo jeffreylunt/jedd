@@ -46,7 +46,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     // credential: every test routes a stub fetch, and the client only ever talks
     // to api.themoviedb.org, which no test is permitted to reach.
     tmdb: { readToken: 'test-read-token' },
-    qbittorrent: { baseUrl: 'http://qbittorrent.invalid:8080' },
+    qbittorrent: { baseUrl: 'http://qbittorrent.invalid:8080', lanUrl: 'http://qbit-lan.invalid:8080' },
     jfago: {
       baseUrl: 'http://jfa-go.invalid:8056',
       inviteBaseUrl: 'https://jf.invalid/accounts',

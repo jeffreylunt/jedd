@@ -148,14 +148,38 @@ export interface Config {
   tmdb: { readToken: string };
   qbittorrent: {
     /**
-     * ⚠️ `http://172.20.0.1:8080` — the DOCKER BRIDGE GATEWAY, not
-     * `192.168.1.7:8080`. qBittorrent lives in gluetun-torrents' network
-     * namespace and its API is only reachable on the bridge address, from the
-     * host itself. Auth-bypass is on for that source, which is why no
-     * credentials appear here; a request arriving from anywhere else gets
-     * `Unauthorized`, and that is not a bug.
+     * `http://172.20.0.1:8080` — the DOCKER BRIDGE GATEWAY. qBittorrent lives in
+     * gluetun-torrents' network namespace, and this is the address that works
+     * from **hp itself**, which is why every tool that curls it over ssh uses
+     * this one. No credentials appear here because auth-bypass is on.
+     *
+     * 🔴 CORRECTION 2026-08-26 — THE SENTENCE THAT USED TO BE HERE WAS WRONG.
+     * It said the API "is only reachable on the bridge address, from the host
+     * itself" and that "a request arriving from anywhere else gets
+     * `Unauthorized`". **Measured from this Mac, unauthenticated:**
+     *
+     *   GET http://192.168.1.7:8080/api/v2/app/version    -> 200 in 7 ms
+     *   GET http://192.168.1.7:8080/api/v2/torrents/info  -> 200, 121 torrents
+     *   GET http://172.20.0.1:8080/api/v2/app/version     -> 000 after 8 s
+     *
+     * So the LAN address reads fine from off-host and it is the BRIDGE address
+     * that is unreachable from here — the reverse of what was written. The
+     * belief that there was no second transport is why `homelab-read.ts`
+     * excluded qBittorrent entirely.
+     *
+     * ⚠️ Verified for READS only. Whether a POST (e.g. `topPrio`,
+     * `setPreferences`) is accepted unauthenticated from the LAN is NOT
+     * measured — do not assume the read result covers writes.
      */
     baseUrl: string;
+    /**
+     * The LAN address, reachable from this process. See the correction above.
+     *
+     * 🔴 TWO ADDRESSES FOR TWO TRANSPORTS, NEITHER CANONICAL. They are not two
+     * values for one fact; they are two addresses for two callers, named for the
+     * caller. Do not "tidy" them into one.
+     */
+    lanUrl: string;
   };
   /**
    * Read-only mode: every tool that would mutate the homelab refuses.
@@ -305,6 +329,7 @@ export function loadConfig(): Config {
     tmdb: { readToken: (process.env.TMDB_READ_TOKEN ?? '').trim() },
     qbittorrent: {
       baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',
+      lanUrl: process.env.QBITTORRENT_LAN_URL ?? 'http://192.168.1.7:8080',
     },
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',
