@@ -681,3 +681,22 @@ test('stop() cancels a pending reconnect', async () => {
   await tick(90);
   assert.equal(sockets.length, before, 'a stopped client must not come back to life');
 });
+
+test('🔴 the search timeout has headroom over MEASURED bot latency', () => {
+  /**
+   * Live `@search` replies measured 2026-08-26: 17.6s, 25.4s, ~34s, 47.0s,
+   * 60.9s. The original 45s default timed out the last two — reporting "the
+   * search bot did not answer" about a bot that was merely slower than our cap.
+   * A timeout tighter than the thing it measures manufactures its own negative.
+   *
+   * This asserts the default keeps room above the slowest observed reply. It is
+   * a guard against someone "tidying" the number back down without the data.
+   */
+  const SLOWEST_OBSERVED_MS = 60_900;
+  const irc = new IrcEbooks({ dial: (() => { throw new Error('unused'); }) as never });
+  const used = (irc as unknown as { o: { searchTimeoutMs: number } }).o.searchTimeoutMs;
+  assert.ok(
+    used > SLOWEST_OBSERVED_MS,
+    `search timeout ${used}ms must exceed the slowest measured reply ${SLOWEST_OBSERVED_MS}ms`,
+  );
+});

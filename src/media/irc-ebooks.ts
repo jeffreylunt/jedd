@@ -73,7 +73,20 @@ export interface IrcOptions {
   nick?: string;
   /** How long the server makes us wait before it will accept the JOIN. */
   joinDelayMs?: number;
-  /** How long to wait for SearchBot's results before giving up on this search. */
+  /**
+   * How long to wait for SearchBot's results before giving up on this search.
+   *
+   * 🔴 MEASURED, AND THE FIRST VALUE WAS TOO TIGHT. Live latencies for a
+   * `@search` reply: 17.6s, 25.4s, ~34s, **47.0s, 60.9s**. The original 45s cap
+   * timed out BOTH queries in the run that found this, reporting "the search bot
+   * did not answer" when the bot was simply slower than the cap — a
+   * self-inflicted false negative that would have made IRC look useless.
+   *
+   * ⚠️ This is a genuine trade-off, not a free win: `search_ebook` waits on this
+   * before returning, so a slow IRC costs the turn real seconds. It is bounded
+   * by running the two sources CONCURRENTLY (Prowlarr is unaffected) and by the
+   * fact that turns on this deployment already run 130-790s.
+   */
   searchTimeoutMs?: number;
   /** How long to wait for a book bot to answer at all. */
   offerTimeoutMs?: number;
@@ -100,7 +113,7 @@ const DEFAULTS = {
   channel: '#ebooks',
   nick: 'jeddbot',
   joinDelayMs: 70_000,
-  searchTimeoutMs: 45_000,
+  searchTimeoutMs: 90_000,
   offerTimeoutMs: 8 * 60_000,
   maxBytes: 25 * 1024 * 1024,
   connectTimeoutMs: 110_000,
