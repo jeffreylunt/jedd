@@ -669,7 +669,7 @@ export class IrcEbooks {
       return;
     }
 
-    if (quoted === undefined || !sameQuery(quoted, p.query)) {
+    if (quoted === undefined || !sameSearchEcho(quoted, p.query)) {
       if (quoted !== undefined) {
         this.o.log(`[irc] ignoring a notice about "${quoted}"; we asked "${p.query}"`);
       }
@@ -1042,6 +1042,41 @@ function stripFormatting(s: string): string {
     .replace(/\x03\d{0,2}(?:,\d{1,2})?/g, '') // colour, with optional background
     .replace(/\x04[0-9a-fA-F]{6}/g, '') // hex colour
     .replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]/g, ''); // bold/reset/monospace/reverse/italic/strike/underline
+}
+
+/**
+ * 🔴 THE BOT DOES NOT ECHO THE QUERY BACK VERBATIM — IT STRIPS PUNCTUATION.
+ *
+ * Caught on the FIRST live run of the notice handling, 2026-08-27, and by
+ * nothing before it:
+ *
+ *     sent  : @search Vengeance Is Mine Richard E. Turley
+ *     echoed: Your search for "Vengeance Is Mine Richard E Turley" ...
+ *                                             ^ the full stop is gone
+ *
+ * `sameQuery` is an exact match after case and spacing normalisation, so it read
+ * SearchBot's answer to our own query as somebody else's search and ignored it.
+ * The search then fell through to the full timeout — the precise silent-inert
+ * failure the `stripFormatting` note warns about, arriving by a second route.
+ *
+ * ⚠️ EVERY UNIT TEST PASSED THROUGH THIS. They feed the query back the way we
+ * sent it, because that is what a test author writes; only the real bot
+ * rewrites it. A fixture built from an assumption cannot falsify the assumption.
+ *
+ * Punctuation is folded on BOTH sides, and nothing else is: the failure being
+ * guarded against is a COMPLETELY different query, and "Vengeance Is Mine" still
+ * does not match "Something Else Entirely" under this. Kept separate from
+ * `sameQuery` so the results-header check kicks unchanged — that one reads a
+ * file the bot generates, not a line it re-types.
+ */
+function sameSearchEcho(a: string, b: string): boolean {
+  const fold = (x: string) =>
+    x
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  return fold(a) === fold(b);
 }
 
 /**

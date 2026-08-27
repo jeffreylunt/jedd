@@ -845,6 +845,33 @@ test('🔴 the mIRC colour codes inside the quoted query do not defeat the corre
   irc.stop();
 });
 
+test('🔴 the bot echoes the query with PUNCTUATION STRIPPED and is still recognised', async () => {
+  /**
+   * ── FOUND ON THE FIRST LIVE RUN, BY NOTHING BEFORE IT ──────────────────────
+   *
+   * Every test in this file fed the query back exactly as sent, because that is
+   * what a test author writes. The real bot does not:
+   *
+   *     sent  : @search Vengeance Is Mine Richard E. Turley
+   *     echoed: Your search for "Vengeance Is Mine Richard E Turley" ...
+   *
+   * One missing full stop, and the exact-match correlation rejected SearchBot's
+   * answer to our own query as somebody else's. The search fell through to the
+   * full 90s timeout and the whole notice path was inert — passing tests and
+   * all. **A fixture built from an assumption cannot falsify the assumption**,
+   * so this case carries the bot's spelling, not ours.
+   */
+  const { irc, sockets } = noticeHarness(30_000, 60_000);
+  const started = Date.now();
+  const p = irc.search('Vengeance Is Mine Richard E. Turley');
+  const s = await bringUp(sockets);
+  s.line(NO_MATCHES('Vengeance Is Mine Richard E Turley')); // as the bot re-types it
+  const r = await p;
+  assert.equal(r.state, 'none', 'the punctuation-folded echo is still OUR search');
+  assert.ok(Date.now() - started < 5_000, 'and it settles on the notice, not the cap');
+  irc.stop();
+});
+
 test('🔴 CONTROL: a notice about a DIFFERENT query is ignored, not acted on', async () => {
   /**
    * The check has to DISCRIMINATE, or it is not a check. This module has already
