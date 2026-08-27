@@ -51,8 +51,15 @@ interface Msg {
   text: string;
 }
 
-const KAELA = '+18017078488';
-const JEFF = '+18018396586';
+/**
+ * 🔴 555 EXCHANGES, RESERVED FOR FICTION. The live transcripts quoted above are
+ * real people's threads and their handles belong in `.env`, never in the tree —
+ * `owner-config-fail-closed.test.ts` scans every tracked file for exactly this
+ * and it caught the first draft of this file. The names are what matter here;
+ * the digits are only a key that has to differ between two senders.
+ */
+const KAELA = '+18015550188';
+const JEFF = '+18015550123';
 
 // ── the burst: many messages in, ONE turn out ───────────────────────────────
 
@@ -135,16 +142,26 @@ test('CONTROL: two different senders run CONCURRENTLY — the lane is per sender
 
 // ── ordering: a message that arrives mid-turn is answered AFTER it ──────────
 
+/**
+ * ⚠️ THESE TWO USE AN IMMEDIATE SETTLE ON PURPOSE.
+ *
+ * A hand-driven settle window would serialise these turns all by itself, and
+ * the test would then pass against a queue with no lane at all — asserting
+ * ordering that the fixture, not the code, was producing. With `settle`
+ * resolving at once, **the lane is the only thing keeping these in order**, so
+ * removing it turns them red. (Confirmed by mutation; see the commit.)
+ */
+const immediate = async (): Promise<void> => {};
+
 test('🔴 a message arriving MID-TURN is answered after it, never before — turn 11 beat turn 10 live', async () => {
   const finished: string[] = [];
   let releaseFirst!: () => void;
   const firstHeld = new Promise<void>((r) => {
     releaseFirst = r;
   });
-  const gate = manualSettle();
   const q = new TurnQueue<Msg>({
     keyOf: (m) => m.senderHandle,
-    settle: gate.settle,
+    settle: immediate,
     run: async (batch) => {
       if (batch[0]!.text.startsWith('Start')) await firstHeld;
       finished.push(batch.map((m) => m.text).join('|'));
@@ -152,15 +169,13 @@ test('🔴 a message arriving MID-TURN is answered after it, never before — tu
   });
 
   const first = q.submit({ senderHandle: JEFF, text: 'Start with the earliest missing episodes' });
-  gate.open(); // the first turn is now running and held
-  await Promise.resolve();
-  await Promise.resolve();
+  // Let the first turn get inside `run` and block there, exactly as a 53s
+  // release search does, before the second message arrives.
+  for (let i = 0; i < 10; i++) await Promise.resolve();
 
   const second = q.submit({ senderHandle: JEFF, text: 'Is that what you think' });
   releaseFirst();
-  await first;
-  gate.open(); // let the queued message's batch settle
-  await second;
+  await Promise.all([first, second]);
 
   assert.deepEqual(
     finished,
@@ -175,25 +190,44 @@ test('a message arriving mid-turn is NOT lost — it gets its own turn afterward
   const held = new Promise<void>((r) => {
     release = r;
   });
-  const gate = manualSettle();
   const q = new TurnQueue<Msg>({
     keyOf: (m) => m.senderHandle,
-    settle: gate.settle,
+    settle: immediate,
     run: async (batch) => {
       for (const m of batch) seen.push(m.text);
       if (seen.length === 1) await held;
     },
   });
   const a = q.submit({ senderHandle: JEFF, text: 'one' });
-  gate.open();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let i = 0; i < 10; i++) await Promise.resolve();
   const b = q.submit({ senderHandle: JEFF, text: 'two' });
   release();
-  await a;
-  gate.open();
-  await b;
+  await Promise.all([a, b]);
   assert.deepEqual(seen, ['one', 'two']);
+});
+
+/**
+ * 🔴 THE LOST-MESSAGE WINDOW, WHICH IS THE FAILURE THE THIRD STATE PREVENTS.
+ *
+ * A message that arrives in the instant a lane is being torn down must not fall
+ * between the two states. This drives that instant directly: submit again from
+ * inside the `run` of the last batch, which is the closest a test can get to
+ * "the drain loop is about to give up".
+ */
+test('🔴 a message submitted from INSIDE the last turn is still answered', async () => {
+  const seen: string[] = [];
+  let follower: Promise<void> | undefined;
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: immediate,
+    run: async (batch) => {
+      for (const m of batch) seen.push(m.text);
+      if (seen.length === 1) follower = q.submit({ senderHandle: JEFF, text: 'landed in the teardown gap' });
+    },
+  });
+  await q.submit({ senderHandle: JEFF, text: 'first' });
+  await follower;
+  assert.deepEqual(seen, ['first', 'landed in the teardown gap'], 'a message was accepted into a lane nobody drained');
 });
 
 // ── the lane must survive a turn that throws ────────────────────────────────
