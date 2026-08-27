@@ -106,6 +106,27 @@ It is a band rather than a raw seeder sort so that a 900-seed CAM cannot outrank
 a 40-seed WEB-DL: above a handful of seeds the marginal seed buys nothing, and
 sorting on the raw count would hand the quality decision to popularity.
 
+### ⚠️ This ranking answers "which copy", and only where the work is already pinned
+
+The mechanism depends on a precondition that is easy to miss, because it holds
+on the path it was built for and not on every path that uses it.
+
+**On TV it holds.** Sonarr's release search is scoped to an episode
+(`/release?episodeId=…`), so every candidate is already an encoding of the *same
+episode*. The only open question is which copy to take, and swarm health is a
+good answer to that question.
+
+**On books it does not.** `search_ebook` and `search_audiobook` take free text —
+a title and, if you know it, an author. Nothing pins the *work*. So the
+candidate list can contain genuinely different things: the novel, an abridged
+edition, a companion volume, a study guide *about* the book. Ranking cannot
+answer "which of these is the thing you asked for", and preferring the healthiest
+swarm can prefer a well-seeded study guide over a thinly-seeded novel.
+
+**In practice:** give the author as well as the title, and check what comes back
+before confirming. Pinning book search to a work identifier is not implemented.
+
+
 ## One turn per burst
 
 People double-text. Two messages seconds apart used to become two concurrent
