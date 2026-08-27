@@ -170,6 +170,8 @@ const MAX_GROUPS = 12;
 export function makeCheckStatus(fetchImpl?: FetchImpl, now: () => Date = () => new Date()): Tool {
   return {
     name: 'check_status',
+    // Spans several services and degrades partially — but needs at least ONE.
+    needsAnyService: ['sonarr', 'radarr'],
     description:
       'What is downloading right now, and how it is going. Answers both "what is downloading?" and ' +
       '"is <title> downloading?" — pass the title only to narrow the same answer. This reads the ' +

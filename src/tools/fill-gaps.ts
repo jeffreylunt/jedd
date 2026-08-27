@@ -78,6 +78,8 @@ async function oneSeries(
 export function makeFindGaps(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'find_gaps',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['sonarr'],
     description:
       'List the episodes of ONE show that are monitored but missing — the gaps. Use it for "what is ' +
       'missing from X", "why is X incomplete", or before trying to fill anything in. It only ever ' +
@@ -141,6 +143,8 @@ export function makeFindGaps(fetchImpl?: FetchImpl): Tool {
 export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'search_episode',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['sonarr'],
     description:
       'Find out what releases actually EXIST for one missing episode, including the ones the quality ' +
       'profile refuses and the reason it refused them. Use this to fill a gap: it is how you offer a ' +
@@ -266,6 +270,8 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
 export function makeGrabRelease(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'grab_release',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['sonarr'],
     description:
       'Download the specific release they picked from search_episode. Pass the number they chose. ' +
       'This does not change any quality settings — it grabs that one file, once. ' +

@@ -51,6 +51,8 @@ const MAX_SEASONS_PER_CALL = 12;
 export function makeAddSeason(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'add_season',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['sonarr'],
     description:
       'Turn on and start downloading specific SEASONS of a show that is ALREADY in the library. Use ' +
       'this whenever someone asks for a season of a show we already have — add_series only works for ' +

@@ -337,6 +337,18 @@ async function main(): Promise<void> {
   if (!config.tmdb.readToken) off.push('whats_popular / title_details — set TMDB_READ_TOKEN');
   if (!config.jfago.password || !config.jfago.baseUrl) off.push('invite_to_jellyfin — set JFAGO_URL and JFAGO_PASSWORD');
   if (!config.runbookPath) off.push('read_runbook — set RUNBOOK_PATH');
+  // One line per absent service, naming the variable that turns it back on.
+  // A stranger's most common state is "most of these", so the list has to read
+  // as a checklist rather than as a wall of failures.
+  const svc: [keyof typeof config.services, string][] = [
+    ['sonarr', 'Sonarr (TV: add/search/gaps/grab) — set SONARR_API_KEY'],
+    ['radarr', 'Radarr (films: add_movie) — set RADARR_API_KEY'],
+    ['prowlarr', 'Prowlarr (audiobook search, indexer_admin) — set PROWLARR_API_KEY'],
+    ['jellyfin', 'Jellyfin (jellyfin_sessions) — set JELLYFIN_API_KEY'],
+    ['qbittorrent', 'qBittorrent (stuck_downloads) — set QBITTORRENT_LAN_URL'],
+    ['dispatcharr', 'Dispatcharr (channel_health, livetv_status) — set DISPATCHARR_URL'],
+  ];
+  for (const [key, line] of svc) if (!config.services[key]) off.push(line);
   if (off.length) {
     console.error(`[jedd] not configured, so NOT offered (${off.length}):`);
     for (const line of off) console.error(`[jedd]   - ${line}`);

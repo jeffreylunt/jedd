@@ -289,6 +289,8 @@ function matches(needle: string, number: string, name: string): boolean {
 
 export const channelHealth: Tool = {
   name: 'channel_health',
+  // Useless without this service; absent rather than always-failing.
+  needsServices: ['dispatcharr'],
   // Reaches the homelab over ssh; absent entirely when none is configured.
   needsHomelabSsh: true,
   description:

@@ -55,6 +55,8 @@ export const hpShell: Tool = {
 /** Who is connected to Jellyfin and what, if anything, is playing. */
 export const jellyfinSessions: Tool = {
   name: 'jellyfin_sessions',
+  // Useless without this service; absent rather than always-failing.
+  needsServices: ['jellyfin'],
   description:
     'List current Jellyfin sessions and what each is playing. Use this to answer "is anyone watching" ' +
     'and before proposing anything disruptive.',
@@ -93,6 +95,8 @@ export const jellyfinSessions: Tool = {
  */
 export const livetvStatus: Tool = {
   name: 'livetv_status',
+  // Useless without this service; absent rather than always-failing.
+  needsServices: ['dispatcharr'],
   // Reaches the homelab over ssh; absent entirely when none is configured.
   needsHomelabSsh: true,
   description:

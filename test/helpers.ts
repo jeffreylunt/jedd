@@ -66,6 +66,16 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     // Tests assume a fully-configured homelab unless they say otherwise; the
     // absent case is exercised explicitly in optional-dependencies.test.ts.
     homelabSshConfigured: true,
+    // Tests assume a fully-stocked homelab unless they say otherwise; the absent
+    // cases are exercised explicitly in service-gating.test.ts.
+    services: {
+      sonarr: true,
+      radarr: true,
+      prowlarr: true,
+      jellyfin: true,
+      qbittorrent: true,
+      dispatcharr: true,
+    },
     displayName: 'Jedd',
     audiobook: { savePath: '/downloads/audiobooks', category: 'audiobooks' },
     checkStreamsResultsPath: '/tmp/check-streams-results.txt',

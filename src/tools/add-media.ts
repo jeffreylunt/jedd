@@ -56,6 +56,8 @@ export async function watchIt(
 export function makeAddMovie(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'add_movie',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['radarr'],
     description:
       'Add a film to the library and start searching for it. Use the tmdbId from catalogue_search — ' +
       'do not invent one. If catalogue_search said AMBIGUOUS, ask which they meant first; do not pick.',
@@ -102,6 +104,8 @@ export function makeAddMovie(fetchImpl?: FetchImpl): Tool {
 export function makeAddSeries(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'add_series',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['sonarr'],
     description:
       'Add a TV show and start searching. Use the tvdbId from catalogue_search — do not invent one. ' +
       'Pass `seasons` as the list of season numbers the person actually asked for: work out which ' +

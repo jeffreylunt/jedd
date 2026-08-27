@@ -22,6 +22,8 @@ import { fail, ok, type Tool } from './types.js';
 export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'catalogue_search',
+    // Spans several services and degrades partially — but needs at least ONE.
+    needsAnyService: ['sonarr', 'radarr'],
     description:
       'Search what COULD be added to the library — films in Radarr and shows in Sonarr, both at once. ' +
       'Use this for "can you get X". Do NOT use it to answer "do you have X" — it searches the ' +

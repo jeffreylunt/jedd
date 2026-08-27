@@ -57,6 +57,8 @@ const ACTIONS: Action[] = ['list', 'unstick', 'promote'];
 export function makeStuckDownloads(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'stuck_downloads',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['qbittorrent'],
     /**
      * 🔴 SHORT, AND IT LEADS WITH WHAT IT DOES.
      *

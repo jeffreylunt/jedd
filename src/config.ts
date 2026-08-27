@@ -271,6 +271,33 @@ export interface Config {
    * configured" rather than "configured to something that happens not to exist".
    */
   homelabSshConfigured: boolean;
+  /**
+   * Which external services this deployment actually has. Gates the tools that
+   * cannot do anything without them — see `Tool.needsServices`.
+   *
+   * 🔴 "CONFIGURED" IS NOT THE SAME AS "HAS A NON-EMPTY VALUE", AND TWO OF THESE
+   * WOULD SILENTLY NEVER GATE IF IT WERE.
+   *
+   * The API keys default to `''`, so truthiness genuinely means somebody set
+   * them. But `DISPATCHARR_URL` and `QBITTORRENT_LAN_URL` have NON-EMPTY
+   * defaults, so `if (config.dispatcharr.baseUrl)` is true for a person who has
+   * never heard of Dispatcharr. That gate would look right in review and do
+   * nothing. Both therefore test the ENVIRONMENT VARIABLE, the same distinction
+   * `homelabSshConfigured` draws.
+   *
+   * ⚠️ Dispatcharr is URL-only ON PURPOSE. Its username/password are unset on
+   * the live deployment and it works regardless; gating on credentials would
+   * have deleted `channel_health` and `livetv_status` from a working install —
+   * fixing a publication problem by breaking somebody's setup.
+   */
+  services: {
+    sonarr: boolean;
+    radarr: boolean;
+    prowlarr: boolean;
+    jellyfin: boolean;
+    qbittorrent: boolean;
+    dispatcharr: boolean;
+  };
   displayName: string;
   /**
    * Where audiobook grabs land in qBittorrent, and under what category.
@@ -450,6 +477,17 @@ export function loadConfig(): Config {
       process.env.DOWNLOAD_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'removed-downloads'),
     // Explicitly SET, not merely defaulted — see the field's doc comment.
     homelabSshConfigured: Boolean((process.env.HP_ADMIN_SSH_HOST ?? '').trim()),
+    services: {
+      // Keys default to '' — truthiness is a real signal here.
+      sonarr: Boolean((process.env.SONARR_API_KEY ?? '').trim()),
+      radarr: Boolean((process.env.RADARR_API_KEY ?? '').trim()),
+      prowlarr: Boolean((process.env.PROWLARR_API_KEY ?? '').trim()),
+      jellyfin: Boolean((process.env.JELLYFIN_API_KEY ?? '').trim()),
+      // 🔴 These two have NON-EMPTY defaults, so the env var is the only honest
+      // test of whether anyone configured them.
+      qbittorrent: Boolean((process.env.QBITTORRENT_LAN_URL ?? '').trim()),
+      dispatcharr: Boolean((process.env.DISPATCHARR_URL ?? '').trim()),
+    },
     displayName: process.env.DISPLAY_NAME ?? 'Jedd',
     audiobook: {
       savePath: process.env.AUDIOBOOK_SAVE_PATH ?? '/downloads/audiobooks',

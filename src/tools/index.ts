@@ -372,7 +372,16 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
   // deployment. Neither substitutes for the other: a READ tool over ssh survives
   // the read-only filter and still has nothing to talk to.
   const reachable = config.homelabSshConfigured ? tools : tools.filter((t) => !t.needsHomelabSsh);
-  return config.readOnly ? reachable.filter((t) => !t.writes) : reachable;
+  // A tool for a service nobody runs is not a feature. ALL declared services
+  // must be present — a tool naming two is absent unless both are.
+  const served = reachable
+    .filter((t) => (t.needsServices ?? []).every((svc) => config.services[svc]))
+    // any-of: an empty declaration means "no requirement", not "requires none".
+    .filter((t) => {
+      const any = t.needsAnyService ?? [];
+      return any.length === 0 || any.some((svc) => config.services[svc]);
+    });
+  return config.readOnly ? served.filter((t) => !t.writes) : served;
 }
 
 /** Does this tool's own schema say a `choice` is REQUIRED? */

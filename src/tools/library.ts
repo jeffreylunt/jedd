@@ -89,6 +89,8 @@ export function makeLibrarySearch(deps: LibrarySearchDeps = {}): Tool {
   const jellyfin = deps.jellyfin ?? jellyfinGet;
   return {
     name: 'library_search',
+    // Spans several services and degrades partially — but needs at least ONE.
+    needsAnyService: ['sonarr', 'radarr', 'jellyfin'],
     description:
       'Search the library for a movie or show by title. Returns what is ACTUALLY there — and for a ' +
       'TV show, WHICH SEASONS are there, which are only partly there, and which are missing. Call ' +

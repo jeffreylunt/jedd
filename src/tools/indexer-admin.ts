@@ -90,6 +90,8 @@ const REPORT_ONCE_HOURS = 72;
 export function makeIndexerAdmin(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'indexer_admin',
+    // Useless without this service; absent rather than always-failing.
+    needsServices: ['prowlarr'],
     description:
       'Manage the torrent indexers on Prowlarr, Sonarr and Radarr — force-test, enable, disable, ' +
       'add and remove — and read back what actually happened. This is the only write path to an ' +

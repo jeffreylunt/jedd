@@ -56,6 +56,13 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
   const consumer = isAudio ? 'add_audiobook' : 'send_ebook';
   return {
     name: isAudio ? 'search_audiobook' : 'search_ebook',
+    /**
+     * ⚠️ ONLY THE AUDIOBOOK HALF NEEDS PROWLARR. `search_ebook` has a SECOND
+     * source — IRC — so gating it on Prowlarr would remove a tool that still
+     * works for anyone running IRC_EBOOKS and no indexer. Same factory, and
+     * deliberately not the same dependency.
+     */
+    needsServices: isAudio ? ['prowlarr'] : [],
     description: isAudio
       ? 'Search for an AUDIOBOOK — a book to LISTEN to. Returns a numbered list of releases. ' +
         `PRESENT the numbered options and ask which one they want, then call ${consumer} with their ` +

@@ -71,6 +71,8 @@ const NARROW_ADVICE =
 export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
   return {
     name: 'homelab_read',
+    // Spans several services and degrades partially — but needs at least ONE.
+    needsAnyService: ['sonarr', 'radarr', 'prowlarr', 'jellyfin', 'qbittorrent'],
     /**
      * ── 🔴 THE CHEATSHEET IS PART OF THE CAPABILITY, NOT DOCUMENTATION ───────
      *

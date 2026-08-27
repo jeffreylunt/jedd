@@ -118,6 +118,36 @@ export interface Tool {
    */
   needsHomelabSsh?: boolean;
   /**
+   * External services this tool cannot function without AT ALL.
+   *
+   * ALL of them must be configured or the tool is not registered — so a tool
+   * naming two services is absent unless both exist. Declare only what the tool
+   * is USELESS without.
+   *
+   * ⚠️ DO NOT DECLARE A SERVICE A TOOL MERELY *USES*. `check_status` and
+   * `catalogue_search` span Sonarr and Radarr and degrade PARTIALLY: with Sonarr
+   * alone, "is The Bear downloaded" is still answerable and "is Dune
+   * downloaded" honestly is not. Listing both would delete a working capability
+   * in order to avoid a partial one — over-gating, which is the same harm as
+   * under-gating pointed the other way. They declare nothing, deliberately.
+   */
+  needsServices?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr')[];
+  /**
+   * Services of which AT LEAST ONE must exist — the any-of counterpart to
+   * `needsServices`.
+   *
+   * 🔴 "PARTIAL" NEEDS SOMETHING TO BE PARTIAL *OF*. `check_status` spans Sonarr
+   * and Radarr and degrades gracefully: with Sonarr alone it still answers
+   * "is The Bear downloaded" and honestly cannot answer for a film. Declaring
+   * BOTH under `needsServices` would delete it from a Sonarr-only install —
+   * over-gating. Declaring nothing leaves it registered-and-broken on an install
+   * with NO *arr at all, where there is no half left to answer — under-gating.
+   *
+   * Neither all-of nor nothing is right for these, which is why the any-of case
+   * exists rather than being squeezed into the other field.
+   */
+  needsAnyService?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr')[];
+  /**
    * 🔴 WHICH KIND OF STORED OPTION THIS TOOL RESOLVES A `choice` INTO.
    *
    * ── THE HOLE THIS CLOSES ─────────────────────────────────────────────────
