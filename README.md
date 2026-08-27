@@ -123,8 +123,19 @@ edition, a companion volume, a study guide *about* the book. Ranking cannot
 answer "which of these is the thing you asked for", and preferring the healthiest
 swarm can prefer a well-seeded study guide over a thinly-seeded novel.
 
-**In practice:** give the author as well as the title, and check what comes back
-before confirming. Pinning book search to a work identifier is not implemented.
+Asking for *"The Hobbit, J.R.R. Tolkien"* ranked a Corey Olsen study guide first
+on 24 seeders; the novel itself was third on 8. The ranking was *correct* — every
+candidate was a healthy-swarm `.epub`, so the seeder count decided, and the study
+guide really did have the biggest swarm. The defect was in the question.
+
+**So the book searches ask.** They return the numbered list and Jedd shows it to
+you, and the tools that grab or send a book require the number you picked — they
+have no "just take the top one" path to fall back on. TV is unchanged: the work
+is already pinned, so nobody is asked which torrent.
+
+**Still worth knowing:** that list mixes two questions — *which book* and *which
+copy* — into one. Pinning book search to a work identifier, so only the copies of
+one book are ranked, is not implemented.
 
 ## One turn per burst
 
