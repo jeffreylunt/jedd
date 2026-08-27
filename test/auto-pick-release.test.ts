@@ -43,6 +43,16 @@ import { testConfig } from './helpers.js';
  * Robin asked for *"Don't Say Good Luck"*, Jedd asked *"the 2026 film or the
  * 2003 show?"*, and that question was CORRECT — they are different works and
  * guessing downloads the wrong one. Release choice is not title choice.
+ *
+ * ── 🔴 WHICH IS WHY THE BOOK TESTS BELOW NOW ASSERT ORDER, NOT ABSENCE ──────
+ *
+ * The rule above is a rule about copies of ONE thing. `search_episode` pins the
+ * episode against Sonarr before it ranks anything, so it holds there and every
+ * TV assertion in this file is unchanged. `search_ebook`/`search_audiobook` take
+ * FREE TEXT and their candidates are different WORKS, so auto-picking there was
+ * answering the wrong question — see `book-work-identity.test.ts`. The ranking
+ * did not change and neither did what it ranks first; only whether the losers
+ * are printed. Do not "restore" the `doesNotMatch` assertions.
  */
 
 const tempFile = () => join(mkdtempSync(join(tmpdir(), 'jedd-autopick-')), 'choices.jsonl');
@@ -278,7 +288,24 @@ const prowlarrRelease = (o: Record<string, unknown>) => ({
   ...o,
 });
 
-test('🔴 search_audiobook chooses one release and shows no list', async () => {
+/**
+ * ⚠️ THE BOOK ASSERTIONS BELOW CHANGED SHAPE, AND THE RULE THEY PIN DID NOT.
+ *
+ * They used to read "the runner-up is not even mentioned", because the book
+ * searches auto-picked and returned one release. Books ASK now — see
+ * `book-work-identity.test.ts` for why — so the runner-up IS printed, and
+ * absence is no longer available as evidence.
+ *
+ * So they assert the ORDER instead: the ranking still decides which release is
+ * option 1, and option 1 is still what a person is looking at first. An
+ * assertion that the losing release is missing would have had to be deleted; an
+ * assertion that it ranks SECOND survives the presentation changing, which is
+ * the more durable statement of the same rule.
+ */
+const optionLine = (content: string, n: number): string =>
+  content.split('\n').find((l) => l.trim().startsWith(`${n}. `)) ?? `<no option ${n}>`;
+
+test('🔴 search_audiobook ranks the healthy swarm to option 1 and offers the list', async () => {
   const r = await makeSearchAudiobook(async () =>
     json([
       prowlarrRelease({ title: 'Dune (thin swarm)', infoHash: HASH_A, seeders: 2 }),
@@ -286,13 +313,12 @@ test('🔴 search_audiobook chooses one release and shows no list', async () => 
     ]),
   ).run({ query: 'Dune' }, ctx());
   assert.equal(r.ok, true);
-  assert.match(r.content, /^CHOSE — /);
-  assert.match(r.content, /Dune \(healthy swarm\)/);
-  assert.doesNotMatch(r.content, /^\s*\d+\.\s/m, 'no numbered options');
-  assert.doesNotMatch(r.content, /thin swarm/, 'the runner-up is not offered');
+  assert.match(optionLine(r.content, 1), /healthy swarm/, 'the swarm still decides the order');
+  assert.match(optionLine(r.content, 2), /thin swarm/);
+  assert.match(r.content, /ASK WHICH BOOK THEY MEANT/);
 });
 
-test('🔴 add_audiobook called with NO arguments grabs the chosen release', async () => {
+test('🔴 add_audiobook grabs the release the person NUMBERED', async () => {
   const path = tempFile();
   await makeSearchAudiobook(async () =>
     json([prowlarrRelease({ title: 'Dune', infoHash: HASH_B, seeders: 300 })]),
@@ -306,7 +332,7 @@ test('🔴 add_audiobook called with NO arguments grabs the chosen release', asy
     cb(null, replies[Math.min(i++, replies.length - 1)]!, '');
   };
 
-  const r = await addAudiobook.run({}, ctx({ choices: new ChoiceStore(path), exec }));
+  const r = await addAudiobook.run({ choice: 1 }, ctx({ choices: new ChoiceStore(path), exec }));
   assert.equal(r.ok, true, r.content);
   assert.ok(
     cmds.some((c) => c.includes(HASH_B)),
@@ -314,7 +340,7 @@ test('🔴 add_audiobook called with NO arguments grabs the chosen release', asy
   );
 });
 
-test('🔴 a healthy ABRIDGED copy beats an unabridged one nobody is seeding', async () => {
+test('🔴 a healthy ABRIDGED copy is ranked ABOVE an unabridged one nobody is seeding', async () => {
   // The band has to sit above the quality key or it is decorative. Unabridged is
   // the better book and a thin swarm is the one that does not arrive.
   const r = await makeSearchAudiobook(async () =>
@@ -323,8 +349,8 @@ test('🔴 a healthy ABRIDGED copy beats an unabridged one nobody is seeding', a
       prowlarrRelease({ title: 'Dune abridged', infoHash: HASH_B, seeders: 300 }),
     ]),
   ).run({ query: 'Dune' }, ctx());
-  assert.match(r.content, /Dune abridged/);
-  assert.doesNotMatch(r.content, /Unabridged/);
+  assert.match(optionLine(r.content, 1), /Dune abridged/);
+  assert.match(optionLine(r.content, 2), /Unabridged/);
 });
 
 test('CONTROL: with the swarms level, unabridged wins — the quality key still works', async () => {
@@ -334,7 +360,7 @@ test('CONTROL: with the swarms level, unabridged wins — the quality key still 
       prowlarrRelease({ title: 'Dune Unabridged', infoHash: HASH_A, seeders: 300 }),
     ]),
   ).run({ query: 'Dune' }, ctx());
-  assert.match(r.content, /Dune Unabridged/);
+  assert.match(optionLine(r.content, 1), /Dune Unabridged/);
 });
 
 // ── 🔴 THE EBOOK PATH, WHICH HAD A SECOND COMPARATOR HIDING UNDER THE FIRST ──
@@ -354,8 +380,8 @@ test('🔴 EBOOK: a 500-seeder .azw3 beats a 1-seeder .epub', async () => {
     ]),
   ).run({ query: 'Dune' }, ctx());
   assert.equal(r.ok, true);
-  assert.match(r.content, /Dune\.azw3/);
-  assert.doesNotMatch(r.content, /Dune\.epub/, 'format is a key UNDER the band, not above it');
+  assert.match(optionLine(r.content, 1), /Dune\.azw3/);
+  assert.match(optionLine(r.content, 2), /Dune\.epub/, 'format is a key UNDER the band, not above it');
 });
 
 test('CONTROL: with the swarms level, the .epub wins — format still decides', async () => {
@@ -365,7 +391,7 @@ test('CONTROL: with the swarms level, the .epub wins — format still decides', 
       prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 500 }),
     ]),
   ).run({ query: 'Dune' }, ctx());
-  assert.match(r.content, /Dune\.epub/);
+  assert.match(optionLine(r.content, 1), /Dune\.epub/);
 });
 
 test('🔴 EBOOK: an archive does not outrank a real book on seeders alone', async () => {
@@ -378,8 +404,8 @@ test('🔴 EBOOK: an archive does not outrank a real book on seeders alone', asy
       prowlarrRelease({ title: 'Dune.azw3', infoHash: HASH_B, seeders: 8 }),
     ]),
   ).run({ query: 'Dune' }, ctx());
-  assert.match(r.content, /Dune\.azw3/);
-  assert.doesNotMatch(r.content, /\.rar/);
+  assert.match(optionLine(r.content, 1), /Dune\.azw3/);
+  assert.match(optionLine(r.content, 2), /\.rar/, 'the archive is ranked below a real book, not above it');
 });
 
 test('🔴 an IRC offer outranks a THIN torrent — a DCC transfer has no swarm to be dead', async () => {
@@ -408,8 +434,7 @@ test('🔴 an IRC offer outranks a THIN torrent — a DCC transfer has no swarm 
     irc,
   ).run({ query: 'Dune' }, ctx());
   assert.equal(r.ok, true);
-  assert.match(r.content, /via IRC/, 'the bot wins over a swarm of one');
-  assert.doesNotMatch(r.content, /only 1 seeder/);
+  assert.match(optionLine(r.content, 1), /via IRC/, 'the bot outranks a swarm of one');
 });
 
 test('CONTROL: a HEALTHY torrent still beats the same IRC offer on the tiebreak', async () => {
@@ -433,7 +458,8 @@ test('CONTROL: a HEALTHY torrent still beats the same IRC offer on the tiebreak'
     async () => json([prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 400 })]),
     irc,
   ).run({ query: 'Dune' }, ctx());
-  assert.match(r.content, /400 seeder/);
+  assert.match(optionLine(r.content, 1), /400 seeder/, 'the healthy torrent, not the bot');
+  assert.match(optionLine(r.content, 2), /via IRC/);
 });
 
 test('🔴 a consumer that merely ACCEPTS a choice must still declare its kind', async () => {

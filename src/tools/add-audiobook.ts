@@ -32,31 +32,44 @@ export const addAudiobook: Tool = {
   // Reaches the homelab over ssh; absent entirely when none is configured.
   needsHomelabSsh: true,
   description:
-    'Start downloading the audiobook that search_audiobook chose. Call it with NO arguments — the ' +
-    'search already picked the best release and you do not need to ask anybody which torrent.',
+    'Start downloading the audiobook the person CHOSE from the numbered list search_audiobook ' +
+    'returned. Pass the number they picked. Do not call this until they have actually said which ' +
+    'one — a book search returns different works, not different copies of one book.',
   minRole: 'guest',
   writes: true,
   consumesChoiceKind: 'audiobook-release',
   /**
-   * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is the
-   * release `search_audiobook` ranked to the top and already chose. The
-   * parameter survives only so *"no, the other one"* remains serviceable — the
-   * alternatives are in the store, they were simply never printed.
+   * 🔴 `choice` IS REQUIRED, AND ITS ABSENCE IS A REFUSAL — NOT A DEFAULT.
+   *
+   * It defaulted to option 1 while `search_audiobook` auto-picked and returned
+   * one release, which was coherent: the pick had already been made, and the
+   * number only existed for *"no, the other one"*.
+   *
+   * The search asks now, and a default of 1 would make that ask **advisory**.
+   * The model could show five works, the person could say nothing at all, and a
+   * no-argument call would grab whatever ranked top on seeders — the exact
+   * behaviour the ask exists to stop, arriving through the argument the ask
+   * forgot to close. A prompt that says "wait for their answer" and a schema
+   * that acts without one disagree, and the schema is the half that runs.
    */
   parameters: {
     type: 'object',
     properties: {
       choice: {
         type: 'number',
-        description:
-          'Omit this. Only pass a number if they explicitly asked for a DIFFERENT release than the ' +
-          'one chosen for them.',
+        description: 'The number THEY picked from the list. Required — never guess it, never assume 1.',
       },
     },
-    required: [],
+    required: ['choice'],
   },
   async run(args, ctx) {
-    const n = args['choice'] === undefined ? 1 : Number(args['choice']);
+    if (args['choice'] === undefined) {
+      return fail(
+        'NO PICK — nothing was downloaded. A book search returns different works, so there is no ' +
+          '"best" one to fall back on. Show them the numbered list and ask which book they meant.',
+      );
+    }
+    const n = Number(args['choice']);
     if (!Number.isFinite(n)) return fail('That is not an option number.');
     if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed.');
     if (!ctx.choices) return fail('No option store is available.');
