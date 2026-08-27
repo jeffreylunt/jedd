@@ -12,7 +12,7 @@ import { addAudiobook } from '../src/tools/add-audiobook.js';
 import { makeCatalogueSearch } from '../src/tools/catalogue.js';
 import { resolveChoice } from '../src/tools/choice.js';
 import { makeGrabRelease, makeSearchEpisode } from '../src/tools/fill-gaps.js';
-import { makeSearchAudiobook } from '../src/tools/search-release.js';
+import { makeSearchAudiobook, makeSearchEbook } from '../src/tools/search-release.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
 
@@ -333,6 +333,51 @@ test('CONTROL: with the swarms level, unabridged wins — the quality key still 
     ]),
   ).run({ query: 'Dune' }, ctx());
   assert.match(r.content, /Dune Unabridged/);
+});
+
+// ── 🔴 THE EBOOK PATH, WHICH HAD A SECOND COMPARATOR HIDING UNDER THE FIRST ──
+
+test('🔴 EBOOK: a 500-seeder .azw3 beats a 1-seeder .epub', async () => {
+  /**
+   * This shipped WRONG for a day and the review caught it. The ranker ran, and
+   * then `interleave` re-sorted the whole merged list on `isEpub` with no swarm
+   * term — and `interleave`'s output is what gets grabbed. So the tool chose the
+   * 1-seeder release **while printing "leading on swarm health"**. Ranking and
+   * then re-ranking is how a first key stops being first.
+   */
+  const r = await makeSearchEbook(async () =>
+    json([
+      prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 1 }),
+      prowlarrRelease({ title: 'Dune.azw3', infoHash: HASH_B, seeders: 500 }),
+    ]),
+  ).run({ query: 'Dune' }, ctx());
+  assert.equal(r.ok, true);
+  assert.match(r.content, /Dune\.azw3/);
+  assert.doesNotMatch(r.content, /Dune\.epub/, 'format is a key UNDER the band, not above it');
+});
+
+test('CONTROL: with the swarms level, the .epub wins — format still decides', async () => {
+  const r = await makeSearchEbook(async () =>
+    json([
+      prowlarrRelease({ title: 'Dune.azw3', infoHash: HASH_B, seeders: 500 }),
+      prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 500 }),
+    ]),
+  ).run({ query: 'Dune' }, ctx());
+  assert.match(r.content, /Dune\.epub/);
+});
+
+test('🔴 EBOOK: an archive does not outrank a real book on seeders alone', async () => {
+  // Choosing something that IS a book used to happen when the model read the
+  // list. `.rar` and `.epub` were the same bucket the moment the key was
+  // epub-or-not, so a 90-seeder pack beat an 8-seeder azw3.
+  const r = await makeSearchEbook(async () =>
+    json([
+      prowlarrRelease({ title: 'Dune.Complete.Series.rar', infoHash: HASH_A, seeders: 90 }),
+      prowlarrRelease({ title: 'Dune.azw3', infoHash: HASH_B, seeders: 8 }),
+    ]),
+  ).run({ query: 'Dune' }, ctx());
+  assert.match(r.content, /Dune\.azw3/);
+  assert.doesNotMatch(r.content, /\.rar/);
 });
 
 test('🔴 every candidate dead is ALL DEAD, which is not "nothing was found"', async () => {

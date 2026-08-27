@@ -384,10 +384,26 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
   return config.readOnly ? served.filter((t) => !t.writes) : served;
 }
 
-/** Does this tool's own schema say a `choice` is REQUIRED? */
+/**
+ * Does this tool's own schema TAKE a `choice`?
+ *
+ * ⚠️ IT READS THE PROPERTY, NOT THE `required` LIST, AND THAT IS THE WHOLE
+ * POINT. This used to check `required.includes('choice')`, which was true of
+ * every consumer right up until the release pick became automatic and
+ * `grab_release`, `add_audiobook` and `send_ebook` all moved `choice` out of
+ * `required` so they could be called with no arguments. That left this rule
+ * matching exactly ONE registered tool — `resolve_choice`, whose kind is `'*'`
+ * and is exempt — so the schema axis of the invariant fired for nothing at all,
+ * and those three consumers were covered only by their descriptions happening to
+ * name their producers. A rule that quietly stops applying is worse than one
+ * that was never written.
+ *
+ * A tool that accepts a choice depends on a list, whether or not it insists on
+ * one.
+ */
 function requiresChoice(t: Tool): boolean {
-  const required = (t.parameters as { required?: unknown }).required;
-  return Array.isArray(required) && required.includes('choice');
+  const props = (t.parameters as { properties?: Record<string, unknown> }).properties;
+  return !!props && Object.prototype.hasOwnProperty.call(props, 'choice');
 }
 
 /**

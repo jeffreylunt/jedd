@@ -198,3 +198,48 @@ export class ChoiceStore {
     this.byHandle.delete(senderHandle);
   }
 }
+
+/**
+ * Resolve a pick AND check it came from the list this tool actually meant.
+ *
+ * ── 🔴 WHY A KIND CHECK IS NOT BOOKKEEPING ──────────────────────────────────
+ *
+ * `resolve` is deliberately kind-agnostic: it maps an ordinal back to an object
+ * and does not care what kind that object is. That was harmless while every
+ * consumer took an explicit number a person had chosen from a list they had just
+ * been shown.
+ *
+ * It stopped being harmless the day the consumers began defaulting to option 1
+ * with no argument. `add_audiobook` reads an `infoHash` off whatever it resolves
+ * and hands it to qBittorrent under the AUDIOBOOK category with no shape check
+ * at all — so a pending EBOOK list resolved cleanly, a `.epub` was filed into
+ * `/downloads/audiobooks`, the host cron fed it to Audiobookshelf, and the tool
+ * reported STARTED. Nothing failed anywhere.
+ *
+ * ⚠️ A LIST OF THE WRONG KIND FAILS CLOSED, INCLUDING A LEGACY ONE. Options
+ * stored before the kinds were split carry `release`, which matches neither
+ * consumer now and is refused rather than guessed at. `choices.jsonl` is
+ * durable, so those exist — but they expire within `CHOICE_TTL_MS`, and one hour
+ * of "search again" beats one ebook filed as an audiobook.
+ */
+export function resolveOfKind(
+  store: ChoiceStore,
+  senderHandle: string,
+  n: number,
+  kind: string,
+  now = new Date(),
+): ChoiceResolution {
+  const r = store.resolve(senderHandle, n, now);
+  if (!r.ok) return r;
+  if (r.choice.kind !== kind) {
+    return {
+      ok: false,
+      reason: 'none',
+      detail:
+        `The list waiting for this person is a "${r.choice.kind}" list about "${r.choice.subject}", ` +
+        `not a "${kind}" one, so nothing here can act on it. Do NOT guess — search again for what ` +
+        'they actually asked for.',
+    };
+  }
+  return r;
+}

@@ -1,3 +1,4 @@
+import { resolveOfKind } from '../choices.js';
 import { grabTorrent } from '../media/grab.js';
 import { fail, ok, type Tool } from './types.js';
 
@@ -35,7 +36,7 @@ export const addAudiobook: Tool = {
     'search already picked the best release and you do not need to ask anybody which torrent.',
   minRole: 'guest',
   writes: true,
-  consumesChoiceKind: 'release',
+  consumesChoiceKind: 'audiobook-release',
   /**
    * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is the
    * release `search_audiobook` ranked to the top and already chose. The
@@ -60,7 +61,7 @@ export const addAudiobook: Tool = {
     if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed.');
     if (!ctx.choices) return fail('No option store is available.');
 
-    const picked = ctx.choices.resolve(ctx.senderHandle, n);
+    const picked = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'audiobook-release');
     if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
 
     const infoHash = String(picked.option.value['infoHash'] ?? '');

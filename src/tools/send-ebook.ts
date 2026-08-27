@@ -1,3 +1,4 @@
+import { resolveOfKind } from '../choices.js';
 import { deliverEbook } from '../media/ebook-deliver.js';
 import { grabTorrent, type MountMap } from '../media/grab.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
@@ -56,7 +57,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       'not, ask them for it and save it first.',
     minRole: 'guest',
     writes: true,
-    consumesChoiceKind: 'release',
+    consumesChoiceKind: 'ebook-release',
     /**
      * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is
      * what `search_ebook` ranked to the top and already chose.
@@ -95,7 +96,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       }
 
       // ── which book, and FROM WHERE ───────────────────────────────────────
-      const picked = ctx.choices.resolve(ctx.senderHandle, n);
+      const picked = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'ebook-release');
       if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
       let option = picked.option;
 
@@ -115,12 +116,20 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
        */
       let swapped = '';
       if (isMobi(String(option.value['title'] ?? option.label))) {
-        const alt = picked.choice.options.find(
-          (o) => o.n !== option.n && /\.epub\b/i.test(String(o.value['title'] ?? o.label)),
-        );
+        /**
+         * ⚠️ ANY FORMAT AMAZON ACCEPTS, EPUB FIRST — not `.epub` or nothing.
+         * `ebook-validate.ts` passes `epub`, `azw3` and `pdf`, so refusing a
+         * whole delivery because the only alternative was an `.azw3` would
+         * decline a book that would have arrived perfectly well.
+         */
+        const others = picked.choice.options.filter((o) => o.n !== option.n);
+        const alt =
+          others.find((o) => /\.epub\b/i.test(String(o.value['title'] ?? o.label))) ??
+          others.find((o) => /\.(azw3|pdf)\b/i.test(String(o.value['title'] ?? o.label)));
         if (alt) {
           swapped =
-            ` (the top release was a .mobi, which Amazon rejects silently, so I took the best EPUB instead)`;
+            ' (the top release was a .mobi, which Amazon rejects silently, so I took the best ' +
+            'Kindle-compatible one instead)';
           option = alt;
         }
       }
@@ -153,7 +162,8 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
         return fail(
           `REFUSED — "${title}" is a .mobi. Amazon stopped accepting that format in 2022 and ` +
             'rejects it silently, so it would look sent and never arrive. Nothing was fetched. ' +
-            'Nothing else that was found is an EPUB either — say so and offer to search again.',
+            'Nothing else that was found is a format Amazon accepts either — say so and offer to ' +
+            'search again.',
         );
       }
 

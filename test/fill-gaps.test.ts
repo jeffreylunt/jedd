@@ -375,21 +375,55 @@ test('a 5xx on the grab is UNKNOWN, a 4xx is FAILED', async () => {
 });
 
 test('🔴 a pick of the WRONG KIND is refused rather than POSTed malformed', async () => {
-  // `release` (audiobook/ebook) options carry an infoHash and no guid. Sharing a
-  // choice kind between the two would let one be handed to the other.
+  // An audiobook option carries an infoHash and no guid. Sharing a choice kind
+  // between the two would let one be handed to the other — so the kind is
+  // checked at resolve time, ahead of the payload shape.
   const path = tempFile();
   const store = new ChoiceStore(path);
   store.present({
     senderHandle: '+18015550123',
     subject: 'an audiobook',
-    kind: 'release',
+    kind: 'audiobook-release',
     options: [{ n: 1, label: 'Some audiobook', value: { infoHash: 'a'.repeat(40), title: 'Some audiobook' } }],
   });
   const { fetchImpl, posts } = sonarr();
   const out = await makeGrabRelease(fetchImpl).run({ choice: 1 }, ctx({ choices: new ChoiceStore(path) }));
   assert.equal(out.ok, false);
-  assert.match(out.content, /not a Sonarr release/);
+  assert.match(out.content, /not a "sonarr-release" one/);
   assert.deepEqual(posts, [], 'and nothing was POSTed');
+});
+
+test('🔴 STALE: a search that fails EARLY leaves nothing behind to be grabbed', async () => {
+  /**
+   * The sequence that made this necessary: search S03E01 (stored) → search
+   * S03E02, Sonarr 500 → UNKNOWN → `grab_release` with no arguments. Before the
+   * clear, that grabbed **E01** and reported ACCEPTED, naming the wrong episode.
+   * The payload guard cannot see it: the stale option is a real `sonarr-release`
+   * with a valid guid and indexerId.
+   */
+  const path = tempFile();
+  const first = sonarr({ releases: [rel({ guid: 'guid-E01', title: 'Seinfeld S03E01 720p' })] });
+  await makeSearchEpisode(first.fetchImpl).run(
+    { title: 'Seinfeld', season: 3, episode: 1 },
+    ctx({ choices: new ChoiceStore(path) }),
+  );
+  assert.equal(new ChoiceStore(path).resolve('+18015550123', 1).ok, true, 'the first search really stored one');
+
+  const broken = sonarr({
+    episodes: [ep({ id: 2, episodeNumber: 2 })],
+    releases: async () => json({ message: 'boom' }, 500),
+  });
+  const failed = await makeSearchEpisode(broken.fetchImpl).run(
+    { title: 'Seinfeld', season: 3, episode: 2 },
+    ctx({ choices: new ChoiceStore(path) }),
+  );
+  assert.equal(failed.ok, false);
+  assert.match(failed.content, /UNKNOWN/);
+
+  const after = sonarr();
+  const grab = await makeGrabRelease(after.fetchImpl).run({}, ctx({ choices: new ChoiceStore(path) }));
+  assert.equal(grab.ok, false, `nothing may be grabbed from the dead list: ${grab.content}`);
+  assert.deepEqual(after.posts, [], 'and nothing was POSTed');
 });
 
 test('🔴 with writes disabled it refuses and makes no request', async () => {

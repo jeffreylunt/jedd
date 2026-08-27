@@ -49,7 +49,7 @@ function ctx(opts: { value: Record<string, unknown>; followups?: FollowupStore }
   choices.present({
     senderHandle: JEFF,
     subject: 'a book',
-    kind: 'release',
+    kind: 'ebook-release',
     options: [
       { n: 1, label: String(opts.value['title'] ?? 'opt'), value: opts.value },
       { n: 2, label: 'Some Other Book.epub', value: { source: 'irc', command: '!Bsk Other.epub', bot: 'Bsk', title: 'Some Other Book.epub' } },
@@ -272,7 +272,7 @@ test('🔴 a .mobi is never fetched — the best EPUB is taken instead, without 
    * the list we already ranked is taken, and the swap is stated.
    */
   assert.equal(r.ok, true, r.content);
-  assert.match(r.content, /took the best EPUB instead/);
+  assert.match(r.content, /took the best Kindle-compatible one instead/);
   assert.match(r.content, /Amazon rejects silently/);
 
   /**
@@ -288,8 +288,8 @@ test('🔴 a .mobi is never fetched — the best EPUB is taken instead, without 
 });
 
 test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather than sent', async () => {
-  // The swap is only available when something else really is an EPUB. Amazon
-  // rejects .mobi silently, so a send that "worked" would never arrive.
+  // The swap is only available when something else is a format Amazon accepts.
+  // It rejects .mobi silently, so a send that "worked" would never arrive.
   const sent: unknown[] = [];
   const irc = fakeIrc();
   const tool = makeSendEbook({
@@ -305,10 +305,10 @@ test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather th
   choices.present({
     senderHandle: JEFF,
     subject: 'a book',
-    kind: 'release',
+    kind: 'ebook-release',
     options: [
       { n: 1, label: 'Andy Weir - PHM.mobi', value: { source: 'irc', command: '!Wench x.mobi', bot: 'Wench', title: 'Andy Weir - PHM.mobi' } },
-      { n: 2, label: 'Andy Weir - PHM.azw3', value: { source: 'irc', command: '!Wench y.azw3', bot: 'Wench', title: 'Andy Weir - PHM.azw3' } },
+      { n: 2, label: 'Andy Weir - PHM.rar', value: { source: 'irc', command: '!Wench y.rar', bot: 'Wench', title: 'Andy Weir - PHM.rar' } },
     ],
   });
   const r = await tool.run({}, {

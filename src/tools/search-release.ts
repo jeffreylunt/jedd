@@ -1,6 +1,7 @@
-import { describeSwarm, swarmHealth } from '../media/pick-release.js';
+import { byScore, describeSwarm, swarmHealth, swarmRank } from '../media/pick-release.js';
 import {
   CATEGORY,
+  GRAPHIC_AUDIO,
   ProwlarrClient,
   rankAudiobooks,
   rankReleases,
@@ -89,7 +90,19 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
      * which is the same shape as the bug this file exists to fix.
      */
     writes: false,
-    presentsChoiceKinds: ['release'],
+    /**
+     * 🔴 TWO KINDS, NOT ONE, AND THE SPLIT IS A SAFETY GUARD.
+     *
+     * Both media used to present `release`. `add_audiobook` reads an `infoHash`
+     * off whatever it resolves and hands it to qBittorrent under the AUDIOBOOK
+     * category — with no shape check of any kind — so a pending EBOOK list was
+     * fully resolvable by it, and a `.epub` landed in `/downloads/audiobooks`
+     * where the host cron feeds it to Audiobookshelf. It reported STARTED.
+     *
+     * `sonarr-release` was already split from `release` for exactly this reason
+     * and said so in `fill-gaps.ts`; this is the same argument, one level in.
+     */
+    presentsChoiceKinds: [isAudio ? 'audiobook-release' : 'ebook-release'],
     parameters: {
       type: 'object',
       properties: {
@@ -131,6 +144,11 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
             'Nothing was searched for them to choose from.',
         );
       }
+
+      // 🔴 See the same note in `fill-gaps.ts`: the pending list dies when a new
+      // search STARTS, because the consumer now defaults to option 1 and every
+      // early return below would otherwise leave a stale one grabbable.
+      ctx.choices.clear(ctx.senderHandle);
 
       /**
        * 🔴 BOTH SOURCES ARE QUERIED BEFORE ANY "NOTHING FOUND" IS REPORTED.
@@ -253,11 +271,13 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         .slice(0, 5)
         .map((r) => ({
           label: describe(r),
-          isEpub: /\.epub\b/i.test(r.title),
+          band: swarmRank(r.seeders),
+          format: isAudio ? 0 : formatScore(r.title),
+          seeders: r.seeders,
           value: { source: 'prowlarr', infoHash: r.infoHash, title: r.title, ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}) },
         }));
 
-      const top = interleave(torrentOffers, ircOffers).slice(0, 5);
+      const top = mergeSources(torrentOffers, ircOffers).slice(0, 5);
 
       // Everything was found and everything we can fetch is dead. Same two-zeros
       // rule as the filters above: say which, do not report absence.
@@ -272,8 +292,9 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       ctx.choices.present({
         senderHandle: ctx.senderHandle,
         subject: query,
-        // 🔴 The kind the consumer declares it needs. See types.ts.
-        kind: 'release',
+        // 🔴 The kind the consumer declares it needs. See types.ts and the
+        // note on presentsChoiceKinds above.
+        kind: isAudio ? 'audiobook-release' : 'ebook-release',
         options: top.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
       });
 
@@ -325,7 +346,9 @@ export function makeSearchEbook(fetchImpl?: FetchImpl, irc?: IrcEbooks): Tool {
  * `Graphic Audio`, `GRAPHIC-AUDIO`.
  */
 function isGraphicAudio(r: Release): boolean {
-  return /graphic[\s._-]*audio/i.test(r.title);
+  // 🔴 THE SAME REGEX THE CLASSIFIER USES. Two copies drifted and the narrower
+  // one let spellings through the filter that then scored 0 on the ranker.
+  return GRAPHIC_AUDIO.test(r.title);
 }
 
 function describe(r: Release): string {
@@ -341,8 +364,42 @@ function humanSize(bytes: number): string {
 
 interface Offer {
   label: string;
-  isEpub: boolean;
+  /**
+   * The swarm band, higher is better — `swarmRank` for a torrent.
+   *
+   * 🔴 AN IRC OFFER IS BANDED `healthy`, AND THAT IS A CLAIM ABOUT MECHANISM.
+   * A DCC transfer has no swarm to be dead: a bot either holds the file and
+   * sends it, or it does not answer. Leaving it unbanded would have made a
+   * one-seeder torrent outrank a bot that has the book in hand.
+   */
+  band: number;
+  /**
+   * Format sanity, higher is better. **A SECOND KEY THAT SITS UNDER THE BAND**,
+   * which is the only place a quality judgement is allowed to live.
+   */
+  format: number;
+  /** For the tiebreak only; 0 for IRC, which has no seeder count. */
+  seeders: number;
   value: Record<string, unknown>;
+}
+
+/**
+ * How Kindle-ready a filename looks.
+ *
+ * ⚠️ THIS WAS THE MODEL'S JOB UNTIL NOBODY WAS PICKING ANY MORE. While a person
+ * read the numbered list, the model chose something that was actually a book.
+ * A comparator does not: `Dune.Complete.Series.rar` with 90 seeders beat
+ * `Dune.azw3` with 8 the moment the format key was only `.epub`-or-not.
+ *
+ * The accepted set is `ebook-validate.ts`'s `EbookFormat` — the formats that
+ * survive validation on the way out. `.mobi` scores 0 rather than being ranked
+ * as a book at all: Amazon has rejected it silently since 2022, and `send_ebook`
+ * re-chooses away from one anyway.
+ */
+function formatScore(title: string): number {
+  if (/\.epub\b/i.test(title)) return 2;
+  if (/\.(azw3|pdf)\b/i.test(title)) return 1;
+  return 0;
 }
 
 function ircOffer(r: IrcResult): Offer {
@@ -351,30 +408,40 @@ function ircOffer(r: IrcResult): Offer {
     // The origin is visible to a human, so a pick is never ambiguous about where
     // it came from — and "via IRC" reads differently from a seeder count.
     label: `${r.title} — ${size}, via IRC (${r.bot})`,
-    isEpub: r.ext === '.epub',
+    // See `Offer.band`: a DCC transfer has no swarm, so it is not a thin one.
+    band: swarmRank(HEALTHY_IRC_BAND),
+    format: formatScore(r.ext === '.epub' ? 'x.epub' : r.title),
+    seeders: 0,
     // 🔴 The command is stored VERBATIM. It is what the bot expects to see back,
     // and reconstructing it from the label would be the classic way to break it.
     value: { source: 'irc', command: r.command, bot: r.bot, title: r.title },
   };
 }
 
+/** Any positive count banded `healthy`; see `Offer.band` for why IRC gets one. */
+const HEALTHY_IRC_BAND = 999;
+
 /**
- * One list, both sources represented, EPUBs first.
+ * One list, both sources, ONE COMPARATOR.
  *
- * Alternating rather than concatenating matters: Prowlarr's ebook coverage is
- * thin (7 results where IRC had 27, measured 2026-08-26), and appending IRC
- * after five torrent rows would push every IRC result off the end of a
- * five-item list — a merge in name only.
+ * ── 🔴 WHY THIS IS NOT THE INTERLEAVE IT REPLACED ───────────────────────────
+ *
+ * The old merge alternated the two sources and then re-sorted the whole thing on
+ * `isEpub`. That trailing sort was the FINAL comparator, it had no swarm term,
+ * and `top[0]` is what gets grabbed — so on the ebook path the shipped code
+ * chose a 1-seeder `.epub` over a 500-seeder `.azw3` **while printing "leading
+ * on swarm health"**. Ranking then re-ranking is how a first key stops being
+ * first, and it is the exact ordering `pick-release.ts` exists to forbid.
+ *
+ * So there is one score vector, band first, and the merge no longer decides
+ * anything: sources are concatenated and the comparator sorts them together.
+ *
+ * ⚠️ The interleave existed for a real reason — Prowlarr's ebook coverage is
+ * thin (7 results where IRC had 27, measured 2026-08-26) and appending IRC after
+ * five torrent rows pushed every IRC result off a five-item list. That reason
+ * DIES with the numbered list: nothing is truncated for display any more, and
+ * IRC offers now compete on the band rather than on their position.
  */
-function interleave(a: Offer[], b: Offer[]): Offer[] {
-  const rank = (o: Offer) => (o.isEpub ? 0 : 1);
-  const as = [...a].sort((x, y) => rank(x) - rank(y));
-  const bs = [...b].sort((x, y) => rank(x) - rank(y));
-  const out: Offer[] = [];
-  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
-    if (as[i]) out.push(as[i]!);
-    if (bs[i]) out.push(bs[i]!);
-  }
-  // EPUBs ahead of everything else, order within each group preserved.
-  return out.sort((x, y) => rank(x) - rank(y));
+function mergeSources(a: Offer[], b: Offer[]): Offer[] {
+  return [...a, ...b].sort(byScore((o) => [o.band, o.format, o.seeders]));
 }

@@ -25,7 +25,7 @@ function ssh() {
 function ctx(exec: ExecImpl) {
   const choices = new ChoiceStore(tmp());
   choices.present({
-    senderHandle: '+1555', subject: 'Dune', kind: 'audiobook',
+    senderHandle: '+1555', subject: 'Dune', kind: 'audiobook-release',
     options: [{ n: 1, label: 'Dune Unabridged', value: { infoHash: HASH, title: 'Dune Unabridged' } }],
   });
   return { role: 'guest' as const, senderHandle: '+1555', config: testConfig({ readOnly: false }), choices, exec };

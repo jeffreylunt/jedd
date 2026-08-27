@@ -266,7 +266,7 @@ test('an empty query asks rather than searching for nothing', async () => {
 
 // ── 🔴 THE INVARIANT: a consumer without a producer must not boot ───────────
 
-test('🔴 a "release" consumer with NO registered producer REFUSES to register', async () => {
+test('🔴 an "audiobook-release" consumer with NO registered producer REFUSES to register', async () => {
   /**
    * The exact state add_audiobook and send_ebook shipped in: registered,
    * booting, in the live tool line, uncallable. Every check we had passed,
@@ -277,7 +277,7 @@ test('🔴 a "release" consumer with NO registered producer REFUSES to register'
   assert.equal(orphan.length, 1, 'CONTROL: the consumer exists to be orphaned');
   assert.throws(
     () => registerable(orphan, testConfig({ readOnly: false })),
-    /resolves a "release" choice, but NO registered tool presents one/,
+    /resolves a "audiobook-release" choice, but NO registered tool presents one/,
   );
 });
 
@@ -403,10 +403,10 @@ test('🔴 the two axes catch DIFFERENT tools — neither check is redundant', a
 });
 
 test('🔴 the EBOOK PAIR is atomic: no SMTP credential means neither half registers', async () => {
-  // search_ebook's description says "call send_ebook with their number". With no
-  // SMTP credential send_ebook does not exist, so search_ebook shipped a flow
-  // whose second step was absent — books found, none sendable. Caught by the
-  // name check on its first run.
+  // search_ebook's description names send_ebook. With no SMTP credential
+  // send_ebook does not exist, so search_ebook shipped a flow whose second step
+  // was absent — books found, none sendable. Caught by the name check on its
+  // first run.
   const withSmtp = buildTools(testConfig({ readOnly: false }), undefined, {
     ebook: { send: async () => ({ messageId: 'x' }) },
   }).map((t) => t.name);

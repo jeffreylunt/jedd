@@ -1,4 +1,5 @@
 import { ArrClient, type EpisodeRow, type FetchImpl, type ReleaseOption } from '../media/arr.js';
+import { resolveOfKind } from '../choices.js';
 import { byScore, describeSwarm, swarmRank } from '../media/pick-release.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
 
@@ -195,6 +196,28 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
       // nothing can resolve would offer a flow that cannot complete.
       if (!ctx.choices) return fail('There is nowhere to record a numbered list, so a pick could not be resolved.');
 
+      /**
+       * 🔴 THE OLD LIST DIES THE MOMENT A NEW SEARCH STARTS, NOT WHEN ONE
+       * SUCCEEDS.
+       *
+       * `present` replaces the pending list, so while the consumer took an
+       * explicit number a person had just been shown, a search that returned
+       * EARLY — UNKNOWN, NONE, FILTERED OUT, "no such episode", "already have
+       * it" — simply left the previous list in place and nothing could go wrong.
+       *
+       * It goes wrong now. The consumer defaults to option 1 with no argument,
+       * so the sequence *search S02E01 (stored) → search S02E02 (Sonarr 500,
+       * UNKNOWN) → grab* grabs **E01**, reports ACCEPTED, and names the wrong
+       * episode. `resolve` never consumes and nothing else in `src/` calls
+       * `clear`, so the stale list survives its full hour.
+       *
+       * ⚠️ Clearing FIRST rather than in each early-return branch is the point:
+       * a per-branch clear is a thing to forget, and the branch someone forgets
+       * is the one that ships. The cost of clearing too eagerly is a re-search;
+       * the cost of not clearing is a download nobody asked for.
+       */
+      ctx.choices.clear(ctx.senderHandle);
+
       const sonarr = new ArrClient({ ...ctx.config.sonarr, fetchImpl }, 'series');
       const resolved = await oneSeries(sonarr, title);
       if (!resolved.ok) return resolved.result;
@@ -273,7 +296,7 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
           r.seeders,
         ]),
       );
-      const shown = ranked.slice(0, MAX_RELEASES_KEPT);
+      const kept = ranked.slice(0, MAX_RELEASES_KEPT);
       ctx.choices.present({
         senderHandle: ctx.senderHandle,
         subject: `${resolved.title} ${code(target)}`,
@@ -287,7 +310,7 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
          * in a way that looks like a lost list. Different payload, different kind.
          */
         kind: 'sonarr-release',
-        options: shown.map((r, i) => ({
+        options: kept.map((r, i) => ({
           n: i + 1,
           label: describe(r),
           value: { guid: r.guid, indexerId: r.indexerId, title: r.title, quality: r.quality },
@@ -372,7 +395,7 @@ export function makeGrabRelease(fetchImpl?: FetchImpl): Tool {
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed.');
       if (!ctx.choices) return fail('No option store is available, so nothing can be resolved.');
 
-      const picked = ctx.choices.resolve(ctx.senderHandle, n);
+      const picked = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'sonarr-release');
       if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
 
       const guid = String(picked.option.value['guid'] ?? '');

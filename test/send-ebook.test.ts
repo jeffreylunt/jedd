@@ -71,7 +71,7 @@ function ctx(handle: string, opts: { withAddress?: boolean } = {}) {
   choices.present({
     senderHandle: handle,
     subject: 'The Anxious Generation',
-    kind: 'ebook',
+    kind: 'ebook-release',
     options: [{ n: 1, label: 'The Anxious Generation EPUB', value: { infoHash: HASH, title: 'The Anxious Generation' } }],
   });
   return { role: 'guest' as const, senderHandle: handle, config: testConfig({ readOnly: false }), kindle, choices };

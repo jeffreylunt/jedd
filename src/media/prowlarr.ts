@@ -163,11 +163,23 @@ export class ProwlarrClient {
 /**
  * Rank releases. Code-owned, deterministic, and SWARM HEALTH FIRST.
  *
- * ⚠️ Ordering is a fixed rule, not a judgement — it is about seeders and file
- * size, which the model cannot see better than a comparator can. It used to only
- * decide presentation order; **the top of this list is now the release that gets
+ * ⚠️ Ordering is a fixed rule, not a judgement — it is about the SWARM, which
+ * the model cannot see better than a comparator can. It used to only decide
+ * presentation order; **the top of this list is now the release that gets
  * grabbed**, because nobody is asked which torrent they want any more. See
  * `pick-release.ts` for why the band leads and what it is keyed on.
+ *
+ * ── ⚠️ BE HONEST ABOUT WHAT THE BAND DOES *HERE* ────────────────────────────
+ *
+ * With only those two keys, band-then-seeders produces the SAME ORDER as
+ * seeders alone, so on this function the band is a statement of contract rather
+ * than a behaviour — deleting it would change nothing and no test could catch
+ * it. It is kept so that the next key anyone adds lands UNDERNEATH it instead of
+ * on top, which is the mistake `search_episode` had made.
+ *
+ * The rules that actually bite on this path are the dead-swarm FILTER and the
+ * merge comparator in `search-release.ts`, and for audiobooks `rankAudiobooks`
+ * below, where a real quality key sits under the band.
  */
 export function rankReleases(releases: Release[]): Release[] {
   return [...releases].sort(
@@ -179,19 +191,6 @@ export function rankReleases(releases: Release[]): Release[] {
   );
 }
 
-/**
- * ⚠️ BE HONEST ABOUT WHAT THE BAND DOES HERE.
- *
- * With only those two keys, band-then-seeders produces the SAME ORDER as
- * seeders alone, so on this function the band is a statement of contract rather
- * than a behaviour — deleting it would change nothing and no test could catch
- * it. It is kept so that the next key anyone adds lands UNDERNEATH it instead of
- * on top, which is the mistake `search_episode` had made.
- *
- * The rule that actually bites on this path is the dead-swarm FILTER in
- * `search-release.ts`, and for audiobooks it is `rankAudiobooks` below, where a
- * real quality key sits under the band.
- */
 
 /**
  * Rank AUDIOBOOK releases.
@@ -218,7 +217,19 @@ export interface AudiobookPrefs {
   wantGraphicAudio: boolean;
 }
 
-const GRAPHIC_AUDIO = /graphic\s*audio/i;
+/**
+ * ⚠️ ONE REGEX, EXPORTED, BECAUSE TWO DRIFTED.
+ *
+ * `search-release.ts` filtered on `/graphic[\s._-]*audio/i` and this file
+ * classified on `/graphic\s*audio/i`. Release names spell it every way —
+ * `GraphicAudio`, `Graphic Audio`, `GRAPHIC-AUDIO` — so the hyphen and dot
+ * spellings passed the FILTER as dramatisations and then scored 0 on the
+ * classifier for not being them. With `graphic_audio: true` and equal swarms,
+ * `Dune GRAPHIC-AUDIO Unabridged` lost to `Dune Graphic Audio abridged`.
+ *
+ * The wider one is correct, and there is now only one of it.
+ */
+export const GRAPHIC_AUDIO = /graphic[\s._-]*audio/i;
 const ABRIDGED = /\babridged\b/i;
 const UNABRIDGED = /\bunabridged\b/i;
 
