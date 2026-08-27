@@ -43,10 +43,19 @@ export type WorkSearch =
 
 /**
  * ⚠️ Open Library asks callers to identify themselves so they can be contacted
- * about traffic rather than simply blocked. A generic agent string is how a
- * self-hosted tool becomes indistinguishable from a scraper.
+ * about traffic rather than simply blocked. Naming the software is the part that
+ * serves that; a default agent string is how a self-hosted tool becomes
+ * indistinguishable from a scraper.
+ *
+ * 🔴 IT NAMES THE SOFTWARE AND NOT A PERSON, and the repo's own invariant is
+ * what insisted on that: `owner-config-fail-closed.test.ts` refused the first
+ * version of this line because the repository URL in it carried the owner's
+ * name. That rule exists for model-facing strings, and it lands even harder
+ * here — this string LEAVES THE MACHINE, on every deployment of a public
+ * project, announcing one particular person's identity to a third party from
+ * somebody else's homelab.
  */
-const USER_AGENT = 'jedd/2 (self-hosted homelab agent; https://github.com/jeffreylunt/jedd)';
+const USER_AGENT = 'jedd/2 (self-hosted homelab agent)';
 
 /** Enough to tell works apart in a list a person will read. Nothing more. */
 const FIELDS = 'key,title,author_name,first_publish_year,edition_count';
