@@ -1,5 +1,6 @@
 import type { Config } from './config.js';
 import type { Tool } from './tools/types.js';
+import { ModelTimeoutError } from './turn-notice.js';
 
 export interface LlmToolCall {
   id: string;
@@ -96,17 +97,38 @@ export class OllamaClient implements LlmClient {
     // generating (runner CPU climbing 2.2 -> 11.6%). So a cold load is NOT
     // required to blow this budget: a long enough generation does it alone.
     //
-    // WHAT THIS DOES NOT FIX, and it is the worse half: an abort here is
-    // SILENT. There is no user-facing message, so a killed turn and a message
-    // that never arrived look identical to whoever sent it. Raising the ceiling
-    // makes the failure rarer, not visible. A "still working" signal is the
-    // real fix and is tracked separately.
+    // AND THE ABORT IS NOW VISIBLE. It used to be the worse half of this: the
+    // controller fired, `fetch` threw, the turn died and NOTHING was said, so a
+    // killed turn and a message that never arrived were the same event to
+    // whoever sent it. It is classified as a `ModelTimeoutError` below and
+    // `main.ts` answers it with a sentence that names the timeout.
+    //
+    // 🔴 CLASSIFIED FROM `controller.signal`, NOT FROM `e.name`. Several tools
+    // here run their own `AbortSignal.timeout`, so `AbortError` is a name four
+    // other components also produce; this controller is aborted from exactly one
+    // place. The reasoning is written out in `turn-notice.ts`.
 
+    /**
+     * ⚠️ READ PER CALL FROM CONFIG, WITH THE CONSTANT AS THE DEFAULT. The
+     * constant stays exported because `presence.ts` derives the typing ceiling
+     * from it; the override exists because this number has already been changed
+     * once under pressure and because a timeout nobody can make fire is a
+     * timeout nobody has tested. See `config.parseTurnTimeout`.
+     */
+    const limitMs = this.config.llm.turnTimeoutMs ?? TURN_TIMEOUT_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
-    let res: Response;
+    const startedAt = Date.now();
+    const timer = setTimeout(() => controller.abort(), limitMs);
+    let body: {
+      done_reason?: string;
+      message?: {
+        content?: string;
+        thinking?: string;
+        tool_calls?: { id?: string; function?: { name?: string; arguments?: unknown } }[];
+      };
+    };
     try {
-      res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
+      const res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -123,21 +145,28 @@ export class OllamaClient implements LlmClient {
           options: { temperature: 0.2, num_ctx: 16384, num_predict: 3000 },
         }),
       });
+
+      if (!res.ok) {
+        throw new Error(`Ollama HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      }
+      /**
+       * 🔴 THE BODY READ IS INSIDE THE TIMER, AND IT USED NOT TO BE.
+       *
+       * `clearTimeout` sat in a `finally` around the `fetch` alone. `fetch`
+       * resolves on HEADERS — the body is still arriving — so a response whose
+       * headers landed at 899s and whose body then stalled had no deadline left
+       * on it at all: `res.json()` would wait forever, the turn would never end,
+       * and (since the queue's lane is only released when the turn returns) that
+       * person would never be answered again. That is this same defect in its
+       * worst form, so it is closed here rather than left as the next report.
+       */
+      body = (await res.json()) as typeof body;
+    } catch (e) {
+      if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs);
+      throw e;
     } finally {
       clearTimeout(timer);
     }
-
-    if (!res.ok) {
-      throw new Error(`Ollama HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
-    const body = (await res.json()) as {
-      done_reason?: string;
-      message?: {
-        content?: string;
-        thinking?: string;
-        tool_calls?: { id?: string; function?: { name?: string; arguments?: unknown } }[];
-      };
-    };
 
     const raw = body.message?.tool_calls ?? [];
     const toolCalls: LlmToolCall[] = raw.flatMap((call, i) => {

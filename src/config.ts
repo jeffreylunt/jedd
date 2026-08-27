@@ -36,6 +36,21 @@ export interface Config {
     baseUrl: string;
     model: string;
     apiKey?: string;
+    /**
+     * Wall clock for ONE model call, in ms. Absent means `TURN_TIMEOUT_MS`.
+     *
+     * 🔴 IT IS CONFIGURABLE BECAUSE IT HAS ALREADY BEEN CHANGED ONCE UNDER
+     * PRESSURE. Jeff asked for 240s -> 900s on 2026-08-26 after a turn was
+     * killed silently twice, and satisfying that took a source edit, a rebuild
+     * and a redeploy of the whole bot. It is one number that governs how long a
+     * person waits; it belongs in the environment.
+     *
+     * It is also the only honest way to EXERCISE the timeout. A test or a live
+     * control can set it low and watch the abort produce a real user-facing
+     * message — and a guard nobody has ever seen fire is not evidence of
+     * anything. See `turn-notice.ts`.
+     */
+    turnTimeoutMs?: number;
   };
   jellyfin: {
     /** Base URL *including* the /jellyfin path prefix — the bare host 302s. */
@@ -373,6 +388,32 @@ function required(name: string): string {
  * ⚠️ NAMES ONLY, NEVER VALUES. This file is committed. A secret written here to
  * be helpful is a secret in the repository, in every clone, forever.
  */
+/** Narrowest value `LLM_TURN_TIMEOUT_MS` may take. Below this every turn dies. */
+export const MIN_TURN_TIMEOUT_MS = 1_000;
+/** Widest. An hour per model call is already eight hours of turn at MAX_STEPS. */
+export const MAX_TURN_TIMEOUT_MS = 3_600_000;
+
+/**
+ * `LLM_TURN_TIMEOUT_MS` -> ms, or `undefined` to mean "use the built-in".
+ *
+ * 🔴 EMPTY, GARBAGE, ZERO AND NEGATIVE ALL FALL BACK, THEY DO NOT PARSE TO
+ * SOMETHING SMALL. V1 learned this on `OLLAMA_NUM_CTX`: a variable that reads as
+ * a number when it is nonsense is how a deployment quietly acquires a setting
+ * nobody chose. Here the nonsense reading would be a timeout of 0 — every single
+ * turn killed the instant it starts, on a build that looks configured.
+ *
+ * Out-of-range values are CLAMPED rather than rejected, and the clamp is
+ * announced by the caller. A refusal to boot over a tuning knob would trade a
+ * slow bot for no bot.
+ */
+export function parseTurnTimeout(raw: string | undefined): number | undefined {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.min(MAX_TURN_TIMEOUT_MS, Math.max(MIN_TURN_TIMEOUT_MS, Math.round(n)));
+}
+
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
   // A hostname is deployment configuration; `.env` is authoritative and this
@@ -383,6 +424,7 @@ export function loadConfig(): Config {
   // `??` does NOT fire on an empty string, so an unset-but-present variable used
   // to sail through the inequality check as a "different" host. Trim first.
   const shellSshHost = (process.env.HP_SHELL_SSH_HOST ?? '').trim() || adminSshHost;
+  const turnTimeoutMs = parseTurnTimeout(process.env.LLM_TURN_TIMEOUT_MS);
   return {
     ownerHandle: required('OWNER_HANDLE'),
     shellSshHost,
@@ -396,6 +438,7 @@ export function loadConfig(): Config {
         (provider === 'anthropic' ? 'https://api.anthropic.com' : 'http://localhost:11434'),
       model: process.env.LLM_MODEL ?? 'qwen3.8:27b',
       apiKey: process.env.LLM_API_KEY,
+      ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }),
     },
     jellyfin: {
       baseUrl: process.env.JELLYFIN_URL ?? 'http://localhost:8096/jellyfin',

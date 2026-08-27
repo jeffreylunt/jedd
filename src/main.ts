@@ -14,6 +14,7 @@ import {
   type SendRecord,
 } from './connector.js';
 import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
+import { failureReply, StillWorkingNotice, STILL_WORKING_AFTER_MS } from './turn-notice.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
@@ -509,6 +510,19 @@ async function main(): Promise<void> {
     `[queue] one turn per burst: turns are serialised per sender and a burst settles for ` +
       `${BURST_SETTLE_MS}ms before it runs. Concurrent turns for one sender are no longer possible.`,
   );
+  /**
+   * 🔴 SAID AT BOOT BECAUSE THE ALTERNATIVE IS INFERRING IT FROM AN ABSENCE.
+   *
+   * A turn that runs long and says nothing is indistinguishable from a turn that
+   * died — that is the whole defect this closes — and "is the notice even armed
+   * on this build?" is the same question one level up. Stating the threshold
+   * here means a log that shows no `notices=` token can be read as *no turn ran
+   * that long*, rather than as *the feature may not be in this image*.
+   */
+  console.error(
+    `[notice] a turn still running after ${STILL_WORKING_AFTER_MS}ms tells the sender so, and says it ` +
+      'again once. A turn that dies always sends a message; a timeout says it timed out.',
+  );
 
   /**
    * The whole batch answered by one turn.
@@ -554,6 +568,28 @@ async function main(): Promise<void> {
      */
     const turn = ++turns;
     const started = Date.now();
+    /**
+     * 🔴 THE ONLY THING THAT TELLS THIS PERSON THE TURN IS STILL ALIVE.
+     *
+     * Turns here run 25–790 seconds and the model call can be killed at 900s per
+     * step. Measured live 2026-08-26: Jeff asked "Give me the other 14" twice,
+     * twenty minutes apart, and got NOTHING either time — no reply, no error.
+     * The reasoning, the threshold, and why the notice sends PLAIN rather than
+     * anchored are all in `turn-notice.ts`.
+     *
+     * ⚠️ DECLARED OUTSIDE THE `try`, so the `catch` can disarm it too. Inside,
+     * the catch could not see it — and the one path where a stray notice would
+     * be most visible is the failure path, where the person has just been
+     * apologised to.
+     *
+     * ⚠️ Armed and disarmed around `agent.handle` ONLY: inside the presence
+     * region, outside the send. Disarming before `connector.send` is what makes
+     * it structurally impossible to schedule a "still working" note after the
+     * answer has been composed.
+     */
+    const notice = new StillWorkingNotice({
+      notify: (text) => connector.send(message.senderHandle, text),
+    });
     try {
       /**
        * 🔴 THE READ RECEIPT AND THE TYPING INDICATOR ARE ONE CALL — see
@@ -585,7 +621,13 @@ async function main(): Promise<void> {
         connector,
         message,
         async () => {
-          const r = await agent.handle(message.senderHandle, message.text);
+          notice.arm();
+          let r: TurnRecord;
+          try {
+            r = await agent.handle(message.senderHandle, message.text);
+          } finally {
+            notice.disarm();
+          }
           /**
            * 🔴 `message.sourceGuid` NAMES THE MESSAGE THIS REPLY ANSWERS, AND IT
            * IS A FACT, NOT A CHOICE.
@@ -633,6 +675,16 @@ async function main(): Promise<void> {
            * one-in-one-out turn does not need a token saying it was ordinary.
            */
           `${batch.length > 1 ? `burst=${batch.length} ` : ''}` +
+          /**
+           * 🔴 `notices=` IS THE WITNESS THAT THE STILL-WORKING NOTE FIRED.
+           *
+           * Without it a turn that ran 300s and reassured the sender, and a turn
+           * that ran 300s in silence because the timer was never armed, print the
+           * IDENTICAL line — and the second is the whole defect. Printed only
+           * when a notice actually went out, so an ordinary fast turn keeps its
+           * ordinary line.
+           */
+          `${notice.noticesSent > 0 ? `notices=${notice.noticesSent} ` : ''}` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
           /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
@@ -659,6 +711,14 @@ async function main(): Promise<void> {
       // A failing turn must not stop the next message arriving.
       console.error(`[jedd] turn ${turn} THREW: ${(e as Error).message}`);
       /**
+       * ⚠️ BELT AND BRACES. `withPresence` rethrows, so `agent.handle`'s own
+       * `finally` has already disarmed this on every path that reaches here —
+       * but a future throw between the arm and that `try` would not have, and
+       * the cost of being wrong is a "still working" note arriving four minutes
+       * after the apology. Disarm is idempotent.
+       */
+      notice.disarm();
+      /**
        * 🔴 SILENCE IS NEVER THE RIGHT ANSWER TO A MESSAGE.
        *
        * This catch used to log and nothing else. To the person who texted, a
@@ -681,11 +741,21 @@ async function main(): Promise<void> {
        * out the handler that keeps the NEXT message working.
        */
       try {
-        await connector.send(
-          message.senderHandle,
-          `Something went wrong on my end and I could not answer that. It has been logged — worth trying again in a moment.`,
-          message.sourceGuid,
-        );
+        /**
+         * 🔴 THE WORDING IS `failureReply`'s, NOT A LITERAL HERE, AND THAT IS
+         * THE POINT OF THE CHANGE.
+         *
+         * A timeout used to be told as a generic "worth trying again in a
+         * moment" — advice that is actively wrong for the failure that produced
+         * it, because asking for the same 14-item list again spends another 900
+         * seconds arriving at the same abort. `failureReply` names the timeout
+         * and asks for a shorter question. It is a pure function in
+         * `turn-notice.ts` precisely so a test can assert on the sentence: this
+         * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
+         * IMAP and two SSH identities before it is reachable, so nothing here is
+         * testable in place.
+         */
+        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
