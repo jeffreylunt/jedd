@@ -152,7 +152,7 @@ async function main(): Promise<void> {
   for (const [ci, conv] of sample.entries()) {
    // ONE agent per conversation, so history accumulates as it would live.
    const agent = new Agent(config, llm as never, undefined, tools);
-   const role = conv[0]!.sender === REAL_OWNER ? 'owner' : 'guest';
+   const role = conv[0]!.sender === config.ownerHandle ? 'owner' : 'guest';
    console.error(`\n-- conversation ${ci + 1}/${sample.length} (${role}, ${conv.length} turns) --`);
    for (const turn of conv) {
     const started = Date.now();
