@@ -10,6 +10,9 @@ import {
 } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
+import { matchWork, pinWork, relevantWorks, WORK_MATCH, type Work } from '../media/book-work.js';
+import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
+import { resolveOfKind } from '../choices.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -60,7 +63,12 @@ import { fail, ok, type Tool } from './types.js';
  * provenance in `value.source`. The model never decides which fetcher runs —
  * `send_ebook` switches on the stored value, in code.
  */
-function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl, irc?: IrcEbooks): Tool {
+function makeReleaseSearch(
+  medium: 'audiobook' | 'ebook',
+  fetchImpl?: FetchImpl,
+  irc?: IrcEbooks,
+  openLibrary?: OpenLibraryOptions,
+): Tool {
   const isAudio = medium === 'audiobook';
   const consumer = isAudio ? 'add_audiobook' : 'send_ebook';
   return {
@@ -73,17 +81,17 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
      */
     needsServices: isAudio ? ['prowlarr'] : [],
     description: isAudio
-      ? 'Search for an AUDIOBOOK — a book to LISTEN to. It returns a NUMBERED LIST, because a book ' +
-        'search matches on free text and the results are usually DIFFERENT WORKS — a study guide, a ' +
-        'boxed set, the actual novel. Show them the list and ASK WHICH BOOK THEY MEANT. When they ' +
-        `answer, call ${consumer} with that number. Do NOT say anything is downloading yet — ` +
-        'nothing is until that runs. Set graphic_audio true ONLY if they explicitly asked for a ' +
-        'GraphicAudio dramatisation.'
-      : 'Search for an EBOOK — a book to READ, delivered to their Kindle. It returns a NUMBERED ' +
-        'LIST, because a book search matches on free text and the results are usually DIFFERENT ' +
-        'WORKS — a study guide, a boxed set, the actual novel. Show them the list and ASK WHICH ' +
-        `BOOK THEY MEANT. When they answer, call ${consumer} with that number. Do NOT say anything ` +
-        'is being sent yet. Use search_audiobook instead if they want to LISTEN.',
+      ? 'Search for an AUDIOBOOK — a book to LISTEN to. It works out WHICH BOOK they mean first, ' +
+        'then CHOOSES the best release itself; do NOT list releases and do NOT ask which torrent ' +
+        `they want. Then call ${consumer} to start it. If it comes back asking WHICH BOOK, show ` +
+        'them those books and call this again with the same query and their number as `choice`. Do ' +
+        'NOT say anything is downloading yet. Set graphic_audio true ONLY if they explicitly asked ' +
+        'for a GraphicAudio dramatisation.'
+      : 'Search for an EBOOK — a book to READ, delivered to their Kindle. It works out WHICH BOOK ' +
+        'they mean first, then CHOOSES the best release itself; do NOT list releases and do NOT ask ' +
+        `which torrent they want. Then call ${consumer}. If it comes back asking WHICH BOOK, show ` +
+        'them those books and call this again with the same query and their number as `choice`. Do ' +
+        'NOT say anything is being sent yet. Use search_audiobook instead if they want to LISTEN.',
     minRole: 'guest',
     /**
      * ⚠️ A READ. It searches indexers and stores a list; nothing is grabbed and
@@ -104,7 +112,28 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
      * `sonarr-release` was already split from `release` for exactly this reason
      * and said so in `fill-gaps.ts`; this is the same argument, one level in.
      */
-    presentsChoiceKinds: [isAudio ? 'audiobook-release' : 'ebook-release'],
+    /**
+     * 🔴 TWO KINDS OUT, BECAUSE THERE ARE TWO QUESTIONS AND ONLY ONE OF THEM IS
+     * THE USER'S.
+     *
+     * `book-work` is *which book* — presented only when the catalogue cannot
+     * settle it, and answered by a person. The release kind is *which copy*,
+     * stored but never asked about: that one is decided here, on swarm health,
+     * among releases that are copies of the pinned work.
+     */
+    presentsChoiceKinds: [isAudio ? 'audiobook-release' : 'ebook-release', 'book-work'],
+    /**
+     * 🔴 AND IT CONSUMES THE ONE IT PRODUCES. This tool is RE-ENTRANT: the first
+     * call may hand back candidate works, and the answer comes back to this same
+     * tool rather than to a second one.
+     *
+     * That is deliberate. The alternative — a `find_book` tool that presents
+     * works and hands them on — makes the ebook flow THREE tool calls deep
+     * (find → search → send) and adds a name to a registry where tool selection
+     * was measured at 0/5 at production size on 2026-08-26. Re-entering one tool
+     * keeps the flow two calls deep, exactly as it is today.
+     */
+    consumesChoiceKind: 'book-work',
     parameters: {
       type: 'object',
       properties: {
@@ -113,6 +142,12 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
           description: isAudio
             ? 'Title and author if known, e.g. "Project Hail Mary Andy Weir". Do NOT include the word "audiobook".'
             : 'Title and author if known, e.g. "Project Hail Mary Andy Weir". Do NOT include the word "book".',
+        },
+        choice: {
+          type: 'number',
+          description:
+            'ONLY when this tool has just asked WHICH BOOK they meant and they answered: the number ' +
+            'they picked. Leave it out on a first search. It is never a release number.',
         },
         ...(isAudio
           ? {
@@ -148,6 +183,34 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       }
 
       /**
+       * ═══ STAGE ONE: WHICH BOOK ═══════════════════════════════════════════
+       *
+       * 🔴 THE WORK IS SETTLED BEFORE A SINGLE RELEASE IS RANKED, which is the
+       * whole shape of the fix. See `book-work.ts` for the measurement and for
+       * the honest limit on what pinning can buy on a filename index.
+       *
+       * ⚠️ RESOLVING THE PICK HAPPENS BEFORE THE CLEAR, AND THE ORDER IS LOAD
+       * BEARING. The clear-on-start rule below exists so a stale list cannot be
+       * picked from — but on the re-entrant call the pending list IS the one we
+       * are being answered about. Clearing first would destroy the answer we
+       * were just given, on every ambiguous book, every time.
+       */
+      let work: Work | undefined;
+      const pick = args['choice'];
+      if (pick !== undefined) {
+        const n = Number(pick);
+        if (!Number.isFinite(n)) return fail('That is not an option number.');
+        const chosen = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'book-work');
+        if (!chosen.ok) {
+          return fail(
+            `${chosen.reason.toUpperCase()} — ${chosen.detail} Nothing was searched. If they were ` +
+              'answering a list of BOOKS, search again by name; a release number does not belong here.',
+          );
+        }
+        work = chosen.option.value['work'] as Work;
+      }
+
+      /**
        * 🔴 THE PENDING LIST DIES WHEN A NEW SEARCH **STARTS**, NOT WHEN ONE
        * SUCCEEDS. Same note as `fill-gaps.ts`, and the reason survived the
        * consumer losing its default:
@@ -162,6 +225,72 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        * branch someone forgets is the one that ships.
        */
       ctx.choices.clear(ctx.senderHandle);
+
+      /**
+       * 🔴 THE CATALOGUE IS AN IMPROVEMENT, NOT A DEPENDENCY.
+       *
+       * Every failure here degrades to the behaviour of 2.0.1 — present the
+       * releases and ask which book — rather than taking the flow down. An
+       * `unknown` from the catalogue is a failure to LOOK and must never become
+       * "there is no such book": the fallback is the same either way, but the
+       * wording the model is handed is not, and one of them is a lie.
+       */
+      let workNote = '';
+      if (!work) {
+        const found = await new OpenLibraryClient({
+          baseUrl: ctx.config.openLibrary.baseUrl,
+          ...openLibrary,
+        }).works(query);
+        if (found.state === 'works') {
+          work = pinWork(query, found.works);
+          /**
+           * 🔴 CANDIDATES THAT SHARE NOTHING WITH THE REQUEST ARE NOT AN ANSWER.
+           *
+           * Live, 2026-08-27, *"that hobbit book"* came back with `Final
+           * Planning Book` and `American Film` among the five. See
+           * `relevantWorks`: presenting those asks somebody to choose which of
+           * five wrong books they meant. When nothing plausible survives, the
+           * catalogue genuinely could not settle it, and saying so is the
+           * honest report — it takes the same fallback as an unreachable one.
+           */
+          const plausible = relevantWorks(query, found.works).slice(0, 5);
+          if (!work && plausible.length === 0) {
+            workNote = `the book catalogue returned nothing that looks like "${query}"`;
+          } else if (!work) {
+            /**
+             * 🔴 THE ONE QUESTION WORTH ASKING, AND IT IS ABOUT BOOKS.
+             *
+             * Not a list of torrent filenames — a list of WORKS, with authors
+             * and years, which is a question a person can actually answer. This
+             * is the same shape `catalogue_search` already uses for a film and a
+             * show that share a name, and Jeff has said that question is right.
+             */
+            ctx.choices.present({
+              senderHandle: ctx.senderHandle,
+              subject: query,
+              kind: 'book-work',
+              options: plausible.map((w, i) => ({
+                n: i + 1,
+                label: describeWork(w),
+                value: { work: w as unknown as Record<string, unknown> },
+              })),
+            });
+            return ok(
+              `WHICH BOOK — "${query}" matches more than one book and nothing has been searched for ` +
+                `yet:\n${plausible.map((w, i) => `  ${i + 1}. ${describeWork(w)}`).join('\n')}\n` +
+                'Ask which one they meant. When they answer, call this same tool again with the same ' +
+                'query and their number as `choice` — it will then choose the best release itself. ' +
+                'If NONE of these is the book they want, say so plainly and ask for the author, then ' +
+                'search again with the title and author together — do not talk them into one of ' +
+                'these. Do NOT ask about torrents; that part is not their decision.',
+            );
+          }
+        } else {
+          // 'none' and 'unknown' both land here and are REPORTED differently by
+          // the detail they carry. Neither is "no such book".
+          workNote = found.detail;
+        }
+      }
 
       /**
        * 🔴 BOTH SOURCES ARE QUERIED BEFORE ANY "NOTHING FOUND" IS REPORTED.
@@ -181,13 +310,39 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        * answered in milliseconds. Same reasoning as never blocking a turn on a
        * DCC transfer, with only the number changed.
        */
+      /**
+       * 🔴 ONCE A WORK IS PINNED, THE INDEXERS ARE ASKED ABOUT **THAT BOOK** AND
+       * NOT ABOUT WHAT THE PERSON TYPED — FOUND BY RUNNING IT, 2026-08-27.
+       *
+       * *"Mistborn Brandon Sanderson"* is a SERIES name, so the catalogue could
+       * not pin it and asked which book; the answer was *The Final Empire*. The
+       * search then still ran on the original phrasing and came back with
+       * `Mistborn Series 1-6`, `Mistborn Trilogy`, `Mistborn Complete Edition` —
+       * every one of them correctly refused as a bundle, so the flow reported
+       * NOT THE BOOK about a book that is plainly there. Measured, same minute:
+       *
+       *     "Mistborn Brandon Sanderson"       →  bundles only, 162 seeders top
+       *     "The Final Empire Brandon Sanderson" →  The Final Empire by Brandon
+       *                                             Sanderson EPUB, 30 seeders
+       *
+       * Scoring releases from a search that was never about the pinned work is
+       * an identity filter applied to the wrong population. Asking a second time
+       * would hammer Prowlarr (see its backoff note), so the ONE search it gets
+       * is the one about the right book.
+       *
+       * ⚠️ Where the query already named the book — the measured Hobbit, Dune and
+       * Project Hail Mary cases — the canonical term is the same string in a
+       * different order, so nothing changes for them.
+       */
+      const term = work ? `${work.title} ${work.authors.slice(0, 1).join('')}`.trim() : query;
+
       const [ircFound, found] = await Promise.all([
         hasIrc
-          ? irc!.search(query)
+          ? irc!.search(term)
           : Promise.resolve({ state: 'none' as const, detail: 'IRC is not enabled here.' }),
         ctx.config.prowlarr.apiKey
           ? new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl }).search(
-              query,
+              term,
               isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
             )
           : Promise.resolve({ state: 'none' as const, detail: 'Prowlarr is not configured here.' } as const),
@@ -197,7 +352,7 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       let ircNote = '';
       if (hasIrc) {
         if (ircFound.state === 'ok') {
-          ircOffers = ircFound.results.map(ircOffer);
+          ircOffers = ircFound.results.map((r) => ircOffer(r, work));
           if (ircFound.detail) ircNote = `IRC ${ircFound.detail}`;
         } else {
           // 'none' and 'unknown' are both reported, never treated as "no books".
@@ -280,25 +435,74 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        * Ebooks keep `rankReleases` because their quality key is FORMAT, and
        * `interleave` below applies it across both sources at once.
        */
+      /**
+       * ⚠️ THE `.slice(0, 5)` THAT USED TO BE HERE HAS MOVED BELOW THE WORK
+       * SCORING, AND THAT IS A FIX RATHER THAN TIDYING.
+       *
+       * Truncating to five on SEEDERS before identity is considered would let
+       * the defect survive its own fix on a busier title: five well-seeded
+       * guides at the top and the novel sixth, cut before anything asked whether
+       * it was the book. Measured on the Hobbit the novel came fourth, which is
+       * inside five — by luck, not by design.
+       */
       const torrentOffers: Offer[] = (isAudio ? rankAudiobooks(alive, { wantGraphicAudio: wantsGraphic }) : rankReleases(alive))
-        .slice(0, 5)
         .map((r) => ({
           label: describe(r),
+          work: work ? matchWork(r.title, work).score : WORK_MATCH.PARTIAL,
           band: swarmRank(r.seeders),
           format: isAudio ? 0 : formatScore(r.title),
           seeders: r.seeders,
           value: { source: 'prowlarr', infoHash: r.infoHash, title: r.title, ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}) },
         }));
 
-      const top = mergeSources(torrentOffers, ircOffers).slice(0, 5);
+      const merged = mergeSources(torrentOffers, ircOffers);
 
-      // Everything was found and everything we can fetch is dead. Same two-zeros
-      // rule as the filters above: say which, do not report absence.
-      if (top.length === 0) {
+      /**
+       * ═══ STAGE TWO: WHICH COPY ═══════════════════════════════════════════
+       *
+       * 🔴 A RELEASE THAT IS NOT THIS WORK IS NOT A CANDIDATE, whatever its
+       * swarm. This is the line the Corey Olsen study guide fails on 24 seeders
+       * while the novel passes on 8.
+       */
+      const wrongWork = work ? merged.filter((o) => o.work === WORK_MATCH.NOT_THIS_WORK) : [];
+      const candidates = work ? merged.filter((o) => o.work !== WORK_MATCH.NOT_THIS_WORK) : merged;
+      const top = candidates.slice(0, 5);
+
+      /**
+       * Everything was found and everything we can fetch is dead. Same two-zeros
+       * rule as the filters above: say which, do not report absence.
+       *
+       * ⚠️ TESTED ON `merged`, NOT ON `top`, SO THAT THE WORK FILTER CANNOT
+       * MASQUERADE AS A DEAD SWARM. "every copy is unseeded" and "none of these
+       * is the book you asked for" are different findings with different next
+       * moves, and collapsing them would report the wrong one whenever the
+       * identity filter emptied the list.
+       */
+      if (merged.length === 0) {
         return ok(
           `ALL DEAD — found ${releases.length} ${medium} release(s) for "${query}" and every one has ` +
             'NO seeders, so none of them would ever finish. Nothing was chosen. Say so; do not say ' +
             'nothing was found.',
+        );
+      }
+
+      /**
+       * 🔴 THE WORK IS PINNED AND NOTHING ON OFFER IS A COPY OF IT.
+       *
+       * A third kind of zero, and the useful answer names the filter rather than
+       * reporting absence — exactly the rule the GraphicAudio and dead-swarm
+       * branches already follow. It also does NOT fall back to the unfiltered
+       * list: quietly ranking the guides again the moment the filter finds
+       * nothing is a fail-open, and it would fire on precisely the searches
+       * where the filter was doing its job.
+       */
+      if (top.length === 0 && work) {
+        return ok(
+          `NOT THE BOOK — searching "${query}" returned ${merged.length} ${medium} release(s), and ` +
+            `none of them is a copy of "${describeWork(work)}". They are things like: ` +
+            `${wrongWork.slice(0, 3).map((o) => `${o.label.split(' — ')[0]} (${o.work === WORK_MATCH.NOT_THIS_WORK ? 'not that book' : 'partial'})`).join('; ')}. ` +
+            'Tell them the book itself does not appear to be on the indexers — do NOT offer any of ' +
+            'these instead, and do not say nothing was found.',
         );
       }
 
@@ -321,6 +525,7 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       if (found.state === 'results' && found.discarded) {
         notes.push(`${found.discarded} more had no infoHash and cannot be fetched`);
       }
+      if (wrongWork.length) notes.push(`${wrongWork.length} that are not that book left out`);
       if (prowlarrNote) notes.push(prowlarrNote);
       if (ircNote) notes.push(ircNote);
       const suffix = notes.length ? ` (${notes.join('; ')})` : '';
@@ -356,20 +561,37 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
        * became a filter in code. So the list is RETURNED, and the consumer
        * below refuses to act without a number.
        *
-       * ⚠️ THIS IS THE INTERIM SHAPE, and it is worse than the fix it stands in
-       * for: it hands back a list that mixes "which work" and "which copy" into
-       * one question. The fix is to resolve the WORK first — the two-stage shape
-       * `add_movie`/`add_series` already have with `tmdbId`/`tvdbId` — and then
-       * auto-pick on swarm health among that work's releases only, which is
-       * Jeff's rule restored exactly. Do not delete this note when the list goes
-       * away; delete it when the work is pinned before the ranking.
+       * ── 🔴 SO WHICH BRANCH RUNS IS DECIDED BY WHETHER A WORK IS PINNED ────
+       *
+       * With a work: every candidate has been scored as a copy of THAT book, so
+       * the question left is "which copy" and it is answered here, on the swarm.
+       * Nobody is asked about a torrent — Jeff's rule, restored, and now resting
+       * on the same precondition it always needed.
+       *
+       * Without one — the catalogue was unreachable, or knows no such book, or
+       * the query names no work exactly — the precondition is absent and the
+       * honest thing is the 2.0.1 behaviour: hand back the list and ask. That is
+       * a DEGRADED path and it is labelled as one, so nobody reads a fallback as
+       * the design.
        */
+      if (work) {
+        const best = top[0]!;
+        return ok(
+          `CHOSE — "${describeWork(work)}" is the book, and among the ${top.length} release(s) that ` +
+            `are copies of it I took the healthiest swarm myself: ${best.label}${suffix}.\n` +
+            'Do NOT list releases and do NOT ask which torrent they want — that choice is already ' +
+            `made and it is not theirs. Call ${consumer} now with choice 1. Nothing is ` +
+            `${isAudio ? 'downloading' : 'being sent'} yet.`,
+        );
+      }
+
       const lines = top.map((o, i) => `  ${i + 1}. ${o.label}`).join('\n');
       return ok(
-        `FOUND ${top.length} for "${query}"${suffix}. These are ranked by swarm health, but a ` +
-          `${medium} search matches on TEXT, so they are very likely DIFFERENT WORKS — a study ` +
-          'guide, a companion, a boxed set, the book itself — and NOT copies of one book. Option 1 ' +
-          'is NOT "the best one" in any sense that matters here.\n' +
+        `FOUND ${top.length} for "${query}"${suffix}. ⚠️ The book catalogue could not settle which ` +
+          `book this is${workNote ? ` — ${workNote}` : ''}, so these are ranked by swarm health ` +
+          `alone. A ${medium} search matches on TEXT, so they are very likely DIFFERENT WORKS — a ` +
+          'study guide, a companion, a boxed set, the book itself — and NOT copies of one book. ' +
+          'Option 1 is NOT "the best one" in any sense that matters here.\n' +
           `${lines}\n` +
           'SHOW THEM THIS LIST and ASK WHICH BOOK THEY MEANT. Do not choose for them and do not ' +
           `assume option 1. If none of these is the book they want, say so and offer to search ` +
@@ -380,12 +602,22 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
   };
 }
 
-export function makeSearchAudiobook(fetchImpl?: FetchImpl): Tool {
-  return makeReleaseSearch('audiobook', fetchImpl);
+/**
+ * ⚠️ `openLibrary` IS A TEST SEAM, and it is the reason these signatures grew a
+ * parameter rather than the client being constructed from a module constant.
+ * Without it every book test would reach the real openlibrary.org — slow,
+ * flaky, and rude to a free service that asks callers to identify themselves.
+ */
+export function makeSearchAudiobook(fetchImpl?: FetchImpl, openLibrary?: OpenLibraryOptions): Tool {
+  return makeReleaseSearch('audiobook', fetchImpl, undefined, openLibrary);
 }
 
-export function makeSearchEbook(fetchImpl?: FetchImpl, irc?: IrcEbooks): Tool {
-  return makeReleaseSearch('ebook', fetchImpl, irc);
+export function makeSearchEbook(
+  fetchImpl?: FetchImpl,
+  irc?: IrcEbooks,
+  openLibrary?: OpenLibraryOptions,
+): Tool {
+  return makeReleaseSearch('ebook', fetchImpl, irc, openLibrary);
 }
 
 /**
@@ -413,6 +645,24 @@ function humanSize(bytes: number): string {
 
 interface Offer {
   label: string;
+  /**
+   * 🔴 IS THIS RELEASE A COPY OF THE PINNED WORK — **THE FIRST KEY, ABOVE THE
+   * BAND**, and the one exception to `pick-release.ts`'s rule that swarm health
+   * leads every release comparator.
+   *
+   * That rule forbids a QUALITY key above the band, and the reason is the Fringe
+   * incident: a well-named release with an empty swarm is the worst option, not
+   * the best. This is not a quality key. It answers whether the candidate is the
+   * thing that was asked for AT ALL, which is a question that has to be settled
+   * before "which of these is healthiest" means anything. A 24-seeder study
+   * guide is not a better copy of The Hobbit than an 8-seeder novel; it is not a
+   * copy of it.
+   *
+   * ⚠️ When no work could be pinned every offer gets the same value here, so the
+   * key is inert and the order is exactly what it was before. It is never a
+   * silent tiebreak.
+   */
+  work: number;
   /**
    * The swarm band, higher is better — `swarmRank` for a torrent.
    *
@@ -451,12 +701,23 @@ function formatScore(title: string): number {
   return 0;
 }
 
-function ircOffer(r: IrcResult): Offer {
+function ircOffer(r: IrcResult, work?: Work): Offer {
   const size = r.sizeBytes === undefined ? 'size unknown' : humanSize(r.sizeBytes);
   return {
     // The origin is visible to a human, so a pick is never ambiguous about where
     // it came from — and "via IRC" reads differently from a seeder count.
     label: `${r.title} — ${size}, via IRC (${r.bot})`,
+    /**
+     * 🔴 AN IRC OFFER IS SCORED FOR IDENTITY EXACTLY LIKE A TORRENT.
+     *
+     * Its band is a claim about MECHANISM — a bot holds the file or it does not
+     * — and exempting it from the band was right for that reason. Exempting it
+     * from the identity key would not be: a bot serving `Exploring The Hobbit by
+     * Corey Olsen.epub` is holding a study guide in hand, and holding it firmly
+     * changes nothing about which book it is. An unscored IRC offer would sit
+     * above every torrent on the first key and walk straight past the filter.
+     */
+    work: work ? matchWork(r.title, work).score : WORK_MATCH.PARTIAL,
     // See `Offer.band`: a DCC transfer has no swarm, so it is not a thin one.
     band: swarmRank(HEALTHY_IRC_BAND),
     format: formatScore(r.ext === '.epub' ? 'x.epub' : r.title),
@@ -492,5 +753,5 @@ const HEALTHY_IRC_BAND = 999;
  * IRC offers now compete on the band rather than on their position.
  */
 function mergeSources(a: Offer[], b: Offer[]): Offer[] {
-  return [...a, ...b].sort(byScore((o) => [o.band, o.format, o.seeders]));
+  return [...a, ...b].sort(byScore((o) => [o.work, o.band, o.format, o.seeders]));
 }

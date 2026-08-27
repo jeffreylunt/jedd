@@ -3,6 +3,45 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [2.0.2] — 2026-08-27
+
+Completes what 2.0.1 stood in for. The book searches choose for you again — but
+only after settling **which book**.
+
+### Added
+- **Book searches pin the work before ranking releases**, against
+  [Open Library](https://openlibrary.org) — free, no key, `OPEN_LIBRARY_URL` if
+  you want a mirror. *"The Hobbit J.R.R. Tolkien"* resolves to `/works/OL27482W`
+  and the Corey Olsen study guide is a separate work in the same response.
+  Releases are then scored against that work — a different author credited, a
+  guide, a box set, or a numbered volume of a series is not a candidate — and
+  the healthiest swarm among the survivors is chosen. **Nobody is asked about a
+  torrent.**
+- **A question about books when the catalogue cannot settle it.** *"Mistborn"*
+  is a series rather than a book, so Jedd asks which one and searches nothing
+  until you answer. Answer *The Final Empire* and it searches for that book
+  specifically rather than for what you typed.
+- **`OPEN_LIBRARY_URL`**, documented in `.env.example`. Never a hard dependency:
+  if the catalogue is unreachable or knows no such book, the searches fall back
+  to 2.0.1's behaviour — show the releases and ask — and say which happened.
+
+### Fixed
+- A `.mobi` pick is refused with the compatible options named rather than
+  silently swapped (carried from 2.0.1, and still right: substituting a row can
+  substitute a book).
+
+### Unchanged
+- **TV.** `search_episode` pins the episode against Sonarr before it ranks
+  anything, so swarm health was always answering the right question there.
+
+### Known limitation
+- **There is no `releasesFor(workId)` for books.** Prowlarr and the IRC bots
+  index filenames and have no notion of a work, so pinning gives Jedd a title
+  and an author to compare filenames against rather than a scoped result set.
+  That is weaker than the TV guarantee and the matching is a heuristic. When it
+  declines everything, Jedd says the book does not appear to be on the indexers
+  rather than offering you something else.
+
 ## [2.0.1] — 2026-08-27
 
 ### Fixed

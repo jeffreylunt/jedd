@@ -62,14 +62,21 @@ import { testConfig } from './helpers.js';
  * reaches the download client, what reaches the mail sender — and never on
  * whether a description says the right thing.
  *
- * ── ⚠️ AND WHAT THIS IS NOT ─────────────────────────────────────────────────
+ * ── ⚠️ WHAT THIS FILE NOW COVERS, AFTER THE REAL FIX LANDED ─────────────────
  *
- * This is the INTERIM shape. It hands back one list that mixes *"which work"*
- * and *"which copy"* into a single question, which is worse than the fix it
- * stands in for: resolve the WORK to a canonical identity first — the two-stage
- * shape `add_movie`/`add_series` already have via `tmdbId`/`tvdbId` — then
- * auto-pick on swarm health among that work's releases only, which is Jeff's
- * rule restored exactly.
+ * This was the interim: one list mixing *"which work"* with *"which copy"*. The
+ * work is pinned against a book catalogue now, and the searches CHOOSE again —
+ * see `book-work-pinning.test.ts`.
+ *
+ * 🔴 SO THE LIST-AND-ASK BEHAVIOUR ASSERTED BELOW IS THE **DEGRADED** PATH, and
+ * these tests reach it because `testConfig` points the catalogue at `.invalid`.
+ * That is not a stale test: it is the path that runs whenever Open Library is
+ * down, knows no such book, or cannot settle the query, and it is the last thing
+ * standing between a guest and the study guide when that happens. It is worth
+ * exactly as much scrutiny as the happy path.
+ *
+ * The consumers' REQUIRED pick, asserted here, is not degraded-path-only either:
+ * it is what stops a no-argument call taking option 1 in any state at all.
  */
 
 const tempFile = () => join(mkdtempSync(join(tmpdir(), 'jedd-work-id-')), 'choices.jsonl');
@@ -114,7 +121,9 @@ const optionLine = (content: string, n: number): string =>
 
 // ═══ 1. THE SEARCH ASKS ═════════════════════════════════════════════════════
 
-test('🔴 HOBBIT: the search returns the whole list and tells the model to ASK WHICH BOOK', async () => {
+test('🔴 HOBBIT, CATALOGUE UNREACHABLE: the whole list comes back and the model is told to ASK', async () => {
+  // `testConfig` points the catalogue at `.invalid`, so this IS the degraded
+  // path — no work can be pinned and asking is the only honest move left.
   const r = await makeSearchEbook(hobbitProwlarr).run({ query: 'The Hobbit J.R.R. Tolkien' }, ctx());
   assert.equal(r.ok, true);
 
@@ -129,7 +138,7 @@ test('🔴 HOBBIT: the search returns the whole list and tells the model to ASK 
   assert.match(r.content, /Nothing is being sent yet/);
 });
 
-test('🔴 MUTATION: the fixture really does put the WRONG WORK at the top of the ranking', async () => {
+test('🔴 MUTATION: unpinned, the fixture really does put the WRONG WORK at the top', async () => {
   /**
    * The control that makes the test above non-vacuous. If the ranking happened
    * to put the novel first on this fixture, "the search asks" would be a

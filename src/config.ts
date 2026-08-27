@@ -60,6 +60,21 @@ export interface Config {
    * which reads as "Prowlarr is unreachable" rather than "your URL is wrong".
    */
   prowlarr: { baseUrl: string; apiKey: string };
+  /**
+   * Where "which book did they mean" is answered, before any release is ranked.
+   *
+   * 🔴 IT IS IN CONFIG SO THAT TESTS CAN POINT IT AT NOWHERE. Exactly the lesson
+   * `shellSshHost` already carries in `test/helpers.ts`: a test seam threaded
+   * through a constructor argument is only as good as every test remembering to
+   * thread it, and the one that forgets reaches the REAL openlibrary.org — which
+   * is slow, flaky, and rude to a free service. `testConfig` points this at an
+   * `.invalid` host, so a missed seam fails to resolve and the tool degrades to
+   * its documented fallback instead of quietly making a network call.
+   *
+   * ⚠️ NO API KEY, deliberately: Open Library needs none, so there is nothing to
+   * gate registration on. The book tools work without it — worse, but they work.
+   */
+  openLibrary: { baseUrl: string };
   sonarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   radarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   bluebubbles: {
@@ -390,6 +405,7 @@ export function loadConfig(): Config {
       baseUrl: process.env.PROWLARR_URL ?? 'http://10.0.0.10:9696',
       apiKey: process.env.PROWLARR_API_KEY ?? '',
     },
+    openLibrary: { baseUrl: process.env.OPEN_LIBRARY_URL ?? 'https://openlibrary.org' },
     sonarr: {
       baseUrl: process.env.SONARR_URL ?? 'http://10.0.0.10:8989/sonarr/api/v3',
       apiKey: process.env.SONARR_API_KEY ?? '',
