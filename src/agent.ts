@@ -152,6 +152,18 @@ function systemPrompt(config: Config, role: Role): string {
     'No preamble, no restating the question. If one word answers it, send one word.',
     'A list only when genuinely naming several things, one short line each, never nested.',
     '',
+    // 🔴 MEASURED 2026-08-27: 43% of 238 real replies (data/history.jsonl)
+    // carried at least one markdown construct — mostly **bold** (72) and
+    // *italics* around titles (37), some inline `backticks` (7). iMessage has
+    // no markdown renderer, so those arrive as literal asterisks and backticks
+    // in the punctuation, not emphasis. Plain "1. " numbered lines and "- "
+    // bullets are NOT the problem — they already read fine as plain text — so
+    // this only names the symbol-based constructs, not lists in general.
+    'Plain text only, never markdown. No **asterisks** for bold, no *asterisks* for italics, no',
+    '`backticks`, no # headers, no [link](url) syntax. This is a text message, not a rendered document —',
+    'those symbols show up as literal punctuation, not formatting. Titles get emphasis from wording,',
+    'not from wrapping them in symbols.',
+    '',
     'Ground every factual claim in a tool result. If you have not called a tool, you do not know.',
     'Never say you have done something unless a tool result in this conversation shows it succeeded.',
     'If a tool fails or refuses, say so plainly and say what you would need instead. Do not look for',
