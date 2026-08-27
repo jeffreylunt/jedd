@@ -231,6 +231,33 @@ test('🔴 add_audiobook still honours the number a person actually chose', asyn
   assert.ok(!cmds.some((c) => c.includes(STUDY_GUIDE_HASH)), 'and not the study guide');
 });
 
+test('🔴 a failed second search kills the first list — a number is not self-describing', async () => {
+  /**
+   * Requiring the pick does not make a pick unambiguous. *search Dune (stored) →
+   * search The Hobbit (Prowlarr down) → "yeah, 2"* would resolve **2 from the
+   * Dune list** and grab a book nobody is talking about, because the number
+   * means whatever list is lying around.
+   *
+   * The list is cleared when a search STARTS, so the failing search takes the
+   * stale one with it and the pick has nothing to land on.
+   */
+  const path = tempFile();
+  await makeSearchAudiobook(async () =>
+    json([{ title: 'Dune.epub', infoHash: NOVEL_HASH, seeders: 40, size: 1, indexer: 'i' }]),
+  ).run({ query: 'Dune' }, ctx({ choices: new ChoiceStore(path) }));
+  assert.ok(new ChoiceStore(path).resolve(JEFF, 1).ok, 'the Dune list is there to begin with');
+
+  const failed = await makeSearchAudiobook(() => {
+    throw new Error('ECONNREFUSED');
+  }).run({ query: 'The Hobbit' }, ctx({ choices: new ChoiceStore(path) }));
+  assert.equal(failed.ok, false);
+
+  const { exec, cmds } = recordingExec();
+  const r = await addAudiobook.run({ choice: 1 }, ctx({ choices: new ChoiceStore(path), exec }));
+  assert.equal(r.ok, false, r.content);
+  assert.equal(cmds.length, 0, 'the stale Dune pick did not reach the download client');
+});
+
 test('🔴 send_ebook with NO pick grabs nothing and mails nothing', async () => {
   const path = tempFile();
   await makeSearchEbook(hobbitProwlarr).run(

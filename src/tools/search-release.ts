@@ -147,9 +147,20 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         );
       }
 
-      // 🔴 See the same note in `fill-gaps.ts`: the pending list dies when a new
-      // search STARTS, because the consumer now defaults to option 1 and every
-      // early return below would otherwise leave a stale one grabbable.
+      /**
+       * 🔴 THE PENDING LIST DIES WHEN A NEW SEARCH **STARTS**, NOT WHEN ONE
+       * SUCCEEDS. Same note as `fill-gaps.ts`, and the reason survived the
+       * consumer losing its default:
+       *
+       * *search "Dune" (stored) → search "The Hobbit" (Prowlarr 500, UNKNOWN) →
+       * "yeah, 2"* now resolves **2 from the DUNE list** and reports STARTED
+       * naming a book nobody is talking about. The number is no longer optional,
+       * but a number is not self-describing either — it means whatever list is
+       * lying around.
+       *
+       * ⚠️ Clearing FIRST rather than in each early return is the point: the
+       * branch someone forgets is the one that ships.
+       */
       ctx.choices.clear(ctx.senderHandle);
 
       /**
