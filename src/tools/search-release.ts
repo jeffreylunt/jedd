@@ -310,13 +310,39 @@ function makeReleaseSearch(
        * answered in milliseconds. Same reasoning as never blocking a turn on a
        * DCC transfer, with only the number changed.
        */
+      /**
+       * 🔴 ONCE A WORK IS PINNED, THE INDEXERS ARE ASKED ABOUT **THAT BOOK** AND
+       * NOT ABOUT WHAT THE PERSON TYPED — FOUND BY RUNNING IT, 2026-08-27.
+       *
+       * *"Mistborn Brandon Sanderson"* is a SERIES name, so the catalogue could
+       * not pin it and asked which book; the answer was *The Final Empire*. The
+       * search then still ran on the original phrasing and came back with
+       * `Mistborn Series 1-6`, `Mistborn Trilogy`, `Mistborn Complete Edition` —
+       * every one of them correctly refused as a bundle, so the flow reported
+       * NOT THE BOOK about a book that is plainly there. Measured, same minute:
+       *
+       *     "Mistborn Brandon Sanderson"       →  bundles only, 162 seeders top
+       *     "The Final Empire Brandon Sanderson" →  The Final Empire by Brandon
+       *                                             Sanderson EPUB, 30 seeders
+       *
+       * Scoring releases from a search that was never about the pinned work is
+       * an identity filter applied to the wrong population. Asking a second time
+       * would hammer Prowlarr (see its backoff note), so the ONE search it gets
+       * is the one about the right book.
+       *
+       * ⚠️ Where the query already named the book — the measured Hobbit, Dune and
+       * Project Hail Mary cases — the canonical term is the same string in a
+       * different order, so nothing changes for them.
+       */
+      const term = work ? `${work.title} ${work.authors.slice(0, 1).join('')}`.trim() : query;
+
       const [ircFound, found] = await Promise.all([
         hasIrc
-          ? irc!.search(query)
+          ? irc!.search(term)
           : Promise.resolve({ state: 'none' as const, detail: 'IRC is not enabled here.' }),
         ctx.config.prowlarr.apiKey
           ? new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl }).search(
-              query,
+              term,
               isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
             )
           : Promise.resolve({ state: 'none' as const, detail: 'Prowlarr is not configured here.' } as const),

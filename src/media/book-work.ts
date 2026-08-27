@@ -215,6 +215,66 @@ function bylineNamesSomeoneElse(releaseTitle: string, work: Work): boolean {
   return false;
 }
 
+/**
+ * 🔴 A NARRATOR IS NOT ANOTHER BOOK — FOUND BY RUNNING IT, 2026-08-27.
+ *
+ * Live, *"Ready Player One Ernest Cline"* on the audiobook indexers returned:
+ *
+ *     25  Ernest Cline Ready Player One 2011 - Lacero 2014 Audiobook EPU
+ *     14  Ernest Cline - Ready Player One (Wil Wheaton) - 2011 (80kbps)
+ *      3  Ernest Cline - Ready Player One
+ *
+ * All three are the same book. `Wil Wheaton` is the famous narration of it. But
+ * `wil` and `wheaton` are leftover tokens, so it scored PARTIAL, and the bare
+ * 3-seeder scored CLEAN and **won** — a thin swarm taken over a healthy one for
+ * no gain in identity whatsoever, which is the Fringe failure reappearing
+ * through the very key added to prevent a different one.
+ *
+ * So bracketed segments come out before the leftover comparison. A release group
+ * puts the narrator, the bitrate and the packaging in brackets and the WORK
+ * outside them, near-universally.
+ *
+ * ⚠️ THIS RUNS AFTER THE REFUSALS, NOT BEFORE, AND THAT ORDER IS THE WHOLE
+ * SAFETY OF IT. `Sir. J.R.R. Tolkien The Hobbit (comic strips)` is refused on
+ * the RAW title, where `comic` is still visible; stripping first would hide the
+ * marker and promote a comic adaptation to a candidate. Same for
+ * `(Hobbit)+1-3 (KINDLE)`.
+ */
+function withoutEditionNoise(title: string): string {
+  return title
+    .replace(/[([{][^)\]}]*[)\]}]?/g, ' ')
+    .replace(/\b\d+\s*kbps\b/gi, ' ')
+    .replace(/\b\d+k\b/gi, ' ');
+}
+
+/**
+ * 🔴 `<TITLE> <SMALL NUMBER>` IS A VOLUME OF A SERIES NAMED AFTER THE BOOK.
+ *
+ * ── FOUND BY A CORPUS CHECK, NOT BY THINKING ABOUT IT ──────────────────────
+ *
+ * One live Dune search returned FOUR of these:
+ *
+ *     Frank Herbert - Dune 2: Dune Messiah
+ *     Frank Herbert - Dune 3: Children of Dune
+ *     Frank Herbert - Dune 5: Heretics of Dune
+ *     Frank Herbert - Dune 6: Chapterhouse Dune
+ *
+ * Each names the work, credits the right author, is not a guide and is not a
+ * box set — so every rule above passes them, and they scored PARTIAL. That was
+ * survivable only by luck: a CLEAN `Dune by Frank Herbert EPUB` existed and
+ * outranked them. With no clean copy on the indexers, asking for *Dune* would
+ * have fetched *Children of Dune* and reported success.
+ *
+ * ⚠️ ONE OR TWO DIGITS, NOT MORE. `The Hobbit 1937-2017 Booklet` is a real
+ * release and `1937` is a year, not a volume — a wider rule would refuse
+ * editions by their publication date.
+ */
+function isSeriesPosition(releaseTitle: string, titleTokens: string[]): boolean {
+  if (titleTokens.length === 0) return false;
+  const phrase = titleTokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\W+');
+  return new RegExp(`\\b${phrase}\\W+\\d{1,2}\\b`, 'i').test(releaseTitle);
+}
+
 export interface WorkMatch {
   score: number;
   /** Why, in words, so a refusal is explainable rather than a bare 0. */
@@ -247,6 +307,9 @@ export function matchWork(releaseTitle: string, work: Work): WorkMatch {
   if (BUNDLE.test(releaseTitle)) {
     return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a collection or box set, not this one book' };
   }
+  if (isSeriesPosition(releaseTitle, titleTokens)) {
+    return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a numbered volume of the series, not this book' };
+  }
 
   /**
    * What is left once the title, the author and the format noise are removed.
@@ -259,7 +322,9 @@ export function matchWork(releaseTitle: string, work: Work): WorkMatch {
    */
   const authorTokens = new Set(work.authors.flatMap((a) => tokens(a)));
   const titleSet = new Set(titleTokens);
-  const leftover = significant(ts).filter((t) => !titleSet.has(t) && !authorTokens.has(t));
+  const leftover = significant(tokens(withoutEditionNoise(releaseTitle))).filter(
+    (t) => !titleSet.has(t) && !authorTokens.has(t),
+  );
 
   if (leftover.length === 0) {
     return { score: WORK_MATCH.CLEAN, reason: 'names this work and nothing else' };

@@ -42,6 +42,23 @@ const PHM: Work = {
   editionCount: 32,
 };
 
+const RPO: Work = {
+  key: '/works/OL21455689W',
+  title: 'Ready Player One',
+  authors: ['Ernest Cline'],
+  firstPublishYear: 2008,
+  editionCount: 40,
+};
+
+/** The first Mistborn book. `Mistborn` is the SERIES and is not a work title. */
+const FINAL_EMPIRE: Work = {
+  key: '/works/OL15100036W',
+  title: 'The Final Empire',
+  authors: ['Brandon Sanderson'],
+  firstPublishYear: 2001,
+  editionCount: 40,
+};
+
 // ── 🔴 THE HOBBIT, ALL ELEVEN, AS THEY CAME BACK ────────────────────────────
 
 /** seeders, title — exactly as Prowlarr returned them. */
@@ -198,6 +215,102 @@ test('🔴 CONTROL — DUNE: identity-first agrees with seeders-first where seed
     .sort((a, b) => b.m.score - a.m.score || b.seeders - a.seeders)[0];
 
   assert.equal(top?.title, 'Dune by Frank Herbert EPUB', 'unchanged from what already shipped');
+});
+
+test('🔴 A NARRATOR IS NOT ANOTHER BOOK — the Wil Wheaton regression', () => {
+  /**
+   * ── FOUND BY RUNNING IT, NOT BY READING IT ────────────────────────────────
+   *
+   * Live audiobook search for *"Ready Player One Ernest Cline"*, verbatim:
+   *
+   *     25  Ernest Cline Ready Player One 2011 - Lacero 2014 Audiobook EPU
+   *     14  Ernest Cline - Ready Player One (Wil Wheaton) - 2011 (80kbps)
+   *      3  Ernest Cline - Ready Player One
+   *
+   * All three are the same book. `wil` and `wheaton` scored as leftovers, so the
+   * famous narration was demoted to PARTIAL and the bare 3-seeder took it — a
+   * thin swarm chosen over a healthy one for NO gain in identity. That is the
+   * Fringe failure mode reappearing through the very key added to stop a
+   * different one, and it passed every test in this file at the time.
+   */
+  const narrated = matchWork('Ernest Cline - Ready Player One (Wil Wheaton) - 2011 (80kbps)', RPO);
+  assert.equal(narrated.score, WORK_MATCH.CLEAN, `a narrator credit must not demote it: ${narrated.reason}`);
+
+  const bare = matchWork('Ernest Cline - Ready Player One', RPO);
+  assert.equal(bare.score, WORK_MATCH.CLEAN, 'and the bare one is still clean, so the SWARM decides between them');
+});
+
+test('🔴 CONTROL: stripping brackets does NOT smuggle a derivative past the refusal', () => {
+  /**
+   * The refusals run on the RAW title and the leftover comparison runs on the
+   * stripped one, and that order is the entire safety of the change above.
+   * `(comic strips)` is a real Hobbit result and it lives in brackets: strip
+   * first and the marker vanishes, promoting a comic adaptation to a candidate.
+   */
+  const comic = matchWork('Sir. J.R.R. Tolkien The Hobbit (comic strips)', HOBBIT);
+  assert.equal(comic.score, WORK_MATCH.NOT_THIS_WORK, comic.reason);
+
+  const bundled = matchWork('The Lord of the Rings - \tJ. R. R. Tolkien (Hobbit)+1-3 (KINDLE)', HOBBIT);
+  assert.equal(bundled.score, WORK_MATCH.NOT_THIS_WORK, bundled.reason);
+});
+
+test('🔴 THE WHOLE MEASURED CORPUS, re-checked after the bracket change', () => {
+  /**
+   * ── ⚠️ THIS REPLACED AN ASSERTION I INVENTED, AND THAT IS THE POINT ────────
+   *
+   * The first version of the control above asserted on
+   * `Frank Herbert - Dune (Dune Messiah)` — a name no indexer returned, written
+   * to probe whether a whole different work could hide inside brackets. It
+   * failed, and it was tempting to read that as the bracket change being wrong.
+   *
+   * It is not evidence of anything. This file's own rule is that fixtures come
+   * from the indexers, and I broke it. So the control is now the corpus: every
+   * release name actually measured on 2026-08-27, across four searches, with the
+   * verdict each one must get. If bracket-stripping ever does smuggle something
+   * through, it will be a real name doing it, and this is where it shows up.
+   *
+   * ⚠️ Add to this list by RUNNING A SEARCH. Do not add plausible names.
+   */
+  const corpus: [Work, string, number][] = [
+    // The Hobbit — the search that started this.
+    [HOBBIT, "Exploring J.R.R. Tolkien's The Hobbit by Corey Olsen ePUB eBOOK-", WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'An A Z of JRR Tolkien s The Hobbit by Sarah Oliver EPUB', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'Tolkien RARE The Hobbit 1937-2017 Booklet with Dragons Lecture 1938-01-01', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, THE_NOVEL, WORK_MATCH.PARTIAL],
+    [HOBBIT, 'J.R.R Tolkien - The Lord of the Rings Series + The Hobbit [4 boo', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'The Lord of the Rings - \tJ. R. R. Tolkien (Hobbit)+1-3 (KINDLE)', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'Sir. J.R.R. Tolkien The Hobbit (comic strips)', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'J. R. R. Tolkien Collections[The Hobbit] -DS', WORK_MATCH.NOT_THIS_WORK],
+    [HOBBIT, 'J. R. R. Tolkien - The Hobbit.fb2', WORK_MATCH.CLEAN],
+    // Dune — a control the shipped ranking already got right.
+    [DUNE, 'Dune by Frank Herbert EPUB', WORK_MATCH.CLEAN],
+    [DUNE, 'Dune Messiah by Frank Herbert EPUB', WORK_MATCH.PARTIAL],
+    [DUNE, 'Frank Herbert - Dune 3: Children of Dune', WORK_MATCH.NOT_THIS_WORK],
+    [DUNE, 'Dune Chronicles by Frank Herbert [EPUB, AZW3]', WORK_MATCH.NOT_THIS_WORK],
+    [DUNE, 'Dune [Full 6 tomos][PDF][Spanish][Frank Herbert]', WORK_MATCH.NOT_THIS_WORK],
+    // Project Hail Mary — the byline case.
+    [PHM, 'Project Hail Mary by Andy Weir EPUB', WORK_MATCH.CLEAN],
+    [PHM, 'Andy Weir - Project Hail Mary', WORK_MATCH.CLEAN],
+    // Ready Player One — the narrator case, on the audiobook indexers.
+    [RPO, 'Ernest Cline - Ready Player One (Wil Wheaton) - 2011 (80kbps)', WORK_MATCH.CLEAN],
+    [RPO, 'Ernest Cline - Ready Player One (Split Chapter Files MP3)', WORK_MATCH.CLEAN],
+    [RPO, 'Ernest Cline Ready Player One 2011 - Lacero 2014 Audiobook EPU', WORK_MATCH.PARTIAL],
+    [RPO, 'Ready Player One - Ernest Cline m4b', WORK_MATCH.CLEAN],
+    // Mistborn — every result for the SERIES name is a bundle, which is why
+    // searching the pinned work's own title matters. See `search-release.ts`.
+    [FINAL_EMPIRE, 'Brandon Sanderson - Mistborn Series 1-6(EPUB)', WORK_MATCH.NOT_THIS_WORK],
+    [FINAL_EMPIRE, 'Brandon Sanderson - Mistborn Trilogy', WORK_MATCH.NOT_THIS_WORK],
+    [FINAL_EMPIRE, 'Brandon Sanderson - [Mistborn 04] - The Alloy of Law', WORK_MATCH.NOT_THIS_WORK],
+    [FINAL_EMPIRE, 'The Final Empire by Brandon Sanderson EPUB', WORK_MATCH.CLEAN],
+  ];
+
+  const wrong = corpus
+    .map(([w, title, want]) => ({ title, want, got: matchWork(title, w) }))
+    .filter((r) => r.got.score !== r.want);
+  assert.deepEqual(
+    wrong.map((r) => `${r.title} — wanted ${r.want}, got ${r.got.score} (${r.got.reason})`),
+    [],
+  );
 });
 
 // ── 🔴 PINNING THE WORK ─────────────────────────────────────────────────────
