@@ -3,6 +3,34 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [2.0.1] — 2026-08-27
+
+### Fixed
+- **Book searches now ask which book, instead of choosing one.** `search_ebook` and
+  `search_audiobook` take free text, so the releases they rank are frequently *different works* —
+  the novel, an abridged edition, a companion volume, a study guide *about* the book. Ranking them
+  on swarm health answers "which copy", which is the wrong question: asking for *"The Hobbit,
+  J.R.R. Tolkien"* ranked a Corey Olsen study guide first on 24 seeders and the novel third on 8.
+  The ranking was correct — every candidate was a healthy-swarm `.epub` — so no reordering fixes
+  it. Both searches return the numbered list again, and `send_ebook` / `add_audiobook` now
+  **require** the number that was chosen rather than defaulting to the top-ranked release: a
+  search that asks and a consumer that acts without an answer disagree, and the consumer is the
+  half that runs.
+- **A `.mobi` pick is refused rather than silently swapped.** `send_ebook` used to substitute the
+  best Kindle-compatible release in the list, which was correct while the list was one work's
+  releases. With different works in the list, substituting sends a book nobody asked for. It now
+  declines and names the compatible options.
+
+### Unchanged
+- **TV still chooses for you.** Sonarr's release search is scoped to an episode, so every candidate
+  is an encoding of the same episode and swarm health is the right instrument. `search_episode` and
+  `grab_release` behave exactly as they did in 2.0.0.
+
+### Known limitation
+- The book list mixes *which work* with *which copy* into a single question. Pinning book search to
+  a work identifier first — so that only one book's releases are ranked, and the best of those can
+  be chosen for you again — is not implemented.
+
 ## [2.0.0] — 2026-08-27
 
 A rewrite. Jedd is now a real agent loop rather than a stateless replay, runs in a container, and

@@ -247,7 +247,7 @@ test('🔴 a stored option with NO source still works — the durable-file migra
   assert.equal(sent.length, 0);
 });
 
-test('🔴 a .mobi is never fetched — the best EPUB is taken instead, without asking', async () => {
+test('🔴 a .mobi is never fetched, and NOTHING IS SUBSTITUTED FOR IT', async () => {
   const sent: unknown[] = [];
   const irc = fakeIrc();
   const followups = new FollowupStore(tmp());
@@ -266,30 +266,45 @@ test('🔴 a .mobi is never fetched — the best EPUB is taken instead, without 
     }),
   );
   /**
-   * It used to answer "Option 2 is an EPUB — offer them that one instead", which
-   * is a numbered pick arriving through the failure path. Nobody sees a list of
-   * releases any more, so nobody can be asked to choose from one: the EPUB in
-   * the list we already ranked is taken, and the swap is stated.
+   * ── 🔴 THIS ASSERTION WAS INVERTED, DELIBERATELY ──────────────────────────
+   *
+   * It used to require the opposite: *"the EPUB in the list we already ranked is
+   * taken, and the swap is stated"*, justified by *"nobody sees a list of
+   * releases any more, so nobody can be asked to choose from one."*
+   *
+   * `search_ebook` presents a list again, because its candidates are different
+   * WORKS rather than copies of one book — measured live, option 1 for *"The
+   * Hobbit"* was a study guide and option 3 was the novel. So the number that
+   * arrives here is one a person read and picked, and substituting a different
+   * row for it sends a book NOBODY asked for while reporting SENT.
+   *
+   * ⚠️ The swap becomes correct again once the WORK is pinned before the
+   * releases are ranked, since every option is then the same book. Re-invert
+   * this test THERE, not by deciding the refusal is unhelpful.
    */
-  assert.equal(r.ok, true, r.content);
-  assert.match(r.content, /took the best Kindle-compatible one instead/);
-  assert.match(r.content, /Amazon rejects silently/);
+  assert.equal(r.ok, false, r.content);
+  assert.match(r.content, /^REFUSED/);
+  assert.match(r.content, /NOTHING WAS SUBSTITUTED/);
+  assert.match(r.content, /rejects it SILENTLY/);
+  // The Kindle-compatible options are NAMED so the model can ask about them —
+  // refusing without saying what else there was is a dead end, not a re-ask.
+  assert.match(r.content, /2\. Some Other Book\.epub/);
 
-  /**
-   * ⚠️ The EVIDENCE is the scheduled follow-up, not a fetch. IRC never blocks a
-   * turn — a bot can queue for ten minutes — so asserting `irc.calls` here would
-   * assert against the design and pass only if the concurrency rule broke.
-   */
   assert.equal(irc.calls.length, 0, 'nothing is fetched inside the turn, .mobi or otherwise');
-  const pending = followups.pendingEbook(JEFF, 'Some Other Book.epub');
-  assert.ok(pending, 'the EPUB is what got scheduled');
-  assert.equal(pending.ebook?.command, '!Bsk Other.epub', 'and it is the EPUB, not the .mobi');
+  assert.equal(sent.length, 0, 'and nothing is sent');
+  assert.equal(
+    followups.pendingEbook(JEFF, 'Some Other Book.epub'),
+    undefined,
+    '🔴 THE EPUB IS NOT SCHEDULED EITHER — a substitution through the follow-up store is still a substitution',
+  );
   assert.equal(followups.pendingEbook(JEFF, 'Andy Weir - PHM.mobi'), undefined);
 });
 
-test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather than sent', async () => {
-  // The swap is only available when something else is a format Amazon accepts.
-  // It rejects .mobi silently, so a send that "worked" would never arrive.
+test('CONTROL: with NO Kindle-compatible option anywhere, the refusal names no alternative', async () => {
+  // Both cases refuse now. What separates them is what the model is told to say
+  // next: with an `.epub` in the list there is something to ask about, and with
+  // nothing but a `.rar` the honest answer is "search again" rather than a
+  // numbered option that would not arrive either.
   const sent: unknown[] = [];
   const irc = fakeIrc();
   const tool = makeSendEbook({
@@ -311,7 +326,7 @@ test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather th
       { n: 2, label: 'Andy Weir - PHM.rar', value: { source: 'irc', command: '!Wench y.rar', bot: 'Wench', title: 'Andy Weir - PHM.rar' } },
     ],
   });
-  const r = await tool.run({}, {
+  const r = await tool.run({ choice: 1 }, {
     role: 'guest' as const,
     senderHandle: JEFF,
     config: testConfig({ readOnly: false }),
@@ -321,6 +336,8 @@ test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather th
   assert.equal(r.ok, false);
   assert.match(r.content, /^REFUSED/);
   assert.match(r.content, /2022/);
+  assert.match(r.content, /offer to search again/);
+  assert.doesNotMatch(r.content, /2\. Andy Weir - PHM\.rar/, 'a .rar is not a Kindle format to offer');
   assert.equal(irc.calls.length, 0, 'nothing may be fetched');
   assert.equal(sent.length, 0);
 });

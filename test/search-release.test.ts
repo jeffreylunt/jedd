@@ -45,9 +45,9 @@ test('🔴 READY PLAYER ONE: an audiobook search stores a pick add_audiobook can
   // Jeff, live: "Can you get the ready player one audiobook?" -> "I don't have
   // an audiobook search tool." add_audiobook was registered and uncallable.
   //
-  // ⚠️ The list is no longer PRESENTED — nobody is asked which torrent — but it
-  // is still stored, and the consumer still resolves from it. That seam is what
-  // this test guards, and it did not change.
+  // ⚠️ The seam this test guards is the STORE, not the prose: the producer
+  // writes a list the consumer can resolve. It has survived the list being
+  // withheld and then presented again, which is what makes it the right seam.
   const path = tempFile();
   const store = new ChoiceStore(path);
   const r = await run(
@@ -57,7 +57,7 @@ test('🔴 READY PLAYER ONE: an audiobook search stores a pick add_audiobook can
   );
   assert.equal(r.ok, true);
   assert.match(r.content, /Ready Player One/);
-  assert.match(r.content, /Call add_audiobook now/);
+  assert.match(r.content, /Call add_audiobook ONLY once they have answered/);
   assert.match(r.content, /Nothing is downloading yet/);
 
   // 🔴 The point of the whole exercise: the consumer can now resolve the pick.
@@ -106,7 +106,7 @@ test('search_ebook is the same producer pointed at the ebook category and send_e
   }).run({ query: 'Project Hail Mary' }, ctx());
   assert.equal(r.ok, true);
   assert.match(url, /categories=7020/, 'ebooks are Prowlarr category 7020');
-  assert.match(r.content, /Call send_ebook now/);
+  assert.match(r.content, /Call send_ebook ONLY once they have answered/);
 });
 
 test('search_audiobook uses the audiobook category', async () => {
@@ -233,14 +233,18 @@ test('a dead release is EXCLUDED and counted — it is not a lesser option, it i
   assert.match(r.content, /1 with no seeders left out/, 'and it is counted, never dropped in silence');
 });
 
-test('only ONE release is named, however many were found, and the rest are counted', async () => {
+test('the list is capped at five, in ranked order, and the count is not inflated', async () => {
+  // A book search asks now, so the releases ARE printed — but a numbered list is
+  // something a person has to read, and nine rows of near-identical filenames is
+  // not a question anybody can answer. Five, best first.
   const many = Array.from({ length: 9 }, (_, i) =>
     release({ title: `Release ${i}`, infoHash: `${i}`.repeat(40).slice(0, 40), seeders: 20 - i }),
   );
   const r = await run(async () => json(many), { query: 'x' });
-  assert.match(r.content, /Release 0/, 'the top of the ranking');
-  assert.match(r.content, /4 other release\(s\) not chosen/);
-  assert.doesNotMatch(r.content, /^\s*\d+\.\s/m, 'no numbered options at all');
+  assert.match(r.content, /^\s*1\. Release 0/m, 'the top of the ranking is option 1');
+  assert.match(r.content, /^\s*5\. Release 4/m);
+  assert.doesNotMatch(r.content, /^\s*6\./m, 'nothing past five');
+  assert.match(r.content, /FOUND 5 for "x"/, 'and it says five, not nine — it must not overstate the list');
 });
 
 test('🔴 with no choice store it refuses — a list nothing can resolve is not an offer', async () => {

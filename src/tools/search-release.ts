@@ -73,15 +73,17 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
      */
     needsServices: isAudio ? ['prowlarr'] : [],
     description: isAudio
-      ? 'Search for an AUDIOBOOK — a book to LISTEN to — and CHOOSE the best release. It picks one ' +
-        'itself, leading on how alive the swarm is; do NOT list releases and do NOT ask which ' +
-        `torrent they want. Then call ${consumer} to start it. Do NOT say anything is downloading ` +
-        'yet — nothing is until that runs. Set graphic_audio true ONLY if they explicitly asked for ' +
-        'a GraphicAudio dramatisation.'
-      : 'Search for an EBOOK — a book to READ, delivered to their Kindle — and CHOOSE the best ' +
-        'release. It picks one itself, leading on how alive the swarm is; do NOT list releases and ' +
-        `do NOT ask which torrent they want. Then call ${consumer}. Do NOT say anything is being ` +
-        'sent yet. Use search_audiobook instead if they want to LISTEN.',
+      ? 'Search for an AUDIOBOOK — a book to LISTEN to. It returns a NUMBERED LIST, because a book ' +
+        'search matches on free text and the results are usually DIFFERENT WORKS — a study guide, a ' +
+        'boxed set, the actual novel. Show them the list and ASK WHICH BOOK THEY MEANT. When they ' +
+        `answer, call ${consumer} with that number. Do NOT say anything is downloading yet — ` +
+        'nothing is until that runs. Set graphic_audio true ONLY if they explicitly asked for a ' +
+        'GraphicAudio dramatisation.'
+      : 'Search for an EBOOK — a book to READ, delivered to their Kindle. It returns a NUMBERED ' +
+        'LIST, because a book search matches on free text and the results are usually DIFFERENT ' +
+        'WORKS — a study guide, a boxed set, the actual novel. Show them the list and ASK WHICH ' +
+        `BOOK THEY MEANT. When they answer, call ${consumer} with that number. Do NOT say anything ` +
+        'is being sent yet. Use search_audiobook instead if they want to LISTEN.',
     minRole: 'guest',
     /**
      * ⚠️ A READ. It searches indexers and stores a list; nothing is grabbed and
@@ -145,9 +147,20 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         );
       }
 
-      // 🔴 See the same note in `fill-gaps.ts`: the pending list dies when a new
-      // search STARTS, because the consumer now defaults to option 1 and every
-      // early return below would otherwise leave a stale one grabbable.
+      /**
+       * 🔴 THE PENDING LIST DIES WHEN A NEW SEARCH **STARTS**, NOT WHEN ONE
+       * SUCCEEDS. Same note as `fill-gaps.ts`, and the reason survived the
+       * consumer losing its default:
+       *
+       * *search "Dune" (stored) → search "The Hobbit" (Prowlarr 500, UNKNOWN) →
+       * "yeah, 2"* now resolves **2 from the DUNE list** and reports STARTED
+       * naming a book nobody is talking about. The number is no longer optional,
+       * but a number is not self-describing either — it means whatever list is
+       * lying around.
+       *
+       * ⚠️ Clearing FIRST rather than in each early return is the point: the
+       * branch someone forgets is the one that ships.
+       */
       ctx.choices.clear(ctx.senderHandle);
 
       /**
@@ -298,16 +311,7 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         options: top.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
       });
 
-      /**
-       * 🔴 ONLY THE CHOSEN RELEASE IS RETURNED — the alternatives are stored and
-       * withheld. See the same note in `fill-gaps.ts`: a model cannot offer a
-       * numbered pick it was never given, and Jeff asked for the choice to stop
-       * being the user's. Which BOOK they meant is still theirs; which torrent
-       * carries it is not.
-       */
-      const best = top[0]!;
       const notes: string[] = [];
-      if (top.length > 1) notes.push(`${top.length - 1} other release(s) not chosen`);
       if (deadCount) notes.push(`${deadCount} with no seeders left out (they would never finish)`);
       if (isAudio && before > releases.length) {
         notes.push(`${before - releases.length} GraphicAudio release(s) left out`);
@@ -321,11 +325,56 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       if (ircNote) notes.push(ircNote);
       const suffix = notes.length ? ` (${notes.join('; ')})` : '';
 
+      /**
+       * ── 🔴 THE BOOK PATHS ASK. THE EPISODE PATH DOES NOT. ──────────────────
+       *
+       * Jeff's rule — *"don't give users a choice of which torrent to choose,
+       * just choose the best one"* — is a rule about choosing between COPIES OF
+       * ONE THING, and it is right wherever that is what the candidates are.
+       *
+       * `search_episode` is safe by construction: it takes a title, a season and
+       * an episode, resolves them against Sonarr to ONE `episodeId`, and asks
+       * Sonarr for the releases OF THAT EPISODE. Every candidate is an encoding
+       * of the same work, so ranking answers **"which copy"** and swarm health
+       * is exactly the right instrument.
+       *
+       * These two tools take FREE TEXT. Prowlarr and the IRC bots return
+       * whatever loosely matches it, so the candidates are **different works**
+       * and ranking is being asked **"which thing"** — a question a seeder count
+       * cannot answer and was never asked to.
+       *
+       * ⚠️ MEASURED, LIVE, 2026-08-27. *"The Hobbit J.R.R. Tolkien"* ranked:
+       * (1) a Corey Olsen **study guide**, 24 seeders — AUTO-PICKED; (2) a
+       * 1937-2017 booklet, 10; (3) **the actual novel**, 8; (4) a four-book
+       * collection, 8; (5) LotR+Hobbit, 6. **The ranking was correct.** The
+       * top-ranked release was not the book, and no reordering fixes that,
+       * because the defect is in the question.
+       *
+       * The only thing that caught it was the model noticing and refusing to
+       * send the study guide — enforcement by a reader, which is what
+       * `search_episode`'s old *"do NOT grab 4K"* description was before it
+       * became a filter in code. So the list is RETURNED, and the consumer
+       * below refuses to act without a number.
+       *
+       * ⚠️ THIS IS THE INTERIM SHAPE, and it is worse than the fix it stands in
+       * for: it hands back a list that mixes "which work" and "which copy" into
+       * one question. The fix is to resolve the WORK first — the two-stage shape
+       * `add_movie`/`add_series` already have with `tmdbId`/`tvdbId` — and then
+       * auto-pick on swarm health among that work's releases only, which is
+       * Jeff's rule restored exactly. Do not delete this note when the list goes
+       * away; delete it when the work is pinned before the ranking.
+       */
+      const lines = top.map((o, i) => `  ${i + 1}. ${o.label}`).join('\n');
       return ok(
-        `CHOSE — for "${query}" I picked the best ${medium} release myself, leading on swarm ` +
-          `health: ${best.label}${suffix}.\n` +
-          'Do NOT list releases and do NOT ask which torrent they want — that choice is already ' +
-          `made. Call ${consumer} now to take this one. Nothing is downloading yet.`,
+        `FOUND ${top.length} for "${query}"${suffix}. These are ranked by swarm health, but a ` +
+          `${medium} search matches on TEXT, so they are very likely DIFFERENT WORKS — a study ` +
+          'guide, a companion, a boxed set, the book itself — and NOT copies of one book. Option 1 ' +
+          'is NOT "the best one" in any sense that matters here.\n' +
+          `${lines}\n` +
+          'SHOW THEM THIS LIST and ASK WHICH BOOK THEY MEANT. Do not choose for them and do not ' +
+          `assume option 1. If none of these is the book they want, say so and offer to search ` +
+          `again with the author's name. Call ${consumer} ONLY once they have answered, with the ` +
+          `number they chose. Nothing is ${isAudio ? 'downloading' : 'being sent'} yet.`,
       );
     },
   };

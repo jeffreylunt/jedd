@@ -51,31 +51,39 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
   return {
     name: 'send_ebook',
     description:
-      'Grab the book that search_ebook chose and send it to the person\'s Kindle. Call it with NO ' +
-      'arguments — the search already picked the best release and you do not need to ask anybody ' +
-      'which torrent. You do not supply an address either — theirs is already stored, and if it is ' +
-      'not, ask them for it and save it first.',
+      'Grab the book the person CHOSE from the numbered list search_ebook returned and send it to ' +
+      'their Kindle. Pass the number they picked. Do not call this until they have actually said ' +
+      'which one — a book search returns different works, not different copies of one book. You do ' +
+      'not supply an address — theirs is already stored, and if it is not, ask them for it and save ' +
+      'it first.',
     minRole: 'guest',
     writes: true,
     consumesChoiceKind: 'ebook-release',
     /**
-     * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is
-     * what `search_ebook` ranked to the top and already chose.
+     * 🔴 `choice` IS REQUIRED, AND ITS ABSENCE IS A REFUSAL — NOT A DEFAULT.
+     * See the same note in `add-audiobook.ts`: `search_ebook` asks now, and a
+     * default of 1 would make that ask advisory, since the model could grab the
+     * top-ranked work without anybody ever having answered.
      */
     parameters: {
       type: 'object',
       properties: {
         choice: {
           type: 'number',
-          description:
-            'Omit this. Only pass a number if they explicitly asked for a DIFFERENT release than ' +
-            'the one chosen for them.',
+          description: 'The number THEY picked from the list. Required — never guess it, never assume 1.',
         },
       },
-      required: [],
+      required: ['choice'],
     },
     async run(args, ctx: ToolContext) {
-      const n = args['choice'] === undefined ? 1 : Number(args['choice']);
+      if (args['choice'] === undefined) {
+        return fail(
+          'NO PICK — nothing was grabbed or sent. A book search returns different works, so there ' +
+            'is no "best" one to fall back on. Show them the numbered list and ask which book they ' +
+            'meant.',
+        );
+      }
+      const n = Number(args['choice']);
       if (!Number.isFinite(n)) return fail('That is not an option number.');
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed or sent.');
       if (!ctx.choices) return fail('No option store is available.');
@@ -98,40 +106,50 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       // ── which book, and FROM WHERE ───────────────────────────────────────
       const picked = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'ebook-release');
       if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
-      let option = picked.option;
+      const option = picked.option;
 
       /**
-       * 🔴 A `.mobi` IS RE-CHOSEN, NOT HANDED BACK AS A QUESTION.
+       * ── 🔴 A `.mobi` PICK IS REFUSED AND RE-ASKED. IT IS NOT SWAPPED. ──────
        *
-       * This used to answer *"Option 3 is an EPUB — offer them that one
-       * instead"*, which is the numbered pick Jeff asked us to stop making
-       * people do, just arriving through the failure path.
+       * This code used to silently substitute a different option — *"the top
+       * release was a .mobi, so I took the best Kindle-compatible one instead"*
+       * — and the comment justifying that said so explicitly: *"Nobody is shown
+       * a list of releases any more, so a `choice` number cannot mean 'I looked
+       * at the options and I want the .mobi'. It can only mean 'not that one'."*
        *
-       * ⚠️ It swaps however the pick ARRIVED, and that is deliberate rather than
-       * lazy. Nobody is shown a list of releases any more, so a `choice` number
-       * cannot mean *"I looked at the options and I want the .mobi"* — there was
-       * nothing to look at. It can only mean *"not that one"*. And Amazon has
-       * rejected `.mobi` SILENTLY since 2022, so sending one is never the right
-       * action for anybody: it would look sent and never arrive.
+       * **That premise is now false.** `search_ebook` returns a numbered list of
+       * what are usually DIFFERENT WORKS, and the number that arrives here is
+       * the one a person read and picked. Swapping it for another row is no
+       * longer "the same book in a better format" — measured live, option 1 for
+       * *"The Hobbit"* was a study guide and option 3 was the novel, so the swap
+       * would take a book NOBODY asked for and report it as SENT.
+       *
+       * ⚠️ The swap was correct under auto-pick and it becomes correct again the
+       * moment the WORK is pinned before the releases are ranked, because every
+       * option in the list is then genuinely the same book. Restore it there —
+       * not before.
        */
-      let swapped = '';
       if (isMobi(String(option.value['title'] ?? option.label))) {
         /**
-         * ⚠️ ANY FORMAT AMAZON ACCEPTS, EPUB FIRST — not `.epub` or nothing.
-         * `ebook-validate.ts` passes `epub`, `azw3` and `pdf`, so refusing a
-         * whole delivery because the only alternative was an `.azw3` would
-         * decline a book that would have arrived perfectly well.
+         * ⚠️ ANY FORMAT AMAZON ACCEPTS, not `.epub` or nothing. `ebook-validate.ts`
+         * passes `epub`, `azw3` and `pdf`, so the alternatives OFFERED are all
+         * three — naming only EPUBs would hide a book that would have arrived
+         * perfectly well.
          */
-        const others = picked.choice.options.filter((o) => o.n !== option.n);
-        const alt =
-          others.find((o) => /\.epub\b/i.test(String(o.value['title'] ?? o.label))) ??
-          others.find((o) => /\.(azw3|pdf)\b/i.test(String(o.value['title'] ?? o.label)));
-        if (alt) {
-          swapped =
-            ' (the top release was a .mobi, which Amazon rejects silently, so I took the best ' +
-            'Kindle-compatible one instead)';
-          option = alt;
-        }
+        const usable = picked.choice.options.filter(
+          (o) => o.n !== option.n && /\.(epub|azw3|pdf)\b/i.test(String(o.value['title'] ?? o.label)),
+        );
+        return fail(
+          `REFUSED — option ${option.n} is a .mobi. Amazon stopped accepting that format in 2022 ` +
+            'and rejects it SILENTLY, so it would look sent and never arrive. Nothing was fetched ' +
+            'and NOTHING WAS SUBSTITUTED — the other options may be different books, so do not ' +
+            'quietly send one of them.' +
+            (usable.length
+              ? ` Tell them that one will not work and ask whether one of these is the same book: ` +
+                `${usable.map((o) => `${o.n}. ${o.label}`).join('; ')}.`
+              : ' Nothing else that was found is a format Amazon accepts either — say so and offer ' +
+                'to search again.'),
+        );
       }
 
       const value = option.value;
@@ -150,22 +168,14 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       const source = value['source'] === 'irc' ? 'irc' : 'prowlarr';
 
       /**
-       * 🔴 `.mobi` IS REFUSED BEFORE ANYTHING IS FETCHED, AND NAMES A WAY OUT.
-       *
-       * Amazon has rejected `.mobi` since 2022 and does it SILENTLY — the send
-       * looks fine here and the book never arrives. Declining beats a bounce
-       * nobody can see. `ebook-validate.ts` catches this again on the bytes;
-       * this earlier check exists so the person is told *now*, and told which
-       * numbered option to pick instead, rather than after a pointless download.
+       * ⚠️ THE SECOND `.mobi` GUARD THAT USED TO SIT HERE IS GONE, NOT MOVED BY
+       * ACCIDENT. It tested exactly the expression the refusal above tests, on
+       * the same `option`, and the swap between them was the only thing that
+       * could change the answer. With the swap removed it could never fire, and
+       * a dead guard reads as protection while providing none.
+       * `ebook-validate.ts` still checks the BYTES on the way out, which is the
+       * check that never depended on the filename.
        */
-      if (isMobi(title)) {
-        return fail(
-          `REFUSED — "${title}" is a .mobi. Amazon stopped accepting that format in 2022 and ` +
-            'rejects it silently, so it would look sent and never arrive. Nothing was fetched. ' +
-            'Nothing else that was found is a format Amazon accepts either — say so and offer to ' +
-            'search again.',
-        );
-      }
 
       // ── start the fetch ──────────────────────────────────────────────────
       if (source === 'prowlarr') {
@@ -214,7 +224,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
         { mayBlock: false },
       );
 
-      if (attempt.state === 'delivered') return ok(`SENT — ${attempt.detail}${swapped}`);
+      if (attempt.state === 'delivered') return ok(`SENT — ${attempt.detail}`);
       if (attempt.state === 'failed') return fail(`FAILED — ${attempt.detail}`);
 
       /**
@@ -233,7 +243,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
        */
       if (!ctx.followups) {
         return ok(
-          `STARTED — ${attempt.detail}${swapped} I have NOT sent anything, and I cannot check back ` +
+          `STARTED — ${attempt.detail} I have NOT sent anything, and I cannot check back ` +
             'on my own here. Tell them to ask again in a few minutes.',
         );
       }
@@ -253,7 +263,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       }
 
       return ok(
-        `STARTED — ${attempt.detail}${swapped} NOTHING HAS BEEN SENT YET. Tell them it is on the ` +
+        `STARTED — ${attempt.detail} NOTHING HAS BEEN SENT YET. Tell them it is on the ` +
           'way and that you will message them when it actually lands — do not say it has been sent.',
       );
     },
