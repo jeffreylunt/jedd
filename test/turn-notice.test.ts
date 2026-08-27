@@ -127,6 +127,49 @@ test('🔴 CONTROL: a failure that is NOT the timer stays itself', async () => {
   }
 });
 
+test("🔴 a FOREIGN AbortError is not this turn's timeout — the mutation that named it e.name survived until this existed", async () => {
+  /**
+   * 🔴 THIS TEST EXISTS BECAUSE A MUTATION SURVIVED WITHOUT IT.
+   *
+   * Rewriting the classification from `controller.signal.aborted` to
+   * `e.name === 'AbortError'` — the wrong test, and the tempting one — left the
+   * whole file green. Asserting `isModelTimeout(someAbortError) === false` on a
+   * bare object never reaches `OllamaClient`, so it proved nothing about the
+   * branch that actually runs.
+   *
+   * Tools here (`indexer-admin`, the arr fetches, `probeLlm`) run their own
+   * `AbortSignal.timeout`. Under the mutation, a five-second indexer probe
+   * aborting mid-turn would be reported to the sender as "that ran past my
+   * 15-minute limit, ask for a shorter list".
+   */
+  const config = { ...testConfig(), llm: { ...testConfig().llm, turnTimeoutMs: 600_000 } };
+  const client = new OllamaClient(config);
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => {
+    // Aborted by SOMETHING ELSE: the turn's own controller is untouched and its
+    // 600s timer has not come close to firing.
+    const e = new Error('This operation was aborted');
+    e.name = 'AbortError';
+    return Promise.reject(e);
+  }) as typeof globalThis.fetch;
+
+  try {
+    const err = await client.chat([{ role: 'user', content: 'hi' }], []).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.equal(
+      isModelTimeout(err),
+      false,
+      "an AbortError this controller did not cause must not be reported as the turn's budget expiring",
+    );
+    assert.match(failureReply(err), /trying again/i, 'and the sender gets the generic advice, not "ask for a shorter list"');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test('🔴 a body that stalls after the headers is aborted too — the timer used to end at the headers', async () => {
   /**
    * `fetch` resolves on HEADERS. `clearTimeout` sat in a `finally` around the
