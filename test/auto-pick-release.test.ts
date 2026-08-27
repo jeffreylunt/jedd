@@ -576,3 +576,58 @@ test('the swarm bands are dead / thin / healthy, and dead is anything not positi
   assert.ok(swarmRank(HEALTHY_SWARM_SEEDERS) > swarmRank(1));
   assert.ok(swarmRank(1) > swarmRank(0));
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * WHAT THE PERSON ACTUALLY READS WHEN THE BOOK GENUINELY IS NOT THERE
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+test('🔴 IRC "no matches" reaches the model as an ABSENCE, not as a bot that went quiet', async () => {
+  /**
+   * Live, 2026-08-27. Jeff asked for "Vengeance Is Mine: The Mountain Meadows
+   * Massacre and Its Aftermath". SearchBot answered in 8.5s — no matches — and
+   * Jedd, deaf to the notice it answered on, waited its full 90s cap and said:
+   *
+   *   "The search came back empty — the IRC ebooks bot didn't answer within
+   *    90s, so nothing was found. That's a transient failure, not 'the book
+   *    doesn't exist.' Want me to retry?"
+   *
+   * Both halves were wrong, and the second one is the expensive one: it sent him
+   * back round a loop that could only fail the same way, and he did retry.
+   *
+   * 🔴 THIS ASSERTS ON THE WORDING THAT REACHES THE MODEL, which is the seam
+   * where a `none` and an `unknown` stop being interchangeable. The IRC layer is
+   * covered in `irc-sandbox.test.ts`; what this pins is that a `none` from IRC
+   * merges into a REPORT OF ABSENCE naming both sources, instead of a report
+   * that something failed to answer.
+   */
+  const irc = {
+    rosterHas: () => true,
+    async search() {
+      return {
+        state: 'none' as const,
+        detail:
+          'IRC found nothing — the #ebooks search bot searched and found no matches for ' +
+          '"Vengeance Is Mine Richard E. Turley".',
+      };
+    },
+    async fetch() {
+      return { state: 'failed' as const, detail: 'not used here' };
+    },
+  } as unknown as IrcEbooks;
+
+  const r = await makeSearchEbook(async () => json([]), irc).run(
+    { query: 'Vengeance Is Mine Richard E. Turley' },
+    ctx(),
+  );
+
+  assert.equal(r.ok, true);
+  assert.match(r.content, /NONE/, 'both sources were read and both are empty');
+  assert.match(r.content, /no matches/i, "the bot's own finding must survive the merge");
+  assert.doesNotMatch(
+    r.content,
+    /did not answer|didn't answer|nothing arrived within/i,
+    'reporting silence about a bot that spoke is the defect this closes',
+  );
+});
