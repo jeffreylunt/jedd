@@ -59,6 +59,8 @@ function clampedNumber(value: unknown, fallback: number, min: number, max: numbe
  */
 export const dockerPs: Tool = {
   name: 'docker_ps',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'List every container on hp with its status and image (docker ps -a). This is how you check ' +
     'whether something is up, exited or restarting. The generic shell CANNOT run docker — use this ' +
@@ -100,6 +102,8 @@ export const dockerPs: Tool = {
  */
 export const dockerInspect: Tool = {
   name: 'docker_inspect',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     "Inspect one container's configuration and state on hp: status, health, restart count, start/finish " +
     'times, exit code, image, network mode and restart policy. Takes a container name only. Note this ' +
@@ -157,6 +161,8 @@ export const dockerInspect: Tool = {
  */
 export const dockerLogs: Tool = {
   name: 'docker_logs',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Read recent log lines from one container on hp (stdout and stderr combined). Takes a container ' +
     'name, an optional line count (default 100, max 1000) and an optional age in minutes. The generic ' +
@@ -245,6 +251,8 @@ const STANDALONE_NETWORK_MODES = /^(bridge|host|none|default|[a-zA-Z0-9][a-zA-Z0
  */
 export const containerNetns: Tool = {
   name: 'container_netns',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     "Check whether a container is REALLY sharing another container's network namespace (the gluetun " +
     'tunnel case), by comparing kernel netns inodes (readlink /proc/self/ns/net) rather than trusting ' +

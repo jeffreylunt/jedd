@@ -176,6 +176,54 @@ export class OllamaClient implements LlmClient {
   }
 }
 
+/**
+ * Is the model endpoint actually there, and does it have the model we ask for?
+ *
+ * 🔴 WARN, NEVER FATAL — AND THE DISTINCTION IS THE WHOLE DESIGN.
+ *
+ * Config PRESENCE is statically checkable and cannot become true later, so
+ * hard-failing on it is right. REACHABILITY is a fact about this second: an
+ * Ollama that is restarting at 03:00 is serving again at 03:05. Exiting on it
+ * would convert a two-minute blip into a dead bot, and under a supervisor into
+ * a restart loop. So this reports and returns; it never decides.
+ *
+ * ⚠️ IT IS NOT DECORATION. Nothing else contacts the model before serving, and
+ * a wrong `LLM_BASE_URL` produces the worst failure this system has: the process
+ * boots, the healthcheck passes, the webhook registers, and then EVERY turn
+ * throws — so a person texts and gets silence, indefinitely, with the only
+ * evidence in a log. This line is the difference between finding that out at
+ * boot and finding it out from a user who thinks the bot is ignoring them.
+ */
+export async function probeLlm(
+  config: Config,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; detail: string }> {
+  const base = config.llm.baseUrl.replace(/\/$/, '');
+  try {
+    const r = await fetchImpl(`${base}/api/tags`, { signal: AbortSignal.timeout(5_000) });
+    if (!r.ok) return { ok: false, detail: `${base} answered http ${r.status}` };
+    const body = (await r.json()) as { models?: { name?: string }[] };
+    const names = (body.models ?? []).map((m) => m.name).filter(Boolean) as string[];
+    if (!names.includes(config.llm.model)) {
+      /**
+       * Reachable but WITHOUT the configured model is its own failure, and a
+       * distinct one: the endpoint answers, so every connectivity check passes,
+       * and the model name is only wrong at generation time. Name what IS there
+       * — a typo is obvious next to the real list and invisible on its own.
+       */
+      return {
+        ok: false,
+        detail:
+          `${base} is reachable but has no model named "${config.llm.model}". ` +
+          `It offers: ${names.slice(0, 8).join(', ') || '(none)'}${names.length > 8 ? ', …' : ''}`,
+      };
+    }
+    return { ok: true, detail: `${base} has ${config.llm.model}` };
+  } catch (e) {
+    return { ok: false, detail: `${base} is unreachable: ${(e as Error).message}` };
+  }
+}
+
 export function createLlmClient(config: Config): LlmClient {
   switch (config.llm.provider) {
     case 'ollama':

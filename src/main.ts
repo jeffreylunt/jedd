@@ -18,7 +18,7 @@ import { IrcEbooks } from './media/irc-ebooks.js';
 import { DEFAULT_MOUNTS } from './tools/send-ebook.js';
 import { realMailSender } from './media/kindle-send.js';
 import { imapMailboxReader, imapSettingsFrom } from './kindle-mailbox.js';
-import { createLlmClient } from './llm.js';
+import { createLlmClient, probeLlm } from './llm.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
@@ -99,6 +99,39 @@ async function main(): Promise<void> {
   );
 
   const llm = createLlmClient(config);
+  /**
+   * 🔴 THE MODEL IS REQUIRED FOR FUNCTION AND IS CHECKED NOWHERE ELSE.
+   *
+   * Nothing contacts it before serving, so an unreachable endpoint is invisible
+   * until the first message — and then every turn throws while the process stays
+   * up and healthy. Awaited on purpose (it is one 5s-capped call) so the verdict
+   * appears ABOVE the tool line, where somebody reading a boot log will see it.
+   *
+   * Warned, never fatal: reachability is not config presence. See probeLlm.
+   */
+  const llmProbe = await probeLlm(config);
+  if (llmProbe.ok) {
+    console.error(`[jedd] model OK: ${llmProbe.detail}`);
+  } else {
+    console.error(`[jedd] 🔴 THE MODEL IS NOT USABLE: ${llmProbe.detail}`);
+    console.error(
+      `[jedd] 🔴 Every turn will fail and each sender gets an error reply, not an answer. ` +
+        `Fix LLM_BASE_URL (currently ${config.llm.baseUrl}) or LLM_MODEL (${config.llm.model}).`,
+    );
+    /**
+     * ⚠️ NAMED EXPLICITLY BECAUSE THE DEFAULT IS WRONG BY CONSTRUCTION FOR THE
+     * MOST LIKELY DEPLOYMENT. `localhost` inside a container is THE CONTAINER —
+     * so the shipped default cannot work for anyone running this the documented
+     * way, and it fails looking configured rather than looking unset.
+     */
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)\b/.test(config.llm.baseUrl)) {
+      console.error(
+        `[jedd] 🔴 LLM_BASE_URL points at localhost. IN A CONTAINER THAT IS THE CONTAINER ITSELF, ` +
+          `not the machine running the model. Use host.docker.internal (Docker Desktop) or the ` +
+          `host's LAN address.`,
+      );
+    }
+  }
   const preflight = assertShellIdentityIsSafe(config);
   const shellIdentity = preflight.safe
     ? await proveShellIdentityIsSafe(config)
@@ -287,6 +320,27 @@ async function main(): Promise<void> {
       `writes=${config.readOnly ? 'DISABLED' : 'ENABLED'} hp_shell=${shellIdentity.safe ? 'on' : 'OFF'}`,
   );
   console.error(`[jedd] tools=${tools.map((t) => t.name).join(', ')}`);
+  /**
+   * 🔴 SAY WHAT IS OFF, AND SAY WHICH VARIABLE TURNS IT ON.
+   *
+   * Gating a tool out is the right behaviour — an absent tool cannot be offered
+   * to somebody and then fail. But a capability that vanishes SILENTLY is the
+   * same defect wearing different clothes: the operator sees a smaller bot with
+   * no reason given, and "Jedd cannot restart containers" reads as a bug rather
+   * than as an unset variable. The registry line above says what IS here; this
+   * says what is NOT, and how to change it.
+   */
+  const off: string[] = [];
+  if (!config.homelabSshConfigured) off.push('homelab ssh (12 docker/host tools) — set HP_ADMIN_SSH_HOST');
+  else if (!shellIdentity.safe) off.push(`hp_shell — ${shellIdentity.reason}`);
+  if (!config.kindle.smtpPassword) off.push('ebooks to Kindle (4 tools) — set KINDLE_SMTP_PASSWORD');
+  if (!config.tmdb.readToken) off.push('whats_popular / title_details — set TMDB_READ_TOKEN');
+  if (!config.jfago.password || !config.jfago.baseUrl) off.push('invite_to_jellyfin — set JFAGO_URL and JFAGO_PASSWORD');
+  if (!config.runbookPath) off.push('read_runbook — set RUNBOOK_PATH');
+  if (off.length) {
+    console.error(`[jedd] not configured, so NOT offered (${off.length}):`);
+    for (const line of off) console.error(`[jedd]   - ${line}`);
+  }
 
   const reg = await client.ensureWebhook(config.bluebubbles.publicUrl, ['new-message']);
   console.error(`[jedd] webhook ${reg.outcome}: ${config.bluebubbles.publicUrl}`);
@@ -456,6 +510,37 @@ async function main(): Promise<void> {
     } catch (e) {
       // A failing turn must not stop the next message arriving.
       console.error(`[jedd] turn ${turns} THREW: ${(e as Error).message}`);
+      /**
+       * 🔴 SILENCE IS NEVER THE RIGHT ANSWER TO A MESSAGE.
+       *
+       * This catch used to log and nothing else. To the person who texted, a
+       * thrown turn was INDISTINGUISHABLE from the bot being switched off,
+       * ignoring them, or never receiving it — and the only evidence was a line
+       * in a log they cannot read. The most likely cause is also the most
+       * invisible: an unreachable model endpoint, which throws here on every
+       * single turn while the process stays up and healthy forever.
+       *
+       * The reply is deliberately plain. It says something failed and that a
+       * retry is worth trying; it does NOT carry the exception text, which can
+       * name internal hosts and is meaningless to the reader anyway.
+       *
+       * ⚠️ It goes through `connector.send`, so `JEDD_SEND_TO` still applies —
+       * a handle outside the audience is suppressed here exactly as it is on the
+       * success path. This does not become a way to text someone we may not.
+       *
+       * ⚠️ And it is itself wrapped: if BlueBubbles is what failed, the apology
+       * cannot be delivered either, and throwing from a catch block would take
+       * out the handler that keeps the NEXT message working.
+       */
+      try {
+        await connector.send(
+          message.senderHandle,
+          `Something went wrong on my end and I could not answer that. It has been logged — worth trying again in a moment.`,
+          message.sourceGuid,
+        );
+      } catch (sendErr) {
+        console.error(`[jedd] turn ${turns} could not even report the failure: ${(sendErr as Error).message}`);
+      }
     }
   });
 }

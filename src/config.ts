@@ -250,6 +250,27 @@ export interface Config {
    * this project keys on; making them vary per deployment would break the one
    * thing that must stay greppable across machines.
    */
+  /**
+   * Did this deployment actually configure a homelab ssh host?
+   *
+   * 🔴 THIS GATES TWELVE TOOLS, AND IT IS DELIBERATELY A CONFIG FACT RATHER
+   * THAN A REACHABILITY PROBE.
+   *
+   * Config presence cannot become true later: nobody set `HP_ADMIN_SSH_HOST`,
+   * so there is no homelab to reach, and that is a property of the deployment.
+   * Reachability is a property of THIS SECOND — a host down at 03:00 is up at
+   * 03:05. Gating the registry on a live probe would silently delete twelve
+   * tools from a working install because one ssh call timed out during boot,
+   * and the operator would have no idea why their bot got smaller.
+   *
+   * So the split is: **presence decides the registry, reachability only warns.**
+   * `main.ts` still probes and says loudly when a CONFIGURED host cannot be
+   * reached — that is an outage worth reporting, not a reason to unregister.
+   *
+   * The default host name is a placeholder, so an unset variable means "not
+   * configured" rather than "configured to something that happens not to exist".
+   */
+  homelabSshConfigured: boolean;
   displayName: string;
   /**
    * Where audiobook grabs land in qBittorrent, and under what category.
@@ -427,6 +448,8 @@ export function loadConfig(): Config {
       process.env.INDEXER_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'prowlarr-indexers'),
     downloadBackupDir:
       process.env.DOWNLOAD_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'removed-downloads'),
+    // Explicitly SET, not merely defaulted — see the field's doc comment.
+    homelabSshConfigured: Boolean((process.env.HP_ADMIN_SSH_HOST ?? '').trim()),
     displayName: process.env.DISPLAY_NAME ?? 'Jedd',
     audiobook: {
       savePath: process.env.AUDIOBOOK_SAVE_PATH ?? '/downloads/audiobooks',

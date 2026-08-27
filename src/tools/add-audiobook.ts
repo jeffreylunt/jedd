@@ -28,6 +28,8 @@ import { fail, ok, type Tool } from './types.js';
  */
 export const addAudiobook: Tool = {
   name: 'add_audiobook',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Start downloading an audiobook that an audiobook search found. Pass the number they chose. ' +
     'Set graphic_audio ONLY if they explicitly asked for a GraphicAudio dramatisation — if they ' +

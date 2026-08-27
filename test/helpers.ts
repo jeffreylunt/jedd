@@ -63,6 +63,9 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     downloadBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-download-backup-')), 'captures'),
     // The real default, so assertions on user-facing text keep reading as the
     // shipped product rather than as a placeholder.
+    // Tests assume a fully-configured homelab unless they say otherwise; the
+    // absent case is exercised explicitly in optional-dependencies.test.ts.
+    homelabSshConfigured: true,
     displayName: 'Jedd',
     audiobook: { savePath: '/downloads/audiobooks', category: 'audiobooks' },
     checkStreamsResultsPath: '/tmp/check-streams-results.txt',

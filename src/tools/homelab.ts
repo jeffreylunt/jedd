@@ -93,6 +93,8 @@ export const jellyfinSessions: Tool = {
  */
 export const livetvStatus: Tool = {
   name: 'livetv_status',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Check Live TV health: whether the Dispatcharr proxy is up and serving, its recent error lines, ' +
     'whether gluetun is up, and whether Jellyfin itself is alive. Use this for any "live TV is broken / ' +
@@ -192,6 +194,8 @@ export const livetvStatus: Tool = {
  */
 export const restartContainer: Tool = {
   name: 'restart_container',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Restart a homelab container. Protected containers (jellyfin, dispatcharr, gluetun) are restarted ' +
     'ONLY when completely down and only when Jellyfin reports nobody watching. The preconditions are ' +
@@ -275,6 +279,8 @@ export const restartContainer: Tool = {
  */
 export const restartArrStack: Tool = {
   name: 'restart_arr_stack',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Restart sonarr, radarr and prowlarr together. This is the fix for the common "arrs are down / ' +
     'Jedd cannot search" fault caused by a stale network namespace after a gluetun restart. Safe ' +

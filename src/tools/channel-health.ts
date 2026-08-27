@@ -289,6 +289,8 @@ function matches(needle: string, number: string, name: string): boolean {
 
 export const channelHealth: Tool = {
   name: 'channel_health',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Per-channel Live TV health: which IPTV channels were working the last time the stream checker ' +
     'ran, with codec and resolution, plus the Dispatcharr channel roster and which channels the check ' +

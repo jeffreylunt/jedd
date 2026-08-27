@@ -190,6 +190,8 @@ export async function readThrottleState(
  */
 export const diagnoseHostContention: Tool = {
   name: 'diagnose_host_contention',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Measure whether the homelab host is overloaded, which is the most common cause of live-TV ' +
     'stuttering. Compares Jellyfin\'s LAN response time (the canary: ~1 ms healthy, hundreds of ms ' +
@@ -219,6 +221,8 @@ export const diagnoseHostContention: Tool = {
  */
 export const shedHostLoad: Tool = {
   name: 'shed_host_load',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Fix live-TV stuttering caused by host overload, by throttling qBittorrent to free uplink bandwidth ' +
     'and VPN-encryption CPU. SAFE WHILE SOMEONE IS WATCHING — it touches no container in the playback ' +
@@ -393,6 +397,8 @@ export const shedHostLoad: Tool = {
 /** The inverse. Also an enumerated SAFE-tier action, not an invention. */
 export const restoreQbitSpeed: Tool = {
   name: 'restore_qbit_speed',
+  // Reaches the homelab over ssh; absent entirely when none is configured.
+  needsHomelabSsh: true,
   description:
     'Undo shed_host_load: switch qBittorrent back to its normal speed limits. Safe at any time. Use this ' +
     'once live TV is no longer being watched, or if the throttle did not help.',

@@ -84,7 +84,6 @@ const GUEST_TOOLS: Tool[] = [
   makeCatalogueSearch(),
   makeCheckStatus(),
   resolveChoice,
-  kindleStatus,
   // 🔴 The PRODUCERS for add_audiobook and send_ebook, which shipped without
   // them and were uncallable. Reads: they search and store a list; nothing is
   // grabbed until the consumer runs. See search-release.ts.
@@ -122,7 +121,6 @@ const GUEST_WRITE_TOOLS: Tool[] = [
   // path at all. Jeff hit it on his first real test, asking for Seinfeld S3.
   makeAddSeason(),
   makeGrabRelease(),
-  saveKindleEmail,
   addAudiobook,
 ];
 
@@ -289,7 +287,13 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   // Same rule as hp_shell and read_runbook: no jfa-go, no tool. A registered
   // invite tool that cannot reach jfa-go would offer a capability that fails
   // AFTER the model has promised it to someone.
-  if (deps.invite && config.jfago.password) tools.push(makeInviteTool(deps.invite));
+  // ⚠️ BOTH fields, not just the password. A config with a password and no
+  // base URL used to register a tool that could only ever fire requests at an
+  // empty base — a gate that checks one of the two things it needs is not a
+  // gate, it just narrows the ways of getting it wrong.
+  if (deps.invite && config.jfago.password && config.jfago.baseUrl) {
+    tools.push(makeInviteTool(deps.invite));
+  }
   // Same rule: no SMTP credential, no tool. A send_ebook that cannot mail would
   // tell somebody their book is on the way and then fail at the last step.
   /**
@@ -309,6 +313,21 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
     tools.push(
       makeSendEbook(deps.irc ? { ...deps.ebook, irc: deps.irc } : deps.ebook),
       makeSearchEbook(undefined, deps.irc),
+      /**
+       * 🔴 THE INTAKE HALF BELONGS TO THE SAME GATE — SECOND INSTANCE OF THE
+       * ORPHAN BUG, AND THE QUIET ONE.
+       *
+       * `save_kindle_email` and `kindle_status` used to be registered
+       * unconditionally, so a deployment with no SMTP offered a guest the chance
+       * to hand over their Kindle address, told them it was SAVED, and had
+       * nothing in the registry that could ever send them a book. Nothing
+       * errored; the capability simply dead-ended.
+       *
+       * Collecting an address is not a feature on its own — it is the first step
+       * of delivery. All four halves of the flow appear together or not at all.
+       */
+      saveKindleEmail,
+      kindleStatus,
     );
   }
   // Same rule again: no TMDB token, no tool. A registered whats_popular with no
@@ -348,7 +367,12 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
   }
   assertChoiceProducersExist(tools);
   assertNamedProducersExist(tools);
-  return config.readOnly ? tools.filter((t) => !t.writes) : tools;
+  // Two independent filters, applied together. `readOnly` is about whether the
+  // tool may ACT; `needsHomelabSsh` is about whether it could act at all on this
+  // deployment. Neither substitutes for the other: a READ tool over ssh survives
+  // the read-only filter and still has nothing to talk to.
+  const reachable = config.homelabSshConfigured ? tools : tools.filter((t) => !t.needsHomelabSsh);
+  return config.readOnly ? reachable.filter((t) => !t.writes) : reachable;
 }
 
 /** Does this tool's own schema say a `choice` is REQUIRED? */
@@ -477,6 +501,15 @@ export const ALL_TOOLS: Tool[] = [
   // like `read_runbook` it must be hand-listed here or every invariant
   // quantified over ALL_TOOLS silently skips it.
   makeSearchEbook(),
+  // ⚠️ Moved out of the unconditional arrays 2026-08-26 so the ebook flow gates
+  // atomically (intake and delivery together, or neither). That move took them
+  // out of ALL_TOOLS as a side effect, and TWO invariants caught it immediately:
+  // registry-coverage ("defined but absent from ALL_TOOLS") and the
+  // delivery-address rule, which reported that only ONE address-shaped parameter
+  // was left to exercise. Conditional registration means hand-listed here — the
+  // same rule as read_runbook, whats_popular and the ebook pair above.
+  saveKindleEmail,
+  kindleStatus,
 ];
 
 export type { Tool } from './types.js';

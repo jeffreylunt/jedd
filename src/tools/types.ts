@@ -92,6 +92,32 @@ export interface Tool {
    */
   writes: boolean;
   /**
+   * True if this tool cannot do anything without an ssh path to the homelab.
+   *
+   * ── WHY THIS IS A FLAG ON THE TOOL, NOT A LIST IN THE REGISTRY ────────────
+   *
+   * Exactly the lesson `writes` already carries: a hand-maintained list of
+   * "the ssh tools" fixes today's twelve and rebuilds the same trap one list
+   * further along, because the NEXT ssh tool joins the array and nobody
+   * remembers the list. Reachability is a property of the MEMBER.
+   *
+   * ── WHAT IT PREVENTS ─────────────────────────────────────────────────────
+   *
+   * Measured on a simulated stranger's deploy (Ollama + Sonarr, no ssh host at
+   * all): **twelve tools that reach the homelab over ssh were still offered to
+   * the model.** Nothing crashed. The bot booted, reported healthy, and every
+   * one of those tools would have failed at the moment somebody relied on it —
+   * which reads as a homelab outage rather than as "you did not configure this".
+   * An ABSENT tool cannot be offered, argued for, or promised to a user.
+   *
+   * ⚠️ Unlike `writes` this is OPTIONAL and defaults to false, because "needs
+   * no ssh" is the honest answer for most tools and demanding a declaration
+   * from every author would be noise. The failure direction is safe: a new ssh
+   * tool that forgets the flag is merely registered when it should not be —
+   * the status quo — rather than silently disappearing from a working install.
+   */
+  needsHomelabSsh?: boolean;
+  /**
    * 🔴 WHICH KIND OF STORED OPTION THIS TOOL RESOLVES A `choice` INTO.
    *
    * ── THE HOLE THIS CLOSES ─────────────────────────────────────────────────
