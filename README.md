@@ -128,14 +128,39 @@ on 24 seeders; the novel itself was third on 8. The ranking was *correct* — ev
 candidate was a healthy-swarm `.epub`, so the seeder count decided, and the study
 guide really did have the biggest swarm. The defect was in the question.
 
-**So the book searches ask.** They return the numbered list and Jedd shows it to
-you, and the tools that grab or send a book require the number you picked — they
-have no "just take the top one" path to fall back on. TV is unchanged: the work
-is already pinned, so nobody is asked which torrent.
+**So the book searches pin the work first**, against [Open
+Library](https://openlibrary.org) — free, no key, nothing to configure. The
+question becomes two questions asked in order:
 
-**Still worth knowing:** that list mixes two questions — *which book* and *which
-copy* — into one. Pinning book search to a work identifier, so only the copies of
-one book are ranked, is not implemented.
+1. **Which book?** The catalogue turns *"The Hobbit J.R.R. Tolkien"* into
+   `/works/OL27482W` — *The Hobbit*, J.R.R. Tolkien, 1937. The Corey Olsen study
+   guide is a separate work in the same response, under its own author.
+2. **Which copy?** Releases are then scored against that work — a release
+   crediting a different author, or announcing itself as a guide, a box set or a
+   numbered volume of a series, is not a candidate — and the healthiest swarm
+   among the survivors is chosen for you. Nobody is asked about a torrent.
+
+If the catalogue cannot settle the first question, Jedd asks **which book** and
+searches nothing until you answer. *"Mistborn"* is a series rather than a book,
+so it asks; answer *The Final Empire* and it finds that book specifically. And
+if the catalogue is unreachable, it falls back to showing you the releases and
+asking — worse, and labelled as the fallback it is.
+
+### ⚠️ What pinning the work can and cannot buy
+
+**There is no `releasesFor(workId)` for books.** Sonarr can scope a release
+search to an episode id. Prowlarr and the IRC bots index filenames and have no
+notion of a work at all, so pinning does not hand Jedd a scoped set of releases
+the way an `episodeId` does — it hands it a title and an author to compare
+filenames against. That is genuinely weaker than the TV guarantee, and the
+comparison is a heuristic over release names.
+
+What it buys is a much narrower question, asked one release at a time: *is this
+filename a copy of **this** work* rather than *which of these six filenames is
+the book*. On the searches it has been measured against it gets the right book;
+on a filename that carries neither the author nor a recognisable title it can
+still decline a release that was fine, in which case Jedd says the book does not
+appear to be on the indexers rather than offering you something else.
 
 ## One turn per burst
 
