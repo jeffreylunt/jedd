@@ -242,8 +242,54 @@ export class Agent {
     this.registry = registry;
   }
 
+  /**
+   * ── 🔴 A TRIPWIRE, NOT A GUARD. IT CHANGES NOTHING AND THAT IS THE POINT. ──
+   *
+   * `this.histories` holds ONE MUTABLE ARRAY per sender. Two turns for the same
+   * person running at once both push their user text into it and both read it
+   * back, so each answers with the other's question in its context. That is what
+   * produced the crossed replies of 2026-08-26 and the reply that cited a tool
+   * call another turn had made.
+   *
+   * The repair is that nothing calls this concurrently: `TurnQueue` serialises
+   * per sender at the one place messages are dispatched. **This does not
+   * duplicate that.** A second guard here — a lock, a clone-on-entry — would
+   * cover for the queue's absence, and two guards that mask each other both
+   * survive being mutated individually, so neither can be shown to work.
+   *
+   * A tripwire cannot mask anything, because it does not act. It exists so that
+   * the day some future path reaches `handle` without going through the queue —
+   * a new entry point, a scheduled sweep, a tool that calls back in — the log
+   * says so in words instead of the symptom being a wrong answer weeks later.
+   *
+   * ⚠️ A COUNT, NOT A FLAG. A set entry deleted by an inner call would clear the
+   * mark while the outer turn was still running.
+   */
+  private readonly inFlight = new Map<string, number>();
+
   async handle(senderHandle: string, userText: string): Promise<TurnRecord> {
     const role = roleFor(senderHandle, this.config);
+    const inFlightKey = `${senderHandle}::${role}`;
+    const already = this.inFlight.get(inFlightKey) ?? 0;
+    if (already > 0) {
+      console.error(
+        `[agent] 🔴 CONCURRENT TURN for ${inFlightKey} — ${already + 1} turns are inside handle() at ` +
+          'once. They share one history array, so each will see the other\'s messages and may answer ' +
+          'the wrong one. Something reached the agent WITHOUT going through TurnQueue; find it, do ' +
+          'not add a lock here.',
+      );
+    }
+    this.inFlight.set(inFlightKey, already + 1);
+    try {
+      return await this.runTurn(senderHandle, userText, role);
+    } finally {
+      const left = (this.inFlight.get(inFlightKey) ?? 1) - 1;
+      if (left <= 0) this.inFlight.delete(inFlightKey);
+      else this.inFlight.set(inFlightKey, left);
+    }
+  }
+
+  private async runTurn(senderHandle: string, userText: string, role: Role): Promise<TurnRecord> {
     const tools = this.registry.filter((t) => roleSatisfies(role, t.minRole));
     const ctx: ToolContext = {
       role,

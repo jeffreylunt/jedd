@@ -11,6 +11,8 @@ import { ChoiceStore } from './choices.js';
 import { KindleRegistry } from './kindle.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
+import type { IncomingMessage } from './connector.js';
+import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
 
 /**
  * SHADOW MODE — receive real traffic, answer nobody.
@@ -102,22 +104,40 @@ async function main(): Promise<void> {
   console.error(`[shadow] registered ${config.bluebubbles.publicUrl}`);
 
   let turns = 0;
-  await connector.listen(async (message) => {
-    turns += 1;
-    const started = Date.now();
-    try {
-      const record = await agent.handle(message.senderHandle, message.text);
-      // 🔴 The reply is WRITTEN, never sent. This is the whole point of the mode.
-      console.error(
-        `[shadow] turn ${turns} from ${message.senderHandle}: ` +
-          `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
-          `${Date.now() - started}ms — would have replied ${record.replyText.length} chars`,
-      );
-    } catch (e) {
-      // A failing turn must not stop the next message arriving.
-      console.error(`[shadow] turn ${turns} THREW: ${(e as Error).message}`);
-    }
+
+  /**
+   * 🔴 THE SAME QUEUE THE LIVE PATH USES, FOR THE REASON SHADOW MODE EXISTS.
+   *
+   * A shadow whose dispatch differs from production is not measuring production.
+   * If this answered a burst as two concurrent turns while `main.ts` answered it
+   * as one, the parity corpus would record V2 behaving in a way V2 no longer
+   * does, and every conclusion drawn from it would be about a build nobody runs.
+   */
+  const queue = new TurnQueue<IncomingMessage>({
+    keyOf: (m) => m.senderHandle,
+    settle: () => sleep(BURST_SETTLE_MS),
+    run: async (batch) => {
+      const turn = ++turns;
+      const started = Date.now();
+      const senderHandle = batch[batch.length - 1]!.senderHandle;
+      try {
+        const record = await agent.handle(senderHandle, batch.map((m) => m.text).join('\n'));
+        // 🔴 The reply is WRITTEN, never sent. This is the whole point of the mode.
+        console.error(
+          `[shadow] turn ${turn} from ${senderHandle}: ` +
+            `${batch.length > 1 ? `burst=${batch.length} ` : ''}` +
+            `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
+            `${Date.now() - started}ms — would have replied ${record.replyText.length} chars`,
+        );
+      } catch (e) {
+        // A failing turn must not stop the next message arriving.
+        console.error(`[shadow] turn ${turn} THREW: ${(e as Error).message}`);
+      }
+    },
   });
+  console.error(`[shadow] one turn per burst: serialised per sender, ${BURST_SETTLE_MS}ms settle.`);
+
+  await connector.listen((message) => queue.submit(message));
 }
 
 main().catch((e) => {

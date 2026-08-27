@@ -5,7 +5,15 @@ import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
 import { SeenStore } from './bluebubbles/seen.js';
 import { ChoiceStore } from './choices.js';
-import { presenceToken, sendToken, withPresence, type PresenceRecord, type SendRecord } from './connector.js';
+import {
+  presenceToken,
+  sendToken,
+  withPresence,
+  type IncomingMessage,
+  type PresenceRecord,
+  type SendRecord,
+} from './connector.js';
+import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
@@ -431,7 +439,48 @@ async function main(): Promise<void> {
   timer.unref();
 
   let turns = 0;
-  await connector.listen(async (message) => {
+
+  /**
+   * ── 🔴 ONE TURN PER BURST. THIS IS THE DISPATCH, AND IT IS THE FIX. ────────
+   *
+   * `BlueBubblesReceiver` starts every webhook with a bare `void this.ingest(…)`
+   * and turns here run 25–790 SECONDS, so texting twice used to mean two turns
+   * running at once, each blind to the other and both mutating the one history
+   * array `Agent` keeps per sender. Measured live 2026-08-27: `add_movie` ran
+   * twice for one request, and on Jeff's thread the reply to his second message
+   * landed ten seconds before the reply to his first.
+   *
+   * The queue serialises PER SENDER — Kaela never waits behind Jeff — and merges
+   * a burst into a single turn. The reasoning for joining rather than queueing
+   * or superseding is in `turn-queue.ts`; the short version is that only joining
+   * makes "every tool ran twice" structurally impossible, because a batch is one
+   * tool loop and one reply.
+   */
+  const queue = new TurnQueue<IncomingMessage>({
+    keyOf: (m) => m.senderHandle,
+    settle: () => sleep(BURST_SETTLE_MS),
+    run: async (batch) => handleBurst(batch),
+  });
+  console.error(
+    `[queue] one turn per burst: turns are serialised per sender and a burst settles for ` +
+      `${BURST_SETTLE_MS}ms before it runs. Concurrent turns for one sender are no longer possible.`,
+  );
+
+  /**
+   * The whole batch answered by one turn.
+   *
+   * 🔴 THE TEXT IS JOINED AND THE LAST MESSAGE IS THE ONE ANSWERED. Both are
+   * facts rather than choices: the person wrote these lines one after another,
+   * which is how they read on the phone, and a reply to a burst belongs against
+   * its final message the way a human's would.
+   */
+  const handleBurst = async (batch: IncomingMessage[]): Promise<void> => {
+    const last = batch[batch.length - 1]!;
+    const message: IncomingMessage = {
+      senderHandle: last.senderHandle,
+      text: batch.map((m) => m.text).join('\n'),
+      ...(last.sourceGuid ? { sourceGuid: last.sourceGuid } : {}),
+    };
     /**
      * 🔴 CAPTURED AT ENTRY, NOT READ AT LOG TIME.
      *
@@ -491,14 +540,34 @@ async function main(): Promise<void> {
            * 🔴 `message.sourceGuid` NAMES THE MESSAGE THIS REPLY ANSWERS, AND IT
            * IS A FACT, NOT A CHOICE.
            *
-           * `agent.handle` is handed exactly one message's text, so a turn is
-           * structurally incapable of answering two — the target is the message
-           * that started this turn, always. Nothing here picks it, and nothing
-           * here decides whether to anchor to it; that rule lives in
-           * `ReplyThreading` and it fires only when this person had more than
-           * one reply outstanding.
+           * ⚠️ AMENDED 2026-08-27. This used to read *"`agent.handle` is handed
+           * exactly one message's text, so a turn is structurally incapable of
+           * answering two"*. A turn is now handed a whole BURST, so it answers
+           * every message in it on purpose — and the target is the LAST one,
+           * which is where a person's own reply to a burst would go.
+           *
+           * That is not a weakening. Before the queue, a turn was handed one
+           * message and answered a different one anyway, because a second turn
+           * was pushing into the same history array while it ran. The trigger
+           * and the subject were only ever believed to match; now the batch IS
+           * the subject, and there is nothing else in flight to confuse it with.
            */
           await connector.send(message.senderHandle, r.replyText, message.sourceGuid, sent);
+          /**
+           * 🔴 ONE REPLY ANSWERED ALL OF THEM, SO CLOSE ALL OF THEM.
+           *
+           * `sendReporting` closes the message it was given. The earlier ones in
+           * the batch were answered by the same reply and would otherwise sit in
+           * the burst until `BURST_TTL_MS` (20 minutes), quote-anchoring every
+           * reply this person got in the meantime.
+           *
+           * ⚠️ Inert while `REPLY_THREADING_ENABLED` is false — `threading` is
+           * `undefined` then. It is written now because the alternative is a
+           * landmine that arms itself the day somebody flips that flag.
+           */
+          for (const earlier of batch.slice(0, -1)) {
+            threading?.answered(earlier.senderHandle, earlier.sourceGuid);
+          }
           return r;
         },
         signals,
@@ -518,6 +587,17 @@ async function main(): Promise<void> {
        */
       console.error(
         `[jedd] turn ${turn} from ${message.senderHandle}: ` +
+          /**
+           * 🔴 `burst=` IS THE WITNESS THAT COALESCING HAPPENED ON THIS TURN.
+           *
+           * Absent it, a burst answered once and a burst that never coalesced
+           * are the same line, and the only way to tell would be to count
+           * inbound messages in BlueBubbles' database and pair them by hand —
+           * which is exactly the archaeology that made this defect take two days
+           * to see. Printed only when there was a burst; the ordinary
+           * one-in-one-out turn does not need a token saying it was ordinary.
+           */
+          `${batch.length > 1 ? `burst=${batch.length} ` : ''}` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
           /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
@@ -575,7 +655,17 @@ async function main(): Promise<void> {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
     }
-  });
+  };
+
+  /**
+   * 🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE, INCLUDING REPLAY.
+   *
+   * `submit` resolves when the batch containing the message has been handled, so
+   * `replayMissed` — which awaits each ingest in turn — stays exactly as serial
+   * as it was. And it never rejects: BlueBubbles dispatches fire-and-forget and
+   * there is nowhere above here to put an error.
+   */
+  await connector.listen((message) => queue.submit(message));
 }
 
 main().catch((e) => {
