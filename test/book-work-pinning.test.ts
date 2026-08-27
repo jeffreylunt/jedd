@@ -350,6 +350,47 @@ test('🔴 AN IRC OFFER IS SCORED FOR IDENTITY TOO, band or no band', async () =
   assert.doesNotMatch(r.content, /via IRC/, 'the bot is holding a study guide, so it is not a candidate');
 });
 
+test('🔴 THE IDENTITY KEY SITS ABOVE THE SWARM BAND — a thin right book beats a fat wrong one', async () => {
+  /**
+   * ── ⚠️ THIS TEST EXISTS BECAUSE A MUTATION SURVIVED ────────────────────────
+   *
+   * Swapping the comparator to `[band, work, format, seeders]` — identity BELOW
+   * the swarm — left every other test in this file green. The refusal of
+   * `NOT_THIS_WORK` is a filter and runs whatever the order is, so the guides
+   * disappear either way, and on the Hobbit fixture every survivor happens to
+   * sit in the same band. Order never got to matter, so nothing was testing it.
+   *
+   * It matters here. A CLEAN match in the `thin` band against a PARTIAL match in
+   * `healthy` is the one arrangement where the two orderings disagree, and it is
+   * an ordinary situation: the book somebody asked for is thinly seeded and its
+   * sequel is popular.
+   *
+   * ⚠️ THE NAMES ARE REAL AND THE SEEDER COUNTS ARE CONSTRUCTED, deliberately
+   * and unlike every other fixture in this file. Both came back from the live
+   * Dune search; the counts are set to put them in different bands, because that
+   * is the arrangement under test. Calling that a measurement would be a lie.
+   *
+   * And a 3-seeder copy of the right book really is the better answer than a
+   * 300-seeder copy of the wrong one: a thin swarm is slow, a different book is
+   * simply not what was asked for. The dead-swarm filter still runs first, so
+   * this can never choose something that will never finish.
+   */
+  const OL_DUNE = {
+    docs: [{ key: '/works/OL893414W', title: 'Dune', author_name: ['Frank Herbert'], first_publish_year: 1965, edition_count: 161 }],
+  };
+  const rows = [
+    rel('Dune Messiah by Frank Herbert EPUB', 300, 0),
+    rel('Dune by Frank Herbert EPUB', 3, 1),
+  ];
+  const r = await makeSearchEbook(async () => json(rows), undefined, openLibrary(OL_DUNE)).run(
+    { query: 'Dune' },
+    ctx(),
+  );
+  assert.match(r.content, /^CHOSE — /);
+  assert.match(r.content, /Dune by Frank Herbert EPUB/, 'the book that was asked for');
+  assert.doesNotMatch(r.content, /Messiah/, 'not the sequel, however many people are seeding it');
+});
+
 // ═══ 5. WHEN THE BOOK SIMPLY IS NOT THERE ═══════════════════════════════════
 
 test('🔴 pinned, and nothing on offer is that book: it says so and offers NOTHING', async () => {
