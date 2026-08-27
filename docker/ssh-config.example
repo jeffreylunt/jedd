@@ -1,0 +1,46 @@
+# Copy to docker/ssh-config and fill in YOUR homelab host and accounts.
+# The real file is gitignored: it names a real machine and two real accounts,
+# which is deployment data, not source.
+#
+# WHY THIS FILE EXISTS AT ALL
+#
+# A bare hostname that resolves on your LAN (via a DNS search domain) does NOT
+# resolve inside a container's network namespace, and src/hp.ts passes
+# `-o BatchMode=yes`, so the failure is silent and non-interactive — the tool
+# just returns an error. Pinning HostName to an IP removes the dependency on
+# LAN DNS entirely.
+#
+# 🔴 THE TWO IDENTITIES ARE A SECURITY BOUNDARY, NOT DUPLICATION.
+#
+# admin = privileged (docker group). Used ONLY by structured tools whose command
+#         text is a literal in this repo.
+# shell = UNPRIVILEGED — no docker group, no sudo. The ONLY identity the
+#         free-form, model-composed `hp_shell` tool may use.
+# config.ts refuses to register hp_shell if the two resolve to the same account,
+# and identity-probe.ts proves the split at boot by running `id` over both.
+# Do not collapse these into one Host block, and do not give them the same User.
+
+Host homelab
+    HostName 10.0.0.10
+    User your-admin-user
+    IdentityFile /home/jedd/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+Host homelab-jedd-shell
+    HostName 10.0.0.10
+    User jedd-shell
+    IdentityFile /home/jedd/.ssh/jedd_shell_ed25519
+    IdentitiesOnly yes
+
+Host *
+    # known_hosts is mounted alongside this file. Generate it with:
+    #   ssh-keyscan -t ed25519 <your-host-ip> \
+    #     | sed 's/^/homelab,/' > docker/ssh-known-hosts
+    # then VERIFY the key matches what your own machine already trusts:
+    #   ssh-keygen -F <your-host-ip>
+    # Strict checking must succeed rather than prompt, because BatchMode turns
+    # any prompt into a hard failure.
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /home/jedd/.ssh/known_hosts
+    ServerAliveInterval 15
+    ServerAliveCountMax 3

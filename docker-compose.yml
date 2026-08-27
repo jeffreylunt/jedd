@@ -11,9 +11,9 @@
 #   BlueBubbles REST  host.docker.internal:1234   (this Mac's loopback)
 #   Model (Ollama)    host.docker.internal:11434  (this Mac; binds 0.0.0.0)
 #   Sonarr/Radarr/Prowlarr/qBittorrent/Jellyfin/Dispatcharr
-#                     192.168.1.7:{8989,7878,9696,8080,8096,9191}  (LAN, direct)
+#                     10.0.0.10:{8989,7878,9696,8080,8096,9191}  (LAN, direct)
 #   ssh hp / hp-jedd-shell
-#                     192.168.1.7:22   (keys + config mounted below)
+#                     10.0.0.10:22   (keys + config mounted below)
 #   IRC ebooks        irc.irchighway.net:6667 outbound, plus outbound DCC to
 #                     arbitrary third-party peer IPs. Jedd NEVER listens for
 #                     DCC — passive/reverse offers (port 0) are refused in
@@ -102,8 +102,13 @@ services:
       # read_runbook reads this exact absolute path from the host filesystem.
       # config.ts leaves the tool UNREGISTERED if the path is missing, so a
       # forgotten mount here silently costs Jedd a tool rather than erroring.
-      # Mounted at the identical path so RUNBOOK_PATH needs no override.
-      - /Users/jeff/.superbot2/spaces/jedd-v2/knowledge/homelab-access-inventory.md:/Users/jeff/.superbot2/spaces/jedd-v2/knowledge/homelab-access-inventory.md:ro
+      #
+      # Interpolated from .env (compose reads it for substitution) and mounted at
+      # the SAME path inside, so RUNBOOK_PATH needs no container-side override
+      # and no operator's absolute path is baked into this file.
+      # ⚠️ If RUNBOOK_PATH is unset, compose expands this to ":" and fails to
+      # start rather than silently dropping the tool — the loud direction.
+      - ${RUNBOOK_PATH}:${RUNBOOK_PATH}:ro
 
       # indexer_admin and stuck_downloads capture a backup BEFORE any
       # destructive change; these are the reversibility guarantee those tools

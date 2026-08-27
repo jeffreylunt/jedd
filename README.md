@@ -73,7 +73,7 @@ account — and an empty value passed too. **A string comparison is not a bounda
 **Verified by crossing it, not by reading the config.** From that account: `docker ps` →
 `permission denied … unix:///var/run/docker.sock`; the same through `awk 'BEGIN{system(…)}')`, through
 `curl --unix-socket`, and through `python3`'s raw `AF_UNIX` connect → all denied; `sudo -n true` →
-`a password is required`; `/etc/shadow` and `/home/jeff` → denied. **Control: every one of those
+`a password is required`; `/etc/shadow` and `/home/user` → denied. **Control: every one of those
 succeeds as `jeff`**, so the refusals are caused by the identity and not by something being broken.
 
 **Docker reads are structured tools now** (`docker_ps`, `docker_inspect`, `docker_logs`,

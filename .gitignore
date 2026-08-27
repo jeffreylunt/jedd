@@ -2,3 +2,10 @@ node_modules/
 .env
 *.log
 data/
+
+# Real ssh client config + host keys for the container. Deployment data, not
+# source: they name a real machine, real accounts and a real host key, and
+# cannot be genericised while staying functional. Templates are committed as
+# docker/ssh-config.example; generate known_hosts with ssh-keyscan (see there).
+docker/ssh-config
+docker/ssh-known-hosts

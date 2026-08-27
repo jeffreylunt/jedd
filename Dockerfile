@@ -21,14 +21,15 @@
 #
 # ecosystem.config.cjs pins /opt/homebrew/bin/node because macOS "Local Network"
 # privacy denies LAN-peer access PER BINARY: nvm-built node got EHOSTUNREACH on
-# 192.168.1.7 while the Homebrew build succeeded, same machine, same minute.
+# 10.0.0.10 while the Homebrew build succeeded, same machine, same minute.
 # That is a macOS TCC control and has no analogue inside a Linux container —
-# measured from a container on this host, all of 192.168.1.7:{22,7878,8080,8989,
-# 9696}, 192.168.1.68:11434 and the public internet connect fine. The container
+# measured from a container on this host, all of 10.0.0.10:{22,7878,8080,8989,
+# 9696}, 10.0.0.20:11434 and the public internet connect fine. The container
 # is therefore IMMUNE to the node-version trap that silently broke every homelab
-# read for days. (Control that makes this meaningful: the LAN gateway
-# 192.168.1.1 is EXEMPT from that policy, so "the router answers" proves
-# nothing — reaching .1.7 on five ports is the real evidence.)
+# read for days. (Control that makes this meaningful: the LAN GATEWAY —
+# 10.0.0.1, a different address — is EXEMPT from that policy, so "the router
+# answers" proves nothing. Reaching the HOMELAB HOST on five ports is the
+# real evidence.)
 
 FROM node:24-alpine
 
