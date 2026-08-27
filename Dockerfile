@@ -32,8 +32,49 @@
 
 FROM node:24-alpine
 
-# `ssh` is a hard runtime dependency, not a convenience: src/hp.ts shells out to
-# it via execFile for every docker_ps / hp_shell / qbit / channel_health tool.
+# ── EXTERNAL-BINARY AUDIT (2026-08-26). `ssh` IS THE ONLY ONE. ───────────────
+#
+# Audited every child_process call in src/ and scripts/. There are exactly two,
+# and only one of them ever runs in here:
+#   src/hp.ts:37              execFile('ssh', [...])   ← the only one, always argv,
+#                                                        never a shell string
+#   scripts/messages-poke.mjs execFile('/usr/bin/osascript') ← macOS-only, run by
+#                                                        launchd ON THE MAC, never
+#                                                        in this container
+# Every other `exec(` in the tree is a REGEX `.exec()`, not a process.
+#
+# 🔴 REMOVING openssh-client SILENTLY DISABLES EVERY HOMELAB TOOL — docker_ps,
+# docker_inspect, docker_logs, container_netns, hp_shell, channel_health,
+# restart_container, restart_arr_stack, shed_host_load, restore_qbit_speed,
+# stuck_downloads, indexer_admin, send_ebook — while the bot still boots clean,
+# answers messages and looks perfectly healthy. It reads as a homelab outage.
+# It is installed EXPLICITLY and must stay that way: `node:24-alpine` does NOT
+# ship ssh (verified against a virgin base image), so this line is the only
+# reason it exists here. Nothing we depend on is inherited or transitive.
+#
+# Deliberately NOT installed, each verified unnecessary rather than assumed:
+#   bash    — nothing uses `bash -c` or `shell: true`; busybox `sh` suffices.
+#   git     — no RUNTIME path shells to it. Only two repo-hygiene TESTS do
+#             (test/owner-config-fail-closed.test.ts), and `.git` is excluded by
+#             .dockerignore anyway, so they belong on the host. Do not "fix"
+#             their in-container failure by installing git.
+#   curl    — appears only inside command strings sent THROUGH ssh, i.e. it runs
+#             on the homelab host, not here.
+#   base64  — likewise remote (`base64 -w0` in src/media/fetch-file.ts runs ON
+#             hp, GNU coreutils). ⚠️ busybox's base64 does NOT accept `-w0`, so
+#             if that call ever moves local it fails on a FLAG, not on a missing
+#             binary — a much harder error to read. Everything else base64 in
+#             this codebase is Node's Buffer, no process at all.
+#   file / unzip / ffmpeg / ffprobe — no code shells to any of them. Ebook magic
+#             -byte validation and zip inflation are pure JS (`node:zlib`).
+#             (busybox `unzip` happens to be in the base image; nothing uses it.)
+#   ca-certificates — Node bundles its own CA store. Verified live from the
+#             running container: TMDB and ESPN over HTTPS, and a TLS handshake
+#             to imap.gmail.com:993 returning authorized=true.
+#
+# The npm tree is pure JavaScript — dotenv, imapflow, nodemailer, no binding.gyp
+# anywhere — so there is no native compilation step and no toolchain to install.
+#
 # tini gives us a real init so SIGTERM reaches node (see the stop-signal note in
 # docker-compose.yml — webhook deregistration on shutdown is load-bearing).
 RUN apk add --no-cache openssh-client tini
