@@ -44,7 +44,7 @@ function fakeIrc(over: Partial<Record<'fetch', unknown>> = {}) {
 
 function ctx(opts: { value: Record<string, unknown>; followups?: FollowupStore }) {
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
   const choices = new ChoiceStore(tmp());
   choices.present({
     senderHandle: JEFF,
@@ -104,7 +104,7 @@ test('🔴 the follow-up actually fetches, validates and DELIVERS, then says so'
   const irc = fakeIrc();
   const followups = new FollowupStore(tmp());
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
 
   followups.schedule({
     kind: 'ebook-deliver',
@@ -132,7 +132,7 @@ test('🔴 the follow-up actually fetches, validates and DELIVERS, then says so'
   assert.equal(out[0]?.sent, true);
   assert.equal(irc.calls[0]?.command, '!Bsk A Book.epub');
   assert.equal(mailed.length, 1, 'the book must actually be mailed');
-  assert.equal(mailed[0]?.to, 'a_b@kindle.com', 'address from the registry, read at FIRE time');
+  assert.equal(mailed[0]?.to, 'readerone@kindle.com', 'address from the registry, read at FIRE time');
   assert.ok(mailed[0]?.attachments[0]?.content.equals(EPUB));
   assert.match(spoke[0]!.text, /on its way to your Kindle/);
 });
@@ -144,7 +144,7 @@ test('🔴 a bot that never answers TELLS the person — it does not go quiet', 
   });
   const followups = new FollowupStore(tmp());
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
   followups.schedule({
     kind: 'ebook-deliver',
     senderHandle: JEFF,
@@ -183,7 +183,7 @@ test('🔴 a book whose bytes are NOT a book is discarded and REPORTED, never ma
   });
   const followups = new FollowupStore(tmp());
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
   followups.schedule({
     kind: 'ebook-deliver',
     senderHandle: JEFF,
@@ -324,7 +324,7 @@ test('🔴 overlapping runner ticks cannot double-fetch or double-SEND one book'
   });
   const followups = new FollowupStore(tmp());
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
   followups.schedule({
     kind: 'ebook-deliver',
     senderHandle: JEFF,
@@ -361,7 +361,7 @@ test('🔴 an uncertain SMTP result is NOT retried — better one maybe-sent tha
   let sends = 0;
   const followups = new FollowupStore(tmp());
   const kindle = new KindleRegistry(tmp());
-  kindle.save(JEFF, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
   followups.schedule({
     kind: 'ebook-deliver',
     senderHandle: JEFF,

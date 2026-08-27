@@ -13,7 +13,7 @@
  * 🔴 **Node puts the diagnosis in `e.cause`, and NOTHING in this codebase read
  * it.** `.message` on a failed `fetch()` is the constant string "fetch failed"
  * — it carries no information at all. One field away sat
- * `EHOSTUNREACH 192.168.1.7:8096`, which would have named the cause in seconds.
+ * `EHOSTUNREACH 10.0.0.10:8096`, which would have named the cause in seconds.
  *
  * A model handed a contentless error does what a person does: it guesses. The
  * fix for "the bot described the failure wrongly" is therefore NOT a sentence
@@ -65,7 +65,7 @@ export const MAX_ERROR_CHARS = 300;
  * A compact, legible description of a thrown value, walking the `cause` chain.
  *
  * `fetch failed` becomes `fetch failed — EHOSTUNREACH (connect EHOSTUNREACH
- * 192.168.1.7:8096)`, which names the cause instead of implying a mystery.
+ * 10.0.0.10:8096)`, which names the cause instead of implying a mystery.
  *
  * ⚠️ Redaction is the CALLER's job where the string is persisted or shown — see
  * `describeErrorSafe`. This function does not scrub, because the raw form is

@@ -269,7 +269,7 @@ function toolThat(outcome: 'fails' | 'throws' | 'works'): Tool {
     async run() {
       if (outcome === 'throws') {
         throw Object.assign(new Error('fetch failed'), {
-          cause: Object.assign(new Error('connect EHOSTUNREACH 192.168.1.7:8096'), { code: 'EHOSTUNREACH' }),
+          cause: Object.assign(new Error('connect EHOSTUNREACH 10.0.0.10:8096'), { code: 'EHOSTUNREACH' }),
         });
       }
       if (outcome === 'fails') return { ok: false, content: 'Could not read Jellyfin /Sessions: EHOSTUNREACH.' };

@@ -64,7 +64,7 @@ export type VerificationResult =
  *
  * Thread `19ce8cfb60e359dd`, received 2026-03-13T20:07:32Z: *"could not be
  * processed due to E014 - Unapproved sender email address."* Verified present in
- * `jeffreylunt@gmail.com` on 2026-08-26.
+ * `owner@example.com` on 2026-08-26.
  *
  * **E014 is deliberately the control**, because E014 is the failure a new
  * third-party recipient actually hits — someone who was never told to add the

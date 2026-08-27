@@ -8,12 +8,12 @@ import { fail, ok, type Tool } from './types.js';
  *
  * A **host cron outside V2** moves finished audiobooks into Audiobookshelf:
  *
- *   `*<!>/5 * * * * /usr/bin/python3 /home/jeff/audiobook-mover.py`
+ *   `*<!>/5 * * * * /usr/bin/python3 /home/user/audiobook-mover.py`
  *   (written with a marker because a literal cron expression closes this comment)
  *
  * Verified running (log entries every five minutes) and it does the SAME
  * container→host prefix translation V2 does, then moves into
- * `/home/jeff/audiobookshelf/books` and **refuses to clobber a non-empty
+ * `/home/user/audiobookshelf/books` and **refuses to clobber a non-empty
  * destination**.
  *
  * ⚠️ **So V2 inherits a dependency it does not own.** Our only job is to put the

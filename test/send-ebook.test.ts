@@ -66,7 +66,7 @@ function hp(overrides: Partial<Record<number, { stdout: string; code?: number }>
 
 function ctx(handle: string, opts: { withAddress?: boolean } = {}) {
   const kindle = new KindleRegistry(tmp());
-  if (opts.withAddress !== false) kindle.save(handle, 'a_b@kindle.com', ['a_b@kindle.com']);
+  if (opts.withAddress !== false) kindle.save(handle, 'readerone@kindle.com', ['readerone@kindle.com']);
   const choices = new ChoiceStore(tmp());
   choices.present({
     senderHandle: handle,
@@ -90,7 +90,7 @@ test('🔴 a picked book is grabbed, verified and sent to the STORED address', a
   const r = await tool.run({ choice: 1 }, { ...ctx(JEFF), exec: hp() });
   assert.equal(r.ok, true);
   assert.match(r.content, /^SENT/);
-  assert.equal(sent[0]?.to, 'a_b@kindle.com', 'the address came from the store, not from the model');
+  assert.equal(sent[0]?.to, 'readerone@kindle.com', 'the address came from the store, not from the model');
   assert.ok(sent[0]?.attachments[0]?.content.equals(BOOK), 'the exact bytes read off hp are what got attached');
 });
 

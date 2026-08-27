@@ -245,7 +245,7 @@ async function deliverThroughRunner(mail: (m: unknown) => Promise<{ messageId?: 
   void IrcEbooks;
   const dir = mkdtempSync(join(tmpdir(), 'jedd-sched-'));
   const kindle = new KindleRegistry(join(dir, 'k.jsonl'));
-  kindle.save(GUEST, 'a_b@kindle.com', ['a_b@kindle.com']);
+  kindle.save(GUEST, 'readerone@kindle.com', ['readerone@kindle.com']);
   const s = new FollowupStore(join(dir, 'f.jsonl'));
   s.schedule({
     kind: 'ebook-deliver',

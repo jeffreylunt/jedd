@@ -8,8 +8,8 @@ import { dirname } from 'node:path';
  *
  * V1's model **fabricated a Kindle address and a stranger received someone's
  * book.** `save_kindle_email` accepted a model-supplied string, and the string
- * it supplied — `jeff_27e778@kindle.com` — was Jeff's own real address
- * (`jeffreylunt_27e778@kindle.com`) with the middle of the local part removed.
+ * it supplied — `someone@kindle.com` — was Jeff's own real address
+ * (`someone@kindle.com`) with the middle of the local part removed.
  * It was persisted for a **different** user, ~1h43m after Jeff typed his.
  *
  * The `_27e778` suffix is an exact match on a random token, so coincidence is
@@ -24,7 +24,7 @@ import { dirname } from 'node:path';
  *
  * The answer is PROVENANCE: a value may enter this store only if it appears
  * **verbatim in that sender's own messages**. Not the assistant's prose, not
- * another sender's history, not inferred. `jeff_27e778@kindle.com` was never
+ * another sender's history, not inferred. `someone@kindle.com` was never
  * typed by anyone, so it could not have been stored.
  *
  * And the delivery tool takes **no address parameter at all** — the model cannot

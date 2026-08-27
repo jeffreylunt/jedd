@@ -6,7 +6,7 @@ import { fail, ok, type Tool } from './types.js';
  * 🔴 THIS TOOL ACCEPTS AN ADDRESS AND USUALLY REFUSES IT.
  *
  * That is the design, not a limitation. V1's model **fabricated an address and a
- * stranger received someone's book** — `jeff_27e778@kindle.com`, which is Jeff's
+ * stranger received someone's book** — `someone@kindle.com`, which is Jeff's
  * real address with the middle of the local part removed, persisted for a
  * different user who had never typed one.
  *

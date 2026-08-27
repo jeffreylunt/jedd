@@ -319,7 +319,7 @@ test('a plain send that fails is still a throw — the fallback did not swallow 
 
 // ── 🔴 the self-address loop, measured live 2026-08-26 ──────────────────────
 
-const SELF = 'jeffreylunt@outlook.com';
+const SELF = 'personone@example.com';
 
 function selfPayload(over: Record<string, unknown> = {}) {
   // The shape BlueBubbles actually delivered. Note `isFromMe: false` — this is
@@ -360,7 +360,7 @@ test('the guard is identity, not the isFromMe flag — both copies are stopped',
 });
 
 test('the self guard is case- and formatting-insensitive, like every other handle compare', () => {
-  assert.equal(classifyPayload(selfPayload({ handle: { address: '  JeffreyLunt@Outlook.com ' } }), SELF).action, 'skip');
+  assert.equal(classifyPayload(selfPayload({ handle: { address: '  PersonOne@example.com ' } }), SELF).action, 'skip');
 });
 
 test('🔴 the self guard is NOT a suffix match — a lookalike address still gets answered', () => {

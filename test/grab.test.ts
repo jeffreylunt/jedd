@@ -165,13 +165,13 @@ test('complete-but-no-path is NOT reported as complete', async () => {
 
 // ── 🔴 the container/host path split ─────────────────────────────────────────
 
-const MOUNTS = [{ containerPrefix: '/downloads', hostPrefix: '/home/jeff/gluetun/downloads' }];
+const MOUNTS = [{ containerPrefix: '/downloads', hostPrefix: '/home/user/gluetun/downloads' }];
 
 test('🔴 qBittorrent\'s real reported path is translated to one that exists on hp', () => {
   // Verbatim from the live API today. /downloads does NOT exist on the host.
   assert.equal(
     toHostPath('/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB', MOUNTS),
-    '/home/jeff/gluetun/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB',
+    '/home/user/gluetun/downloads/ebooks/Red Rising Trilogy by Pierce Brown EPUB',
   );
 });
 
@@ -186,7 +186,7 @@ test('🔴 an UNMAPPED path returns null, never the original', () => {
 test('🔴 prefix matching respects path boundaries', () => {
   // A blanket startsWith would rewrite /downloads-old into the wrong mount.
   assert.equal(toHostPath('/downloads-old/x.epub', MOUNTS), null);
-  assert.equal(toHostPath('/downloads', MOUNTS), '/home/jeff/gluetun/downloads');
+  assert.equal(toHostPath('/downloads', MOUNTS), '/home/user/gluetun/downloads');
 });
 
 test('an empty content path is null, matching the complete-but-no-path guard', () => {

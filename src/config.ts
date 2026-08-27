@@ -64,7 +64,7 @@ export interface Config {
   radarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
   bluebubbles: {
     /**
-     * 🔴 `:1234` is JEDD (jeffreylunt@outlook.com). `:1235` is Jeff's PERSONAL
+     * 🔴 `:1234` is JEDD (jedd@example.com). `:1235` is Jeff's PERSONAL
      * Apple ID, used to read 2FA codes. Both accept the same default password
      * and expose the same API, so a typo connects SUCCESSFULLY to the wrong
      * identity — which is why `expectedIdentity` is asserted at boot.
@@ -158,8 +158,8 @@ export interface Config {
      * itself" and that "a request arriving from anywhere else gets
      * `Unauthorized`". **Measured from this Mac, unauthenticated:**
      *
-     *   GET http://192.168.1.7:8080/api/v2/app/version    -> 200 in 7 ms
-     *   GET http://192.168.1.7:8080/api/v2/torrents/info  -> 200, 121 torrents
+     *   GET http://10.0.0.10:8080/api/v2/app/version    -> 200 in 7 ms
+     *   GET http://10.0.0.10:8080/api/v2/torrents/info  -> 200, 121 torrents
      *   GET http://172.20.0.1:8080/api/v2/app/version     -> 000 after 8 s
      *
      * So the LAN address reads fine from off-host and it is the BRIDGE address
@@ -170,7 +170,7 @@ export interface Config {
      * ⚠️ WRITES: auth is NOT refused over the LAN either. Measured with a hash
      * that cannot exist, so nothing real could change:
      *
-     *   POST http://192.168.1.7:8080/api/v2/torrents/topPrio hashes=ffff…  -> 200
+     *   POST http://10.0.0.10:8080/api/v2/torrents/topPrio hashes=ffff…  -> 200
      *   (control, the known-good hp path, same bogus hash)                 -> 200
      *
      * A 403 would have settled it the other way; a 200 means the request was
@@ -290,17 +290,17 @@ export function loadConfig(): Config {
       apiKey: process.env.JELLYFIN_API_KEY ?? '',
     },
     prowlarr: {
-      baseUrl: process.env.PROWLARR_URL ?? 'http://192.168.1.7:9696',
+      baseUrl: process.env.PROWLARR_URL ?? 'http://10.0.0.10:9696',
       apiKey: process.env.PROWLARR_API_KEY ?? '',
     },
     sonarr: {
-      baseUrl: process.env.SONARR_URL ?? 'http://192.168.1.7:8989/sonarr/api/v3',
+      baseUrl: process.env.SONARR_URL ?? 'http://10.0.0.10:8989/sonarr/api/v3',
       apiKey: process.env.SONARR_API_KEY ?? '',
       rootFolder: process.env.SONARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/TV',
       qualityProfileId: Number(process.env.SONARR_QUALITY_PROFILE_ID ?? 9),
     },
     radarr: {
-      baseUrl: process.env.RADARR_URL ?? 'http://192.168.1.7:7878/radarr/api/v3',
+      baseUrl: process.env.RADARR_URL ?? 'http://10.0.0.10:7878/radarr/api/v3',
       apiKey: process.env.RADARR_API_KEY ?? '',
       rootFolder: process.env.RADARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/Movies',
       qualityProfileId: Number(process.env.RADARR_QUALITY_PROFILE_ID ?? 6),
@@ -354,7 +354,7 @@ export function loadConfig(): Config {
     tmdb: { readToken: (process.env.TMDB_READ_TOKEN ?? '').trim() },
     qbittorrent: {
       baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',
-      lanUrl: process.env.QBITTORRENT_LAN_URL ?? 'http://192.168.1.7:8080',
+      lanUrl: process.env.QBITTORRENT_LAN_URL ?? 'http://10.0.0.10:8080',
     },
     // Opt IN to writes, explicitly. Absence of the flag means read-only.
     readOnly: process.env.JEDD_ALLOW_WRITES !== 'true',

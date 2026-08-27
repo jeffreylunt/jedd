@@ -18,7 +18,7 @@ import { fail, ok, type Tool } from './types.js';
 export const hpShell: Tool = {
   name: 'hp_shell',
   description:
-    'Run a READ-ONLY shell command on the homelab host (hp, 192.168.1.7) over ssh, as an ' +
+    'Run a READ-ONLY shell command on the homelab host (hp, 10.0.0.10) over ssh, as an ' +
     'UNPRIVILEGED account. Use this for host-level diagnostics: uptime, df, free, ps, ss, reading ' +
     'files, curl against a local service. Returns exit code, stdout and stderr separately — always ' +
     'read the exit code, because an empty stdout with a non-zero exit is an ERROR, not an empty ' +

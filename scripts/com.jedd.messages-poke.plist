@@ -20,10 +20,22 @@
              the Automation grant for com.apple.MobileSMS. A different node, a
              shell, or bare osascript here silently loses the grant and every
              poke times out at -1712. See scripts/messages-poke.mjs header. -->
+        <!-- 🔴 TEMPLATE — THE THREE ABSOLUTE PATHS BELOW MUST BE EDITED BEFORE
+             INSTALLING. launchd resolves nothing relative and expands no
+             variables, so these cannot be made portable; they are absolute by
+             necessity, not by oversight. Install with:
+               sed -e "s#__NODE__#$(which node)#" \
+                   -e "s#__REPO__#$(pwd)#" \
+                   scripts/com.jedd.messages-poke.plist \
+                 > ~/Library/LaunchAgents/com.jedd.messages-poke.plist
+               launchctl load ~/Library/LaunchAgents/com.jedd.messages-poke.plist
+             ⚠️ __NODE__ must be the SAME node binary that holds the Automation
+             grant (see the note above) — `which node` is only right if that is
+             the one you granted. -->
         <key>ProgramArguments</key>
         <array>
-            <string>/Users/jeff/.nvm/versions/node/v24.12.0/bin/node</string>
-            <string>/Users/jeff/dev/jedd-v2/scripts/messages-poke.mjs</string>
+            <string>__NODE__</string>
+            <string>__REPO__/scripts/messages-poke.mjs</string>
         </array>
         <!-- 120s: the tightest measured failing idle gap is 5m31s and the
              boundary below it is unmeasured down to ~20s, so the field's
@@ -33,6 +45,6 @@
         <key>RunAtLoad</key>
         <true/>
         <key>StandardErrorPath</key>
-        <string>/Users/jeff/dev/jedd-v2/data/messages-poke.err</string>
+        <string>__REPO__/data/messages-poke.err</string>
     </dict>
 </plist>

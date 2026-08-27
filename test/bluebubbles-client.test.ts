@@ -53,24 +53,24 @@ function client(impl: FetchImpl, expectedIdentity?: string) {
 // ── 🔴 the two-servers trap ──────────────────────────────────────────────────
 
 test('🔴 boot REFUSES when the server is the wrong Apple account', async () => {
-  // :1234 is Jedd (jeffreylunt@outlook.com); :1235 is Jeff's PERSONAL account,
+  // :1234 is Jedd (personone@example.com); :1235 is Jeff's PERSONAL account,
   // used to read 2FA codes. Both use the literal default password and the same
   // API shape, so a .env typo connects SUCCESSFULLY to the wrong identity.
   const { impl } = scripted(() => ({
-    body: { data: { detected_imessage: 'jeffreylunt@gmail.com', server_version: '1.9.9' } },
+    body: { data: { detected_imessage: 'persontwo@example.com', server_version: '1.9.9' } },
   }));
   await assert.rejects(
-    () => client(impl, 'jeffreylunt@outlook.com').assertIdentity(),
-    /jeffreylunt@gmail\.com|wrong|identity/i,
+    () => client(impl, 'personone@example.com').assertIdentity(),
+    /persontwo@example\.com|wrong|identity/i,
   );
 });
 
 test('boot accepts the expected identity', async () => {
   const { impl } = scripted(() => ({
-    body: { data: { detected_imessage: 'jeffreylunt@outlook.com', server_version: '1.9.9' } },
+    body: { data: { detected_imessage: 'personone@example.com', server_version: '1.9.9' } },
   }));
-  const info = await client(impl, 'jeffreylunt@outlook.com').assertIdentity();
-  assert.equal(info.detectedIMessage, 'jeffreylunt@outlook.com');
+  const info = await client(impl, 'personone@example.com').assertIdentity();
+  assert.equal(info.detectedIMessage, 'personone@example.com');
 });
 
 test('an unreadable server/info is UNKNOWN and still refuses — it is not "probably fine"', async () => {
@@ -80,7 +80,7 @@ test('an unreadable server/info is UNKNOWN and still refuses — it is not "prob
   // identity still failed the equality test, so the suite stayed green while the
   // UNKNOWN guard was gone. A refusal for the wrong reason is not a passing test.
   await assert.rejects(
-    () => client(impl, 'jeffreylunt@outlook.com').assertIdentity(),
+    () => client(impl, 'personone@example.com').assertIdentity(),
     /could not read|unknown/i,
   );
 });
@@ -144,7 +144,7 @@ test('🔴 registering V2 does NOT delete V1 — a different port is somebody el
       return {
         body: {
           data: [
-            { id: 5, url: 'http://192.168.1.7:18790/webhook', events: ['new-message'] },
+            { id: 5, url: 'http://10.0.0.10:18790/webhook', events: ['new-message'] },
             { id: 9, url: 'http://127.0.0.1:18795/webhook', events: ['*'] },
           ],
         },
@@ -160,7 +160,7 @@ test('🔴 registering V2 does NOT delete V1 — a different port is somebody el
 });
 
 test('🔴 the original orphan is still fixed — a HOST change on our own port is ours', async () => {
-  // The measured V1 incident: 127.0.0.1:18790 -> 192.168.1.7:18790. Same port,
+  // The measured V1 incident: 127.0.0.1:18790 -> 10.0.0.10:18790. Same port,
   // same path, and the old row delivered into a black hole for a whole version.
   const { impl, calls } = scripted((c) => {
     if (c.method === 'GET') {
@@ -169,7 +169,7 @@ test('🔴 the original orphan is still fixed — a HOST change on our own port 
     if (c.method === 'DELETE') return { body: { message: 'deleted' } };
     return { body: { data: { id: 6 } } };
   });
-  const res = await client(impl).ensureWebhook('http://192.168.1.7:18790/webhook', ['new-message']);
+  const res = await client(impl).ensureWebhook('http://10.0.0.10:18790/webhook', ['new-message']);
   assert.ok(calls.some((c) => c.method === 'DELETE' && c.url.includes('/webhook/5')));
   assert.deepEqual(res.removed, [{ id: 5, url: 'http://127.0.0.1:18790/webhook' }]);
 });

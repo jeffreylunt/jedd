@@ -93,7 +93,7 @@ export interface BlueBubblesOptions {
    * 🔴 The Apple account this server MUST be bridging.
    *
    * There are two BlueBubbles servers on the Mac: `:1234` is Jedd
-   * (`jeffreylunt@outlook.com`) and `:1235` is Jeff's PERSONAL account, used by
+   * (`jedd@example.com`) and `:1235` is Jeff's PERSONAL account, used by
    * the orchestrator to read 2FA codes. **Both use the literal default password
    * and expose the same API**, so a copy-pasted `.env` connects *successfully*
    * to the wrong identity and Jedd texts from the wrong person. Nothing about
@@ -283,7 +283,7 @@ export class BlueBubblesClient {
    * `/webhook` was fair game to delete. Live registrations on this server right
    * now:
    *
-   *     id 5  http://192.168.1.7:18790/webhook    ← V1. Production. Serving a household.
+   *     id 5  http://10.0.0.10:18790/webhook    ← V1. Production. Serving a household.
    *     id 9  http://127.0.0.1:18795/webhook      ← a V2 listener
    *
    * Both are `/webhook`, because `/webhook` is what everybody calls it. Under
@@ -295,7 +295,7 @@ export class BlueBubblesClient {
    * moment, and the difference is not something the registration path can see.
    * So it no longer guesses: a row on a **different port is somebody else's**,
    * and we do not delete other people's registrations. The original incident is
-   * still covered, because a host change (`127.0.0.1:18790` → `192.168.1.7:18790`)
+   * still covered, because a host change (`127.0.0.1:18790` → `10.0.0.10:18790`)
    * keeps the port.
    *
    * Taking V1 down is a DELIBERATE, SEPARATE step — `deleteWebhook(5)` in the

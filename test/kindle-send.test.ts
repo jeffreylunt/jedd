@@ -4,7 +4,7 @@ import { sendToKindle, type MailSender } from '../src/media/kindle-send.js';
 import { testConfig } from './helpers.js';
 
 const BYTES = Buffer.from('epub bytes');
-const base = { config: testConfig(), toAddress: 'korbyn96_yo0FhQ@kindle.com', filename: 'book.epub', bytes: BYTES };
+const base = { config: testConfig(), toAddress: 'ReaderTwo@kindle.com', filename: 'book.epub', bytes: BYTES };
 
 function capturing(): { send: MailSender; sent: Parameters<MailSender>[0][] } {
   const sent: Parameters<MailSender>[0][] = [];
@@ -52,7 +52,7 @@ test('🔴 the from-address comes from config, and the address is NOT a paramete
   const { send, sent } = capturing();
   await sendToKindle(base, send);
   assert.equal(sent[0]?.from, 'jedd@invalid');
-  assert.equal(sent[0]?.to, 'korbyn96_yo0FhQ@kindle.com');
+  assert.equal(sent[0]?.to, 'ReaderTwo@kindle.com');
 });
 
 test('🔴 the subject and body are NON-EMPTY — an empty message got E009 No Attachment', async () => {

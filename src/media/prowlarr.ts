@@ -23,7 +23,7 @@ export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ProwlarrOptions {
   /**
-   * 🔴 THE BARE ROOT, e.g. `http://192.168.1.7:9696` — no path prefix.
+   * 🔴 THE BARE ROOT, e.g. `http://10.0.0.10:9696` — no path prefix.
    *
    * Unlike Sonarr/Radarr, Prowlarr has none. `/api/v1` is appended HERE rather
    * than being baked into the base, so the two halves of that fact live in one

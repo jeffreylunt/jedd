@@ -11,7 +11,7 @@ import { runOnHp, type ExecImpl } from './hp.js';
  * strings are spelled, and the boundary is a fact about two OS accounts:
  *
  *   HP_ADMIN_SSH_HOST=hp   HP_SHELL_SSH_HOST=jeff@hp     ← reads as SPLIT, is ONE account
- *   HP_ADMIN_SSH_HOST=hp   HP_SHELL_SSH_HOST=192.168.1.7 ← same
+ *   HP_ADMIN_SSH_HOST=hp   HP_SHELL_SSH_HOST=10.0.0.10 ← same
  *   HP_ADMIN_SSH_HOST=hp   HP_SHELL_SSH_HOST=            ← empty string, also "different"
  *
  * The only real evidence the boundary existed was a crossing run by hand once,

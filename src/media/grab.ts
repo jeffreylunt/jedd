@@ -243,7 +243,7 @@ export type GrabStatus =
  * It is qBittorrent's own view of where the file is, and that view is inside its
  * container's mount namespace. Any consumer must resolve it against the SAME
  * mount, or it will look in a path that does not exist and report a missing file
- * for a download that completed. V1 mounted `/home/jeff/gluetun/downloads` as
+ * for a download that completed. V1 mounted `/home/user/gluetun/downloads` as
  * `/downloads:ro` precisely so the two agreed.
  */
 export async function grabStatus(input: {
@@ -328,7 +328,7 @@ export async function grabStatus(input: {
 export interface MountMap {
   /** What qBittorrent calls it, e.g. `/downloads`. */
   containerPrefix: string;
-  /** What it is on hp, e.g. `/home/jeff/gluetun/downloads`. */
+  /** What it is on hp, e.g. `/home/user/gluetun/downloads`. */
   hostPrefix: string;
 }
 

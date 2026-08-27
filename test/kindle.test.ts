@@ -16,14 +16,14 @@ const OTHER = '+13855550168';
 // ── 🔴 the fabricated address ────────────────────────────────────────────────
 
 test('🔴 THE ACTUAL INCIDENT: a fabricated address cannot be stored', async () => {
-  // Verbatim from the corpus: Jeff typed jeffreylunt_27e778@kindle.com at
+  // Verbatim from the corpus: Jeff typed readerthree@kindle.com at
   // 2026-08-23 16:49. The address persisted for a DIFFERENT user 1h43m later was
-  // jeff_27e778@kindle.com -- the same string with the middle removed. The
+  // readerfour@kindle.com -- the same string with the middle removed. The
   // `_27e778` suffix is an exact match on a random token, so it reached the
   // model's context from somewhere; it was never typed by that user.
   const reg = new KindleRegistry(tempFile());
   const otherUserTurns = ['Can you get Way of Kings on my kindle?', 'Number 1 is great'];
-  const r = reg.save(OTHER, 'jeff_27e778@kindle.com', otherUserTurns);
+  const r = reg.save(OTHER, 'readerfour@kindle.com', otherUserTurns);
   assert.equal(r.ok, false);
   if (r.ok) throw new Error('unreachable');
   assert.match(r.reason, /does not appear in anything this person typed/i);
@@ -34,7 +34,7 @@ test('🔴 a syntactically PERFECT address is still refused without provenance',
   // The point: no property of the STRING distinguishes a real address from a
   // plausible fabrication. A validator would have passed the one that shipped.
   const reg = new KindleRegistry(tempFile());
-  const r = reg.save(OTHER, 'korbyn96_yo0FhQ@kindle.com', ['hi', 'can you get me a book']);
+  const r = reg.save(OTHER, 'ReaderTwo@kindle.com', ['hi', 'can you get me a book']);
   assert.equal(r.ok, false);
 });
 
@@ -42,16 +42,16 @@ test('CONTROL: an address the person DID type is stored', async () => {
   // Without this, "refused" would be consistent with the store never accepting
   // anything, which would be a passing test that proves nothing.
   const reg = new KindleRegistry(tempFile());
-  const r = reg.save(OTHER, 'korbyn96_yo0FhQ@kindle.com', ['korbyn96_yo0FhQ@kindle.com']);
+  const r = reg.save(OTHER, 'ReaderTwo@kindle.com', ['ReaderTwo@kindle.com']);
   assert.equal(r.ok, true);
-  assert.equal(reg.get(OTHER)?.address, 'korbyn96_yo0FhQ@kindle.com');
+  assert.equal(reg.get(OTHER)?.address, 'ReaderTwo@kindle.com');
 });
 
 test("🔴 one person's address is not provenance for another's", async () => {
   // This is the cross-session shape of the real incident.
   const reg = new KindleRegistry(tempFile());
-  reg.save(JEFF, 'jeffreylunt_27e778@kindle.com', ['jeffreylunt_27e778@kindle.com']);
-  const r = reg.save(OTHER, 'jeffreylunt_27e778@kindle.com', ['get me the anxious generation']);
+  reg.save(JEFF, 'readerthree@kindle.com', ['readerthree@kindle.com']);
+  const r = reg.save(OTHER, 'readerthree@kindle.com', ['get me the anxious generation']);
   assert.equal(r.ok, false, "another person's turns are not this person's provenance");
 });
 
@@ -60,7 +60,7 @@ test('🔴 the ASSISTANT saying an address is not provenance', async () => {
   // was exactly this: a loose role filter let assistant text count as evidence.
   const reg = new KindleRegistry(tempFile());
   const onlyUserTurns = ['what do you need?'];
-  const r = reg.save(OTHER, 'invented_abc@kindle.com', onlyUserTurns);
+  const r = reg.save(OTHER, 'readerfive@kindle.com', onlyUserTurns);
   assert.equal(r.ok, false);
 });
 
@@ -69,31 +69,31 @@ test('🔴 the ASSISTANT saying an address is not provenance', async () => {
 test('🔴 the local part is stored VERBATIM; only the domain is lowercased', async () => {
   // V1 lowercased the whole address in front of the user, corrupting it and
   // forcing a re-onboarding.
-  assert.equal(normaliseKindleAddress('Korbyn96_yO0FhQ@KINDLE.COM'), 'Korbyn96_yO0FhQ@kindle.com');
+  assert.equal(normaliseKindleAddress('ReaderTwo@KINDLE.COM'), 'ReaderTwo@kindle.com');
 });
 
 test('an Amazon LOGIN address is refused — it is not a delivery address', async () => {
   // The common user mistake. Sending there silently does nothing.
-  assert.equal(normaliseKindleAddress('someone@gmail.com'), null);
+  assert.equal(normaliseKindleAddress('personfour@example.com'), null);
   assert.equal(normaliseKindleAddress('someone@amazon.com'), null);
   assert.equal(normaliseKindleAddress('not-an-address'), null);
 });
 
 test('matching is case-insensitive even though storage is not', async () => {
   const reg = new KindleRegistry(tempFile());
-  const r = reg.save(OTHER, 'Korbyn96_yO0FhQ@kindle.com', ['my kindle is korbyn96_yo0fhq@KINDLE.COM']);
+  const r = reg.save(OTHER, 'ReaderTwo@kindle.com', ['my kindle is readertwo@KINDLE.COM']);
   assert.equal(r.ok, true, 'the user typing it in a different case is still the same address');
 });
 
 test('an address survives a restart', async () => {
   const path = tempFile();
-  new KindleRegistry(path).save(OTHER, 'a_b@kindle.com', ['a_b@kindle.com']);
-  assert.equal(new KindleRegistry(path).get(OTHER)?.address, 'a_b@kindle.com');
+  new KindleRegistry(path).save(OTHER, 'readerone@kindle.com', ['readerone@kindle.com']);
+  assert.equal(new KindleRegistry(path).get(OTHER)?.address, 'readerone@kindle.com');
 });
 
 test('the source text is kept, so provenance is auditable after the fact', async () => {
   const reg = new KindleRegistry(tempFile());
-  reg.save(OTHER, 'a_b@kindle.com', ['here you go: a_b@kindle.com thanks']);
+  reg.save(OTHER, 'readerone@kindle.com', ['here you go: readerone@kindle.com thanks']);
   assert.match(reg.get(OTHER)!.sourceText, /here you go/);
 });
 
@@ -104,7 +104,7 @@ test('🔴 the TOOL refuses a fabricated address even though it is well-formed',
   const { testConfig } = await import('./helpers.js');
   const reg = new KindleRegistry(tempFile());
   const r = await saveKindleEmail.run(
-    { address: 'jeff_27e778@kindle.com' },
+    { address: 'readerfour@kindle.com' },
     {
       role: 'guest',
       senderHandle: OTHER,
@@ -123,13 +123,13 @@ test('CONTROL: the tool stores an address the person did type', async () => {
   const { testConfig } = await import('./helpers.js');
   const reg = new KindleRegistry(tempFile());
   const r = await saveKindleEmail.run(
-    { address: 'korbyn96_yo0FhQ@kindle.com' },
+    { address: 'ReaderTwo@kindle.com' },
     {
       role: 'guest',
       senderHandle: OTHER,
       config: testConfig({ readOnly: false }),
       kindle: reg,
-      userTurns: ['my kindle is korbyn96_yo0FhQ@kindle.com'],
+      userTurns: ['my kindle is ReaderTwo@kindle.com'],
     },
   );
   assert.equal(r.ok, true);
@@ -167,7 +167,7 @@ test('🔴 EVERY tool that accepts a delivery address REFUSES one nobody typed',
       const r = await t.run(
         // Well-formed, plausible, and never typed by this person. A validator
         // passes it; only provenance rejects it.
-        { [key]: key === 'recipient' ? '+18015559999' : 'korbyn96_yo0FhQ@kindle.com' },
+        { [key]: key === 'recipient' ? '+18015559999' : 'ReaderTwo@kindle.com' },
         {
           role: 'owner',
           senderHandle: OTHER,

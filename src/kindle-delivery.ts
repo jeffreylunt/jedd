@@ -4,7 +4,7 @@
  * ── 🔴 THIS OVERTURNS A V1 BACKLOG CLAIM, AND THE CORRECTION MATTERS ─────────
  *
  * V1's open task says Kindle delivery verification **cannot fail**: a
- * guaranteed-bad address (`jedd_probe_nonexistent@kindle.com`) produced the
+ * guaranteed-bad address (`someone@kindle.com`) produced the
  * *identical* silence as three real successful sends over 22 minutes. The
  * conclusion drawn was that the channel carries no signal.
  *

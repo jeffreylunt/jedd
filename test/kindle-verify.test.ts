@@ -39,7 +39,7 @@ const bounce = (body: string, receivedAt: string): BounceEmail => ({
 const CONTROL_E014 = bounce(
   'Dear customer,\nYour Send to Kindle request at 08:07 PM on Fri, Mar 13, 2026 GMT, could not be ' +
     'processed due to E014 - Unapproved sender email address.\nUnapproved sender email address: ' +
-    'thetrinityslc@gmail.com',
+    'personthree@example.com',
   '2026-03-13T20:07:32Z',
 );
 

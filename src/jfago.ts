@@ -35,8 +35,8 @@ export interface JfagoOptions {
    * served at `<base>/invite/<code>`.
    *
    * **This is NOT the Jellyfin URL, and the two are one path segment apart on
-   * the same host:** `https://jeffreylunt.com/accounts` (jfa-go, correct) versus
-   * `https://jeffreylunt.com/jellyfin` (Jellyfin, wrong). A link built from the
+   * the same host:** `https://media.example.com/accounts` (jfa-go, correct) versus
+   * `https://media.example.com/jellyfin` (Jellyfin, wrong). A link built from the
    * second is a 404 — and it is a 404 handed to a guest inside a message that
    * says "set up your account here", after a real invite has been minted and
    * charged against their quota. Nothing in this process could detect it: the

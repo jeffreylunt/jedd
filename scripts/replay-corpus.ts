@@ -30,8 +30,11 @@ import { loadConfig } from '../src/config.js';
 import { createLlmClient } from '../src/llm.js';
 import { buildTools } from '../src/tools/index.js';
 
-const CORPUS = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v1-parity-corpus.jsonl';
-const OUT = '/Users/jeff/.superbot2/spaces/jedd-v2/corpus/v2-replay.jsonl';
+// Dev-only replay harness. The corpus lives outside the repo (it holds real
+// conversation transcripts and must never be committed), so its location is
+// configuration rather than a constant.
+const CORPUS = process.env.REPLAY_CORPUS ?? './corpus/v1-parity-corpus.jsonl';
+const OUT = process.env.REPLAY_OUT ?? './corpus/v2-replay.jsonl';
 
 /**
  * The handle to replay as OWNER, so the OWNER path is measured, not assumed.

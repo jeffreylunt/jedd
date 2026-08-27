@@ -46,7 +46,11 @@
 import { execFile } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 
-const LOG = '/Users/jeff/dev/jedd-v2/data/messages-poke.log';
+// Resolved from THIS file's location, not from cwd and not from a hardcoded
+// home directory: launchd runs this with an unpredictable working directory,
+// so a relative path would land somewhere arbitrary. `../data/` from
+// scripts/ is the same directory the app's own stores use.
+const LOG = new URL('../data/messages-poke.log', import.meta.url).pathname;
 
 // Local time with offset, so lines correlate with Jeff's reports and
 // events.log without UTC arithmetic (Heroku-vs-Sentry taught that lesson).

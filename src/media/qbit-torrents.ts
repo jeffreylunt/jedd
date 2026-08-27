@@ -168,7 +168,7 @@ export type Fetched<T> = { state: 'ok'; value: T } | { state: 'unknown'; detail:
  * reachable from **hp**, which is why every existing qbit tool curls it over
  * ssh. It is NOT reachable from the Mac this process runs on. Measured today:
  *
- *   http://192.168.1.7:8080/api/v2/app/version  -> 200 in 7 ms
+ *   http://10.0.0.10:8080/api/v2/app/version  -> 200 in 7 ms
  *   http://172.20.0.1:8080/api/v2/app/version   -> 000 after 8 s
  *
  * `homelab-read.ts` refused to invent the second URL and said to raise it as a

@@ -21,7 +21,7 @@ function ssh(meta: string, body: string, codes: [number?, number?] = []) {
   return { exec, commands };
 }
 
-const base = { adminSshHost: 'admin.invalid', hostPath: '/home/jeff/gluetun/downloads/ebooks/x.epub' };
+const base = { adminSshHost: 'admin.invalid', hostPath: '/home/user/gluetun/downloads/ebooks/x.epub' };
 
 // ── 🔴 verification is the point ─────────────────────────────────────────────
 
@@ -96,7 +96,7 @@ test('an oversized file is refused before it is read', async () => {
 // ── the path reaches a shell ─────────────────────────────────────────────────
 
 test('🔴 only a plain absolute path is accepted', () => {
-  assert.equal(isSafeHostPath('/home/jeff/gluetun/downloads/ebooks/Red Rising Trilogy EPUB'), true);
+  assert.equal(isSafeHostPath('/home/user/gluetun/downloads/ebooks/Red Rising Trilogy EPUB'), true);
   for (const bad of ['relative/path', '/a/../../etc/passwd', '/a\nb', '/a\0b']) {
     assert.equal(isSafeHostPath(bad), false, `${JSON.stringify(bad)} must be refused`);
   }

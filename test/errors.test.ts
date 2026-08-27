@@ -14,10 +14,10 @@ import { describeError, MAX_ERROR_CHARS, redactUrlSecrets } from '../src/errors.
 
 /** Exactly what `fetch()` throws when the LAN peer is unreachable. */
 function realFetchFailure(): Error {
-  const cause = Object.assign(new Error('connect EHOSTUNREACH 192.168.1.7:8096 - Local (192.168.1.68:53132)'), {
+  const cause = Object.assign(new Error('connect EHOSTUNREACH 10.0.0.10:8096 - Local (10.0.0.20:53132)'), {
     code: 'EHOSTUNREACH',
     syscall: 'connect',
-    address: '192.168.1.7',
+    address: '10.0.0.10',
     port: 8096,
   });
   return Object.assign(new Error('fetch failed'), { cause });
@@ -32,7 +32,7 @@ test('the useless outer message is not all that is kept', () => {
   // Its own test: something could match EHOSTUNREACH above and still have
   // dropped the readable sentence that tells a person what to do.
   const out = describeError(realFetchFailure());
-  assert.match(out, /192\.168\.1\.7/, 'the address is what makes it actionable');
+  assert.match(out, /10\.0\.0\.10/, 'the address is what makes it actionable');
 });
 
 test('🔴 message is NON-ENUMERABLE, so a naive serialiser silently loses it', () => {
