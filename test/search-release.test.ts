@@ -41,9 +41,13 @@ const run = (f: FetchImpl, args: Record<string, unknown>, over: Partial<ToolCont
 
 // ── 🔴 THE REGRESSION: the producer that did not exist ──────────────────────
 
-test('🔴 READY PLAYER ONE: an audiobook search returns a numbered list add_audiobook can resolve', async () => {
+test('🔴 READY PLAYER ONE: an audiobook search stores a pick add_audiobook can resolve', async () => {
   // Jeff, live: "Can you get the ready player one audiobook?" -> "I don't have
   // an audiobook search tool." add_audiobook was registered and uncallable.
+  //
+  // ⚠️ The list is no longer PRESENTED — nobody is asked which torrent — but it
+  // is still stored, and the consumer still resolves from it. That seam is what
+  // this test guards, and it did not change.
   const path = tempFile();
   const store = new ChoiceStore(path);
   const r = await run(
@@ -52,8 +56,8 @@ test('🔴 READY PLAYER ONE: an audiobook search returns a numbered list add_aud
     { choices: store },
   );
   assert.equal(r.ok, true);
-  assert.match(r.content, /1\. Ready Player One/);
-  assert.match(r.content, /call add_audiobook with their number/);
+  assert.match(r.content, /Ready Player One/);
+  assert.match(r.content, /Call add_audiobook now/);
   assert.match(r.content, /Nothing is downloading yet/);
 
   // 🔴 The point of the whole exercise: the consumer can now resolve the pick.
@@ -102,7 +106,7 @@ test('search_ebook is the same producer pointed at the ebook category and send_e
   }).run({ query: 'Project Hail Mary' }, ctx());
   assert.equal(r.ok, true);
   assert.match(url, /categories=7020/, 'ebooks are Prowlarr category 7020');
-  assert.match(r.content, /call send_ebook with their number/);
+  assert.match(r.content, /Call send_ebook now/);
 });
 
 test('search_audiobook uses the audiobook category', async () => {
@@ -206,13 +210,16 @@ test('graphic_audio: true keeps ONLY the dramatisations', async () => {
       json([release({ infoHash: HASH_A }), release({ title: 'PHM GraphicAudio', infoHash: HASH_B })]),
     { query: 'x', graphic_audio: true },
   );
-  assert.match(r.content, /1\. PHM GraphicAudio/);
-  assert.doesNotMatch(r.content, /1\. Project Hail Mary —/);
+  assert.match(r.content, /PHM GraphicAudio/);
+  assert.doesNotMatch(r.content, /Project Hail Mary —/);
 });
 
 // ── list mechanics ──────────────────────────────────────────────────────────
 
-test('dead releases sort below live ones — a zero-seeder grab never completes', async () => {
+test('a dead release is EXCLUDED and counted — it is not a lesser option, it is no option', async () => {
+  // It used to sort to the bottom, which was fine while a person was choosing
+  // from a list. A comparator choosing silently can take the bottom of a list,
+  // so it is filtered instead.
   const r = await run(
     async () =>
       json([
@@ -221,17 +228,19 @@ test('dead releases sort below live ones — a zero-seeder grab never completes'
       ]),
     { query: 'x' },
   );
-  assert.match(r.content, /1\. Alive/);
-  assert.match(r.content, /2\. Dead/);
+  assert.match(r.content, /Alive/);
+  assert.doesNotMatch(r.content, /Dead —/, 'the zero-seeder release is not chosen and not offered');
+  assert.match(r.content, /1 with no seeders left out/, 'and it is counted, never dropped in silence');
 });
 
-test('the list is capped at 5 and SAYS so', async () => {
+test('only ONE release is named, however many were found, and the rest are counted', async () => {
   const many = Array.from({ length: 9 }, (_, i) =>
     release({ title: `Release ${i}`, infoHash: `${i}`.repeat(40).slice(0, 40), seeders: 20 - i }),
   );
   const r = await run(async () => json(many), { query: 'x' });
-  assert.match(r.content, /showing the top 5 of 9/);
-  assert.doesNotMatch(r.content, /6\. /);
+  assert.match(r.content, /Release 0/, 'the top of the ranking');
+  assert.match(r.content, /4 other release\(s\) not chosen/);
+  assert.doesNotMatch(r.content, /^\s*\d+\.\s/m, 'no numbered options at all');
 });
 
 test('🔴 with no choice store it refuses — a list nothing can resolve is not an offer', async () => {
@@ -357,16 +366,40 @@ test('CONTROL: both register fine WITH catalogue_search present', async () => {
 });
 
 test('🔴 the two axes catch DIFFERENT tools — neither check is redundant', async () => {
-  // A name scan cannot see add_audiobook's dependency ("an audiobook search" is
-  // not a tool name); the structural check cannot see add_movie's (it takes a
-  // tmdb_id, not a choice). Both are needed, and this pins that.
-  const audiobook = ALL_TOOLS.find((t) => t.name === 'add_audiobook')!;
-  assert.doesNotMatch(audiobook.description, /search_audiobook/, 'names no producer — only the structural check sees it');
-  assert.equal(audiobook.consumesChoiceKind, 'release');
+  /**
+   * The name scan and the structural check see different dependencies, and this
+   * pins that they are not the same check twice.
+   *
+   * ⚠️ TOMBSTONE — DO NOT RESTORE THE OLD FORM OF THIS TEST. It used to prove
+   * the structural half by asserting `add_audiobook.description` does NOT say
+   * "search_audiobook". That was true by accident of wording, and the wording
+   * changed the day the release pick became automatic and every consumer started
+   * naming the search that chose for it. Asserting a tool does not mention
+   * another tool is a constraint on prose, not on the check, so it is replaced
+   * with a synthetic pair that cannot drift.
+   */
+  const structuralOnly: Tool = {
+    name: 'fake_consumer',
+    description: 'Consumes a pick and names no producer anywhere in this sentence.',
+    minRole: 'guest',
+    writes: false,
+    consumesChoiceKind: 'no-such-kind',
+    parameters: { type: 'object', properties: { choice: { type: 'number' } }, required: ['choice'] },
+    run: async () => ({ ok: true, content: '' }),
+  };
+  assert.throws(
+    () => assertChoiceProducersExist([structuralOnly]),
+    /NO registered tool presents one/,
+    'a dependency expressed only in the SCHEMA — invisible to a name scan',
+  );
 
   const movie = ALL_TOOLS.find((t) => t.name === 'add_movie')!;
   assert.match(movie.description, /catalogue_search/, 'names its producer — only the name check sees it');
   assert.equal(movie.consumesChoiceKind, undefined, 'and it consumes no choice at all');
+  assert.doesNotThrow(
+    () => assertChoiceProducersExist([movie]),
+    'so the structural check is blind to add_movie, which is the other half of the point',
+  );
 });
 
 test('🔴 the EBOOK PAIR is atomic: no SMTP credential means neither half registers', async () => {

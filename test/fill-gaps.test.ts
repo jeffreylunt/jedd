@@ -165,12 +165,19 @@ test('a show not in the library says so and points at add_series', async () => {
 
 // ── search_episode ──────────────────────────────────────────────────────────
 
-test('🔴 THE POINT: a release the PROFILE REFUSES is still offered, with the reason', async () => {
-  // Jeff asked to change the quality profile to get more options. This is that,
-  // without the change: the 1080p is listed with Sonarr's own refusal beside it.
+test('🔴 THE POINT: a release the PROFILE REFUSES is still TAKEN, with the reason', async () => {
+  /**
+   * Jeff asked to change the quality profile to get more options. This is that,
+   * without the change: the profile refuses the 1080p and we take it anyway,
+   * carrying Sonarr's own refusal so nobody reads it as an error.
+   *
+   * ⚠️ The approved 720p is on a THIN swarm here, which is what lets the refused
+   * one win. With both swarms healthy the profile's opinion decides again — see
+   * the test below. That is the rule, not an accident of this fixture.
+   */
   const { fetchImpl } = sonarr({
     releases: [
-      rel(),
+      rel({ seeders: 2 }),
       rel({
         guid: 'magnet:?xt=urn:btih:AAA',
         title: 'Seinfeld S03E01 1080p AMZN WEB-DL',
@@ -270,7 +277,10 @@ test('an episode that does not exist says so rather than searching', async () =>
   assert.match(r.content, /has no S03E99/);
 });
 
-test('approved releases sort above profile-refused ones', async () => {
+test('approved beats profile-refused WHEN BOTH SWARMS ARE HEALTHY', async () => {
+  // 99 and 13 seeders are the same band, so the quality keys get to decide. The
+  // band leads; it does not throw the profile away. `auto-pick-release.test.ts`
+  // holds the case where they disagree.
   const { fetchImpl } = sonarr({
     releases: [
       rel({ guid: 'g2', title: 'Refused 1080p', approved: false, rejections: ['not wanted in profile'], seeders: 99, quality: { quality: { name: 'WEBDL-1080p', resolution: 1080 } } }),
@@ -278,8 +288,8 @@ test('approved releases sort above profile-refused ones', async () => {
     ],
   });
   const r = await makeSearchEpisode(fetchImpl).run({ title: 'Seinfeld', season: 3, episode: 1 }, ctx());
-  assert.match(r.content, /1\. Approved 720p/);
-  assert.match(r.content, /2\. Refused 1080p/);
+  assert.match(r.content, /Approved 720p/);
+  assert.doesNotMatch(r.content, /Refused 1080p/, 'the runner-up is not offered as a choice any more');
 });
 
 // ── grab_release ────────────────────────────────────────────────────────────
