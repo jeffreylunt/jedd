@@ -10,7 +10,7 @@ import {
 } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
-import { matchWork, pinWork, WORK_MATCH, type Work } from '../media/book-work.js';
+import { matchWork, pinWork, relevantWorks, WORK_MATCH, type Work } from '../media/book-work.js';
 import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
 import { resolveOfKind } from '../choices.js';
 import { fail, ok, type Tool } from './types.js';
@@ -243,7 +243,20 @@ function makeReleaseSearch(
         }).works(query);
         if (found.state === 'works') {
           work = pinWork(query, found.works);
-          if (!work) {
+          /**
+           * 🔴 CANDIDATES THAT SHARE NOTHING WITH THE REQUEST ARE NOT AN ANSWER.
+           *
+           * Live, 2026-08-27, *"that hobbit book"* came back with `Final
+           * Planning Book` and `American Film` among the five. See
+           * `relevantWorks`: presenting those asks somebody to choose which of
+           * five wrong books they meant. When nothing plausible survives, the
+           * catalogue genuinely could not settle it, and saying so is the
+           * honest report — it takes the same fallback as an unreachable one.
+           */
+          const plausible = relevantWorks(query, found.works).slice(0, 5);
+          if (!work && plausible.length === 0) {
+            workNote = `the book catalogue returned nothing that looks like "${query}"`;
+          } else if (!work) {
             /**
              * 🔴 THE ONE QUESTION WORTH ASKING, AND IT IS ABOUT BOOKS.
              *
@@ -256,7 +269,7 @@ function makeReleaseSearch(
               senderHandle: ctx.senderHandle,
               subject: query,
               kind: 'book-work',
-              options: found.works.slice(0, 5).map((w, i) => ({
+              options: plausible.map((w, i) => ({
                 n: i + 1,
                 label: describeWork(w),
                 value: { work: w as unknown as Record<string, unknown> },
@@ -264,13 +277,12 @@ function makeReleaseSearch(
             });
             return ok(
               `WHICH BOOK — "${query}" matches more than one book and nothing has been searched for ` +
-                `yet:\n${found.works
-                  .slice(0, 5)
-                  .map((w, i) => `  ${i + 1}. ${describeWork(w)}`)
-                  .join('\n')}\n` +
+                `yet:\n${plausible.map((w, i) => `  ${i + 1}. ${describeWork(w)}`).join('\n')}\n` +
                 'Ask which one they meant. When they answer, call this same tool again with the same ' +
                 'query and their number as `choice` — it will then choose the best release itself. ' +
-                'Do NOT ask about torrents; that part is not their decision.',
+                'If NONE of these is the book they want, say so plainly and ask for the author, then ' +
+                'search again with the title and author together — do not talk them into one of ' +
+                'these. Do NOT ask about torrents; that part is not their decision.',
             );
           }
         } else {

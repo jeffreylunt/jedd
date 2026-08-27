@@ -198,6 +198,69 @@ test('🔴 a query that names no work exactly asks WHICH BOOK — with authors a
   assert.equal(stored.choice.kind, 'book-work');
 });
 
+test('🔴 candidates that share nothing with the request are NOT presented', async () => {
+  /**
+   * ── FOUND BY RUNNING IT AGAINST THE REAL CATALOGUE, NOT BY READING IT ──────
+   *
+   * Every stubbed test passed while this was broken, because a stub returns the
+   * works you thought it would. Live on 2026-08-27, *"that hobbit book"* came
+   * back with these five, in this order, and this is the verbatim response:
+   *
+   *     Hobbit Quotes Coloring Book — Steffi Buttner, 2020
+   *     Final Planning Book — April Lorenz, 2021
+   *     A hobbit, a wardrobe, and a great war — Joe Loconte, 2015
+   *     American Film — American Film Institute, 1975
+   *     The Enchanted World of Rankin/Bass — Rick Goldschmidt, 1997
+   *
+   * Presented whole, that asks somebody which of five wrong books they meant,
+   * and two have no connection to the request at all. It failed CLOSED — picking
+   * one leads to "none of these releases is that book" — but a question built
+   * out of wrong answers invites the model to talk somebody into one of them.
+   */
+  const OL_VAGUE = {
+    docs: [
+      { key: '/works/OL26968807W', title: 'Hobbit Quotes Coloring Book', author_name: ['Steffi Buttner'], first_publish_year: 2020, edition_count: 1 },
+      { key: '/works/OL27952147W', title: 'Final Planning Book', author_name: ['April Lorenz'], first_publish_year: 2021, edition_count: 1 },
+      { key: '/works/OL17356680W', title: 'A hobbit, a wardrobe, and a great war', author_name: ['Joe Loconte'], first_publish_year: 2015, edition_count: 6 },
+      { key: '/works/OL1795514W', title: 'American Film', author_name: ['American Film Institute'], first_publish_year: 1975, edition_count: 2 },
+      { key: '/works/OL5720297W', title: 'The Enchanted World of Rankin/Bass', author_name: ['Rick Goldschmidt'], first_publish_year: 1997, edition_count: 2 },
+    ],
+  };
+  const r = await makeSearchEbook(hobbitProwlarr, undefined, openLibrary(OL_VAGUE)).run(
+    { query: 'that hobbit book' },
+    ctx(),
+  );
+  assert.match(r.content, /^WHICH BOOK — /);
+  assert.match(r.content, /Hobbit Quotes Coloring Book/, 'the ones that mention a hobbit stay');
+  assert.match(r.content, /a wardrobe, and a great war/);
+  assert.doesNotMatch(r.content, /Final Planning Book/, 'and the ones that share nothing are gone');
+  assert.doesNotMatch(r.content, /American Film/);
+  assert.doesNotMatch(r.content, /Rankin/);
+
+  // 🔴 And the way OUT is named. None of the survivors is The Hobbit either, so
+  // an instruction to pick one of them would still be wrong.
+  assert.match(r.content, /If NONE of these is the book they want/);
+  assert.match(r.content, /ask for the author/);
+});
+
+test('🔴 when NOTHING plausible survives, it says the catalogue could not settle it', async () => {
+  // Not "no such book", and not a list of five unrelated ones either. This is
+  // the same fallback an unreachable catalogue takes, for the same reason: the
+  // question was not answered.
+  const OL_IRRELEVANT = {
+    docs: [
+      { key: '/works/OL1795514W', title: 'American Film', author_name: ['American Film Institute'], first_publish_year: 1975, edition_count: 2 },
+    ],
+  };
+  const r = await makeSearchEbook(hobbitProwlarr, undefined, openLibrary(OL_IRRELEVANT)).run(
+    { query: 'that hobbit book' },
+    ctx(),
+  );
+  assert.match(r.content, /^FOUND /);
+  assert.match(r.content, /returned nothing that looks like/);
+  assert.doesNotMatch(r.content, /American Film/, 'the irrelevant candidate is not offered as a book');
+});
+
 test('🔴 nothing is searched while the BOOK is still in question', async () => {
   /**
    * Prowlarr is slow (35–45 s cold) and repeated searches trip per-indexer

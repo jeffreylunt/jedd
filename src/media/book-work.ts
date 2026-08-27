@@ -302,6 +302,61 @@ export function pinWork(query: string, works: Work[]): Work | undefined {
   return undefined;
 }
 
+/**
+ * Words that carry no identity in a REQUEST for a book.
+ *
+ * ⚠️ Separate from `NOISE`, which is about filenames, and the overlap is the
+ * reason: `book` is meaningless in *"that hobbit book"* and load-bearing in
+ * `[4 books]`. One list serving both would have to choose which of those to get
+ * wrong.
+ */
+const QUERY_NOISE = new Set(
+  ('the a an of and or that this these those my his her their some any one thing ' +
+    'book books novel novels story stories audiobook audiobooks ebook ebooks ' +
+    'please get me want read listen about by').split(/\s+/),
+);
+
+/**
+ * Works that have anything at all to do with what was asked.
+ *
+ * ── 🔴 FOUND BY RUNNING IT AGAINST THE REAL CATALOGUE, 2026-08-27 ───────────
+ *
+ * Open Library's relevance is excellent for a query that names a book and poor
+ * for one that gestures at it. Live, *"that hobbit book"* returned, in order:
+ *
+ *     1. Hobbit Quotes Coloring Book — Steffi Buttner, 2020
+ *     2. Final Planning Book — April Lorenz, 2021
+ *     3. A hobbit, a wardrobe, and a great war — Joe Loconte, 2015
+ *     4. American Film — American Film Institute, 1975
+ *     5. The Enchanted World of Rankin/Bass — Rick Goldschmidt, 1997
+ *
+ * Presenting that verbatim asks somebody to choose which of five wrong books
+ * they meant, and two of them have no discernible connection to the request at
+ * all. The flow still failed CLOSED — picking one leads to "none of these
+ * releases is that book" — but a question built entirely out of wrong answers is
+ * not a question, and it invites the model to talk somebody into one.
+ *
+ * So a candidate has to share a real word with the request. `Final Planning
+ * Book` and `American Film` do not; the two that mention a hobbit do, and the
+ * caller can say plainly that none of them looks right and offer to search
+ * again with an author.
+ *
+ * ⚠️ NOTHING HERE IMPROVES THE RANKING — it only declines to present candidates
+ * that were never plausible. When nothing survives, the honest report is that
+ * the catalogue could not settle the question, which is exactly what it means.
+ */
+export function relevantWorks(query: string, works: Work[]): Work[] {
+  const asked = new Set(
+    tokens(query).filter((t) => t.length > 1 && !QUERY_NOISE.has(t) && !/^(19|20)\d{2}$/.test(t)),
+  );
+  if (asked.size === 0) return works;
+  return works.filter((w) => {
+    const theirs = new Set([...tokens(w.title), ...w.authors.flatMap((a) => tokens(a))]);
+    for (const t of asked) if (theirs.has(t)) return true;
+    return false;
+  });
+}
+
 function sameTokens(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((t, i) => t === b[i]);
