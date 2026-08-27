@@ -39,6 +39,14 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     },
     kindle: { smtpHost: 'smtp.invalid', smtpPort: 587, fromEmail: 'jedd@invalid', smtpPassword: 'test-pw' },
     prowlarr: { baseUrl: 'http://prowlarr.invalid:9696', apiKey: 'test-key' },
+    /**
+     * 🔴 `.invalid` FOR THE SAME REASON THE SSH HOSTS ARE. A book test that
+     * forgets to stub the catalogue then fails to RESOLVE rather than reaching
+     * the real openlibrary.org — and the tool's documented fallback for an
+     * unreachable catalogue is to hand back the list and ask, so such a test
+     * still exercises a real path instead of silently going to the network.
+     */
+    openLibrary: { baseUrl: 'http://openlibrary.invalid' },
     sonarr: { baseUrl: 'http://sonarr.invalid:8989/sonarr/api/v3', apiKey: 'test-key', rootFolder: '/tv', qualityProfileId: 9 },
     radarr: { baseUrl: 'http://radarr.invalid:7878/radarr/api/v3', apiKey: 'test-key', rootFolder: '/movies', qualityProfileId: 6 },
     dispatcharr: { baseUrl: 'http://dispatcharr.test:9191' },
