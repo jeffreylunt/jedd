@@ -98,6 +98,16 @@ test('🔴 a model call killed by its own timer throws a ModelTimeoutError, not 
     assert.ok(isModelTimeout(err), `expected a ModelTimeoutError, got ${String(err)}`);
     assert.equal((err as ModelTimeoutError).limitMs, 1_000);
     assert.ok((err as ModelTimeoutError).elapsedMs >= 900, 'it should report roughly the time it waited');
+    /**
+     * 🔴 THE UNDERLYING REJECTION SURVIVES, AND ONLY THIS ASSERTION PROVES IT.
+     * A mutation dropping the `cause` argument in `llm.ts` left every other test
+     * here green: the cause test beside this one builds the error by hand and so
+     * never exercises the throw site at all. If the socket dies with ECONNRESET
+     * in the same tick the timer fires, this field is the ONLY place the real
+     * diagnosis exists — `main.ts` logs `.message`, which is now synthetic.
+     */
+    assert.ok((err as ModelTimeoutError).cause instanceof Error, 'the replaced error was thrown away');
+    assert.equal(((err as ModelTimeoutError).cause as Error).name, 'AbortError');
   } finally {
     globalThis.fetch = original;
   }
