@@ -1,0 +1,308 @@
+/**
+ * WHICH BOOK — the identity question, decided before any release is ranked.
+ *
+ * ── 🔴 THE DEFECT THIS FILE EXISTS TO CLOSE ─────────────────────────────────
+ *
+ * Swarm health answers *"which copy"*, and that is only the right question
+ * where the WORK is already pinned. `search_episode` pins it: a title, a season
+ * and an episode resolve against Sonarr to one episode row, and the releases it
+ * ranks are `/release?episodeId=…` — every candidate is an encoding of the same
+ * episode. `search_ebook` and `search_audiobook` take FREE TEXT, so the
+ * candidates are different WORKS and the ranking was being asked a question it
+ * cannot answer.
+ *
+ * Measured live against Prowlarr, 2026-08-27, *"The Hobbit J.R.R. Tolkien"*,
+ * eleven results, ordered by seeders:
+ *
+ *     24  Exploring J.R.R. Tolkien's The Hobbit by Corey Olsen ePUB eBOOK-
+ *     13  An A Z of JRR Tolkien s The Hobbit by Sarah Oliver EPUB
+ *     10  Tolkien RARE The Hobbit 1937-2017 Booklet with Dragons Lecture …
+ *      8  Hobbit_ Or There and Back Again, The - J. R. R. Tolkien-viny   ← THE BOOK
+ *      8  J.R.R Tolkien - The Lord of the Rings Series + The Hobbit [4 boo
+ *      6  The Lord of the Rings - J. R. R. Tolkien (Hobbit)+1-3 (KINDLE)
+ *
+ * **The two best-seeded results are study guides.** The ranking was correct and
+ * the answer was wrong, which is why no reordering fixes it.
+ *
+ * ── ⚠️ AND THE HONEST LIMIT OF WHAT THIS CAN BE ─────────────────────────────
+ *
+ * **There is no `releasesFor(workId)` for books.** Sonarr can scope a release
+ * search to an episode id; Prowlarr and the IRC bots have no notion of a work at
+ * all, and index nothing but filenames. So pinning a work does NOT hand us a set
+ * of releases the way an `episodeId` does — it hands us a NAME to compare
+ * filenames against, and this file is that comparison.
+ *
+ * That is weaker than TV's guarantee and it is important not to describe it as
+ * the same thing. What it buys is a much narrower question: instead of *"which
+ * of these six filenames is the book"* it asks *"is this filename a copy of THIS
+ * work"*, one release at a time, against a title and an author that came from a
+ * catalogue rather than from the user's phrasing.
+ *
+ * ── 🔴 SO THIS IS A SCORE, NOT A FILTER, AND THE DIRECTIONS DIFFER ──────────
+ *
+ * A hard filter fails in both directions and one of them is silent:
+ *
+ *  - reject the real book (its filename carries the subtitle, or no author) and
+ *    the flow DEAD-ENDS on "nothing matches" while the book sits right there;
+ *  - accept a guide and the original defect is back.
+ *
+ * `NOT_THIS_WORK` is refused outright — a release naming a different author, or
+ * announcing itself as a guide or a box set, is not a copy of this book under
+ * any reading. Everything else is RANKED, identity first, and the caller decides
+ * what to do when nothing scores well. Falling back to asking is always
+ * available; a dead end is not.
+ */
+
+/** How well a release filename matches a pinned work. Higher is better. */
+export const WORK_MATCH = {
+  /** Not a copy of this work: a foreign author, a guide, a bundle. REFUSED. */
+  NOT_THIS_WORK: 0,
+  /**
+   * The work is in there, and so is something else — a subtitle, a series
+   * position, another volume's name. Rankable, and below a clean match.
+   *
+   * ⚠️ THE REAL BOOK LANDS HERE, NOT ON A CLEAN MATCH, AND THAT IS THE POINT OF
+   * HAVING THIS BAND. `Hobbit_ Or There and Back Again, The - J. R. R. Tolkien`
+   * carries the subtitle that Open Library's work title omits, so a rule that
+   * demanded a clean match would have rejected the one release we are trying to
+   * reach. It still outranks every guide, because they score below it.
+   */
+  PARTIAL: 1,
+  /** This work, and nothing else in the name. */
+  CLEAN: 2,
+} as const;
+
+export interface Work {
+  /** Open Library work key, e.g. `/works/OL27482W`. The identity itself. */
+  key: string;
+  title: string;
+  authors: string[];
+  firstPublishYear?: number;
+  editionCount: number;
+}
+
+/**
+ * Words that say a release is ABOUT a book rather than a copy of one.
+ *
+ * ⚠️ Every one of these was taken from a real Prowlarr result, not imagined.
+ * `booklet` and `lecture` come from the 1937-2017 booklet; `exploring` from the
+ * Corey Olsen guide; `comic` from the comic-strip release.
+ */
+const DERIVATIVE = new RegExp(
+  [
+    'exploring',
+    'compan(?:ion|ions)',
+    'summary',
+    'summaries',
+    'analysis',
+    'study\\s*guide',
+    'study\\s*notes',
+    'sparknotes',
+    'cliffs?\\s*notes',
+    'workbook',
+    'encyclopedia',
+    'lecture',
+    'booklet',
+    'criticism',
+    'essays',
+    'unofficial',
+    'comic',
+    'graphic\\s*novel',
+    'annotated\\s*guide',
+    'a\\s*z\\s*of',
+    'a\\s*to\\s*z\\s*of',
+    'reading\\s*guide',
+    'trivia',
+    'quiz',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * Words and shapes that say a release is MORE THAN this book.
+ *
+ * ⚠️ `\+\s*\d` and `\d\s*-\s*\d` are here because two real results announced
+ * their bundling with punctuation rather than a word: `(Hobbit)+1-3 (KINDLE)`
+ * and `[4 boo…`. A word list alone would have admitted both.
+ */
+const BUNDLE = new RegExp(
+  [
+    'collections?',
+    'complete\\s*(?:series|collection|works)',
+    '\\bseries\\b',
+    'omnibus',
+    'box\\s*set',
+    'boxset',
+    'anthology',
+    'trilogy',
+    '\\bsaga\\b',
+    '\\bcycle\\b',
+    '\\d+\\s*[- ]?\\s*book',
+    'books?\\s*\\d\\s*-\\s*\\d',
+    '\\+\\s*\\d',
+    '\\b\\d\\s*-\\s*\\d\\b',
+    '\\btomos?\\b',
+    'chronicles',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * Format, source and packaging noise — present in a filename, meaningless to
+ * identity. Stripped before the leftover-token comparison so that `EPUB` and
+ * `retail` do not read as "this release is about something else".
+ */
+const NOISE = new Set(
+  ('epub azw azw3 mobi pdf fb2 lit djvu cbz cbr ebook ebooks kindle retail ' +
+    'unabridged abridged audiobook audio mp3 m4b m4a flac vbr cbr128 64k 128k ' +
+    'read narrated by ed edition editions vol volume rar zip iso true pdfs ' +
+    'illustrated reprint anniversary hardcover paperback scan scanned ocr ' +
+    'the a an of and or in on to for with').split(/\s+/),
+);
+
+/** Everything that is not a letter or a digit is a separator in a filename. */
+export function tokens(s: string): string[] {
+  return s
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** The tokens that carry meaning: not noise, not a bare initial, not a year. */
+function significant(ts: string[]): string[] {
+  return ts.filter((t) => t.length > 1 && !NOISE.has(t) && !/^(19|20)\d{2}$/.test(t));
+}
+
+/**
+ * A person's surname, as it appears in a filename.
+ *
+ * `J.R.R. Tolkien` → `tolkien`. Initials are dropped because filenames spell
+ * them every way (`J.R.R`, `J. R. R.`, `JRR`) and the surname is the part that
+ * survives all of them.
+ */
+export function surname(author: string): string {
+  const ts = tokens(author).filter((t) => t.length > 1);
+  return ts[ts.length - 1] ?? '';
+}
+
+/**
+ * 🔴 `by <SOMEBODY ELSE>` IS THE STRONGEST SIGNAL THERE IS, AND IT IS GENERAL.
+ *
+ * Both study guides in the live Hobbit search named their own author in exactly
+ * this shape — *"by Corey Olsen"*, *"by Sarah Oliver"* — while the genuine
+ * article for other books uses the same shape with the RIGHT name: *"Project
+ * Hail Mary by Andy Weir EPUB"*. So the pattern is not the signal; **whose name
+ * follows it is**. A word list could never have covered this: neither `Olsen`
+ * nor `Oliver` is a word anyone would think to ban.
+ */
+function bylineNamesSomeoneElse(releaseTitle: string, work: Work): boolean {
+  const ts = tokens(releaseTitle);
+  const surnames = new Set(work.authors.map(surname).filter(Boolean));
+  const workTitleTokens = new Set(significant(tokens(work.title)));
+  for (let i = 0; i < ts.length - 1; i++) {
+    if (ts[i] !== 'by') continue;
+    // The two tokens after `by` are the candidate name. If neither is one of
+    // this work's surnames, and neither belongs to the title, somebody else is
+    // being credited.
+    const after = ts.slice(i + 1, i + 3).filter((t) => t.length > 1);
+    if (after.length === 0) continue;
+    const namesAuthor = after.some((t) => surnames.has(t));
+    const partOfTitle = after.every((t) => workTitleTokens.has(t) || NOISE.has(t));
+    if (!namesAuthor && !partOfTitle) return true;
+  }
+  return false;
+}
+
+export interface WorkMatch {
+  score: number;
+  /** Why, in words, so a refusal is explainable rather than a bare 0. */
+  reason: string;
+}
+
+/**
+ * Score one release filename against the pinned work.
+ *
+ * ⚠️ ORDER MATTERS ONLY FOR THE EXPLANATION, not the verdict: a release can be
+ * both a guide and a bundle, and the first reason found is the one reported.
+ */
+export function matchWork(releaseTitle: string, work: Work): WorkMatch {
+  const ts = tokens(releaseTitle);
+  const have = new Set(ts);
+  const titleTokens = significant(tokens(work.title));
+
+  // Nothing of the work's title in the name at all: this is not a near miss.
+  const missing = titleTokens.filter((t) => !have.has(t));
+  if (missing.length) {
+    return { score: WORK_MATCH.NOT_THIS_WORK, reason: `does not name "${work.title}"` };
+  }
+
+  if (bylineNamesSomeoneElse(releaseTitle, work)) {
+    return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'credits a different author, so it is about the book' };
+  }
+  if (DERIVATIVE.test(releaseTitle)) {
+    return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a guide or companion, not the book' };
+  }
+  if (BUNDLE.test(releaseTitle)) {
+    return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a collection or box set, not this one book' };
+  }
+
+  /**
+   * What is left once the title, the author and the format noise are removed.
+   *
+   * 🔴 THIS IS WHAT SEPARATES `Dune` FROM `Dune Messiah`. Both name the work's
+   * only significant title token, both credit Frank Herbert, and neither is a
+   * guide or a bundle — measured live, they came back at 78 and 20 seeders. The
+   * leftover token `messiah` is the whole difference, and without this the
+   * sequel would be a clean match for its predecessor.
+   */
+  const authorTokens = new Set(work.authors.flatMap((a) => tokens(a)));
+  const titleSet = new Set(titleTokens);
+  const leftover = significant(ts).filter((t) => !titleSet.has(t) && !authorTokens.has(t));
+
+  if (leftover.length === 0) {
+    return { score: WORK_MATCH.CLEAN, reason: 'names this work and nothing else' };
+  }
+  return {
+    score: WORK_MATCH.PARTIAL,
+    reason: `names this work plus ${leftover.slice(0, 3).join(', ')}`,
+  };
+}
+
+/**
+ * Pick the WORK a free-text query means, or refuse to.
+ *
+ * ── 🔴 THE RULE IS AN EXACT TITLE MATCH, AND NOT A POPULARITY MARGIN ────────
+ *
+ * `edition_count` is tempting — the Hobbit novel has 481 editions and the
+ * Spark Publishing study guide has one — but it breaks on the case it most
+ * needs to survive. Measured on Open Library: *"Dune"* returns Dune (161
+ * editions) ahead of **Dune Messiah (101)**, which is not a dominant margin by
+ * any threshold worth writing, so a margin rule would stop and ask which book
+ * somebody meant by "Dune".
+ *
+ * The title does separate them: strip the author from the query and `dune`
+ * equals `Dune` exactly, while `Dune Messiah` does not. Same for `The Hobbit
+ * J.R.R. Tolkien` → `the hobbit`, and `Project Hail Mary Andy Weir` → `project
+ * hail mary`. All three pin; a vaguer query does not, and asking is then the
+ * correct answer rather than a failure.
+ */
+export function pinWork(query: string, works: Work[]): Work | undefined {
+  if (works.length === 0) return undefined;
+
+  const queryTokens = tokens(query);
+  for (const w of works) {
+    // Remove this candidate's own author tokens from the query, so that
+    // "The Hobbit J.R.R. Tolkien" is compared as "the hobbit".
+    const authorTokens = new Set(w.authors.flatMap((a) => tokens(a)));
+    const asked = queryTokens.filter((t) => !authorTokens.has(t));
+    if (sameTokens(asked, tokens(w.title))) return w;
+  }
+  return undefined;
+}
+
+function sameTokens(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((t, i) => t === b[i]);
+}
