@@ -695,11 +695,29 @@ test('🔴 the search timeout has headroom over MEASURED bot latency', () => {
    */
   const SLOWEST_OBSERVED_MS = 60_900;
   const irc = new IrcEbooks({ dial: (() => { throw new Error('unused'); }) as never });
-  const used = (irc as unknown as { o: { searchTimeoutMs: number } }).o.searchTimeoutMs;
+  const o = (irc as unknown as { o: { searchTimeoutMs: number; searchSpokenTimeoutMs: number } }).o;
+  const used = o.searchTimeoutMs;
   assert.ok(
     used > SLOWEST_OBSERVED_MS,
     `search timeout ${used}ms must exceed the slowest measured reply ${SLOWEST_OBSERVED_MS}ms`,
   );
+
+  /**
+   * ── AND THE SECOND CEILING CANNOT SIT BELOW THE FIRST ──────────────────────
+   *
+   * `searchSpokenTimeoutMs` is granted when the bot CONFIRMS it is working. If
+   * it were ever set below the silent cap, an acknowledgement would SHORTEN the
+   * wait — the bot saying "I am on it" would make Jedd give up sooner, which is
+   * the exact inversion of what the notice is for, and it would be invisible:
+   * the search would simply fail earlier and still report honestly.
+   */
+  assert.ok(
+    o.searchSpokenTimeoutMs >= used,
+    `an acknowledged search (${o.searchSpokenTimeoutMs}ms) must never get LESS time than a silent one (${used}ms)`,
+  );
+
+  /** Both ceilings stay finite: a wait that never ends hangs the turn. */
+  assert.ok(Number.isFinite(used) && Number.isFinite(o.searchSpokenTimeoutMs));
 });
 
 test('🔴 the IRC OUTCOME lines carry the same [irc] prefix as the problem lines', () => {
@@ -726,4 +744,243 @@ test('🔴 the IRC OUTCOME lines carry the same [irc] prefix as the problem line
   // Both outcomes must be greppable by their outcome WORD, not by prefix alone.
   assert.match(main, /#ebooks joined/);
   assert.match(main, /#ebooks UNAVAILABLE/);
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SEARCHBOT SPEAKS BEFORE IT SENDS — AND IT SOMETIMES SPEAKS INSTEAD
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Captured live on 2026-08-27 from irc.irchighway.net, two searches on one
+ * connection. The bytes below are the wire bytes, colour codes and all:
+ *
+ *   "The Hobbit Tolkien"  +3.5s  accepted / queued
+ *                         +12.5s "returned 178 matches. Sending results..."
+ *                         +15.6s DCC SEND
+ *
+ *   "Vengeance Is Mine…"  +5.5s  accepted
+ *                         +8.5s  "returned NO MATCHES. Search took 1.09s"
+ *                         ——     no DCC, ever
+ *
+ * The module used to hear only the DCC. The second shape is the one Jeff hit:
+ * the bot answered in 8.5 seconds and Jedd reported "the search bot did not
+ * answer" after 90, then offered a retry — a wrong verdict AND a wrong next
+ * step, produced by a detector that could not observe the outcome.
+ */
+
+/** A notice exactly as SearchBot sends it, mIRC colour codes included. */
+function notice(body: string): string {
+  return `:Search!Search@ihw-4cj.udv.25.50.IP NOTICE jeddtest :\x031,9\x16\x02<<SearchBot>>\x02\x16 ${body}`;
+}
+const ACCEPTED = (q: string) => notice(`Your search for "\x0312,09${q}\x0301,09" has been accepted. Searching...`);
+const NO_MATCHES = (q: string) =>
+  notice(`Sorry, your search for "\x0312,09${q}\x0301,09" returned no matches. Search took 1.09 seconds.`);
+const SENDING = (q: string) =>
+  notice(`Your search for "\x0312,09${q}\x0301,09" returned 178 matches. Sending results to you as x.txt.zip.`);
+const DENIED = notice('Search results already waiting to be recieved. Search denied.');
+
+function noticeHarness(searchTimeoutMs: number, searchSpokenTimeoutMs: number) {
+  const sockets: FakeSocket[] = [];
+  const dial: Dialer = (_h, _p, onConnect) => {
+    const s = new FakeSocket();
+    sockets.push(s);
+    queueMicrotask(onConnect);
+    return s;
+  };
+  const irc = new IrcEbooks({
+    dial,
+    joinDelayMs: 0,
+    searchTimeoutMs,
+    searchSpokenTimeoutMs,
+    offerTimeoutMs: 60,
+    maxBytes: 4096,
+    connectTimeoutMs: 200,
+    nick: 'jeddtest',
+  });
+  return { irc, sockets };
+}
+
+test('🔴 "returned no matches" is a FINDING — none, at once, not unknown at the cap', async () => {
+  /**
+   * The regression this pins is Jeff's, exactly: 90 seconds of waiting followed
+   * by "the search bot did not answer" about a search the bot had answered in
+   * 8.5 seconds. Both halves are asserted — the STATE, because `none` and
+   * `unknown` send the model down different paths (`unknown` invites a retry
+   * that can only fail the same way), and the LATENCY, because settling at the
+   * cap with the right word would still hold a turn open for a minute and a half.
+   */
+  const { irc, sockets } = noticeHarness(30_000, 60_000);
+  const started = Date.now();
+  const p = irc.search('Vengeance Is Mine');
+  const s = await bringUp(sockets);
+  s.line(ACCEPTED('Vengeance Is Mine'));
+  s.line(NO_MATCHES('Vengeance Is Mine'));
+
+  const r = await p;
+  const took = Date.now() - started;
+  assert.equal(r.state, 'none', 'the bot LOOKED and found nothing — that is none, not unknown');
+  assert.match(r.detail, /no matches/i);
+  assert.ok(took < 5_000, `settled on the notice, not the 30s cap (took ${took}ms)`);
+  irc.stop();
+});
+
+test('🔴 the mIRC colour codes inside the quoted query do not defeat the correlation check', async () => {
+  /**
+   * ⚠️ THE MUTATION THAT MATTERS. Delete `stripFormatting` from the NOTICE path
+   * and the capture becomes `12,09Vengeance Is Mine` — colour digits welded to
+   * the title — so `sameQuery` reads the bot's answer to OUR query as somebody
+   * else's search and ignores it. Nothing throws. Nothing logs a failure. The
+   * search simply goes back to timing out, and every test above that does not
+   * assert on TIMING would still pass. Verified by hand: with the strip removed
+   * this case runs the full cap and returns `unknown`.
+   */
+  const { irc, sockets } = noticeHarness(30_000, 60_000);
+  const started = Date.now();
+  const p = irc.search('Vengeance Is Mine');
+  const s = await bringUp(sockets);
+  s.line(NO_MATCHES('Vengeance Is Mine'));
+  const r = await p;
+  assert.equal(r.state, 'none');
+  assert.ok(Date.now() - started < 5_000, 'a stripped notice must settle the wait');
+  irc.stop();
+});
+
+test('🔴 CONTROL: a notice about a DIFFERENT query is ignored, not acted on', async () => {
+  /**
+   * The check has to DISCRIMINATE, or it is not a check. This module has already
+   * been burned once by acting on another nick's results (see `search()`), and a
+   * "no matches" for someone else's book must not become a finding about ours.
+   */
+  const { irc, sockets } = noticeHarness(300, 60_000);
+  const p = irc.search('Vengeance Is Mine');
+  const s = await bringUp(sockets);
+  s.line(NO_MATCHES('Something Else Entirely'));
+  const r = await p;
+  assert.equal(r.state, 'unknown', 'someone else\'s no-matches says nothing about our book');
+  assert.match(r.detail, /did not answer/);
+  irc.stop();
+});
+
+test('🔴 "Search denied" is a REFUSAL — unknown, and it names the uncollected file', async () => {
+  /**
+   * Measured live: once a results file is offered and never collected, EVERY
+   * later search from that nick is denied within ~4s, indefinitely. Jedd creates
+   * that state itself — a timed-out search clears its slot, the late DCC offer
+   * then arrives unsolicited and is refused, and the file stays queued on the
+   * bot. Before this branch the wedge was SILENT, because the denial is a
+   * notice: each subsequent search waited out its whole cap and reported "did
+   * not answer", which reads as a dead bot rather than a full mailbox.
+   *
+   * 🔴 It must NOT be `none`. We learned nothing about the book.
+   */
+  const { irc, sockets } = noticeHarness(30_000, 60_000);
+  const started = Date.now();
+  const p = irc.search('Vengeance Is Mine');
+  const s = await bringUp(sockets);
+  s.line(DENIED);
+  const r = await p;
+  assert.equal(r.state, 'unknown', 'a refusal is not a finding of absence');
+  assert.match(r.detail, /refused|denied/i);
+  assert.match(r.detail, /never collected|still queued/i, 'the report must name the actual cause');
+  assert.ok(Date.now() - started < 5_000, 'a denial settles at once');
+  irc.stop();
+});
+
+test('🔴 the bot saying it is WORKING buys real extra time — past the silent cap', async () => {
+  /**
+   * This is the half of Jeff's "let it wait longer" that is genuinely right: a
+   * search the bot has CONFIRMED it is running deserves more of a turn than one
+   * nobody is running. The DCC below lands after the silent cap has passed and
+   * must still be collected.
+   */
+  const { irc, sockets } = noticeHarness(80, 5_000);
+  const p = irc.search('project hail mary');
+  const s = await bringUp(sockets);
+  s.line(ACCEPTED('project hail mary'));
+
+  // Well past searchTimeoutMs — under the old blind cap this file was abandoned.
+  await new Promise((r) => setTimeout(r, 300));
+
+  const zip = makeZip('results.txt', '!Bsk Project Hail Mary - Andy Weir.epub ::INFO:: 2.5MB');
+  s.line(dccOffer('results.txt.zip', 5100, zip.length));
+  await tick();
+  const dcc = sockets[1]!;
+  dcc.emit('data', zip);
+  dcc.emit('close');
+
+  const r = await p;
+  assert.equal(r.state, 'ok', 'an acknowledged search must not be abandoned at the silent cap');
+  irc.stop();
+});
+
+test('🔴 CONTROL: with NO acknowledgement, that same late file is NOT collected', async () => {
+  /**
+   * Without this the test above proves nothing — a 5s ceiling alone would pass
+   * it. The ONLY difference here is the missing notice, and the outcome must
+   * invert.
+   */
+  const { irc, sockets } = noticeHarness(80, 5_000);
+  const p = irc.search('project hail mary');
+  const s = await bringUp(sockets);
+  // deliberately no ACCEPTED notice
+  await new Promise((r) => setTimeout(r, 300));
+  const zip = makeZip('results.txt', '!Bsk Project Hail Mary - Andy Weir.epub ::INFO:: 2.5MB');
+  s.line(dccOffer('results.txt.zip', 5101, zip.length));
+  await tick();
+
+  const r = await p;
+  assert.equal(r.state, 'unknown', 'an unacknowledged search still ends at the silent cap');
+  irc.stop();
+});
+
+test('🔴 extensions are ABSOLUTE — a chatty bot cannot ratchet the wait open', async () => {
+  /**
+   * `rearm` sets the deadline relative to when the wait STARTED, not to now. If
+   * it were additive, every notice would push the deadline out again, and a bot
+   * that repeats itself — or a stranger who can make it repeat — would hold
+   * somebody's turn open for as long as it kept talking. A bounded wait a third
+   * party can extend at will is not a bounded wait.
+   *
+   * ── ⚠️ WHAT THIS TEST HAD TO BE FIXED TO ACTUALLY CATCH ────────────────────
+   *
+   * The first version of it asserted `took < 2000ms` while the ratchet it was
+   * meant to catch only reached ~760ms, so it passed against BOTH behaviours: a
+   * budget looser than the effect measures nothing. It is now pinned just above
+   * the absolute ceiling, where the two outcomes actually separate:
+   *
+   *   absolute  -> settles at ~300ms (the ceiling, mid-stream of notices)
+   *   additive  -> settles at ~900ms (600ms of notices, then a fresh 300ms)
+   *
+   * 🔴 The guard is REDUNDANT BY CONSTRUCTION — `spoken` also limits it to one
+   * extension — so this reddens only when BOTH are removed. That is deliberate
+   * and is why the mutation run had to strip both to see it fail.
+   */
+  const SPOKEN_CEILING_MS = 300;
+  const { irc, sockets } = noticeHarness(50, SPOKEN_CEILING_MS);
+  const started = Date.now();
+  /**
+   * ⚠️ The settle time is stamped WHEN IT SETTLES, not after the loop below.
+   * Awaiting the search only once the notice loop had finished measured the
+   * LOOP — 600ms of it — and reported that as the wait, which failed the correct
+   * implementation at 637ms. The clock has to be on the thing being timed.
+   */
+  let settledAt = 0;
+  const p = irc.search('dune').then((out) => {
+    settledAt = Date.now();
+    return out;
+  });
+  const s = await bringUp(sockets);
+  for (let i = 0; i < 12; i += 1) {
+    s.line(ACCEPTED('dune'));
+    s.line(SENDING('dune'));
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const r = await p;
+  const took = settledAt - started;
+  assert.equal(r.state, 'unknown');
+  assert.ok(
+    took < SPOKEN_CEILING_MS * 1.8,
+    `24 notices must not stack past the ${SPOKEN_CEILING_MS}ms ceiling (took ${took}ms)`,
+  );
+  irc.stop();
 });

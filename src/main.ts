@@ -323,8 +323,16 @@ async function main(): Promise<void> {
      * A non-zero count no longer means trouble, so do not read it as a health
      * signal. Read the OUTCOME WORD instead:
      *
-     *   grep 'irc #ebooks joined'      -> connected. One per IRC-enabled boot.
-     *   grep 'irc #ebooks UNAVAILABLE' -> tried and could not.
+     *   grep '#ebooks joined'      -> connected. One per IRC-enabled boot.
+     *   grep '#ebooks UNAVAILABLE' -> tried and could not.
+     *
+     * ⚠️ THOSE PATTERNS DROP THE `irc` PREFIX ON PURPOSE, AND THAT IS A FIX.
+     * They used to read `grep 'irc #ebooks joined'`, which matches NOTHING: the
+     * line emitted below is `[irc] #ebooks joined`, so the literal `irc ` is
+     * followed by `]`, not a space. The recipe written to stop someone
+     * miscounting IRC health returned 0 against a healthy connection — the same
+     * false zero it exists to prevent, one layer up. Confirmed 2026-08-27 while
+     * diagnosing a live search failure.
      *   grep '\[irc\]' | grep -v '#ebooks' -> the problem lines only.
      *
      * The point of one prefix is that "did this run?" and "did it have trouble?"

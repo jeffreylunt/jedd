@@ -74,7 +74,7 @@ export interface IrcOptions {
   /** How long the server makes us wait before it will accept the JOIN. */
   joinDelayMs?: number;
   /**
-   * How long to wait for SearchBot's results before giving up on this search.
+   * How long to wait for a search SearchBot has told us NOTHING about.
    *
    * 🔴 MEASURED, AND THE FIRST VALUE WAS TOO TIGHT. Live latencies for a
    * `@search` reply: 17.6s, 25.4s, ~34s, **47.0s, 60.9s**. The original 45s cap
@@ -82,12 +82,30 @@ export interface IrcOptions {
    * did not answer" when the bot was simply slower than the cap — a
    * self-inflicted false negative that would have made IRC look useless.
    *
-   * ⚠️ This is a genuine trade-off, not a free win: `search_ebook` waits on this
-   * before returning, so a slow IRC costs the turn real seconds. It is bounded
-   * by running the two sources CONCURRENTLY (Prowlarr is unaffected) and by the
-   * fact that turns on this deployment already run 130-790s.
+   * ⚠️ This is now the SILENT ceiling only. Once the bot has said anything at
+   * all about this query it is superseded by `searchSpokenTimeoutMs` — see
+   * `onSearchNotice`. It is deliberately left at the value the old blind cap
+   * used, because every search that succeeds today succeeds inside it: lowering
+   * it would be a regression bought with no evidence, and the fast paths that
+   * matter now end on a NOTICE rather than on this timer.
    */
   searchTimeoutMs?: number;
+  /**
+   * How long to wait once SearchBot has CONFIRMED it is working on this query.
+   *
+   * 🔴 THIS IS PATIENCE GRANTED ON EVIDENCE, NOT A BIGGER GUESS. It only ever
+   * applies after an `accepted` or `returned N matches` notice — i.e. after the
+   * bot has said, in its own words, that a file is coming. A search that is
+   * merely slow is a different thing from a search nobody is running, and only
+   * the first one deserves more of somebody's turn.
+   *
+   * ⚠️ Unlike the number it replaces, this one is NOT a measured latency — the
+   * slowest reply ever observed here is 60.9s. It is a bound on how long we are
+   * willing to hold a turn open for work we know is in progress. It stays finite
+   * on purpose: an unbounded wait would hang the turn, and a hung turn and a
+   * message that never arrived are indistinguishable to the person waiting.
+   */
+  searchSpokenTimeoutMs?: number;
   /** How long to wait for a book bot to answer at all. */
   offerTimeoutMs?: number;
   /** Hard cap on a DCC transfer, enforced while reading, not from the offer. */
@@ -114,6 +132,7 @@ const DEFAULTS = {
   nick: 'jeddbot',
   joinDelayMs: 70_000,
   searchTimeoutMs: 90_000,
+  searchSpokenTimeoutMs: 180_000,
   offerTimeoutMs: 8 * 60_000,
   maxBytes: 25 * 1024 * 1024,
   connectTimeoutMs: 110_000,
@@ -131,6 +150,17 @@ export type IrcFetchOutcome =
   | { state: 'failed'; detail: string }
   | { state: 'unknown'; detail: string };
 
+/**
+ * How a wait ended, when the ending was something other than "a file arrived"
+ * or "our timer ran out".
+ *
+ * 🔴 `no-matches` IS THE ONE THAT CHANGES AN ANSWER. It is SearchBot stating a
+ * finding — it looked, and there is nothing — which is `none`. Every other way
+ * a search can end without a file is a failure to LOOK, which is `unknown`.
+ * Collapsing the two is the two-zeros error this module guards everywhere else.
+ */
+type SearchVerdict = 'no-matches' | 'denied';
+
 interface PendingTransfer {
   /** Distinguishes one caller's slot from another's, so a timer clears only its own. */
   id: number;
@@ -138,7 +168,25 @@ interface PendingTransfer {
   kind: 'search' | 'fetch';
   /** For 'fetch': the ONLY nick whose offer may be accepted, lowercased. */
   bot: string | null;
-  resolve: (b: { filename: string; bytes: Buffer } | null, detail: string) => void;
+  /**
+   * For 'search': the query AS SENT, so a notice quoting it back can be checked
+   * against it. Not the caller's raw string — `sanitise` may have changed it,
+   * and the bot echoes what it received.
+   */
+  query: string | null;
+  /** Set once the bot has spoken about this query, so patience is only extended once. */
+  spoken: boolean;
+  /** When the wait began, so a re-armed deadline stays absolute rather than compounding. */
+  startedAt: number;
+  resolve: (b: { filename: string; bytes: Buffer } | null, detail: string, verdict?: SearchVerdict) => void;
+  /**
+   * Move this slot's deadline to `totalMs` after it STARTED.
+   *
+   * 🔴 ABSOLUTE, NOT ADDITIVE. A bot that sends three notices must not buy three
+   * extensions — that is how a bounded wait quietly becomes an unbounded one at
+   * the mercy of a stranger's message rate.
+   */
+  rearm: (totalMs: number) => void;
 }
 
 export class IrcEbooks {
@@ -180,6 +228,7 @@ export class IrcEbooks {
       nick: opts.nick ?? DEFAULTS.nick,
       joinDelayMs: opts.joinDelayMs ?? DEFAULTS.joinDelayMs,
       searchTimeoutMs: opts.searchTimeoutMs ?? DEFAULTS.searchTimeoutMs,
+      searchSpokenTimeoutMs: opts.searchSpokenTimeoutMs ?? DEFAULTS.searchSpokenTimeoutMs,
       offerTimeoutMs: opts.offerTimeoutMs ?? DEFAULTS.offerTimeoutMs,
       maxBytes: opts.maxBytes ?? DEFAULTS.maxBytes,
       connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULTS.connectTimeoutMs,
@@ -397,6 +446,37 @@ export class IrcEbooks {
       return;
     }
 
+    /**
+     * 🔴 SEARCHBOT ANSWERS ON A CHANNEL THIS MODULE USED TO BE DEAF TO.
+     *
+     * Everything below this point reads PRIVMSG and looks for `DCC SEND`. That
+     * was the ONLY thing a search could hear — and it is the LAST of four
+     * signals the bot actually emits. Measured live, 2026-08-27, two searches on
+     * one connection:
+     *
+     *   "The Hobbit Tolkien"   +3.5s accepted -> +12.5s "returned 178 matches,
+     *                          sending results" -> +15.6s DCC SEND
+     *   "Vengeance Is Mine …"  +5.5s accepted -> +8.5s "returned NO MATCHES"
+     *                          -> no DCC, ever
+     *
+     * The second is the shape Jeff hit. The bot answered him in 8.5 seconds, in
+     * plain words, and Jedd — able to hear only a file that was never coming —
+     * sat out its full 90s cap and reported **"the search bot did not answer"**
+     * about a bot that had answered promptly and definitively. It then offered a
+     * retry, because the report said UNKNOWN when the truth was NONE.
+     *
+     * ⚠️ THIS IS WHY THE TIMEOUT WAS THE WRONG SUSPECT. The wait was not shorter
+     * than the phenomenon — the phenomenon had finished, on a channel nothing
+     * was listening to. Raising the cap, which is the obvious reading of "let it
+     * wait longer", would have made Jeff wait THREE MINUTES for the same wrong
+     * answer. A detector that cannot observe the outcome always reports absence.
+     */
+    const nt = line.match(/^:(\S+?)!\S+ NOTICE (\S+) :(.*)$/);
+    if (nt) {
+      this.onSearchNotice(bareNick(nt[1] ?? ''), stripFormatting(nt[3] ?? ''));
+      return;
+    }
+
     const pm = line.match(/^:(\S+?)!\S+ PRIVMSG (\S+) :(.*)$/);
     if (!pm) return;
     const from = bareNick(pm[1] ?? '').toLowerCase();
@@ -535,6 +615,108 @@ export class IrcEbooks {
     );
   }
 
+  /**
+   * Act on what SearchBot said about the search we are currently waiting on.
+   *
+   * ── WHY EVERY BRANCH CHECKS THE QUOTED QUERY ────────────────────────────────
+   *
+   * The same reason the results header is checked in `search()`: this module has
+   * already been burned once by acting on somebody else's search. SearchBot
+   * quotes the query verbatim in all four notices, so the check is free, and a
+   * notice about a different query tells us nothing about ours — it is IGNORED
+   * rather than treated as an outcome, and our own deadline still governs.
+   *
+   * ── ⚠️ AN UNRECOGNISED NOTICE CHANGES NOTHING, ON PURPOSE ───────────────────
+   *
+   * Only wordings MEASURED against the live bot are matched here. A notice this
+   * does not recognise is logged and otherwise ignored, so the old timeout
+   * remains the backstop for anything the bot says that we have not seen. The
+   * log line is there so the next person has a real sample to add rather than a
+   * regex somebody guessed.
+   */
+  private onSearchNotice(from: string, body: string): void {
+    const p = this.pending;
+    if (!p || p.kind !== 'search' || !p.query) return;
+
+    const quoted = body.match(/your search for\s+"([^"]*)"/i)?.[1];
+    const said = (what: RegExp) => what.test(body);
+
+    /**
+     * 🔴 "SEARCH DENIED" IS THE ONE THAT NAMES A WOUND WE INFLICT ON OURSELVES.
+     *
+     * Measured live: after a results file was offered and never collected, EVERY
+     * later search from that nick came back *"Search results already waiting to
+     * be recieved. Search denied."* (the bot's own spelling), within 4s, forever.
+     *
+     * ⚠️ Jedd CREATES that state. When a search times out, the slot is cleared;
+     * the DCC offer then arrives, finds no live request, and is refused as
+     * unsolicited — correctly, but the file stays uncollected on the bot's side.
+     * So one timed-out search can wedge every subsequent one, and before this
+     * branch existed the wedge was SILENT: the denial is a NOTICE, so each
+     * later search waited out its full cap and reported "did not answer".
+     *
+     * It is deliberately not quoted-query-checked: the denial is about the nick's
+     * whole state, not about this query, and it names no query at all.
+     */
+    if (said(/search (?:denied|refused)/i) || said(/already waiting to be reci?eved/i)) {
+      this.o.log(`[irc] search denied by ${from}: ${body}`);
+      this.settlePending(
+        'denied',
+        `the #ebooks search bot refused the search: "${body}". This is a REFUSAL, not a finding ` +
+          'about the book. It usually means an earlier results file was never collected and is ' +
+          'still queued for us on the bot.',
+      );
+      return;
+    }
+
+    if (quoted === undefined || !sameQuery(quoted, p.query)) {
+      if (quoted !== undefined) {
+        this.o.log(`[irc] ignoring a notice about "${quoted}"; we asked "${p.query}"`);
+      }
+      return;
+    }
+
+    /**
+     * 🔴 A FINDING, NOT A FAILURE. The bot looked and there is nothing — which
+     * is `none`, and settles the wait NOW rather than at the cap. This is the
+     * branch that turns Jeff's 90-second wrong answer into a ~9-second right one.
+     */
+    if (said(/returned no matches/i)) {
+      this.o.log(`[irc] ${from}: no matches for "${p.query}"`);
+      this.settlePending(
+        'no-matches',
+        `the #ebooks search bot searched and found no matches for "${p.query}".`,
+      );
+      return;
+    }
+
+    /**
+     * Both remaining wordings mean WORK IS IN PROGRESS, so both buy the same
+     * extension — `accepted` (queued) and `returned N matches` (file on its way).
+     * Extending once is enough; see `rearm`'s absolute-deadline note.
+     */
+    if (said(/has been accepted/i) || said(/returned\s+[\d,]+\s+match/i)) {
+      if (p.spoken) return;
+      p.spoken = true;
+      p.rearm(this.o.searchSpokenTimeoutMs);
+      this.o.log(
+        `[irc] ${from} is working on "${p.query}" — waiting up to ` +
+          `${Math.round(this.o.searchSpokenTimeoutMs / 1000)}s for the results file`,
+      );
+      return;
+    }
+
+    this.o.log(`[irc] unrecognised search notice from ${from}: ${body}`);
+  }
+
+  /** End the live wait with a verdict the bot stated, rather than with our timer. */
+  private settlePending(verdict: SearchVerdict, detail: string): void {
+    const p = this.pending;
+    if (!p) return;
+    this.pending = null;
+    p.resolve(null, detail, verdict);
+  }
+
   private completePending(filename: string, bytes: Buffer, detail: string): void {
     const p = this.pending;
     if (!p) return;
@@ -563,25 +745,55 @@ export class IrcEbooks {
     timeoutMs: number,
     kind: 'search' | 'fetch',
     bot: string | null,
-  ): Promise<{ file: { filename: string; bytes: Buffer } | null; detail: string }> {
+    query: string | null = null,
+  ): Promise<{
+    file: { filename: string; bytes: Buffer } | null;
+    detail: string;
+    verdict?: SearchVerdict;
+  }> {
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (file: { filename: string; bytes: Buffer } | null, detail: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const startedAt = this.o.now();
+
+      const finish = (
+        file: { filename: string; bytes: Buffer } | null,
+        detail: string,
+        verdict?: SearchVerdict,
+      ) => {
         if (settled) return;
         settled = true;
-        resolve({ file, detail });
+        // 🔴 The deadline must die with the wait. Left running, a re-armed timer
+        // outlives its own slot and clears a LATER caller's — the exact stale
+        // -timer bug the id check below exists to prevent, reintroduced from the
+        // other side.
+        if (timer) clearTimeout(timer);
+        resolve({ file, detail, ...(verdict ? { verdict } : {}) });
       };
+
+      const arm = (totalMs: number) => {
+        if (settled) return;
+        if (timer) clearTimeout(timer);
+        const left = Math.max(0, totalMs - (this.o.now() - startedAt));
+        timer = setTimeout(() => {
+          if (this.pending?.id === slot.id) this.pending = null;
+          finish(null, `nothing arrived within ${Math.round(totalMs / 1000)}s.`);
+        }, left);
+        timer.unref?.();
+      };
+
       const slot: PendingTransfer = {
         id: this.nextPendingId++,
         kind,
         bot: bot ? bot.toLowerCase() : null,
+        query,
+        spoken: false,
+        startedAt,
         resolve: finish,
+        rearm: arm,
       };
       this.pending = slot;
-      setTimeout(() => {
-        if (this.pending?.id === slot.id) this.pending = null;
-        finish(null, `nothing arrived within ${Math.round(timeoutMs / 1000)}s.`);
-      }, timeoutMs).unref?.();
+      arm(timeoutMs);
     });
   }
 
@@ -606,9 +818,25 @@ export class IrcEbooks {
           return { state: 'unknown', detail: 'the IRC connection is already handling another request.' };
         }
 
-        const wait = this.awaitTransfer(this.o.searchTimeoutMs, 'search', null);
-        this.send(`PRIVMSG ${this.o.channel} :@search ${sanitise(query)}`);
-        const { file, detail } = await wait;
+        const sent = sanitise(query);
+        const wait = this.awaitTransfer(this.o.searchTimeoutMs, 'search', null, sent);
+        this.send(`PRIVMSG ${this.o.channel} :@search ${sent}`);
+        const { file, detail, verdict } = await wait;
+
+        /**
+         * 🔴 THE BOT'S OWN WORDS OUTRANK OUR TIMER, AND THEY SPLIT THREE WAYS.
+         *
+         * `no-matches` is the only one that is a FINDING. It is reported as
+         * `none` — the caller's contract for "this source was read and has
+         * nothing" — which is what stops the model offering a retry for a book
+         * the catalogue genuinely does not carry.
+         *
+         * A denial is a REFUSAL and stays `unknown`: we learned nothing about
+         * the book, and saying "no copies" on the strength of it would be a
+         * false absence built out of our own uncollected file.
+         */
+        if (verdict === 'no-matches') return { state: 'none', detail: `IRC found nothing — ${detail}` };
+        if (verdict === 'denied') return { state: 'unknown', detail };
         if (!file) return { state: 'unknown', detail: `the #ebooks search bot did not answer — ${detail}` };
 
         const un = unzipSingleTextEntry(file.bytes);
@@ -792,6 +1020,28 @@ function defaultDial(host: string, port: number, onConnect: () => void): IrcSock
   const s = netConnect({ host, port }, onConnect);
   s.setTimeout?.(0);
   return s as unknown as IrcSocketLike;
+}
+
+/**
+ * 🔴 STRIP mIRC FORMATTING BEFORE READING A NOTICE — THE CODES ARE *INSIDE* THE
+ * QUOTED QUERY, NOT AROUND IT.
+ *
+ * The raw notice is, byte for byte:
+ *
+ *     \x0301,09<<SearchBot>> Your search for "\x0312,09Vengeance Is
+ *     Mine\x0301,09" has been accepted. Searching...
+ *
+ * so a `for "([^"]*)"` capture on the raw line yields `12,09Vengeance Is Mine`
+ * — colour digits welded onto the front of the title. `sameQuery` would then
+ * reject the bot's answer to OUR OWN QUERY as somebody else's search, and the
+ * notice handling would appear to work while silently never firing. Nothing
+ * would fail; the search would just go back to timing out, exactly as before.
+ */
+function stripFormatting(s: string): string {
+  return s
+    .replace(/\x03\d{0,2}(?:,\d{1,2})?/g, '') // colour, with optional background
+    .replace(/\x04[0-9a-fA-F]{6}/g, '') // hex colour
+    .replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]/g, ''); // bold/reset/monospace/reverse/italic/strike/underline
 }
 
 /**
