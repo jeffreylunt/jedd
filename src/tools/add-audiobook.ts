@@ -31,22 +31,32 @@ export const addAudiobook: Tool = {
   // Reaches the homelab over ssh; absent entirely when none is configured.
   needsHomelabSsh: true,
   description:
-    'Start downloading an audiobook that an audiobook search found. Pass the number they chose. ' +
-    'Set graphic_audio ONLY if they explicitly asked for a GraphicAudio dramatisation — if they ' +
-    'said they did not want one, or did not mention it, leave it false.',
+    'Start downloading the audiobook that search_audiobook chose. Call it with NO arguments — the ' +
+    'search already picked the best release and you do not need to ask anybody which torrent.',
   minRole: 'guest',
   writes: true,
   consumesChoiceKind: 'release',
+  /**
+   * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is the
+   * release `search_audiobook` ranked to the top and already chose. The
+   * parameter survives only so *"no, the other one"* remains serviceable — the
+   * alternatives are in the store, they were simply never printed.
+   */
   parameters: {
     type: 'object',
     properties: {
-      choice: { type: 'number', description: 'The option number they picked.' },
+      choice: {
+        type: 'number',
+        description:
+          'Omit this. Only pass a number if they explicitly asked for a DIFFERENT release than the ' +
+          'one chosen for them.',
+      },
     },
-    required: ['choice'],
+    required: [],
   },
   async run(args, ctx) {
-    const n = Number(args['choice']);
-    if (!Number.isFinite(n)) return fail('A choice number is required.');
+    const n = args['choice'] === undefined ? 1 : Number(args['choice']);
+    if (!Number.isFinite(n)) return fail('That is not an option number.');
     if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed.');
     if (!ctx.choices) return fail('No option store is available.');
 

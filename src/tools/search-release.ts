@@ -1,3 +1,4 @@
+import { describeSwarm, swarmHealth } from '../media/pick-release.js';
 import { CATEGORY, ProwlarrClient, rankReleases, type FetchImpl, type Release } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
@@ -64,14 +65,15 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
      */
     needsServices: isAudio ? ['prowlarr'] : [],
     description: isAudio
-      ? 'Search for an AUDIOBOOK — a book to LISTEN to. Returns a numbered list of releases. ' +
-        `PRESENT the numbered options and ask which one they want, then call ${consumer} with their ` +
-        'number. Do NOT say anything is downloading yet — nothing is, until they pick. Set ' +
-        'graphic_audio true ONLY if they explicitly asked for a GraphicAudio dramatisation.'
-      : 'Search for an EBOOK — a book to READ, delivered to their Kindle. Returns a numbered list ' +
-        `of releases. PRESENT the numbered options and ask which one they want, then call ${consumer} ` +
-        'with their number. Do NOT say anything is being sent yet. Use search_audiobook instead if ' +
-        'they want to LISTEN.',
+      ? 'Search for an AUDIOBOOK — a book to LISTEN to — and CHOOSE the best release. It picks one ' +
+        'itself, leading on how alive the swarm is; do NOT list releases and do NOT ask which ' +
+        `torrent they want. Then call ${consumer} to start it. Do NOT say anything is downloading ` +
+        'yet — nothing is until that runs. Set graphic_audio true ONLY if they explicitly asked for ' +
+        'a GraphicAudio dramatisation.'
+      : 'Search for an EBOOK — a book to READ, delivered to their Kindle — and CHOOSE the best ' +
+        'release. It picks one itself, leading on how alive the swarm is; do NOT list releases and ' +
+        `do NOT ask which torrent they want. Then call ${consumer}. Do NOT say anything is being ` +
+        'sent yet. Use search_audiobook instead if they want to LISTEN.',
     minRole: 'guest',
     /**
      * ⚠️ A READ. It searches indexers and stores a list; nothing is grabbed and
@@ -210,7 +212,21 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         );
       }
 
-      const torrentOffers: Offer[] = rankReleases(releases)
+      /**
+       * 🔴 A DEAD TORRENT IS NEVER A CANDIDATE NOW THAT NOBODY IS ASKED.
+       *
+       * While a person picked from a list, a 0-seeder release at the bottom was
+       * merely a bad option they would not take. A comparator that picks
+       * silently can take it, and the Fringe pool is what that costs: 60 hours,
+       * zero bytes. So it is FILTERED, and counted rather than dropped quietly —
+       * "found nothing" and "found only things that will never finish" are
+       * different answers. IRC offers are unaffected: a DCC transfer has no
+       * swarm to be dead.
+       */
+      const alive = releases.filter((r) => swarmHealth(r.seeders) !== 'dead');
+      const deadCount = releases.length - alive.length;
+
+      const torrentOffers: Offer[] = rankReleases(alive)
         .slice(0, 5)
         .map((r) => ({
           label: describe(r),
@@ -220,6 +236,16 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
 
       const top = interleave(torrentOffers, ircOffers).slice(0, 5);
 
+      // Everything was found and everything we can fetch is dead. Same two-zeros
+      // rule as the filters above: say which, do not report absence.
+      if (top.length === 0) {
+        return ok(
+          `ALL DEAD — found ${releases.length} ${medium} release(s) for "${query}" and every one has ` +
+            'NO seeders, so none of them would ever finish. Nothing was chosen. Say so; do not say ' +
+            'nothing was found.',
+        );
+      }
+
       ctx.choices.present({
         senderHandle: ctx.senderHandle,
         subject: query,
@@ -228,9 +254,17 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
         options: top.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
       });
 
+      /**
+       * 🔴 ONLY THE CHOSEN RELEASE IS RETURNED — the alternatives are stored and
+       * withheld. See the same note in `fill-gaps.ts`: a model cannot offer a
+       * numbered pick it was never given, and Jeff asked for the choice to stop
+       * being the user's. Which BOOK they meant is still theirs; which torrent
+       * carries it is not.
+       */
+      const best = top[0]!;
       const notes: string[] = [];
-      const totalFound = releases.length + ircOffers.length;
-      if (top.length < totalFound) notes.push(`showing the top ${top.length} of ${totalFound}`);
+      if (top.length > 1) notes.push(`${top.length - 1} other release(s) not chosen`);
+      if (deadCount) notes.push(`${deadCount} with no seeders left out (they would never finish)`);
       if (isAudio && before > releases.length) {
         notes.push(`${before - releases.length} GraphicAudio release(s) left out`);
       }
@@ -243,11 +277,11 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       if (ircNote) notes.push(ircNote);
       const suffix = notes.length ? ` (${notes.join('; ')})` : '';
 
-      const lines = top.map((o, i) => `  ${i + 1}. ${o.label}`).join('\n');
       return ok(
-        `${top.length} ${medium} release(s) for "${query}"${suffix}:\n${lines}\n` +
-          `(present these as a numbered list and ask which one; then call ${consumer} with their ` +
-          'number. Nothing is downloading yet.)',
+        `CHOSE — for "${query}" I picked the best ${medium} release myself, leading on swarm ` +
+          `health: ${best.label}${suffix}.\n` +
+          'Do NOT list releases and do NOT ask which torrent they want — that choice is already ' +
+          `made. Call ${consumer} now to take this one. Nothing is downloading yet.`,
       );
     },
   };
@@ -272,7 +306,7 @@ function isGraphicAudio(r: Release): boolean {
 }
 
 function describe(r: Release): string {
-  return `${r.title} — ${humanSize(r.sizeBytes)}, ${r.seeders} seeder(s), ${r.indexer}`;
+  return `${r.title} — ${humanSize(r.sizeBytes)}, ${describeSwarm(r.seeders)}, ${r.indexer}`;
 }
 
 function humanSize(bytes: number): string {

@@ -19,6 +19,8 @@
  * honest UNKNOWN on failure.
  */
 
+import { byScore, swarmRank } from './pick-release.js';
+
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ProwlarrOptions {
@@ -159,21 +161,22 @@ export class ProwlarrClient {
 }
 
 /**
- * Rank releases. Code-owned and deterministic.
+ * Rank releases. Code-owned, deterministic, and SWARM HEALTH FIRST.
  *
  * ⚠️ Ordering is a fixed rule, not a judgement — it is about seeders and file
- * size, which the model cannot see better than a comparator can. The MODEL still
- * chooses which release the person wanted; this only decides what order to
- * present them in.
+ * size, which the model cannot see better than a comparator can. It used to only
+ * decide presentation order; **the top of this list is now the release that gets
+ * grabbed**, because nobody is asked which torrent they want any more. See
+ * `pick-release.ts` for why the band leads and what it is keyed on.
  */
 export function rankReleases(releases: Release[]): Release[] {
-  return [...releases].sort((a, b) => {
-    // Alive before dead: a zero-seeder release will never complete.
-    const aAlive = a.seeders > 0 ? 1 : 0;
-    const bAlive = b.seeders > 0 ? 1 : 0;
-    if (aAlive !== bAlive) return bAlive - aAlive;
-    return b.seeders - a.seeders;
-  });
+  return [...releases].sort(
+    byScore((r) => [
+      // 🔴 FIRST KEY. A dead swarm never completes however good the name is.
+      swarmRank(r.seeders),
+      r.seeders, // tiebreak WITHIN a band, never across one
+    ]),
+  );
 }
 
 /**
@@ -220,19 +223,17 @@ export function classifyAudiobook(title: string): {
 }
 
 export function rankAudiobooks(releases: Release[], prefs: AudiobookPrefs): Release[] {
-  const score = (r: Release): number[] => {
-    const c = classifyAudiobook(r.title);
-    return [
-      r.seeders > 0 ? 1 : 0, // alive before dead: a 0-seeder release never completes
-      c.graphicAudio === prefs.wantGraphicAudio ? 1 : 0, // matches what they asked for
-      c.abridged ? 0 : 1, // unabridged unless they said otherwise
-      r.seeders, // tiebreak
-    ];
-  };
-  return [...releases].sort((a, b) => {
-    const x = score(a);
-    const y = score(b);
-    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i]! - x[i]!;
-    return 0;
-  });
+  return [...releases].sort(
+    byScore((r) => {
+      const c = classifyAudiobook(r.title);
+      return [
+        // 🔴 FIRST KEY, ahead of every judgement about the NAME. A thin swarm
+        // outranks a perfectly-labelled unabridged reading nobody is seeding.
+        swarmRank(r.seeders),
+        c.graphicAudio === prefs.wantGraphicAudio ? 1 : 0, // matches what they asked for
+        c.abridged ? 0 : 1, // unabridged unless they said otherwise
+        r.seeders, // tiebreak
+      ];
+    }),
+  );
 }

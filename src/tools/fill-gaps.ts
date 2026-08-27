@@ -1,4 +1,5 @@
 import { ArrClient, type EpisodeRow, type FetchImpl, type ReleaseOption } from '../media/arr.js';
+import { byScore, describeSwarm, swarmRank } from '../media/pick-release.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
 
 /**
@@ -34,7 +35,25 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
 
 /** A list this long is already more than a text message can carry usefully. */
 const MAX_GAPS_SHOWN = 15;
-const MAX_RELEASES_SHOWN = 6;
+
+/**
+ * How many ranked releases are KEPT, not how many are shown — nothing but the
+ * chosen one is shown any more. The rest stay in the choice store so a later
+ * *"get a different one"* has something to resolve against.
+ */
+const MAX_RELEASES_KEPT = 6;
+
+/**
+ * ⚠️ 4K IS EXCLUDED IN CODE NOW, BECAUSE NOBODY IS PICKING ANY MORE.
+ *
+ * *"Do NOT offer or grab 4K / 2160p releases — they are far too large for this
+ * library"* used to live in this tool's DESCRIPTION, and it worked because a
+ * model read the list and chose from it. The moment a comparator chooses, a
+ * description is not a control: a 2160p remux with a big swarm would win on
+ * every key. So the policy moves into the filter beside CAM and non-English,
+ * counted like they are.
+ */
+const MAX_RESOLUTION = 1080;
 
 /** Resolve a title to one owned series, or say why not. */
 async function oneSeries(
@@ -146,11 +165,12 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
     // Useless without this service; absent rather than always-failing.
     needsServices: ['sonarr'],
     description:
-      'Find out what releases actually EXIST for one missing episode, including the ones the quality ' +
-      'profile refuses and the reason it refused them. Use this to fill a gap: it is how you offer a ' +
-      '1080p when the profile only wants 720p, WITHOUT changing any settings. Present the numbered ' +
-      'options with their quality, then call grab_release with the number they pick. ' +
-      'Do NOT offer or grab 4K / 2160p releases — they are far too large for this library.',
+      'Find the best release for one missing episode and CHOOSE IT. Use this to fill a gap: it looks ' +
+      'past the quality profile, so it is how a 1080p gets in when the profile only wants 720p, ' +
+      'WITHOUT changing any settings. It picks the release itself, leading on how alive the swarm is ' +
+      '— do NOT list the releases and do NOT ask which torrent they want, that choice is not theirs ' +
+      'to make and a good-looking name with a dead swarm never finishes. Then call grab_release to ' +
+      'take the one it chose.',
     minRole: 'guest',
     writes: false,
     presentsChoiceKinds: ['sonarr-release'],
@@ -202,21 +222,28 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
       }
 
       /**
-       * 🔴 THREE EXCLUSIONS, EACH COUNTED, NONE SILENT.
+       * 🔴 FOUR EXCLUSIONS, EACH COUNTED, NONE SILENT.
        *
        * These are the rejections that are the system WORKING, so bypassing them
        * is a regression rather than the feature. Everything else — including
-       * "not wanted in profile", which is the entire point of this tool — stays.
+       * "not wanted in profile", which is the entire point of this tool — stays
+       * and is ranked.
+       *
+       * ⚠️ The order of the tests matters only so each release is counted in
+       * exactly one bucket; it is not a priority.
        */
       const dead = all.filter((r) => r.seeders <= 0);
-      const cam = all.filter((r) => r.seeders > 0 && isCam(r));
-      const foreign = all.filter((r) => r.seeders > 0 && !isCam(r) && isForeign(r));
-      const usable = all.filter((r) => r.seeders > 0 && !isCam(r) && !isForeign(r));
+      const rest = all.filter((r) => r.seeders > 0);
+      const cam = rest.filter((r) => isCam(r));
+      const foreign = rest.filter((r) => !isCam(r) && isForeign(r));
+      const tooBig = rest.filter((r) => !isCam(r) && !isForeign(r) && r.resolution > MAX_RESOLUTION);
+      const usable = rest.filter((r) => !isCam(r) && !isForeign(r) && r.resolution <= MAX_RESOLUTION);
 
       const excluded: string[] = [];
       if (dead.length) excluded.push(`${dead.length} with no seeders (they would never finish)`);
       if (cam.length) excluded.push(`${cam.length} CAM/theater rip(s)`);
       if (foreign.length) excluded.push(`${foreign.length} non-English`);
+      if (tooBig.length) excluded.push(`${tooBig.length} above ${MAX_RESOLUTION}p (4K is too large for this library)`);
 
       // A filter that removed everything is not a finding that nothing exists.
       if (usable.length === 0) {
@@ -226,10 +253,27 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
         );
       }
 
+      /**
+       * 🔴 SWARM HEALTH IS THE FIRST KEY. THIS ORDER IS THE WHOLE FEATURE.
+       *
+       * This comparator used to read `approved DESC, resolution DESC, seeders
+       * DESC` — label quality first — and that ordering *reproduces the Fringe
+       * incident on demand*: a 720p HDTV the profile approves, with a swarm
+       * nobody is in, outranks a 1080p WEB-DL with 400 seeders. It looked right
+       * and moved zero bytes for 60 hours.
+       *
+       * So the band comes first and the quality keys break ties INSIDE a band.
+       * See `pick-release.ts`.
+       */
       const ranked = [...usable].sort(
-        (a, b) => Number(b.approved) - Number(a.approved) || b.resolution - a.resolution || b.seeders - a.seeders,
+        byScore((r) => [
+          swarmRank(r.seeders),
+          Number(r.approved),
+          r.resolution,
+          r.seeders,
+        ]),
       );
-      const shown = ranked.slice(0, MAX_RELEASES_SHOWN);
+      const shown = ranked.slice(0, MAX_RELEASES_KEPT);
       ctx.choices.present({
         senderHandle: ctx.senderHandle,
         subject: `${resolved.title} ${code(target)}`,
@@ -250,18 +294,35 @@ export function makeSearchEpisode(fetchImpl?: FetchImpl): Tool {
         })),
       });
 
+      /**
+       * 🔴 ONLY THE CHOSEN RELEASE IS RETURNED. THE REST NEVER REACH THE MODEL.
+       *
+       * Jeff, verbatim: *"When downloading media, don't give users a choice of
+       * which torrent to choose, just choose the best one."* Telling the model
+       * not to present a list would be a request; handing it one release is a
+       * fact. **A model cannot offer a numbered pick it was never given.**
+       *
+       * The alternatives are still PERSISTED above, so *"get a different one"*
+       * has something to resolve against — they are withheld from the prose, not
+       * discarded.
+       *
+       * ⚠️ This is release choice only. Deciding WHICH WORK someone meant — the
+       * 2026 film or the 2003 show — is a different question with a different
+       * wrong answer, and `catalogue_search` still asks it.
+       */
+      const best = ranked[0]!;
       const notes: string[] = [];
-      if (shown.length < ranked.length) notes.push(`showing the top ${shown.length} of ${ranked.length}`);
+      if (ranked.length > 1) notes.push(`${ranked.length - 1} other usable release(s) not chosen`);
       if (excluded.length) notes.push(`excluded ${excluded.join(', ')}`);
       const suffix = notes.length ? ` (${notes.join('; ')})` : '';
 
-      const lines = shown.map((r, i) => `  ${i + 1}. ${describe(r)}`).join('\n');
       return ok(
-        `${shown.length} release(s) for ${code(target)} "${target.title}"${suffix}:\n${lines}\n` +
-          '(present these with their quality and ask which one; then call grab_release with their ' +
-          'number. A line saying "not wanted in profile" just means it is outside the usual quality ' +
-          'setting — it can still be grabbed, and nothing about the settings changes. ' +
-          'Nothing is downloading yet.)',
+        `CHOSE — for ${code(target)} "${target.title}" I picked the best release myself, leading on ` +
+          `swarm health: ${describe(best)}${suffix}.\n` +
+          'Do NOT list releases and do NOT ask which torrent they want — that choice is already made. ' +
+          'A line saying "not wanted in profile" just means it is outside the usual quality setting; ' +
+          'it can still be grabbed and nothing about the settings changes. ' +
+          'Call grab_release now to take this one. Nothing is downloading yet.',
       );
     },
   };
@@ -273,20 +334,41 @@ export function makeGrabRelease(fetchImpl?: FetchImpl): Tool {
     // Useless without this service; absent rather than always-failing.
     needsServices: ['sonarr'],
     description:
-      'Download the specific release they picked from search_episode. Pass the number they chose. ' +
-      'This does not change any quality settings — it grabs that one file, once. ' +
-      'Never grab a 4K / 2160p release.',
+      'Download the release that search_episode chose. Call it with NO arguments — search_episode ' +
+      'already picked the best one and you do not need to ask anybody which. This does not change ' +
+      'any quality settings; it grabs that one file, once.',
     minRole: 'guest',
     writes: true,
     consumesChoiceKind: 'sonarr-release',
+    /**
+     * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH.
+     *
+     * `search_episode` ranks and picks; option 1 IS that pick. Leaving the
+     * parameter in place means a person who says *"actually, the other one"* can
+     * still be served — the alternatives are in the store even though they were
+     * never printed — but nothing has to be asked to reach the common case.
+     *
+     * ⚠️ It is no longer in `required`, so `requiresChoice` in `index.ts` will not
+     * flag this tool. `consumesChoiceKind` is what keeps the producer invariant
+     * alive here, and it is still declared.
+     */
     parameters: {
       type: 'object',
-      properties: { choice: { type: 'number', description: 'The option number they picked.' } },
-      required: ['choice'],
+      properties: {
+        choice: {
+          type: 'number',
+          description:
+            'Omit this. Only pass a number if the person explicitly asked for a DIFFERENT release ' +
+            'than the one that was chosen for them.',
+        },
+      },
+      required: [],
     },
     async run(args, ctx: ToolContext) {
-      const n = Number(args['choice']);
-      if (!Number.isFinite(n)) return fail('A choice number is required.');
+      // 🔴 THE DEFAULT IS THE PICK. Option 1 is the top of the ranked list that
+      // `search_episode` stored, so "no argument" means "the one we chose".
+      const n = args['choice'] === undefined ? 1 : Number(args['choice']);
+      if (!Number.isFinite(n)) return fail('That is not an option number.');
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed.');
       if (!ctx.choices) return fail('No option store is available, so nothing can be resolved.');
 
@@ -377,7 +459,9 @@ function isForeign(r: ReleaseOption): boolean {
 function describe(r: ReleaseOption): string {
   const size = r.sizeBytes > 0 ? `${(r.sizeBytes / 1024 ** 3).toFixed(1)} GB` : 'size unknown';
   const why = r.approved ? 'matches the usual quality' : r.rejections.join('; ') || 'outside the usual quality';
-  return `${r.title.slice(0, 70)} — ${r.quality}, ${size}, ${r.seeders} seeder(s), ${r.indexer} [${why}]`;
+  // The swarm is worded rather than left as a bare integer — "only 2 seeder(s)"
+  // and "40 seeder(s)" are different facts and should not read the same.
+  return `${r.title.slice(0, 70)} — ${r.quality}, ${size}, ${describeSwarm(r.seeders)}, ${r.indexer} [${why}]`;
 }
 
 /** Queue rows carry the release name; compare on the distinctive head of it. */

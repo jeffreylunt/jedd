@@ -50,22 +50,33 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
   return {
     name: 'send_ebook',
     description:
-      'Grab a book that was found by an ebook search and send it to the person\'s Kindle. Pass the ' +
-      'number they chose from the list you showed them. You do not supply an address — theirs is ' +
-      'already stored, and if it is not, ask them for it and save it first.',
+      'Grab the book that search_ebook chose and send it to the person\'s Kindle. Call it with NO ' +
+      'arguments — the search already picked the best release and you do not need to ask anybody ' +
+      'which torrent. You do not supply an address either — theirs is already stored, and if it is ' +
+      'not, ask them for it and save it first.',
     minRole: 'guest',
     writes: true,
     consumesChoiceKind: 'release',
+    /**
+     * 🔴 `choice` IS OPTIONAL, AND ITS ABSENCE IS THE NORMAL PATH. Option 1 is
+     * what `search_ebook` ranked to the top and already chose.
+     */
     parameters: {
       type: 'object',
       properties: {
-        choice: { type: 'number', description: 'The option number they picked.' },
+        choice: {
+          type: 'number',
+          description:
+            'Omit this. Only pass a number if they explicitly asked for a DIFFERENT release than ' +
+            'the one chosen for them.',
+        },
       },
-      required: ['choice'],
+      required: [],
     },
     async run(args, ctx: ToolContext) {
-      const n = Number(args['choice']);
-      if (!Number.isFinite(n)) return fail('A choice number is required.');
+      const explicit = args['choice'] !== undefined;
+      const n = explicit ? Number(args['choice']) : 1;
+      if (!Number.isFinite(n)) return fail('That is not an option number.');
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed or sent.');
       if (!ctx.choices) return fail('No option store is available.');
       if (!ctx.kindle) return fail('No address store is available.');
@@ -87,8 +98,35 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       // ── which book, and FROM WHERE ───────────────────────────────────────
       const picked = ctx.choices.resolve(ctx.senderHandle, n);
       if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
-      const value = picked.option.value;
-      const title = String(value['title'] ?? picked.option.label);
+      let option = picked.option;
+
+      /**
+       * 🔴 A `.mobi` AT THE TOP IS RE-CHOSEN, NOT HANDED BACK AS A QUESTION.
+       *
+       * This used to answer *"Option 3 is an EPUB — offer them that one
+       * instead"*, which is the numbered pick Jeff asked us to stop making
+       * people do, just arriving through the failure path. When nobody named a
+       * number, nobody should be asked for one: take the best EPUB in the list
+       * we already ranked and say we did.
+       *
+       * ⚠️ Only when the pick was AUTOMATIC. If they asked for a specific option
+       * by number, silently swapping it is overriding a person, and the refusal
+       * below is the honest answer.
+       */
+      let swapped = '';
+      if (!explicit && isMobi(String(option.value['title'] ?? option.label))) {
+        const alt = picked.choice.options.find(
+          (o) => o.n !== option.n && /\.epub\b/i.test(String(o.value['title'] ?? o.label)),
+        );
+        if (alt) {
+          swapped =
+            ` (the top release was a .mobi, which Amazon rejects silently, so I took the best EPUB instead)`;
+          option = alt;
+        }
+      }
+
+      const value = option.value;
+      const title = String(value['title'] ?? option.label);
 
       /**
        * 🔴 ABSENT `source` MEANS PROWLARR, EXPLICITLY.
@@ -111,14 +149,11 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
        * this earlier check exists so the person is told *now*, and told which
        * numbered option to pick instead, rather than after a pointless download.
        */
-      if (/\.mobi\b/i.test(title)) {
-        const alt = picked.choice.options.find((o) => /\.epub\b/i.test(String(o.value['title'] ?? o.label)));
+      if (isMobi(title)) {
         return fail(
           `REFUSED — "${title}" is a .mobi. Amazon stopped accepting that format in 2022 and ` +
             'rejects it silently, so it would look sent and never arrive. Nothing was fetched. ' +
-            (alt
-              ? `Option ${alt.n} is an EPUB — offer them that one instead.`
-              : 'None of the other options is an EPUB; offer to search again.'),
+            'Nothing else that was found is an EPUB either — say so and offer to search again.',
         );
       }
 
@@ -169,7 +204,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
         { mayBlock: false },
       );
 
-      if (attempt.state === 'delivered') return ok(`SENT — ${attempt.detail}`);
+      if (attempt.state === 'delivered') return ok(`SENT — ${attempt.detail}${swapped}`);
       if (attempt.state === 'failed') return fail(`FAILED — ${attempt.detail}`);
 
       /**
@@ -208,9 +243,14 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       }
 
       return ok(
-        `STARTED — ${attempt.detail} NOTHING HAS BEEN SENT YET. Tell them it is on the way and ` +
-          'that you will message them when it actually lands — do not say it has been sent.',
+        `STARTED — ${attempt.detail}${swapped} NOTHING HAS BEEN SENT YET. Tell them it is on the ` +
+          'way and that you will message them when it actually lands — do not say it has been sent.',
       );
     },
   };
+}
+
+/** Amazon has rejected `.mobi` since 2022, and does it silently. */
+function isMobi(title: string): boolean {
+  return /\.mobi\b/i.test(title);
 }
