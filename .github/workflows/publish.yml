@@ -27,7 +27,12 @@ jobs:
             VERSION="$(node -p "require('./package.json').version")"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Publishing version ${VERSION}"
+          # ADDITIVE, not a replacement: :latest and the full :X.Y.Z tag are
+          # published exactly as they always have been. This adds a shorter
+          # :X.Y pointer alongside them so `jedd:2.0` resolves.
+          MAJOR_MINOR="$(printf '%s' "${VERSION}" | cut -d. -f1,2)"
+          echo "major_minor=${MAJOR_MINOR}" >> "$GITHUB_OUTPUT"
+          echo "Publishing version ${VERSION} (also tagging ${MAJOR_MINOR})"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -51,3 +56,4 @@ jobs:
           tags: |
             ghcr.io/jeffreylunt/jedd:latest
             ghcr.io/jeffreylunt/jedd:${{ steps.ver.outputs.version }}
+            ghcr.io/jeffreylunt/jedd:${{ steps.ver.outputs.major_minor }}

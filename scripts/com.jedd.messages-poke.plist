@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>com.jedd.messages-poke</string>
+        <!-- 🔴 THIS DOES NOT FIX THE TYPING INDICATOR — REFUTED 2026-08-26 by a
+             matched pair on the production path: poke ON, 10m50s gap, 6/6
+             firings confirmed at exact cadence → indicator still failed (and a
+             30s-gap message minutes later succeeded, poke state constant, so
+             the gap is the variable and the poke is not). Messages answered
+             `count of chats` in 108ms after 43 poke-free minutes — the
+             scripting surface was never the dormant component. Kept installed
+             ONLY because its log labels idle gaps for the ongoing
+             investigation. Do not re-derive this as a remedy; the full record
+             is in spaces/jedd-v2/knowledge/messages-poke-workaround.md. -->
+
+        <!-- 🔴 MUST be this exact node binary: it is the launchd job root and
+             therefore the TCC responsible process, and this path already holds
+             the Automation grant for com.apple.MobileSMS. A different node, a
+             shell, or bare osascript here silently loses the grant and every
+             poke times out at -1712. See scripts/messages-poke.mjs header. -->
+        <!-- 🔴 TEMPLATE — THE THREE ABSOLUTE PATHS BELOW MUST BE EDITED BEFORE
+             INSTALLING. launchd resolves nothing relative and expands no
+             variables, so these cannot be made portable; they are absolute by
+             necessity, not by oversight. Install with:
+               sed -e "s#__NODE__#$(which node)#" \
+                   -e "s#__REPO__#$(pwd)#" \
+                   scripts/com.jedd.messages-poke.plist \
+                 > ~/Library/LaunchAgents/com.jedd.messages-poke.plist
+               launchctl load ~/Library/LaunchAgents/com.jedd.messages-poke.plist
+             ⚠️ __NODE__ must be the SAME node binary that holds the Automation
+             grant (see the note above) — `which node` is only right if that is
+             the one you granted. -->
+        <key>ProgramArguments</key>
+        <array>
+            <string>__NODE__</string>
+            <string>__REPO__/scripts/messages-poke.mjs</string>
+        </array>
+        <!-- 120s: the tightest measured failing idle gap is 5m31s and the
+             boundary below it is unmeasured down to ~20s, so the field's
+             usual 5-minute cadence is NOT proven safe for this machine. -->
+        <key>StartInterval</key>
+        <integer>120</integer>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>__REPO__/data/messages-poke.err</string>
+    </dict>
+</plist>

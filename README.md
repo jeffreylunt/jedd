@@ -1,204 +1,316 @@
 # Jedd
 
-Jedd is a self-hosted iMessage bot that takes movie and TV requests in plain English and adds them
-to your Sonarr/Radarr. Family and friends just text it ("can you get Dune Part Two?", "add Severance
-season 1", "is it ready yet?") and it searches, adds, and follows up when the download is done — all
-driven by a local LLM running on [Ollama](https://ollama.com), so requests never leave your network.
+A self-hosted agent that runs your homelab from a text message.
 
-<p align="center">
-  <img src="docs/screenshots/jedd-demo.jpg" alt="Jedd in action: an iMessage conversation adding a movie" width="380">
-</p>
+Ask it for a film and it searches your indexers, picks a release that will
+actually finish, and adds it to Sonarr or Radarr. Ask it why live TV is
+stuttering and it measures the box before it touches anything. It answers on
+iMessage via BlueBubbles, or on stdout for development.
 
-It connects to three services you run yourself:
+The bet: **a modern model is good at calling tools, so the code's job is to
+decide what may be called — not to police what gets said.** There is no output
+filtering anywhere in the loop.
 
-- **[BlueBubbles](https://bluebubbles.app)** — bridges iMessage (requires a Mac running Messages.app).
-- **[Ollama](https://ollama.com)** — runs the LLM that understands requests (needs a tool-calling model).
-- **[Sonarr](https://sonarr.tv) + [Radarr](https://radarr.video)** — your existing media library.
-
-## Prerequisites
-
-Jedd assumes you already run these — it does not bundle or set them up:
-
-- **Sonarr + Radarr** — your existing instances ([sonarr.tv](https://sonarr.tv) / [radarr.video](https://radarr.video)).
-- **Ollama** with a tool-calling model — install [ollama.com](https://ollama.com), then `ollama pull qwen2.5:7b`.
-- **BlueBubbles server** on a Mac running Messages.app signed into an iMessage account — guide at [bluebubbles.app](https://bluebubbles.app).
+---
 
 ## Quickstart
 
-If your Sonarr/Radarr/Ollama run on standard ports you only need a handful of env vars. Pull the
-published image and go:
-
-```sh
-docker run -d --name jedd \
-  -p 18790:18790 \
-  -e SONARR_API_KEY=... -e RADARR_API_KEY=... \
-  -e SONARR_ROOT_FOLDER=/tv -e RADARR_ROOT_FOLDER=/movies \
-  -e BLUEBUBBLES_URL=http://host.docker.internal:1234 -e BLUEBUBBLES_PASSWORD=... \
-  -e BLUEBUBBLES_WEBHOOK_HOST=0.0.0.0 \
-  -e BLUEBUBBLES_WEBHOOK_URL=http://<this-docker-host-LAN-IP>:18790/webhook \
-  -e OWNER_PHONE=+15551234567 \
-  -e OLLAMA_URL=http://host.docker.internal:11434 \
-  -e SONARR_URL=http://host.docker.internal:8989/api/v3 \
-  -e RADARR_URL=http://host.docker.internal:7878/api/v3 \
-  -v jedd-data:/app/data \
-  ghcr.io/jeffreylunt/jedd:latest
+```bash
+git clone https://github.com/jeffreylunt/jedd.git && cd jedd
+cp .env.example .env
+docker compose up -d --build
+docker compose logs -f
 ```
 
-Or with Compose — copy [`.env.example`](.env.example) to `.env`, fill in the REQUIRED block, and:
+### 🔴 Two variables have no default and the process REFUSES to start without them
 
-```sh
-docker compose up -d && docker compose logs -f
+This is deliberate — both decide *who Jedd will talk to*, and guessing either
+one wrong means texting the wrong people.
+
+| variable | why it fails closed |
+|---|---|
+| `OWNER_HANDLE` | who is the owner. Everyone else is a guest with a smaller tool list. |
+| `JEDD_SEND_TO` | who Jedd may reply to at all. `everyone`, or a comma-separated handle list. |
+
+`JEDD_SEND_TO=""` is **also** a refusal, not a default — an empty value that
+parsed to an empty list would be an ambiguous audience, so it declines to boot
+rather than pick the permissive reading. Both failures print
+`[jedd] FATAL: …` and exit non-zero.
+
+Everything else in `.env.example` has a working default. Fill in the API keys
+for the services you actually run; tools for services you have not configured
+simply do not appear.
+
+**Running it without Docker**, or wiring it to a real homelab, is covered in
+[SETUP.md](SETUP.md).
+
+## The model
+
+Recommended: **`qwen3.8:27b`** via [Ollama](https://ollama.com) (~18 GB).
+
+```bash
+ollama pull qwen3.8:27b
 ```
 
-When it starts, Jedd registers a webhook with your BlueBubbles server and begins handling messages.
-Text the iMessage account from your `OWNER_PHONE` to try it — working in a couple of minutes.
+On **Apple Silicon**, `qwen3.8:27b-mlx` is the MLX build of the same model and
+is what this project is developed against. It is Apple-only — on Linux or
+x86 use the plain `qwen3.8:27b` tag above.
 
-### Drop into an existing *arr stack
+`LlmClient` is a seam, not an abstraction to build out. Any Ollama-compatible
+model with tool-calling will run, but note that **`tool_choice` is silently
+ignored by this stack** (verified: `tool_choice:"required"` on a message needing
+no tool returned no call), so nothing may depend on forced tool calling.
 
-If your Sonarr/Radarr (and maybe Ollama) already run via Docker Compose, add Jedd to the **same
-compose file / network** and reference the others by service name — no `host.docker.internal`, no
-LAN IPs needed for them:
+## The tools
 
-```yaml
-  jedd:
-    image: ghcr.io/jeffreylunt/jedd:latest
-    restart: unless-stopped
-    ports: ["18790:18790"]
-    volumes: ["jedd-data:/app/data"]
-    environment:
-      SONARR_URL: http://sonarr:8989/api/v3      # add /sonarr base path for lscr.io images
-      RADARR_URL: http://radarr:7878/api/v3
-      OLLAMA_URL: http://ollama:11434
-      SONARR_API_KEY: ...
-      RADARR_API_KEY: ...
-      SONARR_ROOT_FOLDER: /tv
-      RADARR_ROOT_FOLDER: /movies
-      BLUEBUBBLES_URL: http://<mac-running-bluebubbles>:1234
-      BLUEBUBBLES_PASSWORD: ...
-      BLUEBUBBLES_WEBHOOK_HOST: 0.0.0.0
-      BLUEBUBBLES_WEBHOOK_URL: http://<docker-host-LAN-IP>:18790/webhook
-      OWNER_PHONE: "+15551234567"
-# volumes: { jedd-data: {} }
+**37 tools**, and the set you get is assembled from what you have configured and
+what the requester is allowed to use — so a default install exposes fewer than
+37, and a guest sees fewer than the owner. Counting the tools you see and
+getting a smaller number is the system working.
+
+They cover Sonarr/Radarr/Prowlarr search and adds, Jellyfin sessions and
+invites, qBittorrent queue triage, ebook and audiobook delivery to Kindle, live
+TV and channel health, container inspection, and a deliberately unprivileged
+shell.
+
+Three independent gates decide what exists on any given turn:
+
+- **What you configured.** No TMDB token, no `whats_popular`. No JFA-GO
+  password, no `invite_to_jellyfin`. A tool whose dependency is absent is never
+  registered, rather than registered and failing at call time.
+- **Who is asking.** One owner, everyone else a guest; `src/permissions.ts`
+  fails closed. Identity is resolved from the transport's sender handle in code
+  and expressed as *which tools exist this turn* — a guest's list has no admin
+  tools in it, and **no text in the context window can add one.**
+- **Whether writes are on.** `JEDD_ALLOW_WRITES` is off by default. Absence of
+  the flag is read-only, and every tool must declare its write-ness at
+  registration or it is refused.
+
+Authorisation and safety are kept apart on purpose. Being the owner unlocks the
+restart tool; it does not unlock restarting while someone is watching.
+
+## Picking a release on the swarm, not the name
+
+Releases are ranked on **swarm health first**, with quality only breaking ties
+*within* a band — `healthy` (≥5 seeders), `thin`, `dead`.
+
+This encodes a specific failure. A Sonarr search returned a pool of 720p
+releases that every quality profile approved: right show, right season, right
+format. In qBittorrent they sat for 50–60 hours with zero bytes moved, ever.
+Blocklisting them and taking a 1080p WEB-DL the profile liked *less* completed
+in minutes.
+
+> **A well-named release with an empty swarm is the worst option, not the best.**
+
+It is a band rather than a raw seeder sort so that a 900-seed CAM cannot outrank
+a 40-seed WEB-DL: above a handful of seeds the marginal seed buys nothing, and
+sorting on the raw count would hand the quality decision to popularity.
+
+## One turn per burst
+
+People double-text. Two messages seconds apart used to become two concurrent
+turns sharing one history array — they answered each other's questions and ran
+every tool twice.
+
+The queue serialises **per sender** and merges a burst into a single turn.
+Different senders still run concurrently, so one person's slow homelab query
+never blocks another's.
+
+## Shape
+
+```
+connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission gate  ──▶  tool  ──▶  homelab
+(stdout /       (one turn        (history +       (role vs             (its own
+ BlueBubbles)    per burst,       tool calls)      tool.minRole)        preconditions)
+                 per sender)
 ```
 
-> **LinuxServer.io (lscr.io) images** often serve the API under a `/sonarr` or `/radarr` base path —
-> if so, include it in the URL (e.g. `http://sonarr:8989/sonarr/api/v3`).
+- **`src/turn-queue.ts`** — serialises per sender, merges bursts.
+- **`src/agent.ts`** — ask the model, run the tools it asked for, append
+  results, repeat (max 8 steps). No output filtering.
+- **`src/permissions.ts`** — one owner, everyone else a guest. Fails closed.
+- **`src/command-gate.ts`** — deny-by-default allowlist for the generic shell.
+- **`src/safety.ts`** — restart preconditions, including "UNKNOWN is not idle".
+- **`src/store.ts`** — append-only conversation history.
+- **`src/connector.ts`** — the transport seam. Nothing above it knows the
+  transport.
 
-> **Inbound webhook:** the BlueBubbles server must be able to POST messages *back* to the container.
-> Bind `0.0.0.0` (set above) and point `BLUEBUBBLES_WEBHOOK_URL` at an address the BlueBubbles host
-> can reach this container at. See `.env.example` for details.
-
-### Running from source (no Docker)
-
-```sh
-npm ci && npm run build
-node dist/index.js   # reads .env from the working directory
+```bash
+npm install
+npm test        # 1286 tests, no network needed
+npm run chat    # talk to it on stdout
 ```
 
-## Configuration
+In the chat REPL, `sender:+15559998888` switches which identity you are speaking
+as. That is how you exercise the permission boundary by hand.
 
-All configuration is via environment variables (a `.env` file). Every option is documented in
-[`.env.example`](.env.example). Summary:
+---
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `SONARR_URL` | | `http://localhost:8989/api/v3` | Sonarr API v3 base URL |
-| `SONARR_API_KEY` | yes | — | Sonarr API key |
-| `SONARR_ROOT_FOLDER` | yes | — | Root folder path as seen by Sonarr |
-| `SONARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added shows (1 = "Any" — set a real HD profile) |
-| `RADARR_URL` | | `http://localhost:7878/api/v3` | Radarr API v3 base URL |
-| `RADARR_API_KEY` | yes | — | Radarr API key |
-| `RADARR_ROOT_FOLDER` | yes | — | Root folder path as seen by Radarr |
-| `RADARR_QUALITY_PROFILE_ID` | | `1` | Quality profile id for added movies (1 = "Any" — set a real HD profile) |
-| `OLLAMA_URL` | | `http://localhost:11434` | Ollama daemon URL |
-| `OLLAMA_MODEL` | | `qwen2.5:7b` | Tool-calling model |
-| `BLUEBUBBLES_URL` | | `http://localhost:1234` | BlueBubbles server URL |
-| `BLUEBUBBLES_PASSWORD` | yes | — | BlueBubbles server password |
-| `BLUEBUBBLES_WEBHOOK_PORT` | | `18790` | Port the inbound webhook listens on |
-| `BLUEBUBBLES_WEBHOOK_HOST` | | `127.0.0.1` | Bind host (use `0.0.0.0` in a container) |
-| `BLUEBUBBLES_WEBHOOK_URL` | | derived | URL BlueBubbles POSTs inbound messages to |
-| `OWNER_PHONE` | | — | Owner's number (full access, never spam-blocked) |
-| `ALLOWED_SENDERS` | | (empty) | Comma-separated additional allowed numbers (see Access control) |
-| `ALLOW_ALL_SENDERS` | | `false` | `true` opens the bot to anyone (see Access control) |
-| `DISPLAY_NAME` | | `Jedd` | The bot's persona name |
+# Why it is built this way
 
-### Access control (default deny)
+The rest of this file is design rationale. You do not need it to run Jedd.
 
-By default Jedd is **locked down**: only the `OWNER_PHONE` and any numbers in `ALLOWED_SENDERS` can
-interact with it. Every other number is silently ignored — no processing, no reply. Out of the box
-(empty `ALLOWED_SENDERS`, `ALLOW_ALL_SENDERS` unset) **only the owner can use the bot** until you add
-numbers to the config.
+## Why there are no prose guards
 
-- To let specific people in, add their numbers to `ALLOWED_SENDERS` (comma-separated, E.164 or US
-  10-digit), e.g. `ALLOWED_SENDERS=+15557654321,+15559876543`.
-- To open the bot to **anyone** who messages it, set `ALLOW_ALL_SENDERS=true`. (Spam is still
-  rate-limited and pattern-blocked.)
-- The owner is always allowed and is never spam-blocked.
+An earlier version grew ~20 predicates that read the bot's own words looking for
+lies, because a stateless replay-the-history design let the model claim an
+action it never took. Grounding answers *"is that true"*; it can never answer
+*"did you do it"*.
 
-### Sonarr/Radarr setup notes
+In a real loop that second question is answered by the transcript: a tool either
+executed and returned a result, or it is absent. Every turn is appended to
+`data/audit.jsonl` with the tools it called and whether each succeeded — so a
+claim can be checked against the record instead of against a regex.
 
-- **Quality profile id** and **root folder** are specific to *your* instance. Find the profile id
-  in the URL when editing a profile (Settings > Profiles), and the root folder under
-  Settings > Media Management. **Set the quality profile** — the default `1` is usually the "Any"
-  profile, which will grab low-quality cam/screener releases; point it at a real HD profile.
-- **Language preference:** set this in your Sonarr/Radarr quality profiles via Custom Formats — add a
-  positive "Language: <lang>" CF and a negative "Not <lang>" CF. All language scoring happens in your
-  arr instance; Jedd does not handle language itself.
+**Read the honest limit of that claim before relying on it:** the loop makes the
+answer *auditable*, not *impossible to misstate*. A model can still narrate a
+write it never performed. What makes that harmless here is that writes are
+unreachable except through gated tools — so a bluffed claim moves no bytes, and
+shows up as a turn with no matching tool call.
 
-## Recommended model
+## 🔴 The security boundary is the OS, not the command filter
 
-**Use `qwen2.5:7b`** (4.7 GB) — it is the config default (`OLLAMA_MODEL=qwen2.5:7b`) and the model
-Jedd ships pointed at. It had the best tool-calling reliability *and* responsiveness for the iMessage
-use case: a general instruct model out-performed the coding-specialized models at Jedd's actual job
-(deciding which tool to call, with the right arguments, over a multi-turn chat).
+`src/command-gate.ts` is defence-in-depth, **not** the boundary. A review found
+`awk 'BEGIN{system("docker restart gluetun")}'` passed it — and the lesson was
+not "add awk to a denylist" but that a filter reading command *text* to predict
+its *effect* is the same losing game as prose nets. **Every allowlisted binary
+is a potential interpreter.**
 
-Jedd needs a **tool-calling-capable** model — one that supports native function calling in Ollama.
-A model without tool support won't work regardless of how capable it otherwise is.
+So `hp_shell` connects as an **unprivileged ssh identity with no docker group**
+(`HP_SHELL_SSH_HOST`), while structured tools use a privileged one
+(`HP_ADMIN_SSH_HOST`) and carry the safety preconditions. A smuggled interpreter
+then fails at the kernel regardless of what the filter believed. **`hp_shell` is
+not registered at all when the two are equal.**
 
-We evaluated candidates against a live scenario suite that drives Jedd's real code path against real
-Sonarr/Radarr (movie/TV adds, season selection, disambiguation, status checks, access control). Top
-results:
+**The boundary is proven at every boot, by running something.**
+`proveShellIdentityIsSafe()` reads `id` on both ssh identities and requires
+different uids, a non-root shell identity, and no privileged group; then it
+attempts the docker crossing with the admin identity succeeding as the inverting
+control. `buildTools()` registers `hp_shell` only on a safe verdict, so
+**forgetting to prove the boundary yields no shell** rather than one granted on
+a string comparison.
 
-| Model | Size | Live pass rate | p50 latency | Notable behavior |
-|---|---|---|---|---|
-| **qwen2.5:7b** | 4.7 GB | **12/12 (100%)** | ~4s | Recommended default. Zero false "added it", zero hangs. |
-| qwen2.5-coder:14b | 9.0 GB | 10/12 (83%) | ~7s | Over-disambiguates (asks instead of adding), slower. |
-| qwen3:8b | 5.2 GB | 9/12 (75%) | ~2.7s | Fast; missed a recovery case. Solid lighter alternative. |
-| qwen2.5:14b | 9.0 GB | 8/12 (67%) | ~5.3s | One wrong-tool false-success. |
-| llama3.1:8b | 4.9 GB | 7/12 (58%) | ~4.6s | Weak routing; spurious tool calls on greetings. |
-| mistral-nemo | 7.1 GB | 7/12 (58%) | ~11s | Slow; missed disambiguation cases. |
-| granite3.3:8b | 4.9 GB | 2/12 (17%) | ~3.9s | Poor tool-caller — avoid. |
+⚠️ It replaced a check that compared two ssh **aliases for inequality**, which
+meant `HP_SHELL_SSH_HOST=user@host` against `HP_ADMIN_SSH_HOST=host` read as a
+live split while being one account — and an empty value passed too. **A string
+comparison is not a boundary check.**
 
-If you want a lighter footprint, **qwen3:8b** is a reasonable trade-off. Otherwise stick with the
-default. See [docs/MODELS.md](docs/MODELS.md) for the full methodology and scenario list.
+**Verified by crossing it, not by reading the config.** From the unprivileged
+account: `docker ps` → `permission denied … unix:///var/run/docker.sock`; the
+same through `awk 'BEGIN{system(…)}'`, through `curl --unix-socket`, and through
+`python3`'s raw `AF_UNIX` connect → all denied; `sudo -n true` → `a password is
+required`. **Control: every one of those succeeds as the admin identity**, so
+the refusals are caused by the identity and not by something being broken.
 
-> These numbers were measured on an Apple M1 Max (32 GB) via Ollama; smaller/slower hardware will
-> raise latency but not change which models are reliable tool-callers.
+**Docker reads are structured tools** (`docker_ps`, `docker_inspect`,
+`docker_logs`, `container_netns`) on the admin identity, parameterized by a
+validated container name and clamped numbers. **No socket proxy was built** —
+those reads were never shell-shaped, so the boundary cost no capability.
 
-## How it works
+## Persistence exists to finish a job
 
-1. The BlueBubbles server POSTs inbound iMessages to Jedd's webhook receiver.
-2. Jedd runs a native tool-calling loop against your Ollama model. The model has tools to
-   `search_movie` / `search_tv`, `add_movie` / `add_tv`, and `check_status`, all wired to the
-   Sonarr/Radarr REST APIs.
-3. When something is added, Jedd tracks it and a scheduler periodically checks the download state,
-   proactively texting the requester when it's ready (or re-triggering a silently-failed search).
-4. Replies go back out over the BlueBubbles REST API.
+History survives a restart, per sender, in an append-only log (`src/store.ts`).
+Eviction and repair are **appended**, so a poisoned turn leaves replay without
+wiping the conversation or rewriting the audit trail:
 
-Several safety nets handle small-model quirks (promising an action without calling the tool,
-claiming an add that didn't happen, over-disambiguating) so requests resolve reliably.
+```bash
+npm run history -- list <handle>
+npm run history -- evict <id> "<reason>"
+```
 
-## macOS / iMessage caveat
+🔴 **Tool results are NOT persisted and never replayed.** A tool result is an
+observation with a timestamp; replaying one presents yesterday's reading as
+today's context, and the model has no way to tell. The whole architecture rests
+on *"ground every claim in a tool result"*, so silently ageing those results
+poisons the one thing the model is told to trust. **Jedd remembers what was said
+and re-observes what is true.**
 
-iMessage requires Apple hardware. The **BlueBubbles server + Messages.app must run on a Mac** that
-the container can reach. Jedd itself can run anywhere (Linux, a container, the same Mac), and Ollama
-and Sonarr/Radarr can run on any reachable host.
+The replay bound (20 turns / 7 days) **announces its truncation** rather than
+hiding it. Replaying a fixed window and silently losing the rest means a
+conversation continuing across an outage comes back with a hole nobody can see.
 
-## Scope (v1)
+## The first safe autonomous fix, and why it is not a restart
 
-In scope: movies and TV, over iMessage (via BlueBubbles), using a local Ollama model. Out of scope:
-ebooks, other messaging channels (Telegram/Discord/etc.), and non-Ollama LLM backends.
+`shed_host_load` throttles qBittorrent to free uplink and VPN-encryption CPU. It
+exists because of an inversion that is easy to get backwards: **"I'm watching
+the game and it's stuttering" comes from an ACTIVE VIEWER, so the report is
+proof that the restart-blocking condition holds.** The intuitive response —
+restart something in the live-TV path — is the worst available action; a
+mid-game restart once cost eight hours of live TV. Shedding torrent bandwidth is
+the one documented fix that helps a viewer *without touching the stream*.
+
+- **The precondition is four-state and three of them refuse.**
+  `shed-warranted` is the only one that authorises the write. `clear` says the
+  box was measured and is fine; `qbit-not-the-cause` says the box is loaded but
+  shedding would not help; `unknown` says the instruments were blind.
+  **`unknown` and `clear` are deliberately different verdicts** — "I could not
+  see" must never be reported as "nothing is wrong".
+- **Two ways to be contended**, because one statistic cannot see both shapes: a
+  sustained slowdown moves the median, and an intermittent stall does not move
+  it at all — and intermittent is exactly what a stuttering viewer experiences.
+- **The after-check re-measures the SYMPTOM**, never the mechanism. "The API
+  returned 200" and "qBittorrent says alternate limits are on" are the fix
+  grading its own homework.
+- ⚠️ The obvious implementation, `toggleSpeedLimitsMode`, would have made things
+  **worse**: on the box this was written for, the alternate limits are unlimited
+  while the normal upload limit is capped, so flipping modes would have removed
+  the only cap in force.
+
+## The only path by which Jedd speaks without being spoken to
+
+`shed_host_load` leaves a throttle that nothing else would ever remove, so it
+schedules its own return visit. Every follow-up record carries **why** it was
+scheduled, **to whom** it must speak, and **what was observed** at the time;
+when it wakes it re-observes and reports both.
+
+- **Refuses rather than guesses** — unreadable qBittorrent, unreadable
+  `/Sessions`, unmeasurable host all defer, and none licenses touching the
+  throttle.
+- **Holds while anyone is watching.** Lifting puts load *back* on the box, so
+  this is the direction that can disturb a viewer.
+- **Deferral is bounded, and it says when it gave up.** A follow-up that quietly
+  stops retrying has left a change on the box that nobody knows about.
+- **No news is not news** — if there is nothing to do it resolves silently.
+- The recipient's authorisation is **re-derived at send time**, never trusted
+  from the record.
+- ⚠️ Only a `clear` verdict lifts the throttle. `qbit-not-the-cause` must not:
+  while the throttle is on, qBittorrent's throughput is capped by definition, so
+  a successful shed is exactly what makes it look innocent. **A measurement
+  taken through your own intervention is not independent of it.**
+
+## Safety lives in code, not in the prompt
+
+- `hp_shell` runs on the homelab host only — never on the machine Jedd runs on.
+  Deny-by-default allowlist; every pipeline segment is checked, command
+  substitution and file redirection are refused.
+- `restart_container` gathers its own evidence (is it up? is anyone watching?)
+  and refuses on UNKNOWN. Protected containers restart only when completely down
+  and nobody is watching.
+- The VPN container is never restarted and its settings are never touched — no
+  tool expresses it.
+- Writes are off unless `JEDD_ALLOW_WRITES=true`. Absence of the flag is
+  read-only.
+
+None of this is phrased as an instruction the model could be argued out of.
+
+## Known limitations
+
+- **`docker_logs` puts container log lines verbatim into the model's context**,
+  which is an untrusted-content channel. It is bounded by the same tool boundary
+  as everything else — a prompt-injected model still cannot reach a write except
+  through a gated tool — but it is real surface.
+- **The permission model has exactly two roles**, owner and guest. There is no
+  per-tool grant, no group, and no way to give one guest more than another.
+- **There is no forced tool calling on this stack.** `tool_choice` is silently
+  ignored, so the loop cannot compel a call and must tolerate a turn that
+  answers without one.
+- **`hp_shell` requires two genuinely separate ssh accounts.** If you only have
+  one, the boot probe refuses the verdict and the tool is simply absent — safe,
+  but it means the generic shell is unavailable until you provision the second
+  account.
+- **The connector implements stdout and BlueBubbles.** `Connector` is the seam;
+  any other transport is unwritten.
 
 ## License
 
-[MIT](LICENSE).
+MIT — see [LICENSE](LICENSE).

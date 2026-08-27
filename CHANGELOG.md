@@ -3,6 +3,50 @@
 All notable changes to Jedd are documented here. Versions follow [semver](https://semver.org/);
 each release also ships a multi-arch image at `ghcr.io/jeffreylunt/jedd:<version>`.
 
+## [2.0.0] — 2026-08-27
+
+A rewrite. Jedd is now a real agent loop rather than a stateless replay, runs in a container, and
+reaches well beyond movie/TV requests into homelab operations and ebook delivery.
+
+**This is a breaking change.** The configuration variables, the tool set and the deployment model are
+all different from 1.x; treat it as a new install rather than an upgrade.
+
+### Added
+- **37 tools**, up from a handful. Sonarr/Radarr/Prowlarr search and adds, Jellyfin sessions and
+  invites, qBittorrent queue triage, ebook and audiobook delivery to Kindle, live TV and channel
+  health, container inspection, and a deliberately unprivileged shell. The set is assembled per turn
+  from what you have configured and what the requester is allowed to use.
+- **Release selection ranks on swarm health, not on the name.** Releases fall into `healthy`
+  (≥5 seeders) / `thin` / `dead` bands and quality only breaks ties *within* a band. A pool of
+  well-named 720p releases that every quality profile approved once sat for 50–60 hours with zero
+  bytes moved; a 1080p WEB-DL the profile liked less finished in minutes. Bands rather than a raw
+  seeder sort, so a 900-seed CAM cannot outrank a 40-seed WEB-DL.
+- **One turn per burst.** Double-texting used to produce two concurrent turns sharing one history
+  array — they answered each other's questions and ran every tool twice. The queue now serialises per
+  sender and merges a burst into a single turn, while different senders still run concurrently.
+- **Conversation history survives a restart**, per sender, in an append-only log. Eviction and repair
+  are appended rather than rewritten (`npm run history -- list|evict`), so a poisoned turn leaves
+  replay without wiping the conversation or the audit trail. Tool results are deliberately never
+  replayed — a stale observation presented as current is the one thing the model cannot detect.
+- **The ssh privilege boundary is proven at boot**, by running `id` on both identities and requiring
+  different uids, a non-root shell identity and no privileged group, with the admin identity's
+  success as the inverting control. The generic shell is not registered at all on a failed verdict.
+- **Containerised.** `docker compose up -d --build`, with a healthcheck and a restart policy.
+
+### Changed
+- **Recommended model is now `qwen3.8:27b`** (`qwen3.8:27b-mlx` on Apple Silicon), configured through
+  **`LLM_MODEL`**. v1 read `OLLAMA_MODEL` and defaulted to `qwen2.5:7b`.
+- **`OWNER_HANDLE` and `JEDD_SEND_TO` have no defaults and the process refuses to start without
+  them.** Both decide who Jedd will talk to, and an empty `JEDD_SEND_TO` is a refusal rather than a
+  permissive default.
+- Writes are off unless `JEDD_ALLOW_WRITES=true`, and every tool must declare its write-ness at
+  registration or it is refused.
+- The image now also carries a `:X.Y` tag (`2.0`) alongside the existing `:X.Y.Z` and `:latest`.
+
+### Removed
+- The prose guards. v1 grew ~20 predicates that read the bot's own words looking for lies; a real
+  loop answers "did you do it" from the transcript instead. There is no output filtering in the loop.
+
 ## [1.4.5] — 2026-06-16
 
 Handle typos and slightly-wrong titles gracefully instead of a flat "couldn't find it."

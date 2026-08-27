@@ -1,56 +1,131 @@
-# Jedd — iMessage media-request bot.
+# Jedd V2 — container definition for the Mac that runs BlueBubbles.
 #
-# This container talks to THREE external services that you run yourself (it does NOT bundle them):
-#   - a BlueBubbles server (on a Mac running Messages.app, signed into an iMessage account)
-#   - an Ollama server with a tool-calling model (e.g. qwen2.5:7b)
-#   - your existing Sonarr + Radarr
+# Jedd is unusually host-coupled for a container: it reaches a LAN homelab, a
+# model server on this Mac's loopback, an IRC network on the public internet,
+# two SSH identities on another box, and it must be REACHED BACK by BlueBubbles.
+# Every one of those is solved explicitly below, and each was measured on this
+# machine rather than assumed.
 #
-# Configure everything in a `.env` file next to this compose file (see .env.example).
+# ── EVERY OUTBOUND DEPENDENCY AND HOW IT IS REACHED ─────────────────────────
 #
-# REACHING THE EXTERNAL SERVICES:
-#   - On macOS / Windows Docker Desktop, point the *_URL vars at `host.docker.internal`
-#     (e.g. OLLAMA_URL=http://host.docker.internal:11434) to reach services on the host.
-#   - On Linux, use the host's LAN IP, or uncomment `network_mode: host` below and use localhost.
+#   BlueBubbles REST  host.docker.internal:1234   (this Mac's loopback)
+#   Model (Ollama)    host.docker.internal:11434  (this Mac; binds 0.0.0.0)
+#   Sonarr/Radarr/Prowlarr/qBittorrent/Jellyfin/Dispatcharr
+#                     10.0.0.10:{8989,7878,9696,8080,8096,9191}  (LAN, direct)
+#   ssh hp / homelab-jedd-shell
+#                     10.0.0.10:22   (keys + config mounted below)
+#   IRC ebooks        irc.irchighway.net:6667 outbound, plus outbound DCC to
+#                     arbitrary third-party peer IPs. Jedd NEVER listens for
+#                     DCC — passive/reverse offers (port 0) are refused in
+#                     irc-protocol.ts — so no inbound port is needed for it.
+#   IMAP (Kindle)     imap.gmail.com:993 outbound
+#   TMDB / ESPN       public HTTPS
 #
-# INBOUND WEBHOOK (important): the BlueBubbles server must be able to POST inbound messages back to
-# this container. The container listens on BLUEBUBBLES_WEBHOOK_PORT, bound to BLUEBUBBLES_WEBHOOK_HOST
-# (set it to 0.0.0.0 in .env so the port is reachable). Set BLUEBUBBLES_WEBHOOK_URL in .env to an
-# address the BlueBubbles host can reach this container at (e.g. http://<docker-host-LAN-IP>:18790/webhook).
-#
-# macOS/iMessage caveat: iMessage requires a Mac. BlueBubbles + Messages.app must run on a Mac the
-# container can reach. Ollama and Sonarr/Radarr can run anywhere reachable.
+# All of the above were probed from inside a node:24-alpine container on this
+# host and every one connected. Bridge networking is sufficient; `network_mode:
+# host` is NOT needed and on macOS would not behave like it does on Linux
+# anyway (Docker Desktop runs a Linux VM, so "host" means the VM, not the Mac —
+# it would break both the loopback services AND the inbound webhook).
 
 services:
   jedd:
-    image: ghcr.io/jeffreylunt/jedd:latest
-    # To build from source instead of pulling the published image, comment out `image:` above
-    # and uncomment:
-    # build: .
-    container_name: jedd
+    build:
+      context: .
+    image: jedd-v2:local
+    container_name: jedd-v2
     restart: unless-stopped
+
+    # 🔴 uid 501:20 = jeff:staff. Not cosmetic — see the Dockerfile comment.
+    # It is what makes the 0600 SSH keys readable and what stops the bind-mounted
+    # data/ from drifting to another owner (which would break a pm2 rollback).
+    user: "501:20"
+
+    # Real config first, container-specific overrides second. Compose applies
+    # these in order and LATER WINS, so .env stays the single source of truth for
+    # credentials and only the handful of host-relative addresses get rewritten.
+    # This is deliberately not a copy of .env: two files holding the same secrets
+    # drift, and the copy is the one that gets stale.
     env_file:
       - .env
+      - .env.docker
+
     ports:
-      # host:container — the inbound BlueBubbles webhook receiver.
-      - "${BLUEBUBBLES_WEBHOOK_PORT:-18790}:${BLUEBUBBLES_WEBHOOK_PORT:-18790}"
+      # ── 🔴 THIS PORT MAPPING IS PART OF THE CONTRACT, NOT A PREFERENCE ─────
+      #
+      # BlueBubbles dedups webhook registrations by EXACT URL STRING. The live
+      # pm2 process registers http://127.0.0.1:18796/webhook. If the container
+      # registered anything even slightly different, BlueBubbles would not
+      # UPDATE the row — it would ADD a second one, and then fan out to BOTH.
+      # It dispatches fire-and-forget and only logs a failed POST at DEBUG, so
+      # the dead row is silent: inbound messages go to a black hole with no
+      # error anywhere. (This exact orphan bit V1 once already.)
+      #
+      # Binding the published port to 127.0.0.1 on the host means the registered
+      # URL can stay byte-identical to the pm2 one, so the cutover REPLACES the
+      # row instead of racing a second one. Verified on this host: a POST from
+      # the Mac to 127.0.0.1:<published> arrives inside the container.
+      # It also keeps the webhook off the LAN, which is the right default.
+      - "127.0.0.1:18796:18796"
+
     volumes:
-      # Persist state.json (active jobs, processed-message ids, conversation history) AND the durable
-      # structured logs under /app/data/logs (size-rotated by the app, ~250 MB hard cap by default).
-      - jedd-data:/app/data
-    # Cap `docker logs` so the container's stdout JSON can't grow unbounded (separate from the app's
-    # own file rotation above). 50 MB per file, 5 files → ~250 MB max for docker logs.
+      # ── 🔴 STATE: BIND MOUNT THE REAL DIRECTORY, NOT A NAMED VOLUME ────────
+      #
+      # A named volume would start EMPTY, and empty is not a clean slate here:
+      # seen.jsonl carries the BlueBubbles replay watermark, and a virgin store
+      # reads as watermark 0, which receiver.ts fails CLOSED on — it skips
+      # replay entirely, silently dropping anything that arrived during the
+      # pm2→container gap. followups.jsonl carries scheduled kindle-verify and
+      # ebook-deliver jobs that would simply cease to exist. Sharing the real
+      # directory also makes rollback to pm2 instant and lossless: both
+      # supervisors read and write the same state. (Never run both at once.)
+      - ./data:/app/data
+
+      # ── SSH: two identities, deliberately unequal ──────────────────────────
+      #
+      # `hp` is the privileged admin identity (docker group) used only by
+      # structured tools whose command text is a literal in the repo.
+      # `homelab-jedd-shell` is unprivileged and is the ONLY identity the free-form,
+      # model-composed hp_shell tool may use. config.ts refuses to register
+      # hp_shell at all if the two resolve to the same account, and
+      # identity-probe.ts proves the split at boot by running `id` over both.
+      # Mounting both read-only preserves that separation inside the container.
+      # This grants the container no access the pm2 process did not already have.
+      - ${HOME}/.ssh/id_ed25519:/home/jedd/.ssh/id_ed25519:ro
+      - ${HOME}/.ssh/jedd_shell_ed25519:/home/jedd/.ssh/jedd_shell_ed25519:ro
+      # Generated for the container: resolves the bare hostname `hp` by IP.
+      # On the Mac `hp` resolves through the LAN DNS search domain, which is NOT
+      # available inside the container's network namespace — without this file
+      # every admin-side tool would fail on name resolution alone.
+      - ./docker/ssh-config:/home/jedd/.ssh/config:ro
+      - ./docker/ssh-known-hosts:/home/jedd/.ssh/known_hosts:ro
+
+      # read_runbook reads this exact absolute path from the host filesystem.
+      # config.ts leaves the tool UNREGISTERED if the path is missing, so a
+      # forgotten mount here silently costs Jedd a tool rather than erroring.
+      #
+      # Interpolated from .env (compose reads it for substitution) and mounted at
+      # the SAME path inside, so RUNBOOK_PATH needs no container-side override
+      # and no operator's absolute path is baked into this file.
+      # ⚠️ If RUNBOOK_PATH is unset, compose expands this to ":" and fails to
+      # start rather than silently dropping the tool — the loud direction.
+      - ${RUNBOOK_PATH}:${RUNBOOK_PATH}:ro
+
+      # indexer_admin and stuck_downloads capture a backup BEFORE any
+      # destructive change; these are the reversibility guarantee those tools
+      # advertise, so they must outlive the container.
+      - ./data/backups:/home/jedd/.superbot2/backups
+
+    # main.ts deregisters its webhook on SIGINT and SIGTERM. Docker sends
+    # SIGTERM, which is handled — but the handler makes an HTTP round trip to
+    # BlueBubbles, and the default 10s grace can be tight if BlueBubbles is
+    # slow. pm2 uses kill_timeout 10000 for exactly this reason. A SIGKILL
+    # part-way through leaves an orphaned registration that must then be deleted
+    # by hand before anything else starts.
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "5"
-    # On Linux you can instead share the host network (then use localhost URLs and drop `ports`):
-    # network_mode: host
-
-    # DROP-IN to an existing *arr stack: add this service to the same compose file as your
-    # sonarr/radarr (or set `networks:` to join their network), then reference them by service
-    # name in .env — SONARR_URL=http://sonarr:8989/api/v3, RADARR_URL=http://radarr:7878/api/v3,
-    # OLLAMA_URL=http://ollama:11434. No host.docker.internal needed when on the same network.
-
-volumes:
-  jedd-data:

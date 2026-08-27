@@ -1,28 +1,39 @@
 # Choosing a local model for Jedd
 
 Jedd's quality depends almost entirely on how well the local Ollama model handles **tool calling** —
-picking the right tool (`search_movie` / `search_tv` / `add_movie` / `add_tv` / `check_status`),
-passing the right arguments (title, year, season), and following a multi-turn conversation without
-hallucinating a result or claiming an add that never happened.
-
-This document records the models we tested and why we recommend the default.
+picking the right tool out of the registry, passing the right arguments, and following a multi-turn
+conversation without hallucinating a result or claiming an add that never happened.
 
 ## Recommendation
 
-**`qwen2.5:7b`** (4.7 GB) — the config default (`OLLAMA_MODEL=qwen2.5:7b`).
+**`qwen3.8:27b`** (~18 GB) — the current default.
 
-- Best correctness in the live tool-calling suite (perfect score), with no false-success and no hangs.
-- ~2x faster than the larger coding model it replaced.
-- A general **instruct** model beat the coding-specialized models at Jedd's actual task. Coding models
-  tended to over-disambiguate (list every same-title result and ask "which one?") instead of just
-  adding the obvious match, and were slower.
+```bash
+ollama pull qwen3.8:27b
+```
 
-**Lighter alternative:** `qwen3:8b` (5.2 GB) is fast and nearly as reliable if you want a smaller
-resident model. For qwen3-family models in Ollama, disable hidden "thinking" (it otherwise burns the
-token budget on multi-turn tool calls).
+On **Apple Silicon**, `qwen3.8:27b-mlx` is the MLX build of the same model and is what the project is
+developed against. It is Apple-only; on Linux or x86 use the plain tag.
 
 **Hard requirement:** the model must support **native tool calling** in Ollama. A model without tool
-support cannot drive Jedd at all. `ollama pull qwen2.5:7b` and you're set.
+support cannot drive Jedd at all. Note also that **`tool_choice` is silently ignored** by this stack,
+so Jedd never relies on forced tool calling.
+
+For qwen3-family models, disable hidden "thinking" — it otherwise burns the token budget on
+multi-turn tool calls.
+
+---
+
+## ⚠️ Everything below is a v1.x measurement, kept for its methodology
+
+The table and scenarios below were measured against **Jedd v1.x**, whose tool registry, prompt and
+session code all differ from the current version — v1 had a handful of movie/TV tools where v2 has 37
+across media, homelab and delivery. **The pass rates are therefore not comparable to today's build and
+`qwen2.5:7b` is no longer the recommended model.**
+
+It is kept because the *method* is the useful part: a live scenario suite against real services beats
+a mock suite for picking a driving model, and the false-success criterion is the one that matters
+most. Re-running it against v2 has not been done.
 
 ## Methodology
 
@@ -60,7 +71,7 @@ The suite covers the things people actually text the bot:
 
 | Model | Size | Pass rate | p50 | p95 | max | Notes |
 |---|---|---|---|---|---|---|
-| **qwen2.5:7b** | 4.7 GB | **12/12 (100%)** | ~4.0s | ~6–10s | ~10s | **Recommended default.** Consistent 12/12 across repeated runs; zero false-success, zero hangs. |
+| **qwen2.5:7b** | 4.7 GB | **12/12 (100%)** | ~4.0s | ~6–10s | ~10s | **v1 default.** Consistent 12/12 across repeated runs; zero false-success, zero hangs. |
 | qwen2.5-coder:14b | 9.0 GB | 10/12 (83%) | ~7s | 9–30s | 30s | Previous default. Over-disambiguates and ignores the add-first rule; slower. |
 | qwen3:8b | 5.2 GB | 9/12 (75%) | ~2.7s | ~10s | 10s | Fast; missed a recovery case. Good lighter alternative. |
 | qwen2.5:14b | 9.0 GB | 8/12 (67%) | ~5.3s | ~16s | 16s | Called the wrong tool on a movie pick (a false-success). |
@@ -74,5 +85,7 @@ lookups, bare "Adding X" false-success). **Prefer the live result for picking th
 
 ## Switching models
 
-Set `OLLAMA_MODEL` in your `.env` (e.g. `OLLAMA_MODEL=qwen3:8b`), make sure you've `ollama pull`ed it,
+Set `LLM_MODEL` in your `.env` (e.g. `LLM_MODEL=qwen3.8:27b`), make sure you've `ollama pull`ed it,
 and restart Jedd. The model must support tool calling.
+
+> v1 read this from `OLLAMA_MODEL`; the current variable is `LLM_MODEL`.

@@ -1,10 +1,11 @@
 node_modules/
-dist/
 .env
+*.log
 data/
 
-# Internal worker-memory dir — must never enter the public repo.
-knowledge/
-
-# Local experiment/harness scripts — some embed live arr API keys (run-stress.sh). Never commit.
-experiments/
+# Real ssh client config + host keys for the container. Deployment data, not
+# source: they name a real machine, real accounts and a real host key, and
+# cannot be genericised while staying functional. Templates are committed as
+# docker/ssh-config.example; generate known_hosts with ssh-keyscan (see there).
+docker/ssh-config
+docker/ssh-known-hosts
