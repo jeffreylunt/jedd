@@ -81,8 +81,41 @@ export class OpenLibraryClient {
     this.baseUrl = opts.baseUrl ?? 'https://openlibrary.org';
   }
 
-  /** Candidate works for a free-text query, best first as Open Library ranks them. */
-  async works(query: string, limit = 5): Promise<WorkSearch> {
+  /**
+   * Candidate works for a free-text query, best first as Open Library ranks
+   * them.
+   *
+   * ── 🔴 WHY 10 AND NOT 5, MEASURED 2026-08-27 ─────────────────────────────
+   *
+   * At `limit=5`, real production traffic: Jeff asked *"Can you try the
+   * author maybe?"*, the model searched `Richard E. Turley`, and the wanted
+   * work (`Vengeance Is Mine`) sat at rank 9 of 30. `pinWork` scans this
+   * FULL array (it is never sliced), so `limit=10` lets a well-formed
+   * title(+author) query auto-pick a work buried at rank 6-10 — proven with a
+   * mutation: a synthetic query whose exact match sits at rank 7 behind 6
+   * same-author decoys goes from `presented-MISSING` at `limit=5` to a silent
+   * correct auto-pick at `limit=10`, unchanged at `limit=20`.
+   *
+   * `limit=20` was measured too and bought nothing further, on either the
+   * synthetic proof or 21 real book queries drawn from `v1-parity-corpus`
+   * and `data/audit.jsonl` (production `search_ebook`/`search_audiobook`
+   * calls) — so 10 is the number, not a round guess that happens to cover
+   * one case.
+   *
+   * ⚠️ THIS DOES NOT FIX THE TURLEY CASE ITSELF. `pinWork` requires the
+   * QUERY to name the title; `"Richard E. Turley"` is author-only, so the
+   * title-tokens-after-stripping-the-author are empty and no candidate can
+   * ever match. The disambiguation list the caller falls back to
+   * (`relevantWorks(...).slice(0, 5)`) is capped independently of this
+   * limit — measured identical at 5/10/20 on all 21 real queries. `Array
+   * .filter` preserves order, so a bigger fetch can never DISLODGE five
+   * already-passing higher-ranked candidates; it could only GROW the list
+   * when fewer than 5 pass within the smaller fetch, which none of the 21
+   * real queries happened to do. An author-only query needs a different fix
+   * (title context carried across turns, or a wider disambiguation list) —
+   * this change is not it.
+   */
+  async works(query: string, limit = 10): Promise<WorkSearch> {
     const url =
       `${this.baseUrl}/search.json?q=${encodeURIComponent(query)}` +
       `&fields=${encodeURIComponent(FIELDS)}&limit=${limit}`;
