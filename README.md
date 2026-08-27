@@ -13,6 +13,9 @@ npm run chat              # talk to it on stdout
 In the chat REPL, `sender:+15559998888` switches which identity you are speaking as. That is how you
 exercise the permission boundary by hand.
 
+**Setting it up on your own homelab: see [SETUP.md](SETUP.md).** This file is
+about why it is built the way it is, not how to run it.
+
 ## The shape
 
 ```
