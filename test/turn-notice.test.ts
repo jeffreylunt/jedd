@@ -6,6 +6,7 @@ import {
   isModelTimeout,
   ModelTimeoutError,
   StillWorkingNotice,
+  parseStillWorkingMs,
   STILL_WORKING_AFTER_MS,
   stillWorkingText,
   type TimerSeam,
@@ -412,4 +413,14 @@ test('a usable value is taken, and an out-of-range one is clamped rather than re
   assert.equal(parseTurnTimeout('999999999'), MAX_TURN_TIMEOUT_MS);
   // Clamped, never refused: a bad tuning knob must not trade a slow bot for no bot.
   assert.doesNotThrow(() => parseTurnTimeout('999999999'));
+});
+
+test('🔴 JEDD_STILL_WORKING_MS falls back on nonsense — a threshold of 0 texts everybody on every turn', () => {
+  for (const bad of [undefined, '', '  ', 'later', '0', '-1', 'NaN']) {
+    assert.equal(parseStillWorkingMs(bad), undefined, `${JSON.stringify(bad)} must fall back`);
+  }
+  assert.equal(parseStillWorkingMs('5000'), 5_000);
+  assert.equal(parseStillWorkingMs('10'), 1_000, 'floored: 10ms would fire on literally every turn');
+  // Not clamped at the top — a very large value coherently means "never".
+  assert.equal(parseStillWorkingMs('99999999'), 99_999_999);
 });

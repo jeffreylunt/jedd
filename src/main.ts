@@ -14,7 +14,7 @@ import {
   type SendRecord,
 } from './connector.js';
 import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
-import { failureReply, StillWorkingNotice, STILL_WORKING_AFTER_MS } from './turn-notice.js';
+import { failureReply, parseStillWorkingMs, StillWorkingNotice, STILL_WORKING_AFTER_MS } from './turn-notice.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
@@ -88,6 +88,8 @@ function anchorFrom(batch: IncomingMessage[]): { sourceGuid?: string } {
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  /** See `parseStillWorkingMs`: overridable so the notice can be made to fire on demand. */
+  const stillWorkingMs = parseStillWorkingMs(process.env['JEDD_STILL_WORKING_MS']) ?? STILL_WORKING_AFTER_MS;
   // 🔴 First, before a socket is opened or a webhook registered. A refusal here
   // must cost nothing and leave nothing behind.
   const audience = parseSendAudience(process.env['JEDD_SEND_TO']);
@@ -520,7 +522,7 @@ async function main(): Promise<void> {
    * that long*, rather than as *the feature may not be in this image*.
    */
   console.error(
-    `[notice] a turn still running after ${STILL_WORKING_AFTER_MS}ms tells the sender so, and says it ` +
+    `[notice] a turn still running after ${stillWorkingMs}ms tells the sender so, and says it ` +
       'again once. A turn that dies always sends a message; a timeout says it timed out.',
   );
 
@@ -589,6 +591,7 @@ async function main(): Promise<void> {
      */
     const notice = new StillWorkingNotice({
       notify: (text) => connector.send(message.senderHandle, text),
+      afterMs: stillWorkingMs,
     });
     try {
       /**

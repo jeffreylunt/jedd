@@ -131,6 +131,29 @@ export function failureReply(e: unknown): string {
 export const STILL_WORKING_AFTER_MS = 240_000;
 
 /**
+ * `JEDD_STILL_WORKING_MS` -> ms, or `undefined` for the measured default.
+ *
+ * 🔴 IT IS OVERRIDABLE FOR ONE REASON: OTHERWISE IT CANNOT BE EXERCISED. At
+ * four minutes, the notice fires on roughly one turn in thirty-seven, so a
+ * deploy could carry it for weeks without a single live firing — and "never ran"
+ * and "ran fine" are the same log. The same argument that made
+ * `LLM_TURN_TIMEOUT_MS` exist applies here and for the same reason.
+ *
+ * ⚠️ Empty, garbage, zero and negative all FALL BACK. The nonsense reading is a
+ * threshold of 0, which texts every sender a "still working" note on every
+ * message, on a build that looks configured.
+ */
+export function parseStillWorkingMs(raw: string | undefined): number | undefined {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  // Floored, not clamped at the top: a very LARGE value simply means "never",
+  // which is a coherent thing to ask for. A very small one is never coherent.
+  return Math.max(1_000, Math.round(n));
+}
+
+/**
  * How many notices one turn may send.
  *
  * A turn's worst case is `TURN_TIMEOUT_MS * MAX_STEPS` = two hours, so a single
