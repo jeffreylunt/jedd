@@ -87,6 +87,25 @@
  * interleave if some future path called it directly — which is why `Agent` now
  * carries a re-entrancy tripwire that says so loudly rather than a second guard
  * that would quietly cover for this one.
+ *
+ * ⚠️ `src/index.ts` (the terminal) is a THIRD caller of `agent.handle` and does
+ * NOT go through this queue. It is safe because `StdoutConnector` reads one
+ * typed line at a time, and the tripwire covers it if that ever stops being
+ * true. Stated here so the next reader does not have to establish it again.
+ *
+ * 🔴 REPLAY DOES NOT COALESCE, AND THAT IS DELIBERATE. `replayMissed` awaits
+ * each `ingest`, `ingest` awaits the handler, and `submit` resolves only after
+ * the lane is torn down — so each recovered message opens a FRESH lane and gets
+ * its own turn. A burst that happened during downtime is therefore still
+ * replayed as two turns, and `add_movie` could still run twice on that one path.
+ *
+ * It is left that way on purpose: the alternative is submitting the whole
+ * backlog without awaiting, which turns a restart into one enormous merged turn
+ * answering messages of quite different ages — and `receiver.ts` already refuses
+ * to replay from a virgin watermark precisely because a burst of stale answers
+ * is the worst restart behaviour available. Serial-and-in-order beats
+ * merged-and-confusing here. The cost is `BURST_SETTLE_MS` per recovered
+ * message at boot.
  */
 
 /** A message waiting for its turn, with the promise its submitter is holding. */
@@ -113,6 +132,30 @@ export interface TurnQueueOptions<T> {
    */
   run: (batch: T[]) => Promise<void>;
   /**
+   * 🔴 CALLED THE INSTANT A MESSAGE IS ACCEPTED, BEFORE THE SETTLE WINDOW.
+   *
+   * This exists because the settle window would otherwise delay the READ RECEIPT
+   * as well as the reply, and those two are not the same promise. `connector.ts`
+   * says of `markRead`: *"The read receipt goes out as Jedd picks the message
+   * up, not after it has thought about it."* Marking read from inside the turn
+   * would have made that sentence quietly false for every message — five seconds
+   * of total silence after texting is exactly what the receipt exists to
+   * prevent, and the settle's cost was weighed against a 25–790s turn, which is
+   * the right frame for the REPLY and the wrong one for the ACKNOWLEDGEMENT.
+   *
+   * ⚠️ It must not be slow — it runs inside the submitter's own frame — and
+   * anything it throws is caught and logged rather than allowed to fail the
+   * submit. A failed read receipt must never cost somebody their answer.
+   */
+  onAccepted?: (item: T) => void;
+  /**
+   * Most messages one batch may carry. `lane.pending` is otherwise unbounded:
+   * during a 790s turn a person can queue arbitrarily many messages and they
+   * would all be joined into ONE model input. The remainder is not dropped — the
+   * drain loop takes it on the next pass, in order.
+   */
+  maxBatch?: number;
+  /**
    * The burst-settle window: awaited before each batch is committed, so
    * messages still arriving join it. Injected rather than a bare number so
    * tests drive it by hand and nothing here waits on a real clock.
@@ -135,6 +178,13 @@ export interface TurnQueueOptions<T> {
  * costs nothing that a person can feel over SMS.
  */
 export const BURST_SETTLE_MS = 5_000;
+
+/**
+ * Most messages one turn will answer at once. Not a correctness bound — the
+ * remainder is taken by the next pass, in order — but a bound on how much of one
+ * person's typing becomes a single model input.
+ */
+export const MAX_BATCH = 20;
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -161,6 +211,11 @@ export class TurnQueue<T> {
    * so replay stays serial and a test can await a turn — and **never rejects**,
    * because the live caller is a fire-and-forget webhook with nowhere to put an
    * error.
+   *
+   * ⚠️ It can still throw SYNCHRONOUSLY if `keyOf` throws, which is a different
+   * escape from that contract and is the caller's own bug. `receiver.ts` catches
+   * it; nothing here can, because without a key there is no lane to put the
+   * message in and no honest way to resolve its promise.
    */
   submit(item: T): Promise<void> {
     const key = this.opts.keyOf(item);
@@ -176,10 +231,31 @@ export class TurnQueue<T> {
       // lane is the entire fix: this message will be answered by that turn's
       // batch or the next one, and never by a second concurrent turn.
       lane.pending.push(queued);
-      return handled;
+    } else {
+      this.lanes.set(key, { pending: [queued] });
+      /**
+       * ⚠️ `.catch` RATHER THAN A BARE `void`. `drain` contains everything it
+       * can, but a rejection escaping here would be an UNHANDLED REJECTION, and
+       * this ships on node:24-alpine where the default is
+       * `--unhandled-rejections=throw` — the process would EXIT. Jedd going
+       * silent for the whole household is not an acceptable consequence of one
+       * lane failing.
+       */
+      void this.drain(key).catch((e) => {
+        this.log(`[queue] 🔴 ${key}: the drain loop itself failed: ${(e as Error).message}`);
+      });
     }
-    this.lanes.set(key, { pending: [queued] });
-    void this.drain(key);
+
+    /**
+     * ⚠️ AFTER the message is safely in a lane, never before. This is the read
+     * receipt (see `onAccepted`), and a receipt for a message we then failed to
+     * enqueue would be a lie told instantly.
+     */
+    try {
+      this.opts.onAccepted?.(item);
+    } catch (e) {
+      this.log(`[queue] ${key}: onAccepted threw and was ignored: ${(e as Error).message}`);
+    }
     return handled;
   }
 
@@ -198,7 +274,7 @@ export class TurnQueue<T> {
 
         // Take-all, synchronously. Anything that arrives from here on lands in
         // a fresh `pending` and is handled by the next pass, in order.
-        const batch = lane.pending.splice(0, lane.pending.length);
+        const batch = lane.pending.splice(0, Math.min(lane.pending.length, this.opts.maxBatch ?? MAX_BATCH));
         if (batch.length > 1) {
           this.log(
             `[queue] ${key}: ${batch.length} messages COALESCED into one turn — they arrived as one ` +
@@ -224,9 +300,31 @@ export class TurnQueue<T> {
       }
     } finally {
       /**
+       * 🔴 THE LOOP CAN ALSO BE LEFT BY A THROW, AND THAT PATH ORPHANS MESSAGES.
+       *
+       * `settle()` and `log()` are INJECTED and sit outside the inner try, so a
+       * throw from either abandons the loop with items still in `pending` —
+       * their `done()` never called, their submitters hanging forever, their
+       * messages never answered. Neither can throw as shipped, which is exactly
+       * why it would go unnoticed the day one can.
+       *
+       * So nothing leaves this function still owed a resolution. A dropped
+       * message is bad; a dropped message that also HANGS its caller is worse,
+       * and the caller here is `replayMissed`, which awaits it.
+       */
+      if (lane.pending.length > 0) {
+        this.log(
+          `[queue] 🔴 ${key}: the drain loop was abandoned with ${lane.pending.length} message(s) ` +
+            'still queued. They will NOT be answered. This should be unreachable — read what threw above it.',
+        );
+        for (const q of lane.pending) q.done();
+        lane.pending.length = 0;
+      }
+      /**
        * 🔴 NO `await` BETWEEN THE LOOP TEST ABOVE AND THIS LINE. See the header.
        * A message accepted into a lane after the last drain has given up is a
-       * message nobody will ever answer.
+       * message nobody will ever answer. The straggler loop above is synchronous
+       * and so does not open that window.
        */
       this.lanes.delete(key);
     }

@@ -34,18 +34,28 @@
  * ── WHICH MESSAGE A REPLY TARGETS IS NOT A GUESS ────────────────────────────
  *
  * There is no heuristic here for picking the target and there must not be one.
- * `agent.handle(senderHandle, message.text)` is handed exactly ONE message's
- * text; a turn is physically incapable of answering two. So the message a reply
- * addresses is the message that started its turn — structurally, not by
- * inference — and `decide()` is only ever asked whether to anchor, never where.
- * A model-chosen or "most similar" target would be a guess layered on top of a
- * fact the code already holds.
+ *
+ * ⚠️ AMENDED 2026-08-27. This paragraph used to argue from *"`agent.handle` is
+ * handed exactly ONE message's text; a turn is physically incapable of answering
+ * two."* **That is no longer true** — `main.ts` now hands it a whole BURST,
+ * joined — and it was never the load-bearing part anyway, because a second
+ * concurrent turn was mutating the same history array while the first ran, so a
+ * turn answered whatever had been pushed into it regardless of what it was
+ * handed.
+ *
+ * The conclusion survives on a better premise: **one turn per burst** means the
+ * batch IS the subject, and the reply addresses the batch's newest message the
+ * way a person's own reply to a burst would. Still structural, still not
+ * inference, and `decide()` is still only ever asked whether to anchor, never
+ * where. A model-chosen or "most similar" target would be a guess layered on top
+ * of a fact the code already holds.
  */
 
 /**
  * ══════════════════════════════════════════════════════════════════════════
- * 🔴 DISABLED 2026-08-26. THE PREMISE BELOW IS FALSE. DO NOT RE-ENABLE UNTIL
- *    THE CONCURRENCY BUG IS FIXED — task-2026-08-26T17-22-35Z.
+ * 🔴 DISABLED 2026-08-26 — AND ITS PRECONDITION WAS MET ON 2026-08-27.
+ *    STILL OFF, DELIBERATELY. READ THE "STATUS" BLOCK AT THE BOTTOM OF THIS
+ *    COMMENT BEFORE ASSUMING IT IS STILL BLOCKED.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * Everything in this file is correct about WHICH MESSAGE TRIGGERED A TURN, and
@@ -91,6 +101,25 @@
  * answer is ABOUT rather than the one that triggered the turn, which means a
  * heuristic. That was correctly refused while the trigger was believed
  * reliable; that premise is now dead, so the choice is a heuristic or nothing.
+ *
+ * ── 🔴 STATUS 2026-08-27: THE PRECONDITION IS MET. THE FLAG IS STILL FALSE. ──
+ *
+ * `src/turn-queue.ts` delivers **one turn per burst** — the first of the two
+ * options named above, exactly as written. Concurrent turns for one sender are
+ * no longer possible, so the trigger→content mapping is sound again and the
+ * reason this flag was switched off no longer exists.
+ *
+ * It stays `false` anyway, and NOT by inertia. Flipping it is a separate change
+ * with its own live verification: anchoring has never once been observed against
+ * a coalesced burst, and the open question it raises is new — a batch of N
+ * messages produces ONE reply, so `decide()` sees `burstSize >= 2` and anchors
+ * it to the newest, which is *probably* right and has never been seen on a real
+ * phone. Shipping two unverified behaviours in one restart is how you end up
+ * unable to say which one broke.
+ *
+ * ⚠️ A DATED GATE WHOSE CONDITION HAS QUIETLY BEEN MET READS AS STILL-BLOCKED
+ * FOREVER. That is why this paragraph exists rather than nothing. Whoever picks
+ * this up: the blocker is discharged, the work left is verification, not repair.
  */
 export const REPLY_THREADING_ENABLED = false;
 

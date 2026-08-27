@@ -19,11 +19,15 @@ about why it is built the way it is, not how to run it.
 ## The shape
 
 ```
-connector  ──▶  agent loop  ──▶  permission gate  ──▶  tool  ──▶  homelab
-(stdout /       (history +       (role vs             (its own
- BlueBubbles)    tool calls)      tool.minRole)        preconditions)
+connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission gate  ──▶  tool  ──▶  homelab
+(stdout /       (one turn        (history +       (role vs             (its own
+ BlueBubbles)    per burst,       tool calls)      tool.minRole)        preconditions)
+                 per sender)
 ```
 
+- **`src/turn-queue.ts`** — serialises turns per sender and merges a burst into one turn. Without it
+  two messages seconds apart become two concurrent turns that share one history array, answer each
+  other's questions, and run every tool twice.
 - **`src/agent.ts`** — the loop. Ask the model, run the tools it asked for, append results, repeat
   (max 8 steps). There is no output filtering anywhere in it.
 - **`src/permissions.ts`** — one owner, everyone else a guest. Fails closed.

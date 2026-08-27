@@ -67,6 +67,24 @@ function recordTurn(record: TurnRecord): void {
 /** How often to look for follow-ups that have come due. */
 const TICK_MS = 60_000;
 
+/**
+ * The newest guid in a burst, for a reply that has to name a message.
+ *
+ * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
+ * `IncomingMessage` — a transport that cannot name a message leaves it unset —
+ * so a burst whose LAST message lacks a guid still has an anchorable earlier
+ * one, and taking the last unconditionally would discard it. Returns an empty
+ * object so it can be spread over a message without inventing an `undefined`
+ * field on a type where absent and undefined mean the same thing.
+ */
+function anchorFrom(batch: IncomingMessage[]): { sourceGuid?: string } {
+  for (let i = batch.length - 1; i >= 0; i--) {
+    const guid = batch[i]?.sourceGuid;
+    if (guid) return { sourceGuid: guid };
+  }
+  return {};
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   // 🔴 First, before a socket is opened or a webhook registered. A refusal here
@@ -460,6 +478,24 @@ async function main(): Promise<void> {
     keyOf: (m) => m.senderHandle,
     settle: () => sleep(BURST_SETTLE_MS),
     run: async (batch) => handleBurst(batch),
+    /**
+     * 🔴 THE READ RECEIPT DOES NOT WAIT FOR THE SETTLE WINDOW.
+     *
+     * `connector.ts` promises the receipt goes out "as Jedd picks the message
+     * up, not after it has thought about it", and marking read from inside the
+     * turn would have made that false by five seconds for EVERY message — which
+     * is precisely the silence the receipt exists to fill. So it is marked at
+     * accept time, here.
+     *
+     * ⚠️ `withPresence` marks read AGAIN when the turn starts, and that is
+     * deliberate rather than an oversight: `markChatRead` is idempotent and
+     * fire-and-forget, the second call keeps the `presence=` token in the turn
+     * line honest about what the TURN itself signalled, and one redundant call
+     * is a fair price for not splitting a two-line seam across two files.
+     */
+    onAccepted: (m) => {
+      connector.markRead(m.senderHandle);
+    },
   });
   console.error(
     `[queue] one turn per burst: turns are serialised per sender and a burst settles for ` +
@@ -476,10 +512,16 @@ async function main(): Promise<void> {
    */
   const handleBurst = async (batch: IncomingMessage[]): Promise<void> => {
     const last = batch[batch.length - 1]!;
+    /**
+     * ⚠️ SPREAD, NOT REBUILT FIELD BY FIELD. A hand-listed copy type-checks
+     * today because those are all the fields `IncomingMessage` has — and would
+     * silently DROP any field added to it later, on the burst path only, with
+     * nothing failing to compile.
+     */
     const message: IncomingMessage = {
-      senderHandle: last.senderHandle,
+      ...last,
       text: batch.map((m) => m.text).join('\n'),
-      ...(last.sourceGuid ? { sourceGuid: last.sourceGuid } : {}),
+      ...(last.sourceGuid ? {} : anchorFrom(batch)),
     };
     /**
      * 🔴 CAPTURED AT ENTRY, NOT READ AT LOG TIME.
@@ -553,21 +595,6 @@ async function main(): Promise<void> {
            * the subject, and there is nothing else in flight to confuse it with.
            */
           await connector.send(message.senderHandle, r.replyText, message.sourceGuid, sent);
-          /**
-           * 🔴 ONE REPLY ANSWERED ALL OF THEM, SO CLOSE ALL OF THEM.
-           *
-           * `sendReporting` closes the message it was given. The earlier ones in
-           * the batch were answered by the same reply and would otherwise sit in
-           * the burst until `BURST_TTL_MS` (20 minutes), quote-anchoring every
-           * reply this person got in the meantime.
-           *
-           * ⚠️ Inert while `REPLY_THREADING_ENABLED` is false — `threading` is
-           * `undefined` then. It is written now because the alternative is a
-           * landmine that arms itself the day somebody flips that flag.
-           */
-          for (const earlier of batch.slice(0, -1)) {
-            threading?.answered(earlier.senderHandle, earlier.sourceGuid);
-          }
           return r;
         },
         signals,
@@ -653,6 +680,30 @@ async function main(): Promise<void> {
         );
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+      }
+    } finally {
+      /**
+       * 🔴 ONE REPLY ANSWERED ALL OF THEM, SO CLOSE ALL OF THEM — ON EVERY PATH.
+       *
+       * `sendReporting` closes only the message it was handed. The earlier ones
+       * in the batch were answered by that same reply and would otherwise sit in
+       * the burst until `BURST_TTL_MS` (20 minutes), quote-anchoring every reply
+       * this person got in the meantime.
+       *
+       * ⚠️ IN A `finally`, NOT AFTER THE SEND. On the success path either place
+       * works. On the FAILURE path — the model throws, or the send throws — only
+       * this one runs, and that is the path most likely to hit it: the apology
+       * sent from the catch above closes `message.sourceGuid` and nothing else,
+       * so every earlier message of a failed burst would be left open. Which is
+       * verbatim the leak this block exists to prevent, armed on exactly the
+       * case nobody tests.
+       *
+       * ⚠️ Inert while `REPLY_THREADING_ENABLED` is false — `threading` is
+       * `undefined` then. Written now because the alternative is a landmine that
+       * arms itself the day somebody flips that flag.
+       */
+      for (const earlier of batch.slice(0, -1)) {
+        threading?.answered(earlier.senderHandle, earlier.sourceGuid);
       }
     }
   };

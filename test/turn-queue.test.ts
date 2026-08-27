@@ -88,11 +88,17 @@ test('🔴 two messages from one sender that arrive in a burst become ONE turn',
 });
 
 /**
- * 🔴 MUTATION CONTROL — the queue is REMOVED here, on purpose.
+ * 🔴 THE OLD SHAPE, WRITTEN OUT — executable documentation, NOT a control.
  *
- * This is the shape the container was running on 2026-08-27: every webhook
- * dispatched independently. If the assertion above ever passes without the
- * queue, it has stopped measuring anything.
+ * This is how the container dispatched on 2026-08-27: every webhook
+ * independently. ⚠️ It does not touch `TurnQueue` and never will, so unlike the
+ * CONTROL tests below it cannot go red when `src/` regresses — it asserts
+ * `2 === 2` about code declared in its own body. It earns its place by pinning
+ * what the bug LOOKED like next to what the fix looks like; it earns nothing as
+ * a guard, and nobody should read a green here as evidence about the queue.
+ *
+ * The real mutation evidence is in commit a1269f6: removing the serialisation
+ * from `src/turn-queue.ts` turns six of the tests in this file red.
  */
 test('MUTATION: dispatched the OLD way, the same burst produces TWO turns', async () => {
   const turns: Msg[][] = [];
@@ -302,7 +308,7 @@ function stubLlm(onChat: (messages: LlmMessage[]) => void): LlmClient {
   };
 }
 
-test('🔴 CHARACTERISATION: two CONCURRENT agent turns share one history and see each other', async () => {
+test('🔴 CHARACTERISATION: two CONCURRENT agent turns share one history, and the TRIPWIRE says so', async () => {
   const seenUserTurns: string[][] = [];
   const agent = new Agent(
     testConfig({ ownerHandle: JEFF }),
@@ -312,12 +318,56 @@ test('🔴 CHARACTERISATION: two CONCURRENT agent turns share one history and se
     undefined,
     [],
   );
-  await Promise.all([agent.handle(JEFF, 'Yes run the search'), agent.handle(JEFF, 'How many watching?')]);
+  /**
+   * 🔴 STDERR IS CAPTURED, AND THAT IS THE POINT OF THIS BLOCK.
+   *
+   * The tripwire in `Agent.handle` had no coverage: delete its `console.error`,
+   * or invert its `> 0`, and nothing would have gone red. It is the only thing
+   * that will report a future entry point reaching the agent without the queue,
+   * so it needs the same standard as the rest of this file.
+   *
+   * Capturing also stops the suite printing a real 🔴 CONCURRENT TURN line on
+   * every run. In a repo where that marker means a live defect, an EXPECTED one
+   * in test output is how people learn to scroll past the real one.
+   */
+  const realErr = console.error;
+  const stderr: string[] = [];
+  console.error = (...a: unknown[]) => {
+    stderr.push(a.join(' '));
+  };
+  try {
+    await Promise.all([agent.handle(JEFF, 'Yes run the search'), agent.handle(JEFF, 'How many watching?')]);
+  } finally {
+    console.error = realErr;
+  }
+
   const contaminated = seenUserTurns.filter((u) => u.length > 1);
   assert.ok(
     contaminated.length > 0,
     'if this ever goes green, Agent stopped sharing history and this file needs rereading',
   );
+  assert.ok(
+    stderr.some((l) => l.includes('CONCURRENT TURN') && l.includes(JEFF)),
+    `the tripwire did not fire on a genuinely concurrent turn; stderr was ${JSON.stringify(stderr)}`,
+  );
+});
+
+test('CONTROL: the tripwire is SILENT on turns that do not overlap', async () => {
+  // Without this, the assertion above passes for a tripwire that fires on every
+  // single turn — which would be worse than none, because it would be ignored.
+  const agent = new Agent(testConfig({ ownerHandle: JEFF }), stubLlm(() => {}), undefined, []);
+  const realErr = console.error;
+  const stderr: string[] = [];
+  console.error = (...a: unknown[]) => {
+    stderr.push(a.join(' '));
+  };
+  try {
+    await agent.handle(JEFF, 'one at a time');
+    await agent.handle(JEFF, 'and another');
+  } finally {
+    console.error = realErr;
+  }
+  assert.deepEqual(stderr.filter((l) => l.includes('CONCURRENT TURN')), []);
 });
 
 test('🔴 serialised through the queue, one burst is ONE model turn carrying both messages', async () => {
@@ -345,4 +395,119 @@ test('🔴 serialised through the queue, one burst is ONE model turn carrying bo
 
   assert.equal(seenUserTurns.length, 1, 'the burst reached the model more than once');
   assert.deepEqual(seenUserTurns[0], ['Yes run the search\nHow many watching?']);
+});
+
+
+// ── what the review of 2026-08-27 found, pinned ────────────────────────────
+
+test('🔴 the read receipt is acknowledged at ACCEPT time, not after the settle window', async () => {
+  /**
+   * `connector.ts` promises the receipt goes out "as Jedd picks the message up,
+   * not after it has thought about it". Marking read inside the turn would have
+   * made that false by BURST_SETTLE_MS for every message — five seconds of total
+   * silence after texting, which is the exact gap the receipt exists to fill.
+   */
+  const acknowledged: string[] = [];
+  const ran: string[] = [];
+  const gate = manualSettle();
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: gate.settle,
+    onAccepted: (m) => acknowledged.push(m.text),
+    run: async (batch) => {
+      for (const m of batch) ran.push(m.text);
+    },
+  });
+  const a = q.submit({ senderHandle: JEFF, text: 'hello' });
+  assert.deepEqual(acknowledged, ['hello'], 'the receipt waited for the settle window');
+  assert.deepEqual(ran, [], 'and the turn has correctly NOT started yet');
+  gate.open();
+  await a;
+  assert.deepEqual(ran, ['hello']);
+});
+
+test('every message in a burst is acknowledged, not just the one that opened the lane', async () => {
+  const acknowledged: string[] = [];
+  const gate = manualSettle();
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: gate.settle,
+    onAccepted: (m) => acknowledged.push(m.text),
+    run: async () => {},
+  });
+  const a = q.submit({ senderHandle: JEFF, text: 'one' });
+  const b = q.submit({ senderHandle: JEFF, text: 'two' });
+  assert.deepEqual(acknowledged, ['one', 'two']);
+  gate.open();
+  await Promise.all([a, b]);
+});
+
+test('a throwing onAccepted cannot fail the submit or lose the message', async () => {
+  const ran: string[] = [];
+  const logged: string[] = [];
+  const gate = manualSettle();
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: gate.settle,
+    log: (l) => logged.push(l),
+    onAccepted: () => {
+      throw new Error('BlueBubbles refused the read receipt');
+    },
+    run: async (batch) => {
+      for (const m of batch) ran.push(m.text);
+    },
+  });
+  const a = q.submit({ senderHandle: JEFF, text: 'answer me anyway' });
+  gate.open();
+  await a;
+  assert.deepEqual(ran, ['answer me anyway'], 'a failed presence call cost the person their reply');
+  assert.ok(logged.some((l) => l.includes('onAccepted threw')));
+});
+
+/**
+ * 🔴 THE ABANDONED-LANE PATH. `settle` and `log` are injected and sit outside
+ * the inner try, so a throw from either leaves the loop with items still
+ * queued. Nothing may leave `drain` still owed a resolution: a dropped message
+ * is bad, a dropped message that also HANGS its caller is worse — and the
+ * caller here is `replayMissed`, which awaits it.
+ */
+test('🔴 a throwing settle drops nobody silently and hangs nobody at all', async () => {
+  const logged: string[] = [];
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: async () => {
+      throw new Error('the clock injection failed');
+    },
+    log: (l) => logged.push(l),
+    run: async () => {},
+  });
+  // Must RESOLVE rather than hang. A test timeout here is the failure.
+  await q.submit({ senderHandle: JEFF, text: 'stranded?' });
+  assert.ok(
+    logged.some((l) => /abandoned|drain loop itself failed/i.test(l)),
+    `an abandoned lane must be LOUD; got: ${JSON.stringify(logged)}`,
+  );
+  assert.equal(q.inFlight(JEFF), false, 'the lane leaked, so this sender would never be served again');
+});
+
+test('a burst larger than maxBatch is split across turns, in order, losing nothing', async () => {
+  const batches: string[][] = [];
+  const gate = manualSettle();
+  const q = new TurnQueue<Msg>({
+    keyOf: (m) => m.senderHandle,
+    settle: gate.settle,
+    maxBatch: 2,
+    run: async (batch) => {
+      batches.push(batch.map((m) => m.text));
+    },
+  });
+  const all = ['a', 'b', 'c', 'd', 'e'].map((t) => q.submit({ senderHandle: JEFF, text: t }));
+  // Each pass takes one settle; open the gate until the lane closes.
+  for (let i = 0; i < 10 && q.inFlight(JEFF); i++) {
+    gate.open();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  await Promise.all(all);
+  assert.deepEqual(batches, [['a', 'b'], ['c', 'd'], ['e']], 'the remainder must follow, in arrival order');
 });
