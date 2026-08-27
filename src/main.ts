@@ -228,7 +228,24 @@ async function main(): Promise<void> {
    * arrives before it is ready gets an honest "IRC is not available" and the
    * Prowlarr results, rather than a hang.
    */
-  const irc = process.env.IRC_EBOOKS === '1' ? new IrcEbooks({ log: (m) => console.error(m) }) : undefined;
+  /**
+   * Network, channel and nick come from config; the TIMING options deliberately
+   * do not (see `Config.irc`) — they are measured properties of this server's
+   * behaviour, and `IrcOptions` keeps its own defaults for them.
+   *
+   * `nick` matters most: two deployments on the same network collide, and the
+   * second one gets renamed or rejected.
+   */
+  const irc =
+    process.env.IRC_EBOOKS === '1'
+      ? new IrcEbooks({
+          host: config.irc.host,
+          port: config.irc.port,
+          channel: config.irc.channel,
+          nick: config.irc.nick,
+          log: (m) => console.error(m),
+        })
+      : undefined;
   if (irc) {
     /**
      * 🔴 SUCCESS AND FAILURE SHARE THE `[irc]` PREFIX. ON PURPOSE.

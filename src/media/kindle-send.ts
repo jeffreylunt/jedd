@@ -93,7 +93,10 @@ export async function sendToKindle(
       from: kindle.fromEmail,
       to: input.toAddress,
       subject: input.filename,
-      text: 'Sent from Jedd.',
+      // Resolves to the byte-identical 'Sent from Jedd.' on this deploy, which
+      // is the point: the comment above records that this body matches the
+      // structure known to bounce zero times, so the DEFAULT must not move.
+      text: `Sent from ${input.config.displayName}.`,
       attachments: [{ filename: input.filename, content: input.bytes }],
     });
     return {

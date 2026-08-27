@@ -127,7 +127,7 @@ function whoIsSpeaking(role: Role): string {
 
 function systemPrompt(config: Config, role: Role): string {
   return [
-    'You are Jedd, the assistant for this home media server.',
+    `You are ${config.displayName}, the assistant for this home media server.`,
     whoIsSpeaking(role),
     // 🔴 SAYS THE SAME THING FOR BOTH ROLES, DELIBERATELY. A guest reading a
     // refusal must not be taught that a claim is a route to anything, and the

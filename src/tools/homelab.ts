@@ -286,7 +286,9 @@ export const restartArrStack: Tool = {
     const containers = ['sonarr', 'radarr', 'prowlarr'];
 
     if (ctx.config.readOnly) {
-      return fail('Jedd is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was restarted.');
+      return fail(
+        `${ctx.config.displayName} is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was restarted.`,
+      );
     }
 
     // Same viewer gate as everything else. Owner authorisation unlocks the tool;

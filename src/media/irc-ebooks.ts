@@ -264,7 +264,10 @@ export class IrcEbooks {
 
       const sock = this.o.dial(this.o.host, this.o.port, () => {
         this.send(`NICK ${this.o.nick}`);
-        this.send(`USER ${this.o.nick} 0 * :Jedd ebook fetcher`);
+        // The trailing field is IRC's "realname"/gecos — cosmetic. Derived from
+        // the configured nick rather than hardcoding a bot name, so a second
+        // deployment does not announce itself as this one.
+        this.send(`USER ${this.o.nick} 0 * :${this.o.nick} ebook fetcher`);
       });
       this.sock = sock;
 

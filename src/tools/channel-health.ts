@@ -47,14 +47,20 @@ import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.
  * a shell at all. That makes the injection unrepresentable instead of guarded.
  */
 
-const RESULTS_PATH = '/tmp/check-streams-results.txt';
-
 /**
  * mtime, then the host's clock, then the file. One round trip, and the clock
  * comes from the SAME machine as the mtime — comparing hp's mtime against the
  * Mac's clock would fold any clock skew straight into the reported age.
+ *
+ * The path is configuration (`CHECK_STREAMS_RESULTS_PATH`) because it is the
+ * interface to a script this repo does not ship.
+ *
+ * ⚠️ It IS interpolated into a shell command, so it must stay OPERATOR-supplied.
+ * That is the same trust level as the literal it replaced — an env var is set by
+ * whoever deploys this. **A model-supplied string must never reach this**, which
+ * is the rule the header of this file already states for the shell identity.
  */
-const RESULTS_CMD = `stat -c %Y ${RESULTS_PATH} && date +%s && cat ${RESULTS_PATH}`;
+const resultsCmd = (path: string) => `stat -c %Y ${path} && date +%s && cat ${path}`;
 
 /**
  * The roster. `-At -F'|'` gives unaligned, tuple-only, pipe-separated rows, the
@@ -221,10 +227,11 @@ export interface StreamCheckSnapshot {
 export type StreamCheckRead = { ok: true; snapshot: StreamCheckSnapshot } | { ok: false; detail: string };
 
 export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<StreamCheckRead> {
-  const results = await runOnHp(config.shellSshHost, RESULTS_CMD, 30_000, exec);
+  const resultsPath = config.checkStreamsResultsPath;
+  const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${RESULTS_PATH} on hp: ${renderOutcome(results)}` };
+    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
@@ -233,7 +240,7 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
   if (rows.length === 0) {
     return {
       ok: false,
-      detail: `${RESULTS_PATH} was read but holds no parseable channel rows (${unparsed} unparseable line(s))`,
+      detail: `${resultsPath} was read but holds no parseable channel rows (${unparsed} unparseable line(s))`,
     };
   }
   return {

@@ -61,6 +61,15 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     // credentials included — into the user's real ~/.superbot2 backups.
     indexerBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-indexer-backup-')), 'captures'),
     downloadBackupDir: join(mkdtempSync(join(tmpdir(), 'jedd-test-download-backup-')), 'captures'),
+    // The real default, so assertions on user-facing text keep reading as the
+    // shipped product rather than as a placeholder.
+    displayName: 'Jedd',
+    audiobook: { savePath: '/downloads/audiobooks', category: 'audiobooks' },
+    checkStreamsResultsPath: '/tmp/check-streams-results.txt',
+    // 🔴 SAME RULE AS THE SSH HOSTS ABOVE: never name a real network. A test
+    // whose exec seam has a hole must fail to resolve, not connect to a live
+    // IRC server and join a real channel under a real nick.
+    irc: { host: 'irc.invalid', port: 6667, channel: '#test', nick: 'testbot' },
     ...overrides,
   };
 }

@@ -65,8 +65,8 @@ export const addAudiobook: Tool = {
       title,
       // 🔴 Both matter. The category is what the mover watches; the save path is
       // what actually places the file, because a category alone does not.
-      category: 'audiobooks',
-      savePath: '/downloads/audiobooks',
+      category: ctx.config.audiobook.category,
+      savePath: ctx.config.audiobook.savePath,
       exec: ctx.exec,
     });
 

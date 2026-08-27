@@ -237,6 +237,53 @@ export interface Config {
    * record of what must not come back.
    */
   downloadBackupDir: string;
+  /**
+   * The persona name, everywhere the model or a user can see it.
+   *
+   * It is config because a second person running this does not want a bot that
+   * introduces itself as someone else's. It is threaded rather than templated
+   * at one site because it appears in the SYSTEM PROMPT, in refusal text and in
+   * the ebook mail signature — three surfaces with different audiences.
+   *
+   * ⚠️ The `[jedd]` log prefixes are deliberately NOT derived from this. They
+   * are internal diagnostics that every runbook, knowledge file and grep in
+   * this project keys on; making them vary per deployment would break the one
+   * thing that must stay greppable across machines.
+   */
+  displayName: string;
+  /**
+   * Where audiobook grabs land in qBittorrent, and under what category.
+   *
+   * 🔴 BOTH MATTER AND THEY ARE NOT REDUNDANT. The category is what the mover
+   * script watches; the save path is what actually places the file. A category
+   * alone does not move anything. They are configuration because they are a
+   * contract with a script that lives OUTSIDE this repo, on the download host.
+   */
+  audiobook: { savePath: string; category: string };
+  /**
+   * Where the `check-streams` script writes its results ON the homelab host.
+   *
+   * Configuration for the same reason as `audiobook` above: it is the interface
+   * to a script this repo does not ship, so its path is a property of the
+   * deployment rather than of this code.
+   */
+  checkStreamsResultsPath: string;
+  /**
+   * The IRC network, channel and nick used for ebook fetching.
+   *
+   * 🔴 `nick` is the one that MUST be configurable: two people running this
+   * against the same network collide on the same nick, and the second one gets
+   * renamed or rejected by the server. Channel and host follow for the same
+   * reason a second operator may not want this network at all.
+   *
+   * ⚠️ The TIMING constants next to these in `irc-ebooks.ts` are deliberately
+   * NOT config — `joinDelayMs` (~65-70s before irchighway accepts a JOIN) and
+   * `searchTimeoutMs` (90s, pinned by a test above the slowest MEASURED reply)
+   * are facts about that server's behaviour, not preferences. Exposing them
+   * would just let someone set a value that looks reasonable and silently
+   * breaks the search.
+   */
+  irc: { host: string; port: number; channel: string; nick: string };
 }
 
 function required(name: string): string {
@@ -265,7 +312,9 @@ function required(name: string): string {
  */
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
-  const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'hp';
+  // A hostname is deployment configuration; `.env` is authoritative and this
+  // literal is only the fallback for a fresh install.
+  const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'homelab';
   // Defaults to the admin host so a missing variable is CONSPICUOUS (it trips the
   // shared-identity refusal) rather than silently pointing somewhere unexpected.
   // `??` does NOT fire on an empty string, so an unset-but-present variable used
@@ -296,14 +345,29 @@ export function loadConfig(): Config {
     sonarr: {
       baseUrl: process.env.SONARR_URL ?? 'http://10.0.0.10:8989/sonarr/api/v3',
       apiKey: process.env.SONARR_API_KEY ?? '',
-      rootFolder: process.env.SONARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/TV',
-      qualityProfileId: Number(process.env.SONARR_QUALITY_PROFILE_ID ?? 9),
+      /**
+       * ⚠️ `.env` IS AUTHORITATIVE; the literals here are only the fallback for
+       * a fresh install (same rule as `kindle.fromEmail` below). Editing them
+       * alone changes NOTHING for a deploy whose `.env` sets these.
+       *
+       * These are a LIBRARY LAYOUT and a PROFILE NUMBERING, both of which are
+       * true only of one Sonarr. Profile ids especially: `9` is whatever the
+       * ninth profile happens to be on this instance and is meaningless on
+       * anyone else's. A wrong value here does not error — Sonarr accepts it
+       * and files the show into the wrong place at the wrong quality, and
+       * nobody finds out until someone goes looking for it. Profile 1 exists
+       * on every fresh *arr, so it is the safe generic default.
+       */
+      rootFolder: process.env.SONARR_ROOT_FOLDER ?? '/media/tv',
+      qualityProfileId: Number(process.env.SONARR_QUALITY_PROFILE_ID ?? 1),
     },
     radarr: {
       baseUrl: process.env.RADARR_URL ?? 'http://10.0.0.10:7878/radarr/api/v3',
       apiKey: process.env.RADARR_API_KEY ?? '',
-      rootFolder: process.env.RADARR_ROOT_FOLDER ?? '/external/jellyfin/Videos/Movies',
-      qualityProfileId: Number(process.env.RADARR_QUALITY_PROFILE_ID ?? 6),
+      // Same rule as Sonarr above: `.env` wins, and a wrong value here fails
+      // SILENTLY into the wrong folder rather than erroring.
+      rootFolder: process.env.RADARR_ROOT_FOLDER ?? '/media/movies',
+      qualityProfileId: Number(process.env.RADARR_QUALITY_PROFILE_ID ?? 1),
     },
     bluebubbles: {
       baseUrl: process.env.BLUEBUBBLES_URL ?? 'http://127.0.0.1:1234',
@@ -363,6 +427,19 @@ export function loadConfig(): Config {
       process.env.INDEXER_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'prowlarr-indexers'),
     downloadBackupDir:
       process.env.DOWNLOAD_BACKUP_DIR ?? join(homedir(), '.superbot2', 'backups', 'removed-downloads'),
+    displayName: process.env.DISPLAY_NAME ?? 'Jedd',
+    audiobook: {
+      savePath: process.env.AUDIOBOOK_SAVE_PATH ?? '/downloads/audiobooks',
+      category: process.env.AUDIOBOOK_CATEGORY ?? 'audiobooks',
+    },
+    checkStreamsResultsPath:
+      process.env.CHECK_STREAMS_RESULTS_PATH ?? '/tmp/check-streams-results.txt',
+    irc: {
+      host: process.env.IRC_HOST ?? 'irc.irchighway.net',
+      port: Number(process.env.IRC_PORT ?? 6667),
+      channel: process.env.IRC_CHANNEL ?? '#ebooks',
+      nick: process.env.IRC_NICK ?? 'jeddbot',
+    },
   };
 }
 

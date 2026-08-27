@@ -230,7 +230,9 @@ export const shedHostLoad: Tool = {
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     if (ctx.config.readOnly) {
-      return fail('Jedd is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was changed.');
+      return fail(
+        `${ctx.config.displayName} is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was changed.`,
+      );
     }
 
     // ── PRECONDITION ────────────────────────────────────────────────────────
@@ -399,7 +401,9 @@ export const restoreQbitSpeed: Tool = {
   parameters: { type: 'object', properties: {}, required: [] },
   async run(_args, ctx) {
     if (ctx.config.readOnly) {
-      return fail('Jedd is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was changed.');
+      return fail(
+        `${ctx.config.displayName} is running read-only (JEDD_ALLOW_WRITES is not set). Nothing was changed.`,
+      );
     }
     // ⚠️ Do not cancel a throttle that is not ours.
     //
