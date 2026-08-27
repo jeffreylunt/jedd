@@ -432,7 +432,28 @@ async function main(): Promise<void> {
 
   let turns = 0;
   await connector.listen(async (message) => {
-    turns += 1;
+    /**
+     * 🔴 CAPTURED AT ENTRY, NOT READ AT LOG TIME.
+     *
+     * `turns` is shared across concurrent turns, and the completion line prints
+     * at the END. Interpolating `${turns}` there reads whatever the counter has
+     * reached by then, so an earlier-finishing turn prints a LATER turn's
+     * number. Measured live 2026-08-27: two overlapping turns both logged
+     * `turn 3` and no `turn 2` line existed at all —
+     *
+     *   turns=2  A enters 01:04:20
+     *   turns=3  B enters 01:05:47   (A still running)
+     *            A ends 01:07:54 -> printed "turn 3"   ← should be 2
+     *            B ends 01:08:21 -> printed "turn 3"
+     *
+     * ⚠️ NOTHING WAS ACTUALLY DUPLICATED — two different questions, two
+     * different answers, each handled once (verified by hashing `userText` in
+     * audit.jsonl). But two identical `turn 3` lines read exactly like one
+     * message answered twice, and it was reported and escalated as a live
+     * double-reply defect. **A racy label on a correct system reads as a broken
+     * system**, and costs more than the label is worth.
+     */
+    const turn = ++turns;
     const started = Date.now();
     try {
       /**
@@ -496,7 +517,7 @@ async function main(): Promise<void> {
        * purpose — an absent `Presence`, or a handle outside `JEDD_SEND_TO`.
        */
       console.error(
-        `[jedd] turn ${turns} from ${message.senderHandle}: ` +
+        `[jedd] turn ${turn} from ${message.senderHandle}: ` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
           /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
@@ -521,7 +542,7 @@ async function main(): Promise<void> {
       }
     } catch (e) {
       // A failing turn must not stop the next message arriving.
-      console.error(`[jedd] turn ${turns} THREW: ${(e as Error).message}`);
+      console.error(`[jedd] turn ${turn} THREW: ${(e as Error).message}`);
       /**
        * 🔴 SILENCE IS NEVER THE RIGHT ANSWER TO A MESSAGE.
        *
@@ -551,7 +572,7 @@ async function main(): Promise<void> {
           message.sourceGuid,
         );
       } catch (sendErr) {
-        console.error(`[jedd] turn ${turns} could not even report the failure: ${(sendErr as Error).message}`);
+        console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
     }
   });

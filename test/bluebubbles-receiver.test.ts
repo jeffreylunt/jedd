@@ -486,3 +486,89 @@ test('🔴 an unreadable server on first boot skips replay — null is not zero'
   });
   assert.equal(seen.watermark(), 0, 'nothing implausible was stored');
 });
+
+/**
+ * ── 🔴 THE CONCURRENT CASE, WHICH IS THE ONE THAT HAPPENS LIVE ───────────────
+ *
+ * The dedup test above posts the twin AFTER the first has been fully handled.
+ * That is not the shape of the live risk. Turns on this deployment run 190-215
+ * SECONDS, so a second delivery lands while the first is still inside the
+ * handler — the guard has to hold across an in-flight turn, not just between
+ * two finished ones.
+ *
+ * ⚠️ This was written after a `turn 3` label collision was mistaken for a real
+ * double-reply. It was not one — two different questions, verified by hash —
+ * but the investigation showed the dedup guard had **never been exercised in
+ * the container**: zero rejections, because BlueBubbles' double-fires were all
+ * outbound echoes, which the echo classifier catches BEFORE dedup. A guard that
+ * never runs and a guard that runs correctly are indistinguishable from
+ * outside, and these tests are the difference.
+ */
+test('🔴 a twin arriving MID-TURN still reaches the handler exactly once', async () => {
+  const got: IncomingMessage[] = [];
+  let release!: () => void;
+  const inFlight = new Promise<void>((r) => {
+    release = r;
+  });
+  const receiver = new BlueBubblesReceiver({
+    selfIdentity: 'jedd-under-test@example.invalid',
+    client: stubClient(),
+    seen: new SeenStore(tempFile()),
+    host: '127.0.0.1',
+    port: 0,
+    path: '/webhook',
+  });
+  const port = await receiver.start(async (m) => {
+    got.push(m);
+    await inFlight; // the turn is still running when the twin arrives
+  });
+  try {
+    const first = post(port, msg());
+    const twin = post(port, msg()); // same rowid, while the first is mid-handler
+    await Promise.all([first, twin]);
+    assert.equal(got.length, 1, 'the twin was admitted while the first turn was still running');
+    release();
+  } finally {
+    release();
+    await receiver.stop();
+  }
+});
+
+test('🔴 two twins dispatched SIMULTANEOUSLY reach the handler exactly once', async () => {
+  await withReceiver({}, async (_r, port, got) => {
+    await Promise.all([post(port, msg()), post(port, msg())]);
+    assert.equal(got.length, 1);
+  });
+});
+
+test('CONTROL: two DIFFERENT rowids reach the handler twice', async () => {
+  // Without this the assertions above pass for a receiver that drops
+  // everything — they would be asserting an absence that nothing produces.
+  await withReceiver({}, async (_r, port, got) => {
+    await Promise.all([post(port, msg()), post(port, msg({ originalROWID: 2601 }))]);
+    assert.equal(got.length, 2, 'distinct messages must BOTH be delivered');
+  });
+});
+
+/**
+ * 🔴 MUTATION CONTROL — the guard is broken ON PURPOSE here.
+ *
+ * A dedup test is only worth having if it goes RED when dedup stops working.
+ * This substitutes a SeenStore whose `firstSight` always answers "yes, new" —
+ * precisely what a composite key would do if the two fires ever differed in
+ * guid — and proves the twin then gets through. If this test ever passes with
+ * `got.length === 1`, the assertions above have stopped measuring anything.
+ */
+test('🔴 MUTATION: with firstSight always-true, the twin DOES get through', async () => {
+  const broken = new SeenStore(tempFile());
+  broken.firstSight = () => true; // the guard, disabled
+  await withReceiver({ seen: broken }, async (_r, port, got) => {
+    await post(port, msg());
+    await post(port, msg());
+    assert.equal(
+      got.length,
+      2,
+      'the mutation did not change the outcome, so the dedup tests above prove nothing',
+    );
+  });
+});
