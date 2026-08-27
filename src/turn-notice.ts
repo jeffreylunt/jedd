@@ -71,6 +71,20 @@ export function isModelTimeout(e: unknown): e is ModelTimeoutError {
 }
 
 /**
+ * The budget, in the unit a person would use for it.
+ *
+ * 🔴 SECONDS BELOW TWO MINUTES, AND NOT AS A NICETY. Rounding to whole minutes
+ * with a floor of 1 makes a THREE-SECOND budget announce itself as a
+ * "1-minute limit" — a false sentence sent to a real person, and precisely the
+ * configuration a live control of this path runs under. A message that only
+ * tells the truth at the shipped default is not one you can rehearse.
+ */
+function describeLimit(limitMs: number): string {
+  if (limitMs < 120_000) return `${Math.max(1, Math.round(limitMs / 1000))}-second`;
+  return `${Math.round(limitMs / 60_000)}-minute`;
+}
+
+/**
  * What the person is told when the turn ends without an answer.
  *
  * 🔴 PURE, EXPORTED, AND TESTED HERE RATHER THAN INLINE IN `main.ts`. The catch
@@ -86,9 +100,8 @@ export function isModelTimeout(e: unknown): e is ModelTimeoutError {
  */
 export function failureReply(e: unknown): string {
   if (isModelTimeout(e)) {
-    const mins = Math.max(1, Math.round(e.limitMs / 60_000));
     return (
-      `That one ran past my ${mins}-minute limit, so I stopped it rather than leave you hanging. ` +
+      `That one ran past my ${describeLimit(e.limitMs)} limit, so I stopped it rather than leave you hanging. ` +
       'A long list is usually what does it — ask me for a shorter one and it should come straight back.'
     );
   }

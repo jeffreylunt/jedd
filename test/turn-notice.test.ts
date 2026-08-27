@@ -227,6 +227,14 @@ test('🔴 a timeout is TOLD as a timeout, and a generic failure is not', () => 
   assert.match(timedOut, /too long|limit/i, 'the timeout reply must name the limit it hit');
   assert.match(timedOut, /shorter/i, 'and say the one thing that makes a retry work');
   assert.equal(timedOut.includes('15-minute'), true, 'and name the actual budget, from the error');
+  /**
+   * 🔴 A THREE-SECOND BUDGET MUST NOT ANNOUNCE ITSELF AS A "1-minute limit".
+   * That is the configuration a live control of this path runs under, and a
+   * rounded floor would have sent Jeff a false sentence to prove a true one.
+   */
+  assert.match(failureReply(new ModelTimeoutError(3_100, 3_000)), /3-second limit/);
+  assert.match(failureReply(new ModelTimeoutError(61_000, 60_000)), /60-second limit/);
+  assert.match(failureReply(new ModelTimeoutError(241_000, 240_000)), /4-minute limit/);
 
   // 🔴 THE CONTROL. Without it, a `failureReply` that returns the timeout
   // sentence for EVERYTHING passes every assertion above.
