@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
   failureReply,
   isModelTimeout,
+  MAX_NOTICES,
   ModelTimeoutError,
   StillWorkingNotice,
   parseStillWorkingMs,
@@ -324,7 +327,14 @@ test('🔴 a notice already queued when the turn ends is still not sent', () => 
   assert.deepEqual(sent, [], 'a "still working" note after the turn ended is worse than none at all');
 });
 
-test('the notice repeats once and then stops — reassurance is bounded, the wait is not', () => {
+test('🔴 the notices keep coming on a DOUBLING gap, four times, then stop', () => {
+  /**
+   * This was two notices on a fixed gap and that was wrong. `presence.ts` sizes
+   * the typing ceiling at `TURN_TIMEOUT_MS * MAX_STEPS` — two hours — because a
+   * real turn was measured at 787 seconds. Two fixed notices covered the first
+   * eight minutes of that and then went silent, which is the defect again with a
+   * longer fuse.
+   */
   const timers = fakeTimers();
   const sent: string[] = [];
   const notice = new StillWorkingNotice({
@@ -334,15 +344,105 @@ test('the notice repeats once and then stops — reassurance is bounded, the wai
     timers,
   });
 
+  const T = STILL_WORKING_AFTER_MS;
   notice.arm();
-  // Stepped, not jumped: this fake clock schedules the NEXT notice from inside
-  // the callback, so one big jump would only ever fire the first. Twelve steps
-  // is deliberately far more than the cap, which is the point being asserted.
-  for (let i = 0; i < 12; i++) timers.advance(STILL_WORKING_AFTER_MS);
 
-  assert.equal(sent.length, 2, 'two notices, not one and not twelve');
-  assert.notEqual(sent[0], sent[1], 'an identical line twice reads as a stuck loop');
-  assert.equal(timers.pending(), 0, 'nothing is left scheduled after the last one');
+  timers.advance(T - 1);
+  assert.equal(sent.length, 0, 'nothing before the first threshold');
+  timers.advance(1);
+  assert.equal(sent.length, 1, `first at ${T}ms`);
+
+  // The gap DOUBLES: the second is 2T after the first, not T.
+  timers.advance(T);
+  assert.equal(sent.length, 1, 'the second must not arrive on the original gap');
+  timers.advance(T);
+  assert.equal(sent.length, 2, 'second at 3T');
+
+  timers.advance(4 * T);
+  assert.equal(sent.length, 3, 'third at 7T');
+  timers.advance(8 * T);
+  assert.equal(sent.length, 4, 'fourth at 15T');
+
+  // And then it stops, however long the turn runs.
+  for (let i = 0; i < 40; i++) timers.advance(16 * T);
+  assert.equal(sent.length, MAX_NOTICES, 'bounded at the cap, no matter how long the turn runs');
+  assert.equal(timers.pending(), 0, 'and nothing is left scheduled');
+  assert.equal(new Set(sent.slice(0, 3)).size, 3, 'the first three say different things');
+});
+
+test('🔴 the clock counts from when they TEXTED, not from when the turn started', () => {
+  /**
+   * The queue serialises per sender, so a message sent while a turn is in flight
+   * waits for that turn (790s, measured), then a settle, then its own turn.
+   * Arming from turn start understates that wait by a whole turn — on the
+   * message most likely to feel ignored, which is the second one.
+   */
+  const timers = fakeTimers();
+  const sent: string[] = [];
+  const notice = new StillWorkingNotice({
+    notify: async (t) => {
+      sent.push(t);
+    },
+    timers,
+  });
+
+  // It has already been queued for all but one second of the threshold.
+  notice.arm(STILL_WORKING_AFTER_MS - 1_000);
+  timers.advance(999);
+  assert.equal(sent.length, 0);
+  timers.advance(1);
+  assert.equal(sent.length, 1, 'the notice is due almost immediately, because the person has already waited');
+});
+
+test('🔴 CONTROL: a message that did NOT wait in the queue gets the full threshold', () => {
+  const timers = fakeTimers();
+  const sent: string[] = [];
+  const notice = new StillWorkingNotice({
+    notify: async (t) => {
+      sent.push(t);
+    },
+    timers,
+  });
+
+  notice.arm(0);
+  timers.advance(STILL_WORKING_AFTER_MS - 1);
+  assert.deepEqual(sent, [], 'without a queue wait, nothing is owed before the threshold');
+});
+
+test('🔴 maxNotices: 0 sends NONE — a cap that cannot express "none" is not a cap', () => {
+  const timers = fakeTimers();
+  const sent: string[] = [];
+  const notice = new StillWorkingNotice({
+    notify: async (t) => {
+      sent.push(t);
+    },
+    timers,
+    maxNotices: 0,
+  });
+
+  notice.arm();
+  for (let i = 0; i < 10; i++) timers.advance(STILL_WORKING_AFTER_MS);
+  assert.deepEqual(sent, [], 'the cap was only checked when RESCHEDULING, so zero used to send one');
+  assert.equal(timers.pending(), 0);
+});
+
+test('re-arming after the cap is spent does not buy another notice', () => {
+  const timers = fakeTimers();
+  const sent: string[] = [];
+  const notice = new StillWorkingNotice({
+    notify: async (t) => {
+      sent.push(t);
+    },
+    timers,
+    maxNotices: 1,
+  });
+
+  notice.arm();
+  timers.advance(STILL_WORKING_AFTER_MS);
+  assert.equal(sent.length, 1);
+  notice.arm();
+  for (let i = 0; i < 5; i++) timers.advance(STILL_WORKING_AFTER_MS * 4);
+  assert.equal(sent.length, 1, 'the cap belongs to the turn, not to the current timer');
 });
 
 test('a notify that throws is contained — it must never fail the turn', () => {
@@ -423,4 +523,66 @@ test('🔴 JEDD_STILL_WORKING_MS falls back on nonsense — a threshold of 0 tex
   assert.equal(parseStillWorkingMs('10'), 1_000, 'floored: 10ms would fire on literally every turn');
   // Not clamped at the top — a very large value coherently means "never".
   assert.equal(parseStillWorkingMs('99999999'), 99_999_999);
+});
+
+test('🔴 the error the timeout REPLACED is kept on `cause` — errors.ts exists because one was thrown away', () => {
+  const real = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+  const timeout = new ModelTimeoutError(901_000, 900_000, real);
+  assert.equal(timeout.cause, real);
+  // And it is reachable the way this codebase reads causes.
+  assert.match(describeError(timeout), /ECONNRESET|socket hang up/);
+});
+
+test('the budget is described in a unit that is TRUE, at every value', () => {
+  assert.equal(failureReply(new ModelTimeoutError(1, 900_000)).includes('15-minute'), true);
+  assert.equal(failureReply(new ModelTimeoutError(1, 240_000)).includes('4-minute'), true);
+  // 🔴 150s is two and a half minutes. Rounding renders "3-minute", which is the
+  // same class of lie this function was written to stop.
+  assert.equal(failureReply(new ModelTimeoutError(1, 150_000)).includes('150-second'), true);
+  assert.equal(failureReply(new ModelTimeoutError(1, 3_000)).includes('3-second'), true);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE WIRING. The tests above prove the parts work, not that anything calls them.
+// ──────────────────────────────────────────────────────────────────────────
+
+test('🔴 the shipped turn body disarms the notice BEFORE it sends, and apologises with failureReply', async () => {
+  /**
+   * A source scan, in the style of the SIGTERM one in
+   * `bluebubbles-presence.test.ts`, because this wiring is what no unit test can
+   * reach. The whole argument that a "still working" note cannot land AFTER the
+   * answer is an ORDERING in `main.ts` — arm and disarm around `agent.handle`,
+   * with `connector.send` outside them. Moving `notice.disarm()` below the send
+   * leaves every other test in this file green and reintroduces the one
+   * user-visible failure that would be embarrassing to ship.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = main.slice(main.indexOf('const handleBurst ='), main.indexOf('🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE'));
+  assert.ok(body.length > 0, 'the turn body could not be located — this scan is now measuring nothing');
+
+  const arm = body.indexOf('notice.arm(');
+  const disarm = body.indexOf('notice.disarm()');
+  const send = body.indexOf('connector.send(message.senderHandle, r.replyText');
+  assert.ok(arm >= 0, 'nothing arms the still-working notice');
+  assert.ok(disarm >= 0, 'nothing disarms it');
+  assert.ok(send >= 0, 'the reply send could not be found — this scan is measuring nothing');
+  assert.ok(arm < disarm, 'the notice is disarmed before it is armed');
+  assert.ok(disarm < send, 'the notice is disarmed AFTER the reply is sent — a note can land after the answer');
+
+  // And the failure path says something, using the classifier rather than a literal.
+  assert.match(body, /connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/, 'the turn catch no longer apologises with failureReply');
+  assert.ok(
+    body.indexOf('notice.arm(') < body.indexOf('failureReply(e)'),
+    'the catch must come after the arm — otherwise this scan is matching the wrong block',
+  );
+});
+
+test('🔴 the notice clock is fed the queue wait, not left at its default', async () => {
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /notice\.arm\(waited\.queuedForMs\)/,
+    'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
+      'restarts the clock at zero — the exact case this is for',
+  );
 });

@@ -59,8 +59,19 @@ export class ModelTimeoutError extends Error {
   constructor(
     readonly elapsedMs: number,
     readonly limitMs: number,
+    /**
+     * 🔴 THE ERROR THIS REPLACED, KEPT. `errors.ts` exists because "Node puts
+     * the diagnosis in `e.cause`, and NOTHING in this codebase read it" cost
+     * hours — and throwing this away would commit the same sin one level up. If
+     * the socket died with ECONNRESET in the same tick the timer fired, the
+     * abort flag is set and the REAL cause is this field. `describeError` walks
+     * it.
+     */
+    cause?: unknown,
   ) {
-    super(`the model call was aborted after ${Math.round(elapsedMs / 1000)}s (limit ${Math.round(limitMs / 1000)}s)`);
+    super(`the model call was aborted after ${Math.round(elapsedMs / 1000)}s (limit ${Math.round(limitMs / 1000)}s)`, {
+      cause,
+    });
     this.name = 'ModelTimeoutError';
   }
 }
@@ -80,8 +91,11 @@ export function isModelTimeout(e: unknown): e is ModelTimeoutError {
  * tells the truth at the shipped default is not one you can rehearse.
  */
 function describeLimit(limitMs: number): string {
-  if (limitMs < 120_000) return `${Math.max(1, Math.round(limitMs / 1000))}-second`;
-  return `${Math.round(limitMs / 60_000)}-minute`;
+  // Minutes only when it IS a whole number of minutes. `Math.round` on 150_000
+  // renders "3-minute" for a two-and-a-half-minute budget — a smaller lie than
+  // the one this function was written to fix, but the same lie.
+  if (limitMs >= 120_000 && limitMs % 60_000 === 0) return `${limitMs / 60_000}-minute`;
+  return `${Math.max(1, Math.round(limitMs / 1000))}-second`;
 }
 
 /**
@@ -156,12 +170,21 @@ export function parseStillWorkingMs(raw: string | undefined): number | undefined
 /**
  * How many notices one turn may send.
  *
- * A turn's worst case is `TURN_TIMEOUT_MS * MAX_STEPS` = two hours, so a single
- * notice at four minutes still leaves an unbounded silence behind it. Two
- * bounds the reassurance instead of the wait: after eight minutes the person has
- * been told twice and a third text adds nothing they do not already know.
+ * ── 🔴 WHY FOUR ON A DOUBLING GAP AND NOT TWO ON A FIXED ONE ────────────────
+ *
+ * This was two fixed notices — 4 and 8 minutes — and that was wrong for the
+ * reason `presence.ts` already knew: a turn's worst case is
+ * `TURN_TIMEOUT_MS * MAX_STEPS`, which is why the typing ceiling is sized at TWO
+ * HOURS, and a real turn has been measured at **787 seconds**. On that exact
+ * turn the sender would be reassured twice and then get five unexplained
+ * minutes, so "distinguishable from dead WHILE it runs" held for the first
+ * eighth of the window the codebase itself sizes for.
+ *
+ * Doubling the gap keeps the count low and the signal alive: at the default the
+ * notices land at 4, 12, 28 and 60 minutes. Bounding the number of TEXTS is the
+ * right goal; bounding the covered WINDOW was not.
  */
-export const MAX_NOTICES = 2;
+export const MAX_NOTICES = 4;
 
 /**
  * ⚠️ THE SECOND NOTICE IS NOT THE FIRST ONE REPEATED. An identical line arriving
@@ -169,9 +192,9 @@ export const MAX_NOTICES = 2;
  * dispel — so the second one says what to do if it goes quiet after that.
  */
 export function stillWorkingText(index: number): string {
-  return index === 0
-    ? "Still working on this one — it's taking a while, but I'm on it."
-    : "Still going. If you don't hear back from me in a few minutes, ask again and I'll start fresh.";
+  if (index === 0) return "Still working on this one — it's taking a while, but I'm on it.";
+  if (index === 1) return "Still going. If you don't hear back from me in a few minutes, ask again and I'll start fresh.";
+  return 'This one is taking much longer than usual. I have not given up, but feel free to ask again for something smaller.';
 }
 
 /** Test seam. Real timers are unref'd so a pending notice cannot hold the process open. */
@@ -225,6 +248,14 @@ export interface StillWorkingOptions {
  * arriving minutes later, would find its anchor already consumed and go out
  * plain. A progress note would have silently disabled reply threading for
  * exactly the long turns threading is most useful on.
+ *
+ * ⚠️ SENDING A NOTICE MOMENTARILY TURNS THE TYPING INDICATOR OFF. `presence.ts`
+ * records as measured fact that BlueBubbles clears its own `typingCache` and
+ * calls `stopTyping` when a message is sent to a chat — so at the moment of
+ * reassurance the "…" disappears. It returns on the next refresh (30s), so the
+ * exposure is bounded and self-healing, but it is the one interaction where this
+ * signal briefly REMOVES the other one. Noted rather than fixed: awaiting a
+ * presence call on this path is the single rule `presence.ts` exists to forbid.
  */
 export class StillWorkingNotice {
   private handle: unknown = null;
@@ -248,10 +279,24 @@ export class StillWorkingNotice {
     this.log = opts.log ?? ((l) => console.error(l));
   }
 
-  /** Start the clock. Idempotent — a second call while armed does nothing. */
-  arm(): void {
-    if (this.stopped || this.handle !== null) return;
-    this.schedule();
+  /**
+   * Start the clock.
+   *
+   * 🔴 `alreadyWaitedMs` IS NOT AN OPTIMISATION. The queue serialises per
+   * sender, so a message texted while a turn is in flight waits for that turn
+   * (up to 790s, measured), then a settle, then its own turn. Arming from turn
+   * START would measure the wrong interval and understate the person's wait by
+   * a whole turn — which is exactly the shape of the incident this file closes:
+   * *he asked the same thing twice*. `main.ts` passes the queue's `queuedForMs`.
+   *
+   * Idempotent — a second call while armed does nothing.
+   */
+  arm(alreadyWaitedMs = 0): void {
+    // 🔴 `sent >= maxNotices` TOO, not just `handle !== null`. Re-arming after
+    // the last notice has fired would otherwise schedule one past the cap — the
+    // cap is a property of the turn, not of the current timer.
+    if (this.stopped || this.handle !== null || this.sent >= this.maxNotices) return;
+    this.schedule(Math.max(0, this.afterMs - alreadyWaitedMs));
   }
 
   /**
@@ -273,7 +318,15 @@ export class StillWorkingNotice {
     return this.sent;
   }
 
-  private schedule(): void {
+  /**
+   * @param gapMs how long to wait before the NEXT notice. Doubles each time —
+   *   see `MAX_NOTICES`.
+   */
+  private schedule(gapMs: number): void {
+    // 🔴 CHECKED HERE, BEFORE ANY TIMER IS SET, and not only at the reschedule
+    // below. Guarding the reschedule alone means `maxNotices: 0` still sends
+    // ONE — a cap that cannot express "none" is not a cap.
+    if (this.sent >= this.maxNotices) return;
     this.handle = this.timers.set(() => {
       this.handle = null;
       if (this.stopped) return;
@@ -285,10 +338,10 @@ export class StillWorkingNotice {
        * side effect of the passage of time, not of the previous notice
        * succeeding.
        */
-      if (this.sent < this.maxNotices) this.schedule();
+      this.schedule(gapMs * 2);
       void this.opts
         .notify(stillWorkingText(index))
         .catch((e) => this.log(`[notice] a "still working" note could not be sent: ${(e as Error).message}`));
-    }, this.afterMs);
+    }, gapMs);
   }
 }

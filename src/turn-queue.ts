@@ -108,9 +108,34 @@
  * message at boot.
  */
 
+/**
+ * How long the batch had already been waiting when its turn finally started.
+ *
+ * Handed to `run` because only the queue knows it: by the time a turn begins,
+ * the arrival times are gone from everywhere else. `main.ts` uses it so the
+ * "still working" notice counts from when the person TEXTED rather than from
+ * when Jedd got round to them.
+ */
+export interface BatchWait {
+  /** Accept time of the OLDEST message in the batch (epoch ms). */
+  oldestAcceptedAt: number;
+  /** How long that message had already waited when the turn started, in ms. */
+  queuedForMs: number;
+}
+
 /** A message waiting for its turn, with the promise its submitter is holding. */
 interface Queued<T> {
   item: T;
+  /**
+   * When `submit` accepted it — NOT when its turn started.
+   *
+   * 🔴 THE DIFFERENCE IS THE WHOLE POINT OF CARRYING IT. A message that arrives
+   * behind an in-flight turn waits for that turn, then a settle, then its own
+   * turn. Anything downstream that measures "how long has this person been
+   * waiting" from turn start is measuring the wrong interval, and understates it
+   * by up to a full turn — 790 seconds, measured.
+   */
+  acceptedAt: number;
   /** Resolved once the batch containing this item has been handled. */
   done: () => void;
 }
@@ -130,7 +155,7 @@ export interface TurnQueueOptions<T> {
    * survives it (see the test), because a failing turn must not cost this person
    * every message they send afterwards.
    */
-  run: (batch: T[]) => Promise<void>;
+  run: (batch: T[], waited: BatchWait) => Promise<void>;
   /**
    * 🔴 CALLED THE INSTANT A MESSAGE IS ACCEPTED, BEFORE THE SETTLE WINDOW.
    *
@@ -223,7 +248,7 @@ export class TurnQueue<T> {
     const handled = new Promise<void>((r) => {
       done = r;
     });
-    const queued: Queued<T> = { item, done };
+    const queued: Queued<T> = { item, acceptedAt: Date.now(), done };
 
     const lane = this.lanes.get(key);
     if (lane) {
@@ -281,8 +306,12 @@ export class TurnQueue<T> {
               'thought and are answered as one, so no tool runs twice',
           );
         }
+        const oldestAcceptedAt = Math.min(...batch.map((b) => b.acceptedAt));
         try {
-          await this.opts.run(batch.map((b) => b.item));
+          await this.opts.run(batch.map((b) => b.item), {
+            oldestAcceptedAt,
+            queuedForMs: Math.max(0, Date.now() - oldestAcceptedAt),
+          });
         } catch (e) {
           /**
            * 🔴 SWALLOWED HERE, SO IT HAS TO BE LOUD HERE.

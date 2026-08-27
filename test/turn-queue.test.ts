@@ -511,3 +511,50 @@ test('a burst larger than maxBatch is split across turns, in order, losing nothi
   await Promise.all(all);
   assert.deepEqual(batches, [['a', 'b'], ['c', 'd'], ['e']], 'the remainder must follow, in arrival order');
 });
+
+test('🔴 the turn is told how long the batch had ALREADY waited, not just what is in it', async () => {
+  /**
+   * A message that arrives behind an in-flight turn waits for that turn (790s,
+   * measured), then a settle, then its own turn. By the time `run` is called the
+   * arrival times exist nowhere else, so the queue is the only thing that can
+   * report the wait — and `main.ts` needs it to start the "still working" clock
+   * from when the person TEXTED rather than from when Jedd got round to them.
+   */
+  const gate = manualSettle();
+  const waits: number[] = [];
+  let release!: () => void;
+  const firstTurn = new Promise<void>((r) => {
+    release = r;
+  });
+  let turns = 0;
+
+  const q = new TurnQueue<{ senderHandle: string; text: string }>({
+    keyOf: (m) => m.senderHandle,
+    settle: gate.settle,
+    run: async (_batch, waited) => {
+      waits.push(waited.queuedForMs);
+      if (++turns === 1) await firstTurn;
+    },
+  });
+
+  const a = q.submit({ senderHandle: 'jeff', text: 'a' });
+  gate.open();
+  await new Promise((r) => setTimeout(r, 30));
+
+  // Arrives while turn 1 is still running: it joins `pending` and waits.
+  const b = q.submit({ senderHandle: 'jeff', text: 'b' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  release();
+  await a;
+  gate.open();
+  await b;
+
+  assert.equal(waits.length, 2, 'two turns ran');
+  assert.ok(waits[0]! >= 0, 'the first turn reports a wait at all');
+  assert.ok(
+    waits[1]! >= 50,
+    `the queued message must report the time it spent waiting, got ${waits[1]}ms — a turn that ` +
+      'reports 0 here would restart every downstream clock from turn start',
+  );
+});

@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { Agent, type TurnRecord } from './agent.js';
+import { Agent, MAX_STEPS, type TurnRecord } from './agent.js';
 import { BlueBubblesClient } from './bluebubbles/client.js';
 import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
@@ -13,8 +13,14 @@ import {
   type PresenceRecord,
   type SendRecord,
 } from './connector.js';
-import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
-import { failureReply, parseStillWorkingMs, StillWorkingNotice, STILL_WORKING_AFTER_MS } from './turn-notice.js';
+import { BURST_SETTLE_MS, sleep, TurnQueue, type BatchWait } from './turn-queue.js';
+import {
+  failureReply,
+  MAX_NOTICES,
+  parseStillWorkingMs,
+  StillWorkingNotice,
+  STILL_WORKING_AFTER_MS,
+} from './turn-notice.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
@@ -27,7 +33,7 @@ import { IrcEbooks } from './media/irc-ebooks.js';
 import { DEFAULT_MOUNTS } from './tools/send-ebook.js';
 import { realMailSender } from './media/kindle-send.js';
 import { imapMailboxReader, imapSettingsFrom } from './kindle-mailbox.js';
-import { createLlmClient, probeLlm } from './llm.js';
+import { createLlmClient, probeLlm, TURN_TIMEOUT_MS } from './llm.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
 
@@ -211,7 +217,19 @@ async function main(): Promise<void> {
    * is handled, and it is invisible: `Presence` swallows it and says so once.
    * Nothing else about this process changes when it starts working.
    */
-  const presence = new Presence({ client });
+  /**
+   * 🔴 THE CEILING IS DERIVED FROM THE RESOLVED BUDGET, NOT THE CONSTANT.
+   *
+   * `CEILING_MS` is `TURN_TIMEOUT_MS * MAX_STEPS`, and `llm.ts` says the two are
+   * coupled on purpose: they were independent magic numbers once and the typing
+   * indicator died at six minutes on a turn that ran 787 seconds and completed
+   * fine. Making the budget overridable QUIETLY BROKE that coupling —
+   * `LLM_TURN_TIMEOUT_MS` moved one side and `presence.ts` still computed from
+   * the other, so a raised budget reproduced the original complaint exactly.
+   * Passing it explicitly is what keeps "changing one forces you past the other"
+   * true now that one of them lives in the environment.
+   */
+  const presence = new Presence({ client, ceilingMs: (config.llm.turnTimeoutMs ?? TURN_TIMEOUT_MS) * MAX_STEPS });
 
   const connector = new BlueBubblesConnector(
     receiver,
@@ -488,7 +506,7 @@ async function main(): Promise<void> {
   const queue = new TurnQueue<IncomingMessage>({
     keyOf: (m) => m.senderHandle,
     settle: () => sleep(BURST_SETTLE_MS),
-    run: async (batch) => handleBurst(batch),
+    run: async (batch, waited) => handleBurst(batch, waited),
     /**
      * 🔴 THE READ RECEIPT DOES NOT WAIT FOR THE SETTLE WINDOW.
      *
@@ -522,8 +540,21 @@ async function main(): Promise<void> {
    * that long*, rather than as *the feature may not be in this image*.
    */
   console.error(
-    `[notice] a turn still running after ${stillWorkingMs}ms tells the sender so, and says it ` +
-      'again once. A turn that dies always sends a message; a timeout says it timed out.',
+    `[notice] a turn still running after ${stillWorkingMs}ms tells the sender so, and again on a ` +
+      `doubling gap up to ${MAX_NOTICES} times. A turn that dies always sends a message; a timeout ` +
+      'says it timed out.',
+  );
+  /**
+   * 🔴 THE EFFECTIVE BUDGET, SAID OUT LOUD. `LLM_TURN_TIMEOUT_MS` falls back
+   * silently on anything unparseable, so `LLM_TURN_TIMEOUT_MS=90O000` (letter O)
+   * runs at the built-in 900s while looking configured. This is the line that
+   * tells the difference, and it is the same argument the `[notice]` line above
+   * makes for itself.
+   */
+  console.error(
+    `[llm] one model call may run ${config.llm.turnTimeoutMs ?? TURN_TIMEOUT_MS}ms` +
+      `${config.llm.turnTimeoutMs === undefined ? ' (built-in default; LLM_TURN_TIMEOUT_MS unset or unparseable)' : ' (from LLM_TURN_TIMEOUT_MS)'}` +
+      `; a turn may make up to ${MAX_STEPS} of them.`,
   );
 
   /**
@@ -534,7 +565,7 @@ async function main(): Promise<void> {
    * which is how they read on the phone, and a reply to a burst belongs against
    * its final message the way a human's would.
    */
-  const handleBurst = async (batch: IncomingMessage[]): Promise<void> => {
+  const handleBurst = async (batch: IncomingMessage[], waited: BatchWait): Promise<void> => {
     const last = batch[batch.length - 1]!;
     /**
      * ⚠️ SPREAD, NOT REBUILT FIELD BY FIELD. A hand-listed copy type-checks
@@ -624,7 +655,14 @@ async function main(): Promise<void> {
         connector,
         message,
         async () => {
-          notice.arm();
+          /**
+           * 🔴 THE CLOCK STARTS WHEN THEY TEXTED, NOT WHEN JEDD GOT ROUND TO
+           * THEM. A message that arrived behind an in-flight turn has already
+           * been waiting — up to a whole 790-second turn plus a settle — and
+           * arming from here would understate that by exactly that much, on the
+           * message MOST likely to feel ignored.
+           */
+          notice.arm(waited.queuedForMs);
           let r: TurnRecord;
           try {
             r = await agent.handle(message.senderHandle, message.text);
@@ -679,13 +717,15 @@ async function main(): Promise<void> {
            */
           `${batch.length > 1 ? `burst=${batch.length} ` : ''}` +
           /**
-           * 🔴 `notices=` IS THE WITNESS THAT THE STILL-WORKING NOTE FIRED.
-           *
-           * Without it a turn that ran 300s and reassured the sender, and a turn
-           * that ran 300s in silence because the timer was never armed, print the
-           * IDENTICAL line — and the second is the whole defect. Printed only
-           * when a notice actually went out, so an ordinary fast turn keeps its
-           * ordinary line.
+           * 🔴 `notices=` SAYS WHAT WAS ATTEMPTED, NOT WHAT ARRIVED — the same
+           * disclaimer `presence=` makes two lines above, and for the same
+           * reason: the counter increments before the send resolves, and a
+           * handle outside `JEDD_SEND_TO` is suppressed quietly. What it does
+           * settle is the half that was unanswerable before it existed: a turn
+           * that ran 300s and reassured the sender, and a turn that ran 300s in
+           * silence because the timer was never armed, printed the IDENTICAL
+           * line — and the second is the whole defect. A failed send announces
+           * itself separately on its own `[notice]` line.
            */
           `${notice.noticesSent > 0 ? `notices=${notice.noticesSent} ` : ''}` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +

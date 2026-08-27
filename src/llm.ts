@@ -147,7 +147,12 @@ export class OllamaClient implements LlmClient {
       });
 
       if (!res.ok) {
-        throw new Error(`Ollama HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+        // ⚠️ CAPTURED BEFORE THE AWAIT. If the abort lands while the error body
+        // is being read, the throw below never happens and the status would be
+        // lost with it — leaving a timeout that cannot say the server had
+        // already answered 500.
+        const status = res.status;
+        throw new Error(`Ollama HTTP ${status}: ${(await res.text()).slice(0, 300)}`);
       }
       /**
        * 🔴 THE BODY READ IS INSIDE THE TIMER, AND IT USED NOT TO BE.
@@ -162,7 +167,7 @@ export class OllamaClient implements LlmClient {
        */
       body = (await res.json()) as typeof body;
     } catch (e) {
-      if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs);
+      if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs, e);
       throw e;
     } finally {
       clearTimeout(timer);
