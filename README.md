@@ -126,7 +126,6 @@ swarm can prefer a well-seeded study guide over a thinly-seeded novel.
 **In practice:** give the author as well as the title, and check what comes back
 before confirming. Pinning book search to a work identifier is not implemented.
 
-
 ## One turn per burst
 
 People double-text. Two messages seconds apart used to become two concurrent
