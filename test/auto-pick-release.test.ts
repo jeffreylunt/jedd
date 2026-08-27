@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { ChoiceStore } from '../src/choices.js';
 import type { FetchImpl } from '../src/media/arr.js';
 import type { ExecImpl } from '../src/hp.js';
+import type { IrcEbooks } from '../src/media/irc-ebooks.js';
 import { byScore, swarmHealth, swarmRank, HEALTHY_SWARM_SEEDERS } from '../src/media/pick-release.js';
 import { rankAudiobooks, rankReleases, type Release } from '../src/media/prowlarr.js';
 import { addAudiobook } from '../src/tools/add-audiobook.js';
@@ -13,7 +14,8 @@ import { makeCatalogueSearch } from '../src/tools/catalogue.js';
 import { resolveChoice } from '../src/tools/choice.js';
 import { makeGrabRelease, makeSearchEpisode } from '../src/tools/fill-gaps.js';
 import { makeSearchAudiobook, makeSearchEbook } from '../src/tools/search-release.js';
-import type { ToolContext } from '../src/tools/types.js';
+import { assertChoiceProducersExist } from '../src/tools/index.js';
+import type { Tool, ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
 
 /**
@@ -378,6 +380,84 @@ test('🔴 EBOOK: an archive does not outrank a real book on seeders alone', asy
   ).run({ query: 'Dune' }, ctx());
   assert.match(r.content, /Dune\.azw3/);
   assert.doesNotMatch(r.content, /\.rar/);
+});
+
+test('🔴 an IRC offer outranks a THIN torrent — a DCC transfer has no swarm to be dead', async () => {
+  /**
+   * The two sources used to be interleaved by position, so a one-seeder torrent
+   * that happened to be an `.epub` was pushed ahead of a bot holding the book in
+   * hand. An IRC offer is banded `healthy` on purpose: a bot either sends the
+   * file or does not answer — there is no swarm for it to be thin.
+   */
+  const irc = {
+    rosterHas: () => true,
+    async search() {
+      return {
+        state: 'ok' as const,
+        detail: 'found 1',
+        results: [{ bot: 'Bsk', command: '!Bsk Dune.epub', title: 'Dune.epub', ext: '.epub', sizeBytes: 900_000 }],
+      };
+    },
+    async fetch() {
+      return { state: 'failed' as const, detail: 'not used here' };
+    },
+  } as unknown as IrcEbooks;
+
+  const r = await makeSearchEbook(
+    async () => json([prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 1 })]),
+    irc,
+  ).run({ query: 'Dune' }, ctx());
+  assert.equal(r.ok, true);
+  assert.match(r.content, /via IRC/, 'the bot wins over a swarm of one');
+  assert.doesNotMatch(r.content, /only 1 seeder/);
+});
+
+test('CONTROL: a HEALTHY torrent still beats the same IRC offer on the tiebreak', async () => {
+  // Both land in the healthy band and both are .epub, so the seeder count breaks
+  // the tie — which is what stops the IRC band from being an override.
+  const irc = {
+    rosterHas: () => true,
+    async search() {
+      return {
+        state: 'ok' as const,
+        detail: 'found 1',
+        results: [{ bot: 'Bsk', command: '!Bsk Dune.epub', title: 'Dune.epub', ext: '.epub', sizeBytes: 900_000 }],
+      };
+    },
+    async fetch() {
+      return { state: 'failed' as const, detail: 'not used here' };
+    },
+  } as unknown as IrcEbooks;
+
+  const r = await makeSearchEbook(
+    async () => json([prowlarrRelease({ title: 'Dune.epub', infoHash: HASH_A, seeders: 400 })]),
+    irc,
+  ).run({ query: 'Dune' }, ctx());
+  assert.match(r.content, /400 seeder/);
+});
+
+test('🔴 a consumer that merely ACCEPTS a choice must still declare its kind', async () => {
+  /**
+   * The schema axis of the registry invariant read `required.includes('choice')`
+   * — which was true of every consumer until this change emptied their `required`
+   * lists so they could be called with no arguments. That left the rule matching
+   * only `resolve_choice`, whose kind is `'*'` and is exempt: it fired for no
+   * real tool in the repo while appearing to guard three. A rule that quietly
+   * stops applying is worse than one that was never written.
+   */
+  const optionalChoice: Tool = {
+    name: 'fake_optional_consumer',
+    description: 'Takes an optional pick and declares nothing.',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: { choice: { type: 'number' } }, required: [] },
+    run: async () => ({ ok: true, content: '' }),
+  };
+  assert.throws(
+    () => assertChoiceProducersExist([optionalChoice]),
+    /does not declare consumesChoiceKind/,
+    'optional is still a dependency on a list some other tool stored',
+  );
 });
 
 test('🔴 every candidate dead is ALL DEAD, which is not "nothing was found"', async () => {
