@@ -312,6 +312,29 @@ test('🔴 add_audiobook called with NO arguments grabs the chosen release', asy
   );
 });
 
+test('🔴 a healthy ABRIDGED copy beats an unabridged one nobody is seeding', async () => {
+  // The band has to sit above the quality key or it is decorative. Unabridged is
+  // the better book and a thin swarm is the one that does not arrive.
+  const r = await makeSearchAudiobook(async () =>
+    json([
+      prowlarrRelease({ title: 'Dune Unabridged', infoHash: HASH_A, seeders: 2 }),
+      prowlarrRelease({ title: 'Dune abridged', infoHash: HASH_B, seeders: 300 }),
+    ]),
+  ).run({ query: 'Dune' }, ctx());
+  assert.match(r.content, /Dune abridged/);
+  assert.doesNotMatch(r.content, /Unabridged/);
+});
+
+test('CONTROL: with the swarms level, unabridged wins — the quality key still works', async () => {
+  const r = await makeSearchAudiobook(async () =>
+    json([
+      prowlarrRelease({ title: 'Dune abridged', infoHash: HASH_B, seeders: 300 }),
+      prowlarrRelease({ title: 'Dune Unabridged', infoHash: HASH_A, seeders: 300 }),
+    ]),
+  ).run({ query: 'Dune' }, ctx());
+  assert.match(r.content, /Dune Unabridged/);
+});
+
 test('🔴 every candidate dead is ALL DEAD, which is not "nothing was found"', async () => {
   // Two different zeros. One of them means the book does not exist and the other
   // means every copy of it is unseeded, and only one is worth searching again for.

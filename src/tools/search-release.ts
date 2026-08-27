@@ -1,5 +1,12 @@
 import { describeSwarm, swarmHealth } from '../media/pick-release.js';
-import { CATEGORY, ProwlarrClient, rankReleases, type FetchImpl, type Release } from '../media/prowlarr.js';
+import {
+  CATEGORY,
+  ProwlarrClient,
+  rankAudiobooks,
+  rankReleases,
+  type FetchImpl,
+  type Release,
+} from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
 import { fail, ok, type Tool } from './types.js';
@@ -226,7 +233,23 @@ function makeReleaseSearch(medium: 'audiobook' | 'ebook', fetchImpl?: FetchImpl,
       const alive = releases.filter((r) => swarmHealth(r.seeders) !== 'dead');
       const deadCount = releases.length - alive.length;
 
-      const torrentOffers: Offer[] = rankReleases(alive)
+      /**
+       * 🔴 THE AUDIOBOOK RANKER IS THE ONE WITH A QUALITY KEY UNDER THE BAND.
+       *
+       * `rankReleases` orders on the band and then on seeders, which — with no
+       * third key — is the same ORDER as sorting on seeders alone. That makes
+       * its band decorative on its own, and a decorative rule is one nobody
+       * notices deleting. `rankAudiobooks` puts `unabridged` UNDER the band, so
+       * an abridged copy that people are actually seeding beats an unabridged
+       * one that nobody is — which is the whole rule, stated where it bites.
+       *
+       * ⚠️ It had NO caller in the repo until now: written, tested, unused. That
+       * is the same shape as `add_audiobook` shipping with no producer.
+       *
+       * Ebooks keep `rankReleases` because their quality key is FORMAT, and
+       * `interleave` below applies it across both sources at once.
+       */
+      const torrentOffers: Offer[] = (isAudio ? rankAudiobooks(alive, { wantGraphicAudio: wantsGraphic }) : rankReleases(alive))
         .slice(0, 5)
         .map((r) => ({
           label: describe(r),

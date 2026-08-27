@@ -180,6 +180,20 @@ export function rankReleases(releases: Release[]): Release[] {
 }
 
 /**
+ * ⚠️ BE HONEST ABOUT WHAT THE BAND DOES HERE.
+ *
+ * With only those two keys, band-then-seeders produces the SAME ORDER as
+ * seeders alone, so on this function the band is a statement of contract rather
+ * than a behaviour — deleting it would change nothing and no test could catch
+ * it. It is kept so that the next key anyone adds lands UNDERNEATH it instead of
+ * on top, which is the mistake `search_episode` had made.
+ *
+ * The rule that actually bites on this path is the dead-swarm FILTER in
+ * `search-release.ts`, and for audiobooks it is `rankAudiobooks` below, where a
+ * real quality key sits under the band.
+ */
+
+/**
  * Rank AUDIOBOOK releases.
  *
  * ── 🔴 THE PREFERENCE IS A PARAMETER. THE CLASSIFICATION IS NOT. ─────────────
