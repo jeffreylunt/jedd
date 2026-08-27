@@ -247,9 +247,10 @@ test('🔴 a stored option with NO source still works — the durable-file migra
   assert.equal(sent.length, 0);
 });
 
-test('🔴 a .mobi pick is refused before any fetch, and names the EPUB to use instead', async () => {
+test('🔴 a .mobi is never fetched — the best EPUB is taken instead, without asking', async () => {
   const sent: unknown[] = [];
   const irc = fakeIrc();
+  const followups = new FollowupStore(tmp());
   const tool = makeSendEbook({
     send: async (m) => {
       sent.push(m);
@@ -259,12 +260,67 @@ test('🔴 a .mobi pick is refused before any fetch, and names the EPUB to use i
   });
   const r = await tool.run(
     { choice: 1 },
-    ctx({ value: { source: 'irc', command: '!Wench x.mobi', bot: 'Wench', title: 'Andy Weir - PHM.mobi' } }),
+    ctx({
+      value: { source: 'irc', command: '!Wench x.mobi', bot: 'Wench', title: 'Andy Weir - PHM.mobi' },
+      followups,
+    }),
   );
+  /**
+   * It used to answer "Option 2 is an EPUB — offer them that one instead", which
+   * is a numbered pick arriving through the failure path. Nobody sees a list of
+   * releases any more, so nobody can be asked to choose from one: the EPUB in
+   * the list we already ranked is taken, and the swap is stated.
+   */
+  assert.equal(r.ok, true, r.content);
+  assert.match(r.content, /took the best EPUB instead/);
+  assert.match(r.content, /Amazon rejects silently/);
+
+  /**
+   * ⚠️ The EVIDENCE is the scheduled follow-up, not a fetch. IRC never blocks a
+   * turn — a bot can queue for ten minutes — so asserting `irc.calls` here would
+   * assert against the design and pass only if the concurrency rule broke.
+   */
+  assert.equal(irc.calls.length, 0, 'nothing is fetched inside the turn, .mobi or otherwise');
+  const pending = followups.pendingEbook(JEFF, 'Some Other Book.epub');
+  assert.ok(pending, 'the EPUB is what got scheduled');
+  assert.equal(pending.ebook?.command, '!Bsk Other.epub', 'and it is the EPUB, not the .mobi');
+  assert.equal(followups.pendingEbook(JEFF, 'Andy Weir - PHM.mobi'), undefined);
+});
+
+test('CONTROL: with NO epub anywhere in the list, the .mobi is refused rather than sent', async () => {
+  // The swap is only available when something else really is an EPUB. Amazon
+  // rejects .mobi silently, so a send that "worked" would never arrive.
+  const sent: unknown[] = [];
+  const irc = fakeIrc();
+  const tool = makeSendEbook({
+    send: async (m) => {
+      sent.push(m);
+      return { messageId: 'x' };
+    },
+    irc,
+  });
+  const kindle = new KindleRegistry(tmp());
+  kindle.save(JEFF, 'readerone@kindle.com', ['readerone@kindle.com']);
+  const choices = new ChoiceStore(tmp());
+  choices.present({
+    senderHandle: JEFF,
+    subject: 'a book',
+    kind: 'release',
+    options: [
+      { n: 1, label: 'Andy Weir - PHM.mobi', value: { source: 'irc', command: '!Wench x.mobi', bot: 'Wench', title: 'Andy Weir - PHM.mobi' } },
+      { n: 2, label: 'Andy Weir - PHM.azw3', value: { source: 'irc', command: '!Wench y.azw3', bot: 'Wench', title: 'Andy Weir - PHM.azw3' } },
+    ],
+  });
+  const r = await tool.run({}, {
+    role: 'guest' as const,
+    senderHandle: JEFF,
+    config: testConfig({ readOnly: false }),
+    kindle,
+    choices,
+  });
   assert.equal(r.ok, false);
   assert.match(r.content, /^REFUSED/);
   assert.match(r.content, /2022/);
-  assert.match(r.content, /Option 2 is an EPUB/, 'a refusal that names the way out beats a bare no');
   assert.equal(irc.calls.length, 0, 'nothing may be fetched');
   assert.equal(sent.length, 0);
 });

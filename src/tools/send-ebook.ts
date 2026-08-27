@@ -74,8 +74,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       required: [],
     },
     async run(args, ctx: ToolContext) {
-      const explicit = args['choice'] !== undefined;
-      const n = explicit ? Number(args['choice']) : 1;
+      const n = args['choice'] === undefined ? 1 : Number(args['choice']);
       if (!Number.isFinite(n)) return fail('That is not an option number.');
       if (ctx.config.readOnly) return fail('Writes are disabled, so nothing was grabbed or sent.');
       if (!ctx.choices) return fail('No option store is available.');
@@ -101,20 +100,21 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       let option = picked.option;
 
       /**
-       * 🔴 A `.mobi` AT THE TOP IS RE-CHOSEN, NOT HANDED BACK AS A QUESTION.
+       * 🔴 A `.mobi` IS RE-CHOSEN, NOT HANDED BACK AS A QUESTION.
        *
        * This used to answer *"Option 3 is an EPUB — offer them that one
        * instead"*, which is the numbered pick Jeff asked us to stop making
-       * people do, just arriving through the failure path. When nobody named a
-       * number, nobody should be asked for one: take the best EPUB in the list
-       * we already ranked and say we did.
+       * people do, just arriving through the failure path.
        *
-       * ⚠️ Only when the pick was AUTOMATIC. If they asked for a specific option
-       * by number, silently swapping it is overriding a person, and the refusal
-       * below is the honest answer.
+       * ⚠️ It swaps however the pick ARRIVED, and that is deliberate rather than
+       * lazy. Nobody is shown a list of releases any more, so a `choice` number
+       * cannot mean *"I looked at the options and I want the .mobi"* — there was
+       * nothing to look at. It can only mean *"not that one"*. And Amazon has
+       * rejected `.mobi` SILENTLY since 2022, so sending one is never the right
+       * action for anybody: it would look sent and never arrive.
        */
       let swapped = '';
-      if (!explicit && isMobi(String(option.value['title'] ?? option.label))) {
+      if (isMobi(String(option.value['title'] ?? option.label))) {
         const alt = picked.choice.options.find(
           (o) => o.n !== option.n && /\.epub\b/i.test(String(o.value['title'] ?? o.label)),
         );
@@ -223,8 +223,8 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
        */
       if (!ctx.followups) {
         return ok(
-          `STARTED — ${attempt.detail} I have NOT sent anything, and I cannot check back on my ` +
-            'own here. Tell them to ask again in a few minutes.',
+          `STARTED — ${attempt.detail}${swapped} I have NOT sent anything, and I cannot check back ` +
+            'on my own here. Tell them to ask again in a few minutes.',
         );
       }
 
