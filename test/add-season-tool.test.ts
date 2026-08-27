@@ -31,7 +31,7 @@ function seriesRow(opts: {
     year: 1989,
     monitored: opts.monitored ?? true,
     // A field nothing here reads, present to prove the PUT does not drop it.
-    rootFolderPath: '/external/jellyfin/Videos/TV',
+    rootFolderPath: '/media/tv',
     qualityProfileId: 9,
     seasons: Object.entries(opts.stats).map(([n, [have, total, monitored]]) => ({
       seasonNumber: Number(n),
@@ -147,7 +147,7 @@ test('🔴 the PUT sends the WHOLE series object back, not a patch', async () =>
   const { fetchImpl, rec } = sonarr(SEINFELD);
   await run(fetchImpl, [3]);
   const body = rec.puts[0]!.body;
-  assert.equal(body['rootFolderPath'], '/external/jellyfin/Videos/TV');
+  assert.equal(body['rootFolderPath'], '/media/tv');
   assert.equal(body['qualityProfileId'], 9);
   assert.equal(body['tvdbId'], 79169);
   assert.equal(body['id'], 77);

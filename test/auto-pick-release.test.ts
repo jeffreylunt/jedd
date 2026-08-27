@@ -40,7 +40,7 @@ import { testConfig } from './helpers.js';
  * ── ⚠️ AND WHAT THIS DELIBERATELY DOES NOT TOUCH ────────────────────────────
  *
  * Which WORK someone meant is still their call, and the last test here pins it.
- * Kaela asked for *"Don't Say Good Luck"*, Jedd asked *"the 2026 film or the
+ * Robin asked for *"Don't Say Good Luck"*, Jedd asked *"the 2026 film or the
  * 2003 show?"*, and that question was CORRECT — they are different works and
  * guessing downloads the wrong one. Release choice is not title choice.
  */
@@ -495,9 +495,9 @@ test('the prowlarr rankers lead on the band, not on the label', () => {
 
 // ── 🔴 THE SCOPE BOUNDARY: TITLE CHOICE IS STILL THEIRS ─────────────────────
 
-test('🔴 KAELA: an ambiguous TITLE still asks which work they meant', async () => {
+test('🔴 ROBIN: an ambiguous TITLE still asks which work they meant', async () => {
   /**
-   * 2026-08-26: Kaela asked for *"Don't Say Good Luck"* and Jedd replied *"1.
+   * 2026-08-26: Robin asked for *"Don't Say Good Luck"* and Jedd replied *"1.
    * the 2026 film, 2. the 2003 show — which did you mean?"* **That question was
    * right and must stay.** A film and a show sharing a name are different works;
    * choosing for someone downloads the wrong thing entirely, and no amount of

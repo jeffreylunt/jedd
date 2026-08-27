@@ -114,7 +114,7 @@ RUN mkdir -p /app/data
 #     501 means every file it creates keeps the same ownership pm2 gave it, so
 #     rolling BACK to pm2 needs no chown and leaves no ownership drift.
 # uid 501 is not in /etc/passwd, so HOME must be set explicitly or ssh will not
-# find ~/.ssh/config and the `hp` / `hp-jedd-shell` aliases will not resolve.
+# find ~/.ssh/config and the `hp` / `homelab-jedd-shell` aliases will not resolve.
 # 🔴 uid 501 needs a REAL /etc/passwd ENTRY, not just $HOME.
 #
 # Setting HOME alone is not enough: OpenSSH calls getpwuid() and refuses to run

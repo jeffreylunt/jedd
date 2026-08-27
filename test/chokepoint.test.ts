@@ -122,7 +122,7 @@ test('🔴 hp_shell is NOT registered unless the boundary was PROVEN — omittin
   // gets no free-form shell. Fail closed by construction rather than by
   // remembering to check, because the thing being protected against is exactly
   // someone forgetting.
-  const split = testConfig({ shellSshHost: 'hp-jedd-shell', adminSshHost: 'hp' });
+  const split = testConfig({ shellSshHost: 'homelab-jedd-shell', adminSshHost: 'hp' });
   assert.equal(
     buildTools(split).some((t) => t.name === 'hp_shell'),
     false,
@@ -135,7 +135,7 @@ test('🔴 hp_shell is NOT registered unless the boundary was PROVEN — omittin
 });
 
 test('CONTROL: hp_shell IS registered once the boundary is proven', () => {
-  const split = testConfig({ shellSshHost: 'hp-jedd-shell', adminSshHost: 'hp' });
+  const split = testConfig({ shellSshHost: 'homelab-jedd-shell', adminSshHost: 'hp' });
   assert.equal(
     buildTools(split, { safe: true, reason: 'proven', evidence: [] }).some((t) => t.name === 'hp_shell'),
     true,
@@ -206,9 +206,9 @@ test('🔴 an EMPTY HP_SHELL_SSH_HOST must not read as a different host', () => 
 
     // CONTROL: a real value still produces a split, so the check is about
     // emptiness and not about the fallback swallowing everything.
-    process.env['HP_SHELL_SSH_HOST'] = 'hp-jedd-shell';
+    process.env['HP_SHELL_SSH_HOST'] = 'homelab-jedd-shell';
     const split = loadConfig();
-    assert.equal(split.shellSshHost, 'hp-jedd-shell');
+    assert.equal(split.shellSshHost, 'homelab-jedd-shell');
     assert.equal(split.shellIdentityShared, false);
   } finally {
     for (const [k, v] of [['HP_SHELL_SSH_HOST', saved.shell], ['HP_ADMIN_SSH_HOST', saved.admin], ['OWNER_HANDLE', saved.owner]] as const) {

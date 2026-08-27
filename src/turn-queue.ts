@@ -122,7 +122,7 @@ interface Lane<T> {
 export interface TurnQueueOptions<T> {
   /**
    * What makes two messages compete. Items with DIFFERENT keys run
-   * concurrently — Kaela's turn must never wait behind Jeff's.
+   * concurrently — Robin's turn must never wait behind Jeff's.
    */
   keyOf: (item: T) => string;
   /**

@@ -5,7 +5,7 @@
  * came back so a claim about this model can be checked rather than trusted.
  */
 const BASE = process.env.LLM_BASE_URL ?? 'http://localhost:11434';
-const MODEL = process.env.LLM_MODEL ?? 'qwen3.8:27b-mlx';
+const MODEL = process.env.LLM_MODEL ?? 'qwen3.8:27b';
 
 const TOOLS = [
   {

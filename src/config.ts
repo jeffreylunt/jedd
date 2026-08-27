@@ -379,7 +379,7 @@ export function loadConfig(): Config {
       baseUrl:
         process.env.LLM_BASE_URL ??
         (provider === 'anthropic' ? 'https://api.anthropic.com' : 'http://localhost:11434'),
-      model: process.env.LLM_MODEL ?? 'qwen3.8:27b-mlx',
+      model: process.env.LLM_MODEL ?? 'qwen3.8:27b',
       apiKey: process.env.LLM_API_KEY,
     },
     jellyfin: {

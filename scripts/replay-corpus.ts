@@ -3,7 +3,7 @@
  *
  * ── WHY OFFLINE RATHER THAN LIVE ─────────────────────────────────────────────
  *
- * V1 and V2 share one Ollama on one Mac (`qwen3.8:27b-mlx`, 23.8 GB, and
+ * V1 and V2 share one Ollama on one Mac (`qwen3.8:27b`, 23.8 GB, and
  * `/api/ps` shows it unloaded between turns). A LIVE shadow means a household
  * message triggers a V1 turn AND a V2 turn for the same model at the same
  * moment — adding latency to Jeff's working bot, whose p90 is already 85 s.

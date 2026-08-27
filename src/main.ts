@@ -468,7 +468,7 @@ async function main(): Promise<void> {
    * twice for one request, and on Jeff's thread the reply to his second message
    * landed ten seconds before the reply to his first.
    *
-   * The queue serialises PER SENDER — Kaela never waits behind Jeff — and merges
+   * The queue serialises PER SENDER — Robin never waits behind Jeff — and merges
    * a burst into a single turn. The reasoning for joining rather than queueing
    * or superseding is in `turn-queue.ts`; the short version is that only joining
    * makes "every tool ran twice" structurally impossible, because a batch is one

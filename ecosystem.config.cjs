@@ -23,11 +23,13 @@
  * pm2 SIGKILLs mid-deregistration the row is orphaned in BlueBubbles' table and
  * the next boot has to clean up after it. 10 s is far more than the call needs.
  */
+const path = require('node:path');
+
 module.exports = {
   apps: [
     {
       name: 'jedd-v2',
-      cwd: '/Users/jeff/dev/jedd-v2',
+      cwd: __dirname,
       script: 'src/main.ts',
       /**
        * 🔴 PINNED ABSOLUTE ON PURPOSE — do NOT relax this back to bare 'node'.
@@ -36,13 +38,13 @@ module.exports = {
        * denial presents as EHOSTUNREACH with no prompt and nothing in any log.
        * Measured 2026-08-25, same machine, same minute, literal IP (no DNS):
        *
-       *   /opt/homebrew/bin/node        v25.2.1   192.168.1.7:8096 -> CONNECT ok
-       *   ~/.nvm/.../v24.12.0/bin/node  v24.12.0  192.168.1.7:8096 -> EHOSTUNREACH
-       *   ~/.nvm/.../v22.22.2/bin/node  v22.22.2  192.168.1.7:8096 -> EHOSTUNREACH
+       *   /opt/homebrew/bin/node        v25.2.1   192.0.2.10:8096 -> CONNECT ok
+       *   ~/.nvm/.../v24.12.0/bin/node  v24.12.0  192.0.2.10:8096 -> EHOSTUNREACH
+       *   ~/.nvm/.../v22.22.2/bin/node  v22.22.2  192.0.2.10:8096 -> EHOSTUNREACH
        *
        * CONTROLS that make it a permission boundary rather than a routing or
        * library fault: all three reach the public internet fine, and all three
-       * reach the GATEWAY 192.168.1.1 — the gateway is EXEMPT, so "the router
+       * reach the GATEWAY 192.0.2.1 — the gateway is EXEMPT, so "the router
        * works" is not evidence the LAN works. Re-signing an nvm node with a
        * fresh unique ad-hoc identity did NOT clear it, so it is not a stale
        * grant keyed to Node Foundation's signing identity.
@@ -53,7 +55,7 @@ module.exports = {
        * service-specific for days.
        *
        * ⚠️ BEFORE changing node versions, probe the CANDIDATE binary first:
-       *   <candidate> -e 'require("net").connect(8096,"192.168.1.7")
+       *   <candidate> -e 'require("net").connect(8096,"192.0.2.10")
        *      .on("connect",()=>console.log("ok")).on("error",e=>console.log(e.code))'
        * A version bump that silently loses LAN access is invisible until a user
        * asks Jedd something about the homelab.
@@ -82,8 +84,8 @@ module.exports = {
         JEDD_ALLOW_WRITES: 'true',
       },
       // Both streams to the file the runbook and every prior restart already use.
-      out_file: '/Users/jeff/dev/jedd-v2/data/jedd.log',
-      error_file: '/Users/jeff/dev/jedd-v2/data/jedd.log',
+      out_file: path.join(__dirname, 'data/jedd.log'),
+      error_file: path.join(__dirname, 'data/jedd.log'),
       merge_logs: true,
       autorestart: true,
       /**

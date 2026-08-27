@@ -58,7 +58,7 @@ interface Msg {
  * and it caught the first draft of this file. The names are what matter here;
  * the digits are only a key that has to differ between two senders.
  */
-const KAELA = '+18015550188';
+const ROBIN = '+18015550188';
 const JEFF = '+18015550123';
 
 // ── the burst: many messages in, ONE turn out ───────────────────────────────
@@ -74,8 +74,8 @@ test('🔴 two messages from one sender that arrive in a burst become ONE turn',
     },
   });
 
-  const a = q.submit({ senderHandle: KAELA, text: 'Option #1.' });
-  const b = q.submit({ senderHandle: KAELA, text: "Don't say good luck the film!" });
+  const a = q.submit({ senderHandle: ROBIN, text: 'Option #1.' });
+  const b = q.submit({ senderHandle: ROBIN, text: "Don't say good luck the film!" });
   gate.open();
   await Promise.all([a, b]);
 
@@ -107,8 +107,8 @@ test('MUTATION: dispatched the OLD way, the same burst produces TWO turns', asyn
   };
   // `void run(...)` per message — exactly `void this.ingest(...)`, no lane, no settle.
   await Promise.all([
-    run([{ senderHandle: KAELA, text: 'Option #1.' }]),
-    run([{ senderHandle: KAELA, text: "Don't say good luck the film!" }]),
+    run([{ senderHandle: ROBIN, text: 'Option #1.' }]),
+    run([{ senderHandle: ROBIN, text: "Don't say good luck the film!" }]),
   ]);
   assert.equal(turns.length, 2, 'without serialisation the burst is two turns — this is the bug');
 });
@@ -117,9 +117,9 @@ test('MUTATION: dispatched the OLD way, the same burst produces TWO turns', asyn
 
 test('CONTROL: two different senders run CONCURRENTLY — the lane is per sender', async () => {
   const started: string[] = [];
-  let releaseKaela!: () => void;
-  const kaelaHeld = new Promise<void>((r) => {
-    releaseKaela = r;
+  let releaseRobin!: () => void;
+  const robinHeld = new Promise<void>((r) => {
+    releaseRobin = r;
   });
   const gate = manualSettle();
   const q = new TurnQueue<Msg>({
@@ -127,22 +127,22 @@ test('CONTROL: two different senders run CONCURRENTLY — the lane is per sender
     settle: gate.settle,
     run: async (batch) => {
       started.push(batch[0]!.senderHandle);
-      if (batch[0]!.senderHandle === KAELA) await kaelaHeld;
+      if (batch[0]!.senderHandle === ROBIN) await robinHeld;
     },
   });
 
-  const k = q.submit({ senderHandle: KAELA, text: 'add a film' });
+  const k = q.submit({ senderHandle: ROBIN, text: 'add a film' });
   const j = q.submit({ senderHandle: JEFF, text: 'what is downloading' });
   gate.open();
-  // Jeff's turn must be able to start and FINISH while Kaela's is still held.
+  // Jeff's turn must be able to start and FINISH while Robin's is still held.
   // (If the lane were global rather than per sender, this `await` never returns.)
   await j;
   assert.deepEqual(
     [...started].sort(),
-    [JEFF, KAELA].sort(),
+    [JEFF, ROBIN].sort(),
     "both senders' turns must be in flight at once — the lane is per sender, not global",
   );
-  releaseKaela();
+  releaseRobin();
   await k;
 });
 

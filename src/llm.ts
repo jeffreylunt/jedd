@@ -46,7 +46,7 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
 }
 
 /**
- * Ollama client for the pinned local model, `qwen3.8:27b-mlx`.
+ * Ollama client for the pinned local model, `qwen3.8:27b`.
  *
  * Every setting below was MEASURED against the live endpoint by
  * `scripts/probe-ollama.mjs`, not inherited. See

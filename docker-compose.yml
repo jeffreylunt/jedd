@@ -12,7 +12,7 @@
 #   Model (Ollama)    host.docker.internal:11434  (this Mac; binds 0.0.0.0)
 #   Sonarr/Radarr/Prowlarr/qBittorrent/Jellyfin/Dispatcharr
 #                     10.0.0.10:{8989,7878,9696,8080,8096,9191}  (LAN, direct)
-#   ssh hp / hp-jedd-shell
+#   ssh hp / homelab-jedd-shell
 #                     10.0.0.10:22   (keys + config mounted below)
 #   IRC ebooks        irc.irchighway.net:6667 outbound, plus outbound DCC to
 #                     arbitrary third-party peer IPs. Jedd NEVER listens for
@@ -84,7 +84,7 @@ services:
       #
       # `hp` is the privileged admin identity (docker group) used only by
       # structured tools whose command text is a literal in the repo.
-      # `hp-jedd-shell` is unprivileged and is the ONLY identity the free-form,
+      # `homelab-jedd-shell` is unprivileged and is the ONLY identity the free-form,
       # model-composed hp_shell tool may use. config.ts refuses to register
       # hp_shell at all if the two resolve to the same account, and
       # identity-probe.ts proves the split at boot by running `id` over both.
