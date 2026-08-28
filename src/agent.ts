@@ -1,3 +1,8 @@
+import {
+  readsAsCapabilityDenial,
+  SECOND_LOOK_NOTE,
+  turnLicensedTheDenial,
+} from './capability-denial.js';
 import { describeError, MAX_ERROR_CHARS, redactUrlSecrets } from './errors.js';
 import type { Config } from './config.js';
 import type { ChoiceStore } from './choices.js';
@@ -62,6 +67,22 @@ export interface TurnRecord {
   toolCalls: ToolInvocation[];
   replyText: string;
   steps: number;
+  /**
+   * Present ONLY on turns where the second look ran — see
+   * `src/capability-denial.ts`.
+   *
+   * 🔴 IT RECORDS THE SUPPRESSED SENTENCE, NOT JUST THAT IT FIRED. A guard whose
+   * durable record is a boolean can be shown to have run and can never be shown
+   * to have been RIGHT. With `deniedText` here, the questions this defect keeps
+   * raising are answerable off the audit log by anyone, months later: how often
+   * does it fire, how often does looking again change the answer, and — the one
+   * that matters — when it changed the answer, what had Jedd been about to say?
+   *
+   * ⚠️ `changed: false` is NOT a failure. Most of the denials this fires on are
+   * TRUE, and a confirmed "no" is the correct outcome. Do not read a low change
+   * rate as the guard not working; read it against `deniedText`.
+   */
+  secondLook?: { changed: boolean; deniedText: string };
 }
 
 /**
@@ -339,6 +360,13 @@ export class Agent {
     const toolCalls: ToolInvocation[] = [];
     let replyText = '';
     let steps = 0;
+    /**
+     * The reply the second look was given a chance to revise, and the index in
+     * `history` where it sits. Unset until (and unless) the second look fires,
+     * which is at most once per turn.
+     */
+    let deniedText: string | undefined;
+    let deniedAt = -1;
 
     for (; steps < MAX_STEPS; steps++) {
       const reply = await this.llm.chat(history, tools);
@@ -346,6 +374,38 @@ export class Agent {
       if (reply.toolCalls.length === 0) {
         replyText = reply.text.trim();
         history.push({ role: 'assistant', content: replyText });
+
+        /**
+         * ── THE SECOND LOOK ──────────────────────────────────────────────────
+         *
+         * See `src/capability-denial.ts` for why this exists and why the model,
+         * not this code, is the one that adjudicates the denial.
+         *
+         * 🔴 `steps + 2 < MAX_STEPS` — THE BUDGET IS SHARED, NOT EXTENDED, and
+         * that is deliberate. `presence.ts` derives the typing-indicator ceiling
+         * from `MAX_STEPS × TURN_TIMEOUT_MS`; a private extra budget here would
+         * push a turn's worst case past a number another file already depends
+         * on, and the indicator would die on a turn that was still alive. The
+         * `+ 2` reserves room for one tool round AND the answer after it, so a
+         * second look that finds something has somewhere to put it.
+         *
+         * ⚠️ AT MOST ONCE. `deniedText` is the latch. Without it a model that
+         * keeps denying would loop against its own note until the step budget
+         * ran out, and the user would get "I got stuck" in place of an answer
+         * that was merely unwelcome.
+         */
+        if (
+          deniedText === undefined &&
+          steps + 2 < MAX_STEPS &&
+          replyText.length > 0 &&
+          readsAsCapabilityDenial(replyText) &&
+          !turnLicensedTheDenial(toolCalls)
+        ) {
+          deniedText = replyText;
+          deniedAt = history.length - 1;
+          history.push({ role: 'system', content: SECOND_LOOK_NOTE });
+          continue;
+        }
         break;
       }
 
@@ -411,6 +471,42 @@ export class Agent {
       }
     }
 
+    /**
+     * 🔴 THE GUARD MUST NEVER MAKE THE REPLY WORSE THAN THE ONE IT INTERRUPTED.
+     *
+     * The second look spends steps. If the extra round exhausts the budget or
+     * comes back empty, the turn would otherwise fall through to "I got stuck" —
+     * so a guard aimed at a WRONG answer would have replaced a merely
+     * UNWELCOME one with no answer at all. The denial it was second-guessing is
+     * still the best thing available, so it is restored verbatim.
+     */
+    let secondLook: TurnRecord['secondLook'];
+    if (deniedText !== undefined) {
+      const restored = replyText.length === 0;
+      if (restored) replyText = deniedText;
+      secondLook = { changed: replyText !== deniedText, deniedText };
+      /**
+       * Take the note and the superseded denial back out of the working history.
+       *
+       * ⚠️ NOT TIDINESS. Whatever is left here is replayed into every later turn
+       * with this sender, and an "I have no tool for that" sitting in context is
+       * the model's own prior claim about its capabilities — the thing the
+       * empty-history control on `task-2026-08-26T17-49-38Z` showed it does not
+       * NEED to fail, but which in a real thread compounds it. Leaving the note
+       * behind is worse still: a standing instruction about a reply that is no
+       * longer there.
+       *
+       * Spliced highest index first so the lower one does not shift. When the
+       * denial is RESTORED it is re-pushed at the end rather than left in
+       * place, so it stays the last thing said — an assistant message stranded
+       * before the tool calls that followed it would read, next turn, as an
+       * answer given before the evidence it was supposedly based on.
+       */
+      history.splice(deniedAt + 1, 1);
+      history.splice(deniedAt, 1);
+      if (restored) history.push({ role: 'assistant', content: replyText });
+    }
+
     if (!replyText) {
       replyText =
         steps >= MAX_STEPS
@@ -426,6 +522,7 @@ export class Agent {
       toolCalls,
       replyText,
       steps: steps + 1,
+      ...(secondLook ? { secondLook } : {}),
     };
     // Persisted AFTER the turn completes, so a crash mid-turn leaves no record
     // of a reply that was never delivered.
