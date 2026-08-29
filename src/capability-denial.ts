@@ -149,8 +149,9 @@
  * this domain. 🔴 **NOT ONE of the 262 corpus turns fires through that path**, so
  * the pinned trigger-rate and precision numbers were structurally incapable of
  * detecting it: a metric can only see the inputs it was computed over. Requiring
- * the apostrophe costs nothing measured — 30 fires, 80% recall, 93% precision,
- * before and after.
+ * the apostrophe was measured NEUTRAL on the corpus — identical fires, recall and
+ * precision with and without it — which is exactly why only the hand-written
+ * adversarial cases in the test file can hold it in place.
  */
 const CAPABILITY_DENIAL =
   // "no tool" / "not have a tool" / "don't have a results tool" / "no write tool for Prowlarr"
