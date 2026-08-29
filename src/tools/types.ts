@@ -191,6 +191,51 @@ export interface Tool {
    * asymmetry — the consumer side is the one that cannot be forgotten.
    */
   presentsChoiceKinds?: string[];
+  /**
+   * 🔴 WHAT THIS TOOL'S RESULT DOES **NOT** COVER, APPENDED TO EVERY RESULT IT
+   * RETURNS — ok, fail and throw alike.
+   *
+   * ── THE DEFECT THIS EXISTS FOR ───────────────────────────────────────────
+   *
+   * Measured 2026-08-28, live, n=10: asked *"has tom watched anything yet"* the
+   * model reached `jellyfin_sessions`, got a **true but narrow** answer — two
+   * idle sessions — and converted the scope of that one result into a claim
+   * about the whole system: *"I can only see live sessions … that's not
+   * something I can pull."* **80% of reps denied a capability the same registry
+   * demonstrably holds** (`homelab_read` had answered the same question two days
+   * earlier). The tool did not fail. It answered a narrower question than the
+   * one asked, and nothing in its answer said so.
+   *
+   * ── WHY A RESULT AND NOT A DESCRIPTION, WHICH IS THE WHOLE IDEA ──────────
+   *
+   * Rewriting the tool's DESCRIPTION was measured on this defect at **p = 0.31,
+   * not convicted** (18 live turns, 3 variants). A description is read *before*
+   * selection, when the model is choosing among 37 tools and has no idea which
+   * one it is about to over-read. A RESULT is read *after* — at the exact moment
+   * the model holds a narrow answer and is about to generalise it. Same words,
+   * different moment, and the moment is the intervention.
+   *
+   * ⚠️ **So do not "improve" this by folding it into `description`.** That is a
+   * different experiment and it has already been run and did not convict.
+   *
+   * ── WHAT BELONGS IN ONE ──────────────────────────────────────────────────
+   *
+   * Three things, and the second is the load-bearing one:
+   *  1. what this result IS (the narrow scope, stated as a scope);
+   *  2. that its silence is NOT evidence of absence — the wrong inference,
+   *     named and refused, because that inference is the actual defect;
+   *  3. WHERE the excluded thing lives, **by tool name**.
+   *
+   * 🔴 A name here is checked. `assertNamedProducersExist` scans this field as
+   * well as `description`, so a note pointing at a tool that is not registered
+   * refuses to boot rather than telling the model to call something that is not
+   * there — which would be this very defect, pointing the other way.
+   *
+   * ⚠️ Optional, and deliberately not defaulted-to-required. Most tools answer
+   * the question they were picked for and a note would be noise; a tool without
+   * one behaves exactly as before. The failure direction is safe.
+   */
+  scopeNote?: string;
   /** JSON Schema for the arguments object. */
   parameters: Record<string, unknown>;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;

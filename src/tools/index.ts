@@ -472,6 +472,18 @@ export function assertChoiceProducersExist(tools: Tool[]): void {
  * ⚠️ Matched on whole `snake_case` words against the set of tool names actually
  * present, so ordinary prose cannot trip it: a name only counts as a reference
  * if some tool in this repo really is called that.
+ *
+ * ── 🔴 IT SCANS `scopeNote` TOO, AND THAT IS NOT AN EXTRA ────────────────────
+ *
+ * The coverage of this rule is defined by WHICH FIELDS IT READS, and `scopeNote`
+ * is a second channel of prose that tells the model to call something by name —
+ * `jellyfin_sessions`'s note says "read it with homelab_read". Adding a new way
+ * to instruct the model without adding it here would have left exactly the hole
+ * this function exists to close, one field along: a note pointing at a tool that
+ * is not registered is the false-capability defect pointed the other way, and it
+ * would boot green. `test/registry-coverage.test.ts` pins that the field is
+ * scanned, so deleting it from this line fails rather than silently narrowing
+ * the rule.
  */
 export function assertNamedProducersExist(tools: Tool[]): void {
   const present = new Set(tools.map((t) => t.name));
@@ -480,7 +492,8 @@ export function assertNamedProducersExist(tools: Tool[]): void {
   // name that is absent would simply stop looking like a tool name.
   const known = new Set(ALL_TOOLS.map((t) => t.name));
   for (const t of tools) {
-    const named = new Set((t.description.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? []).filter((w) => known.has(w)));
+    const prose = `${t.description}\n${t.scopeNote ?? ''}`;
+    const named = new Set((prose.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? []).filter((w) => known.has(w)));
     named.delete(t.name);
     for (const dep of named) {
       if (present.has(dep)) continue;

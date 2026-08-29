@@ -60,6 +60,33 @@ export const jellyfinSessions: Tool = {
   description:
     'List current Jellyfin sessions and what each is playing. Use this to answer "is anyone watching" ' +
     'and before proposing anything disruptive.',
+  /**
+   * 🔴 THE MEASURED FALSE DENIAL, ANSWERED AT THE POINT WHERE IT IS MADE.
+   *
+   * "Has tom watched anything yet" → this tool → two idle sessions → *"I can
+   * only see live sessions, not watch history … that's not something I can
+   * pull."* 8 of 10 live reps, 2026-08-28. The result was TRUE. The conclusion
+   * drawn from it was false, and the step that turns one into the other is
+   * reading THIS result's scope as the system's boundary.
+   *
+   * ⚠️ The middle sentence is the load-bearing one and it is not filler.
+   * "Nobody is playing anything" is the exact observation the model generalises
+   * from, so the note has to refuse that specific inference by name — a scope
+   * line that only says what the tool covers leaves the wrong inference
+   * unaddressed.
+   *
+   * ⚠️ It names `homelab_read` deliberately and that name is CHECKED —
+   * `assertNamedProducersExist` scans this field, so if `homelab_read` were
+   * renamed or unregistered this refuses to boot. Both tools need Jellyfin
+   * configured, so there is no build where this one exists and the other does
+   * not; the assertion is there so that stays true rather than being reasoned
+   * about again later.
+   */
+  scopeNote:
+    'SCOPE OF THIS RESULT — currently-playing sessions ONLY. It is a snapshot of this instant. ' +
+    'It does NOT include watch history: what anyone has already watched is not in this result, and ' +
+    'its absence here is NOT evidence that they have watched nothing. Watch history IS available — ' +
+    'read it with homelab_read against Jellyfin.',
   minRole: 'owner',
   writes: false,
   parameters: { type: 'object', properties: {}, required: [] },

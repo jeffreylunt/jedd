@@ -454,6 +454,28 @@ export class Agent {
           content = `Tool "${tool.name}" threw: ${describeError(e, redactUrlSecrets)}`;
           succeeded = false;
         }
+        /**
+         * ── 🔴 A NARROW RESULT DECLARES ITS OWN LIMIT ────────────────────────
+         *
+         * See `Tool.scopeNote`. Appended HERE — one site, after the try/catch —
+         * so it lands on ok, fail and throw alike. A tool that answers a
+         * narrower question than the one asked must say so in the ANSWER; the
+         * measured defect is the model reading one result's scope as the
+         * system's boundary, and that reading happens after selection, where a
+         * description can no longer reach it.
+         *
+         * ⚠️ Appended by the LOOP, not by each `run()`. Every early return
+         * inside a tool — and `jellyfin_sessions` has three — would otherwise be
+         * a path where the note is silently missing, and the failure would be
+         * invisible: a correct-looking result with the one sentence that matters
+         * absent. There is exactly one place a tool result enters history, so
+         * there is exactly one place to attach this.
+         *
+         * 🔴 It goes into the TOOL MESSAGE, not the reply. Nothing the user sees
+         * is rewritten and no answer is vetoed — the README's "no output
+         * filtering anywhere in the loop" stays literally true.
+         */
+        if (tool.scopeNote) content = `${content}\n\n${tool.scopeNote}`;
         toolCalls.push({
           name: tool.name,
           args: call.arguments,
