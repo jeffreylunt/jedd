@@ -737,17 +737,33 @@ async function main(): Promise<void> {
            * something and a turn where the question never arose print the
            * IDENTICAL line, and the only way to tell would be to go and read
            * `audit.jsonl` — the archaeology every other token here exists to
-           * avoid. `changed` is the half that matters: `2nd-look=changed` means
-           * looking again produced a DIFFERENT answer, i.e. the reply Jeff was
-           * about to receive was wrong. The suppressed sentence itself is in the
-           * turn record, deliberately not here — it is a whole reply and this is
-           * one line.
+           * avoid. The suppressed sentence itself stays in the turn record and
+           * deliberately not here: it is a whole reply and this is one line.
            *
-           * ⚠️ `2nd-look=same` is NOT a failure. Most capability denials are
-           * TRUE (25 of 35 measured over the first 262 production turns), and a
-           * confirmed "no" is the correct outcome.
+           * 🔴 THREE STATES, NOT TWO, BECAUSE "the text changed" IS NOT THE
+           * QUESTION ANYONE ASKS:
+           *   withdrawn — looked again and stopped denying. The guard worked,
+           *               and the reply Jeff was about to receive was wrong.
+           *   reworded  — changed the words and denied anyway. NOT a success,
+           *               and counting it as one would inflate the only metric
+           *               this token exists to support.
+           *   same      — confirmed its answer verbatim.
+           *
+           * ⚠️ `same` IS NOT A FAILURE. Most capability denials are TRUE — 25 of
+           * 35 measured over the first 262 production turns — and a confirmed
+           * "no" is the correct outcome.
            */
-          `${record.secondLook ? `2nd-look=${record.secondLook.changed ? 'changed' : 'same'} ` : ''}` +
+          `${
+            record.secondLook
+              ? `2nd-look=${
+                  !record.secondLook.changed
+                    ? 'same'
+                    : record.secondLook.stillDenies
+                      ? 'reworded'
+                      : 'withdrawn'
+                } `
+              : ''
+          }` +
           /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
            *

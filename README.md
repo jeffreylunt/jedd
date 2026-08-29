@@ -184,6 +184,12 @@ connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission g
 - **`src/turn-queue.ts`** — serialises per sender, merges bursts.
 - **`src/agent.ts`** — ask the model, run the tools it asked for, append
   results, repeat (max 8 steps). No output filtering.
+- **`src/capability-denial.ts`** — when a reply reads as *"I have no tool for
+  that"* and nothing in the turn licensed it, the loop injects one note and gives
+  the model **one more round** to check its own tool list. Still no output
+  filtering: nothing is rewritten or blocked, and if the model says the same
+  thing again that is what is sent, verbatim. It has told its owner three times
+  that it could not do something it could.
 - **`src/permissions.ts`** — one owner, everyone else a guest. Fails closed.
 - **`src/command-gate.ts`** — deny-by-default allowlist for the generic shell.
 - **`src/safety.ts`** — restart preconditions, including "UNKNOWN is not idle".

@@ -1,27 +1,69 @@
 /**
  * ── THE SECOND LOOK: ONE MORE MODEL ROUND BEFORE A CAPABILITY DENIAL SHIPS ───
  *
- * 🔴 WHAT THIS IS FOR, IN ONE SENTENCE: Jedd has told Jeff four times that it
+ * 🔴 WHAT THIS IS FOR, IN ONE SENTENCE: Jedd has three times told its owner it
  * could not do something it could do, and a false denial CLOSES THE QUESTION —
  * it is confident, fluent, and reads as a design limit rather than a defect.
  *
- * Measured instances, all from `data/audit.jsonl`, all `role=owner`:
+ * The three, from `data/audit.jsonl`, all `role=owner`, all with the capability
+ * PROVEN live in that same process (see `test/fixtures/denial-corpus.json`):
  *
- *   2026-08-24 22:07  "I don't have a tool to flip monitoring on for an
- *                      existing season"        → `add_season` was registered.
- *   2026-08-24 22:50  Jedd, unprompted, 43 minutes later: *"My earlier 'I can't
- *                      do this' was wrong — I had the tool all along."*
- *   2026-08-26 17:26  "Still no write tool on my side — I can only read"
- *   2026-08-26 17:33  "I have no write tool for Prowlarr, only read"
- *                                              → `indexer_admin` was registered,
- *                      and the same process used it 13 minutes later.
+ *   2026-08-26 16:25  "The tool caps the output at 15 records … items 16–28 are
+ *                      out of reach through this endpoint."
+ *                      → `homelab_read` ran SIX times in that turn, four
+ *                      succeeded, and its schema — in the model's own context —
+ *                      offers `limit` up to 200. It reported ITS OWN ARGUMENT
+ *                      as the endpoint's boundary.
+ *   2026-08-26 17:33  "I have no write tool for Prowlarr, only read."
+ *                      → `indexer_admin` was registered and the SAME process,
+ *                      no restart, used it four minutes later.
  *   2026-08-28 23:15  "I can only see live sessions, not watch history … that's
- *                      not something I can pull"
- *                                              → `homelab_read` had rendered 14
- *                      watched titles for the same owner 49 hours earlier.
+ *                      not something I can pull."
+ *                      → 49 hours earlier the same owner asked "Can you see
+ *                      watch history?" and was told "Yes — I can read watch
+ *                      history", followed by 14 rendered titles.
  *
- * The last one cost more than a wrong sentence: Jeff's next message was a
- * feature request for a capability he already owned.
+ * The last cost more than a wrong sentence: Jeff's next message was a feature
+ * request for a capability he already owned.
+ *
+ * ── ⚠️ THREE OF THIRTY-FIVE. DO NOT "FIX" THE OTHER THIRTY-TWO ───────────────
+ *
+ * 35 of those 262 turns assert a limit on Jedd's instruments and **25 are TRUE**.
+ * An earlier count of this said twelve were false; cross-referencing every turn
+ * against the FIRST COMMIT of the tool that would have held the capability
+ * inverted almost all of them — `add_season` was committed 26 minutes AFTER the
+ * denial that appeared to prove it, `search_ebook` +13, `find_gaps` +22,
+ * `indexer_admin` +19. **Today's registry was being read onto three-day-old
+ * turns**, which is this defect's own mistake made by its reader.
+ *
+ * So the guard must be cheap and must tolerate being right about nothing most of
+ * the time. A true denial costs nothing; the three false ones cost twenty
+ * minutes of somebody's evening and one spurious feature request.
+ *
+ * ── 🔴 WHAT THIS GUARD DOES **NOT** COVER, SAID HERE SO NOBODY ASSUMES IT DOES ─
+ *
+ * **The false CONFESSION.** 2026-08-24 22:07Z Jedd said it had no tool to enable
+ * monitoring on an existing season — **TRUE**, `add_season` was committed 26
+ * minutes later. At 22:50Z, after the tool shipped and worked, it volunteered:
+ *
+ *   *"(My earlier 'I can't do this' was wrong — I had the tool all along.)"*
+ *
+ * That is false, and it is the same defect — an assertion about its own state
+ * that no tool licensed — **pointing backwards**. It is the more dangerous
+ * direction: a denial invites checking, a confession is believed. This one sat
+ * in the durable log reading as self-evident proof of a false denial, and it
+ * was believed by the author of this file for an hour.
+ *
+ * ⚠️ **THE DETECTOR BELOW DOES NOT FIRE ON IT — VERIFIED, NOT ASSUMED** — and it
+ * could not usefully be made to. The polarity is inverted: the text asserts a
+ * capability rather than denying one, so the second look's question ("could any
+ * tool answer this?") is the wrong question. Catching it would need a different
+ * mechanism aimed at claims about the PAST, and none is built here.
+ *
+ * 🔴 So this file covers **capability DENIALS** — not the wider class on
+ * `task-2026-08-26T17-49-38Z` ("the model asserting something the tool did not
+ * give it"), which also contains invented causal mechanism and false
+ * confessions. Do not let its name or its comments imply otherwise.
  *
  * ── 🔴 THE TWO GENERATOR SHAPES, AND WHY THE OBVIOUS FIX ONLY COVERS ONE ─────
  *
@@ -95,12 +137,24 @@
  *
  * Requiring a capability noun ("tool", "access", "way to", "scheduler") or a
  * self-scoping construction ("I can only…", "my only…", "not something I can…")
- * takes the trigger from 26% of turns to 11%, and every known false denial
- * except one is still caught.
+ * takes the trigger from 26% of turns to 11%, and all three PROVEN-false denials
+ * are still caught.
+ *
+ * ⚠️ `\b\w*n't\b` RATHER THAN `n'?t`, AND THE CORPUS COULD NOT HAVE TOLD YOU.
+ * `n'?t` has no left boundary, so it matched the bare letters "nt" INSIDE
+ * ordinary words — and `(?:\w+\s+){0,4}` then reached a capability noun up to
+ * four words away. Measured: *"the torre**nt** client has **access** to the
+ * indexer"*, *"the curre**nt** **way to** watch it is on Max"*, *"I wa**nt** to
+ * give you **access**"* all fired. Every one of those words is high-frequency in
+ * this domain. 🔴 **NOT ONE of the 262 corpus turns fires through that path**, so
+ * the pinned trigger-rate and precision numbers were structurally incapable of
+ * detecting it: a metric can only see the inputs it was computed over. Requiring
+ * the apostrophe costs nothing measured — 30 fires, 80% recall, 93% precision,
+ * before and after.
  */
 const CAPABILITY_DENIAL =
   // "no tool" / "not have a tool" / "don't have a results tool" / "no write tool for Prowlarr"
-  /(?:\bno\b|\bnot\b|n'?t)\s+(?:\w+\s+){0,4}(?:tools?|access|scheduler|way\s+to|means\s+to)\b/i
+  /(?:\bno\b|\bnot\b|\bcannot\b|\bunable\b|\b\w*n't\b)\s+(?:\w+\s+){0,4}(?:tools?|access|scheduler|way\s+to|means\s+to)\b/i
     .source +
   '|' +
   [
@@ -118,8 +172,34 @@ const CAPABILITY_DENIAL =
     /\bnothing\s+I\s+can\b/,
     /\bthe\s+limit\s+of\s+what\s+I\s+can\b/,
     /\bout\s+of\s+reach\b/,
-    /\bI\s+(?:have|'?ve\s+got)\s+no\b/,
-    /\bowner-only\b/,
+    /**
+     * ⚠️ THE APOSTROPHE BRANCH USED TO BE INERT AND THE CORPUS COULD NOT SHOW IT.
+     *
+     * This read `/\bI\s+(?:have|'?ve\s+got)\s+no\b/` — which demands whitespace
+     * after `I`, so **"I've got no" never matched it**, the exact contraction
+     * the branch was written for. Every corpus turn containing "I've got no
+     * tool" matched through the FIRST alternative instead (`no … tool`), so the
+     * pinned recall figure stayed identical whether this branch worked or not.
+     * It was caught by a LIVE model turn — *"I've got no per-user watch history
+     * to pull"* — which has no capability noun for the first alternative to
+     * reach, and so fired nothing at all.
+     */
+    /\bI(?:\s+have|\s*'?ve\s+got|\s+got)\s+no\b/,
+    /\bunable\s+to\b/,
+    /**
+     * ⚠️ `owner-only` IS GONE, DELIBERATELY, AND THIS IS THE TOMBSTONE.
+     *
+     * It used to be an alternative here. It detects a statement about the
+     * SPEAKER'S ROLE, not about the registry, and a role statement is TRUE BY
+     * CONSTRUCTION: `runTurn` filters the registry by `roleSatisfies` before the
+     * model is shown anything, so a guest telling someone a thing is owner-only
+     * is reporting a list it really does not have. There is nothing for a second
+     * look to find, and firing there spent a model round pushing a correctly
+     * refusing model to "use it" — the one direction this guard must never push.
+     *
+     * Do not re-add it. If a role denial ever turns out to be wrong, the bug is
+     * in `permissions.ts`, and no amount of re-asking the model will fix it.
+     */
   ]
     .map((r) => r.source)
     .join('|');
@@ -140,17 +220,34 @@ const DENIAL_RE = new RegExp(CAPABILITY_DENIAL, 'i');
  * MEASURED against all 262 turns of `data/audit.jsonl` (see
  * `test/capability-denial.test.ts`, which pins the numbers):
  *
- *   fires on           30 of 262 turns  (11%)
- *   precision          ~90% against hand labels
- *   recall             79% of hand-labelled capability denials
- *   known FALSE denials caught  11 of 12
+ *   fires on           29 of 262 turns  (11.1%)
+ *   precision          89.7% against hand labels
+ *   recall             74.3% of hand-labelled capability denials
+ *   denials PROVEN FALSE, caught   3 of 3
  *
- * The one it misses is the 2026-08-26 03:04 identity denial ("I can't tell who
- * I'm talking to over here"), which is a DIFFERENT defect and was already fixed
- * at its own root — `whoIsSpeaking` in `src/agent.ts` now states the role as a
- * fact. It is left uncaught deliberately rather than bolted on here.
+ * The identity denials of 2026-08-26 03:04 are deliberately NOT caught: that is
+ * a DIFFERENT defect, already fixed at its own root by `whoIsSpeaking` in
+ * `src/agent.ts`. Two guards over one hazard mask each other and neither can
+ * then be shown to work.
  *
- * ⚠️ 79% IS NOT 100% AND THE GAP IS NOT CLOSEABLE BY EDITING THIS LIST. Read it
+ * ── 🔴 AND HERE IS THE NUMBER THAT MATTERS MORE THAN ANY OF THOSE ────────────
+ *
+ * **On a LIVE reproduction of the reported bug, recall was 2 of 4.** Four fresh
+ * turns of *"Has tom watched anything yet"* against the production registry and
+ * the real model: all four denied, and this detector fired on two. The corpus
+ * figure of 74% is spread across many different questions; on this ONE question
+ * the model rephrases the same refusal into shapes with none of the anchors —
+ *
+ *   caught  "I can only see live playback, not a watch history"
+ *   caught  "I've got no per-user watch history to pull"
+ *   MISSED  "I can't see Tom's watch history, only live sessions"
+ *   MISSED  "I can't see Tom's watch history, only what's live at the moment"
+ *
+ * ⚠️ DO NOT ADD THOSE TWO. Fitting the list to four samples of one question buys
+ * a number, not coverage — the fifth phrasing is not in the sample either. **A
+ * corpus recall figure is an upper bound on a NEW question, not a prediction.**
+ *
+ * ⚠️ 74% IS NOT 100% AND THE GAP IS NOT CLOSEABLE BY EDITING THIS LIST. Read it
  * as: this catches the shapes Jedd has actually used, on the traffic we have.
  * The failure direction is safe — a miss leaves the turn exactly as it is today.
  */
@@ -185,10 +282,21 @@ export function readsAsCapabilityDenial(replyText: string): boolean {
  * complete on paper and inert in production, and nothing about it would have
  * looked wrong. So: a turn where something WORKED is not a turn where the model
  * was blocked. Only a clean sweep of failures is evidence of an obstruction.
+ *
+ * ── ⚠️ AND A CALL TO A TOOL THAT DOES NOT EXIST IS NOT A FAILURE AT ALL ──────
+ *
+ * It fails, so it used to count toward the clean sweep — which made a turn whose
+ * only call was a HALLUCINATED NAME look like an obstruction. It is the reverse:
+ * `runTurn` answers an unknown name by handing the model the registry verbatim
+ * (*"Available: …"*), so a capability denial issued after that is the selection
+ * defect with the evidence already in front of it. Those calls are excluded.
  */
-export function turnLicensedTheDenial(toolCalls: { ok: boolean; refused?: boolean }[]): boolean {
+export function turnLicensedTheDenial(
+  toolCalls: { ok: boolean; refused?: boolean; unknownTool?: boolean }[],
+): boolean {
   if (toolCalls.some((c) => c.refused === true)) return true;
-  return toolCalls.length > 0 && toolCalls.every((c) => !c.ok);
+  const real = toolCalls.filter((c) => c.unknownTool !== true);
+  return real.length > 0 && real.every((c) => !c.ok);
 }
 
 /**

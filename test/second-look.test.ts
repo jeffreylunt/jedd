@@ -174,6 +174,136 @@ test('if the second look exhausts the step budget, the original denial is restor
   assert.equal(record.replyText, WATCH_HISTORY_DENIAL);
   assert.doesNotMatch(record.replyText, /I got stuck/);
   assert.equal(record.secondLook?.changed, false);
+  assert.equal(record.secondLook?.stillDenies, true);
+});
+
+/**
+ * 🔴 THE BUDGET BOUNDARY, WHICH WAS COMPLETELY UNTESTED.
+ *
+ * The test above fires the second look at `steps = 0`, so `steps + 2 < MAX_STEPS`
+ * was never near its edge — a code review found that both loosening it to `+ 1`
+ * and DELETING IT ENTIRELY left all tests green. These two pin the boundary from
+ * each side.
+ *
+ * What `+ 2` buys is headroom for one tool round AND the answer after it. Firing
+ * with less than that spends a model round that cannot possibly produce a better
+ * reply, which is the one thing a guard justified by "it only costs latency" must
+ * not do gratuitously.
+ */
+async function denyAtStep(n: number): Promise<{ fired: boolean; calls: number }> {
+  // n rounds of tool calls, THEN the denial — so the denial lands at step n.
+  const script: LlmReply[] = [];
+  for (let i = 0; i < n; i++) script.push(call('jellyfin_sessions', `p${i}`));
+  script.push(say(WATCH_HISTORY_DENIAL));
+  // Room for the second look to answer, if it is allowed to happen at all.
+  script.push(call('homelab_read', 'x'), say('Tarzan 51%.'));
+  const llm = new ScriptedLlm(script);
+  const agent = new Agent(config, llm, undefined, TOOLS);
+  const record = await agent.handle(OWNER, 'Has tom watched anything yet');
+  return { fired: record.secondLook !== undefined, calls: llm.seen.length };
+}
+
+test('🔴 it still fires with exactly enough budget left (MAX_STEPS - 3)', async () => {
+  const { fired } = await denyAtStep(MAX_STEPS - 3);
+  assert.equal(fired, true, 'two steps remain: one for a tool round, one for the answer');
+});
+
+test('🔴 it does NOT fire one step later, when the answer would have nowhere to go', async () => {
+  const { fired, calls } = await denyAtStep(MAX_STEPS - 2);
+  assert.equal(fired, false, 'only one step left — a round trip that cannot produce a reply');
+  assert.equal(calls, MAX_STEPS - 1, 'and no extra model call was spent finding that out');
+});
+
+test('the RESTORED denial is left in history, so a follow-up "why not?" has an antecedent', async () => {
+  // ⚠️ EXACTLY `MAX_STEPS - 1` tool rounds after the denial. One more and turn 1
+  // leaves a stray tool call at the head of the script, so turn 2 consumes it
+  // and `seen.at(-1)` is turn 2's SECOND round — which put a tool message last
+  // and made this assertion read the wrong object.
+  const script: LlmReply[] = [say(WATCH_HISTORY_DENIAL)];
+  for (let i = 0; i < MAX_STEPS - 1; i++) script.push(call('homelab_read', `c${i}`));
+  script.push(say('ok'));
+  const llm = new ScriptedLlm(script);
+  const agent = new Agent(config, llm, undefined, TOOLS);
+
+  await agent.handle(OWNER, 'Has tom watched anything yet');
+  await agent.handle(OWNER, 'why not?');
+
+  const secondTurn = llm.seen.at(-1)!;
+  const assistants = secondTurn.filter((m) => m.role === 'assistant' && !m.toolCalls);
+  assert.deepEqual(
+    assistants.map((m) => m.content),
+    [WATCH_HISTORY_DENIAL],
+    'exactly one assistant reply: the one that was actually SENT, and no blank beside it',
+  );
+  assert.equal(assistants.at(-1), secondTurn.filter((m) => m.role !== 'user').at(-1));
+});
+
+/**
+ * ⚠️ A second-look round that comes back with no text used to leave
+ * `{role:'assistant', content:''}` in history next to the restored denial — two
+ * consecutive assistant messages, one blank, produced by the one part of this
+ * loop that cleans up after itself. Some chat templates object to consecutive
+ * assistant turns.
+ */
+test('an EMPTY second-look round leaves no blank assistant message behind', async () => {
+  const llm = new ScriptedLlm([say(WATCH_HISTORY_DENIAL), say('   '), say('ok')]);
+  const agent = new Agent(config, llm, undefined, TOOLS);
+
+  const record = await agent.handle(OWNER, 'Has tom watched anything yet');
+  await agent.handle(OWNER, 'still there?');
+
+  assert.equal(record.replyText, WATCH_HISTORY_DENIAL);
+  const secondTurn = llm.seen.at(-1)!;
+  assert.equal(
+    secondTurn.filter((m) => m.role === 'assistant' && m.content === '').length,
+    0,
+    'no blank assistant message may survive into the next turn',
+  );
+});
+
+/**
+ * 🔴 A HALLUCINATED TOOL NAME IS NOT AN OBSTRUCTION — IT IS THE DEFECT ITSELF.
+ *
+ * The unknown-tool branch answers with the registry verbatim. A capability
+ * denial issued straight afterwards was made with the tool list in front of it.
+ * Before `unknownTool`, that turn looked like a clean sweep of failures and the
+ * second look was skipped — the guard standing down on its clearest case.
+ */
+test('🔴 a denial after a HALLUCINATED tool name still gets a second look', async () => {
+  const llm = new ScriptedLlm([
+    call('watch_history', 'c1'),
+    say(WATCH_HISTORY_DENIAL),
+    call('homelab_read', 'c2'),
+    say('Tarzan 51%, Cars 3 14%.'),
+  ]);
+  const agent = new Agent(config, llm, undefined, TOOLS);
+
+  const record = await agent.handle(OWNER, 'Has tom watched anything yet');
+
+  assert.equal(record.toolCalls[0]!.unknownTool, true);
+  assert.equal(record.toolCalls[0]!.ok, false);
+  assert.equal(record.secondLook?.changed, true);
+  assert.equal(record.secondLook?.stillDenies, false, 'the denial was withdrawn, not re-worded');
+  assert.match(record.replyText, /Tarzan/);
+});
+
+/**
+ * ⚠️ `changed` AND `stillDenies` ARE DIFFERENT QUESTIONS, and the metric that
+ * matters is the second one. A model that looks again and merely rewords its
+ * refusal changes the text; reading that as "the reply was wrong" inflates the
+ * one number this field exists to support.
+ */
+test('a REWORDED denial is changed:true but stillDenies:true — not a success', async () => {
+  const llm = new ScriptedLlm([
+    say(WATCH_HISTORY_DENIAL),
+    say('Still no — I have no tool for watch history.'),
+  ]);
+  const agent = new Agent(config, llm, undefined, TOOLS);
+
+  const record = await agent.handle(OWNER, 'Has tom watched anything yet');
+
+  assert.equal(record.secondLook?.changed, true);
+  assert.equal(record.secondLook?.stillDenies, true);
 });
 
 test('neither the superseded denial nor the note survives into the next turn', async () => {
