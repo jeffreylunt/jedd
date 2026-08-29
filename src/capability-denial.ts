@@ -1,5 +1,5 @@
 /**
- * ── THE SECOND LOOK: ONE MORE MODEL ROUND BEFORE A CAPABILITY DENIAL SHIPS ───
+ * ── COUNTING THE TIMES JEDD DENIES A CAPABILITY IT HAS ──────────────────────
  *
  * 🔴 WHAT THIS IS FOR, IN ONE SENTENCE: Jedd has three times told its owner it
  * could not do something it could do, and a false denial CLOSES THE QUESTION —
@@ -56,9 +56,9 @@
  *
  * ⚠️ **THE DETECTOR BELOW DOES NOT FIRE ON IT — VERIFIED, NOT ASSUMED** — and it
  * could not usefully be made to. The polarity is inverted: the text asserts a
- * capability rather than denying one, so the second look's question ("could any
- * tool answer this?") is the wrong question. Catching it would need a different
- * mechanism aimed at claims about the PAST, and none is built here.
+ * capability rather than denying one, so the question this file asks ("did the
+ * reply assert a LIMIT?") is the wrong question for it. Catching it would need a
+ * different mechanism aimed at claims about the PAST, and none is built here.
  *
  * 🔴 So this file covers **capability DENIALS** — not the wider class on
  * `task-2026-08-26T17-49-38Z` ("the model asserting something the tool did not
@@ -84,35 +84,37 @@
  * and move on. That shape is why these instances survived three readers. It is
  * deliberately NOT what this file does.
  *
- * ── WHY THE ADJUDICATOR HAS TO BE THE MODEL, AND THIS IS THE LOAD-BEARING
- *    ARGUMENT — READ IT BEFORE REPLACING THIS WITH SOMETHING CHEAPER ─────────
+ * ── 🔴 A RETRY WAS BUILT FOR THIS AND MEASURED NOT TO WORK. DO NOT REBUILD IT. ─
  *
- * To decide whether an UNNAMED denial is false, you must answer: *does any
- * registered tool answer what was asked?* **That is the tool-selection problem
- * itself.** If code could decide it, the model would not have got it wrong in
- * the first place — a local, model-free guard that adjudicates the unnamed shape
- * is asking the code to succeed at exactly the task the model just failed.
+ * The obvious next move after "a registry lookup cannot adjudicate the unnamed
+ * shape" is to let the MODEL adjudicate: inject a note, give it one more round
+ * to re-read its own tool list. That was built, reviewed, and mutation-checked
+ * 14/14.
  *
- * So there is no sound purely-lexical verdict here, and this file does not
- * pretend to one. It splits the job:
+ * **On live turns it did nothing.** Against the production registry, the model
+ * re-read its list and repeated the denial VERBATIM.
  *
- *   DETECTING that a denial was made   — lexical, imprecise, FAIL-OPEN (below).
- *   DECIDING whether it is true        — handed back to the model, with its own
- *                                        tool list and one instruction.
+ * The reading that explains it, and the reason a reworded note will not help
+ * either: **re-asking changes how many CHANCES the model gets, not what it
+ * KNOWS.** Its tool list was in the payload the first time. That is also the
+ * cleanest reading of the p=0.31 tool-description result on
+ * `task-2026-08-26T17-49-38Z` — both interventions leave the INFORMATION
+ * unchanged, and both did nothing. 🔴 **The next attempt must vary the
+ * information, not the number of attempts.** The retry is preserved on branch
+ * `false-capability-denial-guard` at commit `f987e45`.
  *
- * The detector is allowed to be a heuristic BECAUSE it never decides anything.
- * Its only power is to spend one more model round. A miss is the status quo; a
- * false fire costs latency and cannot change a correct answer into a wrong one,
- * because the second round has the same tools behind the same role gate.
- *
- * ── 🔴 THIS IS NOT OUTPUT FILTERING, AND THE DIFFERENCE IS NOT A QUIBBLE ─────
+ * ── 🔴 SO THIS FILE ONLY COUNTS. IT IS NOT OUTPUT FILTERING AND NOT A GUARD. ──
  *
  * README: *"the code's job is to decide what may be called — not to police what
- * gets said. There is no output filtering anywhere in the loop."* That still
- * holds. Nothing here rewrites, blocks, or vetoes a reply. The ONLY thing this
- * can do is give the model one more turn with a note. If it says the same thing
- * again, that is what is sent, verbatim. Code never composes user-facing text
- * and never suppresses any.
+ * gets said. There is no output filtering anywhere in the loop."* That is still
+ * LITERALLY true: `runTurn` consults this only after the reply is final, and
+ * nothing here rewrites, blocks, delays or vetoes anything. Code never composes
+ * user-facing text and never suppresses any.
+ *
+ * What it buys is that the defect became COUNTABLE. Until now the only way to
+ * ask "how often does Jedd falsely deny a capability" was to read `audit.jsonl`
+ * by hand and reconstruct the registry as it stood at each timestamp — which is
+ * how the count came out at twelve when it was three.
  */
 
 /**
@@ -301,33 +303,19 @@ export function turnLicensedTheDenial(
 }
 
 /**
- * The note pushed into history before the extra round.
+ * 🔴 THE SECOND-LOOK NOTE USED TO LIVE HERE AND IS DELIBERATELY GONE.
  *
- * 🔴 IT NAMES THE INFERENCE, NOT THE PHRASING. The 2026-08-28 failure was not a
- * wording slip: `jellyfin_sessions` returned a TRUE result (two idle sessions)
- * and the model converted THE SCOPE OF THAT ONE RESULT into a claim about the
- * system — "sessions is all I can see" — while `homelab_read` held the rest.
- * A note that said "be careful how you word denials" would not touch that. This
- * one names the bad step: a tool's result bounds THAT TOOL, never the registry.
+ * The retry it belonged to was built, reviewed, mutation-checked 14/14 — and
+ * MEASURED NOT TO WORK: on live turns the model re-read its tool list and
+ * repeated the denial verbatim. Only the detection above ships.
  *
- * ⚠️ IT MUST NOT SAY "you are probably wrong" OR "call a tool". Both instruct an
- * outcome rather than a check, and a model that complies with either turns a
- * true denial into a fabricated capability or a pointless call. The instruction
- * is to LOOK, and to keep the answer if looking confirms it — so the honest
- * denials in the 11% cost a round trip and nothing else.
+ * It is not left behind switched off. A constant nobody constructs and a branch
+ * nobody takes are how this repo ends up with a capability that looks present
+ * and has never run — the trap `add_audiobook` and `send_ebook` already fell
+ * into. The implementation is on branch `false-capability-denial-guard` at
+ * commit `f987e45`, with its tests, if it is ever wanted.
  *
- * ⚠️ IT SAYS "THIS ASSISTANT", NOT "YOU TOLD THIS USER". It fires for guests
- * too, and a guest has never been told any such thing — a note that opens with a
- * false statement about the conversation it is in would be the model's own
- * unsupported-assertion defect, written by us, in the fix for it.
+ * ⚠️ AND IF IT IS: the reason it failed is that re-asking changes how many
+ * CHANCES the model gets, not what it KNOWS. Rewording the note does not touch
+ * that. Vary the INFORMATION instead.
  */
-export const SECOND_LOOK_NOTE =
-  'Before that reply is sent: it tells the user something cannot be done. That is a claim about ' +
-  'YOUR TOOL LIST, and it is the one kind of claim this assistant has got wrong before — saying ' +
-  'it had no tool for something that was in its list the whole time.\n' +
-  'A tool result describes THAT TOOL. It never describes the boundary of what you can do. If one ' +
-  'tool returned something narrow, that bounds the tool, not you.\n' +
-  'So read your tool list again now, all of it, including the general-purpose ones that do not ' +
-  'have the obvious name for this request. If one of them could answer what was asked, use it. If ' +
-  'you look and none of them can, say the same thing again — a confirmed "no" is a good answer, ' +
-  'and repeating it costs nothing.';

@@ -2,11 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import {
-  readsAsCapabilityDenial,
-  SECOND_LOOK_NOTE,
-  turnLicensedTheDenial,
-} from '../src/capability-denial.js';
+import { readsAsCapabilityDenial, turnLicensedTheDenial } from '../src/capability-denial.js';
 
 /**
  * EVERY turn in `data/audit.jsonl` at the time the guard was built, scrubbed of
@@ -366,14 +362,3 @@ test('🔴 a MIX of success and failure does NOT license it — something worked
   assert.equal(turnLicensedTheDenial([]), false);
 });
 
-test('the note tells the model to LOOK, and never that it is wrong', () => {
-  // If it asserted the denial was mistaken, a compliant model would manufacture
-  // a capability rather than check for one — turning a guard against a wrong
-  // sentence into a generator of them.
-  assert.match(SECOND_LOOK_NOTE, /read your tool list again/i);
-  assert.match(SECOND_LOOK_NOTE, /say the same thing again/i);
-  assert.doesNotMatch(SECOND_LOOK_NOTE, /you are wrong|you're wrong|probably wrong/i);
-  // And it must name the inference that produced the 2026-08-28 failure: a tool
-  // result bounding the tool, not the system.
-  assert.match(SECOND_LOOK_NOTE, /describes THAT TOOL/);
-});

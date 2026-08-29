@@ -730,40 +730,28 @@ async function main(): Promise<void> {
           `${notice.noticesSent > 0 ? `notices=${notice.noticesSent} ` : ''}` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
           /**
-           * 🔴 `2nd-look=` IS THE WITNESS THAT THE DENIAL GUARD RAN — and it is
-           * printed for the same reason as `burst=` and `notices=` above.
+           * 🔴 `denial=unlicensed` IS THE WITNESS THAT JEDD MAY HAVE JUST TOLD
+           * SOMEBODY IT COULD NOT DO SOMETHING IT CAN — printed for the same
+           * reason as `burst=` and `notices=` above.
            *
-           * Without it, a turn where Jedd nearly told Jeff it could not do
-           * something and a turn where the question never arose print the
-           * IDENTICAL line, and the only way to tell would be to go and read
-           * `audit.jsonl` — the archaeology every other token here exists to
-           * avoid. The suppressed sentence itself stays in the turn record and
+           * Without it, a turn where Jedd asserted a limit on its own tools that
+           * nothing in the turn licensed prints the IDENTICAL line to one where
+           * the question never arose, and the only way to tell is archaeology
+           * over `audit.jsonl` — which is precisely what every other token here
+           * exists to avoid. The sentence itself is in the turn record and
            * deliberately not here: it is a whole reply and this is one line.
            *
-           * 🔴 THREE STATES, NOT TWO, BECAUSE "the text changed" IS NOT THE
-           * QUESTION ANYONE ASKS:
-           *   withdrawn — looked again and stopped denying. The guard worked,
-           *               and the reply Jeff was about to receive was wrong.
-           *   reworded  — changed the words and denied anyway. NOT a success,
-           *               and counting it as one would inflate the only metric
-           *               this token exists to support.
-           *   same      — confirmed its answer verbatim.
+           * ⚠️ MOST OF THESE ARE HONEST. 25 of 35 capability denials measured
+           * over the first 262 production turns were TRUE. This flags a turn as
+           * WORTH CHECKING, not as a defect.
            *
-           * ⚠️ `same` IS NOT A FAILURE. Most capability denials are TRUE — 25 of
-           * 35 measured over the first 262 production turns — and a confirmed
-           * "no" is the correct outcome.
+           * 🔴🔴 AND `grep -c` OVER THIS TOKEN IS A FLOOR, NOT A TOTAL — it
+           * under-counts by roughly FOUR. The detector is a phrase list: 74.3%
+           * recall over 262 historical turns spread across many questions, but
+           * **25% over eight live denials of a single question**. Report "at
+           * least N", never "N".
            */
-          `${
-            record.secondLook
-              ? `2nd-look=${
-                  !record.secondLook.changed
-                    ? 'same'
-                    : record.secondLook.stillDenies
-                      ? 'reworded'
-                      : 'withdrawn'
-                } `
-              : ''
-          }` +
+          `${record.unlicensedDenial ? 'denial=unlicensed ' : ''}` +
           /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
            *

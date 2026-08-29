@@ -184,12 +184,14 @@ connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission g
 - **`src/turn-queue.ts`** — serialises per sender, merges bursts.
 - **`src/agent.ts`** — ask the model, run the tools it asked for, append
   results, repeat (max 8 steps). No output filtering.
-- **`src/capability-denial.ts`** — when a reply reads as *"I have no tool for
-  that"* and nothing in the turn licensed it, the loop injects one note and gives
-  the model **one more round** to check its own tool list. Still no output
-  filtering: nothing is rewritten or blocked, and if the model says the same
-  thing again that is what is sent, verbatim. It has told its owner three times
-  that it could not do something it could.
+- **`src/capability-denial.ts`** — **counts** turns where the reply asserted a
+  limit on Jedd's own tools that nothing in the turn licensed. It has told its
+  owner three times that it could not do something it could, and a false denial
+  closes the question — one of them produced a feature request for a capability
+  he already had. Purely observational: the reply is already final, so *no output
+  filtering* stays literally true. ⚠️ The count is a **floor** — a phrase list
+  caught 74% of such turns across the historical log but only 25% of eight live
+  denials of one question. Report "at least N".
 - **`src/permissions.ts`** — one owner, everyone else a guest. Fails closed.
 - **`src/command-gate.ts`** — deny-by-default allowlist for the generic shell.
 - **`src/safety.ts`** — restart preconditions, including "UNKNOWN is not idle".
