@@ -730,6 +730,25 @@ async function main(): Promise<void> {
           `${notice.noticesSent > 0 ? `notices=${notice.noticesSent} ` : ''}` +
           `${record.toolCalls.map((c) => c.name).join(',') || 'no tools'} ` +
           /**
+           * 🔴 `2nd-look=` IS THE WITNESS THAT THE DENIAL GUARD RAN — and it is
+           * printed for the same reason as `burst=` and `notices=` above.
+           *
+           * Without it, a turn where Jedd nearly told Jeff it could not do
+           * something and a turn where the question never arose print the
+           * IDENTICAL line, and the only way to tell would be to go and read
+           * `audit.jsonl` — the archaeology every other token here exists to
+           * avoid. `changed` is the half that matters: `2nd-look=changed` means
+           * looking again produced a DIFFERENT answer, i.e. the reply Jeff was
+           * about to receive was wrong. The suppressed sentence itself is in the
+           * turn record, deliberately not here — it is a whole reply and this is
+           * one line.
+           *
+           * ⚠️ `2nd-look=same` is NOT a failure. Most capability denials are
+           * TRUE (25 of 35 measured over the first 262 production turns), and a
+           * confirmed "no" is the correct outcome.
+           */
+          `${record.secondLook ? `2nd-look=${record.secondLook.changed ? 'changed' : 'same'} ` : ''}` +
+          /**
            * 🔴 `reply=` SAYS WHETHER THIS REPLY WAS QUOTED TO A SPECIFIC MESSAGE.
            *
            * It exists because the answer used to be built and thrown away:

@@ -121,6 +121,41 @@ async function main(): Promise<void> {
     },
   });
 
+  /**
+   * 🔴 PREFLIGHT: CAN THIS BINARY REACH THE HOMELAB AT ALL?
+   *
+   * The first live run of this script produced five clean "did not fire"
+   * results and they meant NOTHING. Every homelab read had failed with
+   * EHOSTUNREACH, so every denial in the run was TRUE and correctly licensed —
+   * a null result that looked exactly like a negative one.
+   *
+   * The cause is the macOS landmine the Dockerfile already documents: **"Local
+   * Network" privacy denies LAN-peer access PER BINARY.** `curl` reached
+   * Jellyfin in 18 ms from the same shell in the same minute, and
+   * `/opt/homebrew/bin/node` returns 200 — while the nvm node on PATH gets
+   * EHOSTUNREACH. `ecosystem.config.cjs` pins the Homebrew binary for exactly
+   * this reason, and `npx` does not.
+   *
+   *   /opt/homebrew/bin/node --import tsx scripts/probe-second-look.ts
+   *
+   * ⚠️ A GREEN `curl` IS NOT EVIDENCE FOR THIS PROCESS. Reproduce in the
+   * runtime that failed, or measure nothing and call it a finding.
+   */
+  const probe = await fetch(`${config.jellyfin.baseUrl}/System/Info/Public`, {
+    signal: AbortSignal.timeout(8000),
+  }).catch((e: unknown) => e as Error);
+  if (probe instanceof Error) {
+    console.error(
+      `🔴 THIS PROCESS CANNOT REACH JELLYFIN (${(probe as { cause?: { code?: string } }).cause?.code ?? probe.message}).\n` +
+        '   Every homelab read would fail, every denial would be TRUE, and the run would look\n' +
+        '   like a clean negative. Refusing to measure.\n' +
+        '   If curl works from the same shell, this is the macOS per-binary Local Network policy:\n' +
+        '     /opt/homebrew/bin/node --import tsx scripts/probe-second-look.ts',
+    );
+    process.exit(1);
+  }
+  console.error(`[probe] homelab reachable from THIS binary: HTTP ${probe.status}`);
+
   const built = tools.map((t) => t.name).join(', ');
   if (built !== EXPECTED_TOOLS) {
     console.error('🔴 REGISTRY MISMATCH — this harness is not production. Refusing to measure.');
