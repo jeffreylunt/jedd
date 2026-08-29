@@ -75,12 +75,18 @@ export const jellyfinSessions: Tool = {
    * line that only says what the tool covers leaves the wrong inference
    * unaddressed.
    *
-   * ⚠️ It names `homelab_read` deliberately and that name is CHECKED —
-   * `assertNamedProducersExist` scans this field, so if `homelab_read` were
-   * renamed or unregistered this refuses to boot. Both tools need Jellyfin
-   * configured, so there is no build where this one exists and the other does
-   * not; the assertion is there so that stays true rather than being reasoned
-   * about again later.
+   * ⚠️ It names `homelab_read` deliberately, and that name is CHECKED TWICE by
+   * two rules with different reach. `assertNamedProducersExist` scans this field
+   * and catches the tool being RENAMED OR DELETED IN CODE; it runs before the
+   * config filters and is blind to config. A second loop at the end of
+   * `registerable()` catches it being absent on THIS DEPLOYMENT.
+   *
+   * ⚠️ The second is not redundant, and why it is not is worth stating: these
+   * two tools are NOT gated alike. This one needs Jellyfin; `homelab_read` needs
+   * any ONE of five services. The implication holds today only because
+   * `jellyfin` is one of those five — a coincidence in a list, not a shared
+   * requirement — and that tool's own comment says it "degrades partially", so
+   * that list is exactly the kind of thing someone edits.
    */
   scopeNote:
     'SCOPE OF THIS RESULT — currently-playing sessions ONLY. It is a snapshot of this instant. ' +

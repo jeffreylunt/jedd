@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Agent } from '../src/agent.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
-import { ALL_TOOLS, assertNamedProducersExist } from '../src/tools/index.js';
+import { ALL_TOOLS, assertNamedProducersExist, registerable } from '../src/tools/index.js';
 import { jellyfinSessions } from '../src/tools/homelab.js';
 import type { Tool } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
@@ -90,8 +90,48 @@ for (const outcome of ['ok', 'fail', 'throw'] as const) {
     assert.match(lastToolMessage(llm), /does not cover history/);
     // The outcome flag is untouched by the append — a failure is still a failure.
     assert.equal(record.toolCalls[0]!.ok, outcome === 'ok');
+
+    /**
+     * 🔴 THE AUDIT REASON MUST NOT ABSORB THE NOTE, and this is not tidiness.
+     * `toolCalls[].error` is `firstLines(content)` and it is what
+     * `data/audit.jsonl` keeps about a failure forever. The blank line in the
+     * `\n\n` separator is the ONLY reason the note falls outside the first two
+     * lines — collapse it to `\n` and every recorded reason grows 300 characters
+     * of note; PREPEND it and the reason is replaced by the note entirely, which
+     * is the cause-less error this repo has already been bitten by. Without this
+     * assertion the whole property rests on an accident nothing pins.
+     */
+    if (outcome !== 'ok') {
+      const reason = record.toolCalls[0]!.error!;
+      assert.doesNotMatch(reason, /SCOPE/, 'the note must not reach the durable record');
+      assert.match(reason, outcome === 'fail' ? /nobody is playing anything/ : /threw: boom/);
+    }
   });
 }
+
+test('🔴 END TO END: the REAL jellyfin_sessions note reaches the model tool message', async () => {
+  /**
+   * Everything else here drives `narrow_reader`, a fixture. That left the
+   * PRODUCTION tool covered only by assertions about its FIELD — so deleting
+   * `scopeNote` from `jellyfin_sessions` would kill only field-presence tests,
+   * and nothing showing the sentence ever arrives anywhere. This drives the real
+   * tool object through the real loop.
+   *
+   * It takes the FAILURE path: `testConfig()` points at no live Jellyfin, so
+   * `jellyfinGet` cannot succeed. Deliberate — that is the path no fixture
+   * covers and the one whose wording is hardest to get right.
+   */
+  const llm = new ScriptedLlm('jellyfin_sessions');
+  const agent = new Agent(config, llm, undefined, [jellyfinSessions]);
+
+  const record = await agent.handle(OWNER, 'has tom watched anything');
+
+  const shown = lastToolMessage(llm);
+  assert.match(shown, /NOT evidence/);
+  assert.match(shown, /homelab_read/);
+  assert.equal(record.toolCalls[0]!.ok, false);
+  assert.doesNotMatch(record.toolCalls[0]!.error!, /SCOPE/);
+});
 
 test('FAILING CONTROL: the same tool WITHOUT a note shows the model the bare result', async () => {
   // Ablates exactly one field. Without this, the assertions above are equally
@@ -101,23 +141,23 @@ test('FAILING CONTROL: the same tool WITHOUT a note shows the model the bare res
 
   await agent.handle(OWNER, 'has tom watched anything');
 
-  const shown = lastToolMessage(llm);
-  assert.equal(shown, 'nobody is playing anything');
-  assert.doesNotMatch(shown, /SCOPE/);
+  // Exact equality, so nothing extra can be appended and still pass. The
+  // `doesNotMatch(/SCOPE/)` that used to follow was implied by it, not a second
+  // check.
+  assert.equal(lastToolMessage(llm), 'nobody is playing anything');
 });
 
-test('🔴 the note goes to the MODEL, never into the reply the user is sent', async () => {
-  // The README promises no output filtering anywhere in the loop. This is an
-  // input to the model, not an edit to its answer, and the difference has to be
-  // asserted rather than intended.
-  const llm = new ScriptedLlm('narrow_reader');
-  const agent = new Agent(config, llm, undefined, [narrowTool('ok', NOTE)]);
-
-  const record = await agent.handle(OWNER, 'has tom watched anything');
-
-  assert.equal(record.replyText, 'done');
-  assert.doesNotMatch(record.replyText, /SCOPE/);
-});
+/**
+ * ⚠️ DELETED RATHER THAN LEFT GREEN: a test asserting the note never reaches
+ * `replyText`. `ScriptedLlm` returns the constant 'done' and ignores the
+ * messages entirely, so `replyText` CANNOT vary with tool content and the test
+ * could not have failed for the reason its name gave. The claim it appeared to
+ * guard — the README's "no output filtering anywhere in the loop" — is real, and
+ * is held by the append site itself, which writes into the tool message and
+ * never touches `replyText`. A stub that cannot express the failure is not
+ * coverage of it, and leaving it in made this file read as though that property
+ * were pinned.
+ */
 
 test('the note is appended AFTER the result, so the tool still says what happened', async () => {
   const llm = new ScriptedLlm('narrow_reader');
@@ -156,7 +196,6 @@ test('MUTATION: the invariant is not satisfied by the description alone', () => 
   // to scan only `description` makes this test pass — so it asserts the note
   // field specifically, with a description that names nothing.
   const scanned = narrowTool('ok', 'Read it with title_details instead.');
-  assert.doesNotMatch(scanned.description, /title_details/);
   assert.throws(() => assertNamedProducersExist([scanned]), /title_details/);
 });
 
@@ -167,9 +206,23 @@ test('MUTATION: the invariant is not satisfied by the description alone', () => 
 test('jellyfin_sessions carries a scope note, and it names a REGISTERED tool', () => {
   const note = jellyfinSessions.scopeNote;
   assert.ok(note, 'this is the tool the 8/10 denial was measured on');
-  // Not a string match on the prose — the check is that whatever it names is
-  // real, run through the same invariant the registry uses.
-  assert.doesNotThrow(() => assertNamedProducersExist(ALL_TOOLS));
+  /**
+   * ⚠️ NOT `assertNamedProducersExist(ALL_TOOLS)`, which was here first and was
+   * worthless: it passes under every mutation of this feature. It is a global
+   * registry-health check that boot and `registry-coverage.test.ts` already
+   * make, and sitting in this test it would have READ as evidence about this
+   * note while being evidence about nothing.
+   *
+   * What bites is running the invariant over THIS tool ALONE — nothing else in
+   * the array can satisfy a name it invents.
+   */
+  assert.throws(() => assertNamedProducersExist([jellyfinSessions]), /homelab_read/);
+  // ⚠️ A NAME-ONLY stand-in, not the real `homelab_read`: that tool's own
+  // description names five others, so passing it here would drag their
+  // dependencies in and could fail for reasons unrelated to this note. The
+  // invariant only ever looks at names, so a stub is the honest isolate.
+  const standIn: Tool = { ...narrowTool('ok'), name: 'homelab_read', description: 'stand-in' };
+  assert.doesNotThrow(() => assertNamedProducersExist([jellyfinSessions, standIn]));
   assert.match(note, /homelab_read/);
 });
 
@@ -181,4 +234,46 @@ test('🔴 the note REFUSES the wrong inference, not just states the scope', () 
   const note = jellyfinSessions.scopeNote!;
   assert.match(note, /NOT evidence/);
   assert.match(note, /currently-playing sessions ONLY/);
+});
+
+
+/**
+ * ── 🔴 THE HOLE THE FIRST VERSION OF THIS FEATURE LEFT ──────────────────────
+ *
+ * `assertNamedProducersExist` runs BEFORE `registerable()`'s config filters, so
+ * its idea of "registered" is "defined in the source arrays". A note naming a
+ * tool that exists in code but is filtered off THIS deployment booted green — a
+ * guard reading as though it covered the class while covering one instance of
+ * it, which is the failure this whole branch is about. The post-filter loop at
+ * the end of `registerable()` closes it, and these are the only things keeping
+ * it closed.
+ */
+
+test('🔴 a scope note naming a tool this DEPLOYMENT filtered out refuses to boot', () => {
+  // `livetv_status` is real and needs Dispatcharr. Without it the tool is
+  // filtered out of the registry, so a note naming it points at nothing HERE —
+  // even though the name is perfectly valid in code and the pre-filter rule
+  // sees it as present.
+  const noDispatcharr = testConfig({
+    services: { ...testConfig().services, dispatcharr: false },
+  });
+  const withNote = narrowTool('ok', 'Use livetv_status for that.');
+  assert.throws(
+    () => registerable([...ALL_TOOLS, withNote], noDispatcharr),
+    /narrow_reader.*livetv_status.*NOT registered on this deployment/s,
+  );
+});
+
+test('FAILING CONTROL: the identical note boots fine where that tool IS registered', () => {
+  // Same tools, same note, one config field different. Without this, the test
+  // above would pass just as well for a rule that rejected every note.
+  const withNote = narrowTool('ok', 'Use livetv_status for that.');
+  assert.doesNotThrow(() => registerable([...ALL_TOOLS, withNote], testConfig()));
+});
+
+test('the shipped registry passes the post-filter rule on a full deployment', () => {
+  // `jellyfin_sessions` names `homelab_read` and the two are NOT gated alike —
+  // one needs Jellyfin, the other any one of five services. This asserts the
+  // coincidence currently holds rather than leaving it reasoned about.
+  assert.doesNotThrow(() => registerable(ALL_TOOLS, testConfig()));
 });

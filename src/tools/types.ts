@@ -226,10 +226,30 @@ export interface Tool {
    *     named and refused, because that inference is the actual defect;
    *  3. WHERE the excluded thing lives, **by tool name**.
    *
-   * 🔴 A name here is checked. `assertNamedProducersExist` scans this field as
-   * well as `description`, so a note pointing at a tool that is not registered
-   * refuses to boot rather than telling the model to call something that is not
-   * there — which would be this very defect, pointing the other way.
+   * 🔴 A name here is checked TWICE, because one check was not enough.
+   * `assertNamedProducersExist` scans this field as well as `description` and
+   * catches a RENAME OR DELETION IN CODE; it runs before `registerable()`'s
+   * config filters and cannot see config-driven absence. A second loop at the
+   * end of `registerable()` re-checks scope notes against the tools ACTUALLY
+   * REGISTERED on this deployment. Either way, a note pointing at a tool that is
+   * not there refuses to boot rather than telling the model to call something
+   * that does not exist — which would be this very defect, pointing the other
+   * way.
+   *
+   * ⚠️ **RULE FOR AUTHORS: name only tools registered unconditionally, or gated
+   * exactly as this one is.** The check cannot tell "call `X`" from "`X` cannot
+   * see this either", so a note that merely MENTIONS a conditionally-registered
+   * tool refuses to boot on a deploy lacking it — a false boot failure on a
+   * correct note. Lowercase, too: both scans are case-sensitive.
+   *
+   * ⚠️ Appended to every result that enters the MODEL'S HISTORY. That is the one
+   * site in `agent.ts`, and it is NOT the same as "every call to `run()`" —
+   * `followup-runner.ts` calls a tool directly and renders its content into
+   * user-facing prose without going near it.
+   *
+   * ⚠️ Not the same thing as the local `scopeNote` inside
+   * `src/tools/sports-fixture.ts`, which is a per-window string built by hand
+   * inside `run()` and predates this field.
    *
    * ⚠️ Optional, and deliberately not defaulted-to-required. Most tools answer
    * the question they were picked for and a note would be noise; a tool without

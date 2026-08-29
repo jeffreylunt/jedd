@@ -381,7 +381,46 @@ export function registerable(tools: Tool[], config: Config): Tool[] {
       const any = t.needsAnyService ?? [];
       return any.length === 0 || any.some((svc) => config.services[svc]);
     });
-  return config.readOnly ? served.filter((t) => !t.writes) : served;
+  const registered = config.readOnly ? served.filter((t) => !t.writes) : served;
+  /**
+   * 🔴 AFTER THE FILTERS, NOT BEFORE — AND THAT ORDERING IS THE WHOLE VALUE.
+   *
+   * `assertNamedProducersExist` above runs on the PRE-FILTER array, so its
+   * "present" set is "defined in this file", not "offered to the model". It
+   * catches a tool RENAMED OR DELETED IN CODE and is blind to one removed BY
+   * CONFIG — and the three filters that decide registration all run below it.
+   *
+   * ⚠️ A comment claiming a scope note "cannot point at an unregistered tool"
+   * would therefore have been a defence covering ONE INSTANCE of a class while
+   * reading as though it covered the class — the exact failure this branch
+   * exists to fix, one field along. `jellyfin_sessions` needs Jellyfin and
+   * `homelab_read` needs ANY ONE of five services, so the implication holds
+   * today only because `jellyfin` happens to be in that list of five. Drop it
+   * from there — plausible, since that tool's own comment says it "degrades
+   * partially" — and a Jellyfin-only deploy boots green with a note pointing at
+   * a tool that is not there.
+   *
+   * ⚠️ ONLY `scopeNote` IS CHECKED HERE, deliberately. Descriptions have named
+   * conditionally-registered siblings for months, and a post-filter rule over
+   * them would turn correct partial deploys into boot failures. Scope notes are
+   * new, few, and governed by the rule on `Tool.scopeNote`: name only tools
+   * registered unconditionally, or gated exactly as you are.
+   */
+  const registeredNames = new Set(registered.map((t) => t.name));
+  const definedNames = new Set(ALL_TOOLS.map((t) => t.name));
+  for (const t of registered) {
+    if (!t.scopeNote) continue;
+    for (const dep of t.scopeNote.match(/[a-z][a-z0-9]*(?:_[a-z0-9]+)+/g) ?? []) {
+      if (!definedNames.has(dep) || dep === t.name || registeredNames.has(dep)) continue;
+      throw new Error(
+        `Tool "${t.name}" has a scope note telling the model to use "${dep}", which is NOT ` +
+          'registered on this deployment. A result that redirects the model to a tool it cannot ' +
+          'see is the false-capability defect pointed the other way. Name only tools gated the ' +
+          'same way this one is.',
+      );
+    }
+  }
+  return registered;
 }
 
 /**
@@ -479,11 +518,19 @@ export function assertChoiceProducersExist(tools: Tool[]): void {
  * is a second channel of prose that tells the model to call something by name —
  * `jellyfin_sessions`'s note says "read it with homelab_read". Adding a new way
  * to instruct the model without adding it here would have left exactly the hole
- * this function exists to close, one field along: a note pointing at a tool that
- * is not registered is the false-capability defect pointed the other way, and it
- * would boot green. `test/registry-coverage.test.ts` pins that the field is
- * scanned, so deleting it from this line fails rather than silently narrowing
- * the rule.
+ * this function exists to close, one field along. `test/scope-note.test.ts`
+ * pins that the field is scanned, so deleting it from this line fails rather
+ * than silently narrowing the rule.
+ *
+ * ⚠️ WHAT THIS FUNCTION DOES **NOT** COVER, because it runs BEFORE the config
+ * filters in `registerable()`: a tool removed by `needsServices`,
+ * `needsAnyService`, `needsHomelabSsh` or `readOnly`. Its "present" set is "in
+ * the source arrays", not "offered to the model". The post-filter loop at the
+ * end of `registerable()` is what covers scope notes against config-driven
+ * absence — do not read this one as doing that job.
+ *
+ * ⚠️ Lowercase-only, here and there. A note that SHOUTS a tool name — plausible
+ * in this file's register — is invisible to both scans.
  */
 export function assertNamedProducersExist(tools: Tool[]): void {
   const present = new Set(tools.map((t) => t.name));

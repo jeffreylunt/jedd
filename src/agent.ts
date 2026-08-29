@@ -468,8 +468,24 @@ export class Agent {
          * inside a tool — and `jellyfin_sessions` has three — would otherwise be
          * a path where the note is silently missing, and the failure would be
          * invisible: a correct-looking result with the one sentence that matters
-         * absent. There is exactly one place a tool result enters history, so
-         * there is exactly one place to attach this.
+         * absent. There is exactly one place a tool result enters the model's
+         * HISTORY, so there is exactly one place to attach this.
+         *
+         * ⚠️ "Enters history" is narrower than "every call to `run()`", and the
+         * difference is real: `followup-runner.ts` calls `restore_qbit_speed`
+         * directly and renders its content into user-facing prose without
+         * passing through here. Nothing on that path carries a note today; one
+         * added to a tool it calls would silently not appear there.
+         *
+         * 🔴 IT MUST STAY ABOVE `toolCalls.push`, WHICH READS `content`. The
+         * audit `error` field is `firstLines(content)` — the first two lines —
+         * and the BLANK LINE in this separator is the only thing keeping the
+         * note out of it. With `\n` instead of `\n\n` every failure's recorded
+         * reason grows the note; PREPENDING replaces the reason outright, which
+         * is the cause-less `fetch failed` regression this file already paid an
+         * evening for. `test/scope-note.test.ts` asserts the audit field on the
+         * fail and throw paths, so that separator is load-bearing rather than
+         * lucky.
          *
          * 🔴 It goes into the TOOL MESSAGE, not the reply. Nothing the user sees
          * is rewritten and no answer is vetoed — the README's "no output
