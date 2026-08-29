@@ -403,6 +403,27 @@ export class Agent {
         ) {
           deniedText = replyText;
           deniedAt = history.length - 1;
+          /**
+           * 🔴 CLEARED, SO THE FALLBACK BELOW IS LOAD-BEARING RATHER THAN LUCKY.
+           *
+           * `replyText` is only ever assigned on a no-tool-call round, so a
+           * second look that spends the rest of the budget on tools would leave
+           * the denial sitting here untouched and the turn would come out right
+           * BY ACCIDENT. A mutation check found it: deleting the restore below
+           * changed nothing, because nothing had ever needed it.
+           *
+           * The correct answer is the same either way, and that is the trap —
+           * a guarantee delivered by a variable nobody reset is a guarantee
+           * that no test can hold onto and the next edit here silently takes
+           * away. Clearing it makes "the guard never makes the reply worse" a
+           * property of one visible line.
+           *
+           * ⚠️ SO DELETING THIS LINE ON ITS OWN BREAKS NO TEST, and that is not
+           * a gap in the tests. It restores the accidental behaviour, which is
+           * behaviourally identical; what it removes is the explicitness.
+           * Deleting the RESTORE below now does go red, which it did not before.
+           */
+          replyText = '';
           history.push({ role: 'system', content: SECOND_LOOK_NOTE });
           continue;
         }

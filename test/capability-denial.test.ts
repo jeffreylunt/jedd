@@ -30,9 +30,10 @@ const CORPUS: {
   at: string;
   role: string;
   capabilityDenial: boolean;
-  verdict: 'false' | 'true' | 'identity' | 'n/a';
-  whyFalse?: string;
-  licensed: boolean;
+  verdict: 'false' | 'true' | 'unproven' | 'identity' | 'unclassified' | 'n/a';
+  why?: string;
+  whyNotable?: string;
+  toolCalls: { ok: boolean; refused?: boolean }[];
   reply: string;
 }[] = JSON.parse(
   readFileSync(fileURLToPath(new URL('./fixtures/denial-corpus.json', import.meta.url)), 'utf8'),
@@ -68,6 +69,31 @@ test('🔴 THE UNNAMED SHAPE FIRES — the 2026-08-28 turn, which names no tool 
     false,
     'if this ever becomes true the fixture has been edited and stops testing the unnamed shape',
   );
+});
+
+/**
+ * 🔴 THE TWO SENTENCES OF THE UNNAMED SHAPE, ASSERTED SEPARATELY — AND THE TEST
+ * ABOVE IS NOT A SUBSTITUTE FOR THIS ONE.
+ *
+ * A mutation check caught it: deleting the "not something I can" alternative
+ * from the detector broke NOTHING, because the same reply also contains "I can
+ * only", and the whole-reply test passed on the other clause. Two alternatives
+ * covering one fixture mask each other, so neither could be shown to work —
+ * which is, one layer down, exactly the partial-defence-with-a-general-name
+ * failure this whole file exists to avoid.
+ *
+ * Each phrasing now stands alone, so removing either one goes red.
+ */
+test('🔴 "that\'s not something I can pull" — alone, with no other denial clause', () => {
+  const sentence = "If you want to know what's been watched, that's not something I can pull.";
+  assert.doesNotMatch(sentence, /I can only|I have no|no tool/i, 'must isolate the one clause');
+  assert.equal(readsAsCapabilityDenial(sentence), true);
+});
+
+test('🔴 "I can only see live sessions, not watch history" — alone, the scope-limit clause', () => {
+  const sentence = 'I can only see live sessions, not watch history.';
+  assert.doesNotMatch(sentence, /not something I can|I have no|no tool/i, 'must isolate the clause');
+  assert.equal(readsAsCapabilityDenial(sentence), true);
 });
 
 test('the NAMED shape fires too — the 2026-08-26 Prowlarr turn', () => {
@@ -130,15 +156,89 @@ test('MEASURED over all 262 real turns: what the detector actually does', () => 
   );
 });
 
-test('🔴 every denial CONFIRMED FALSE against the registry is caught — this is the bug', () => {
+/**
+ * 🔴 THREE, NOT TWELVE — AND THE CORRECTION IS WORTH MORE THAN THE NUMBER.
+ *
+ * The first version of this test asserted TWELVE confirmed-false denials. It was
+ * wrong, and wrong in the way this whole defect is about: **the registry was
+ * read as it is today and applied to turns from three days ago.** Cross-checking
+ * each turn against the FIRST COMMIT of the tool that would have held the
+ * capability inverted almost all of them —
+ *
+ *   "I don't have a tool to flip monitoring on"     add_season, +26 min
+ *   "I don't have an ebook search tool"             search_ebook, +13 min
+ *   "no tool that returns per-episode detail"       find_gaps, +22 min
+ *   "I have no tool to enable indexers in Prowlarr"  indexer_admin, +19 min
+ *
+ * Every one of those denials was TRUE WHEN IT WAS SAID. Jedd was reporting a
+ * genuinely thin registry that was being filled in, in some cases, within the
+ * hour. Counting them as defects would have inflated the bug tenfold and aimed
+ * a fix at turns that had nothing wrong with them.
+ *
+ * ⚠️ ASYMMETRIC EVIDENCE, AND THE VERDICTS RESPECT IT. "The source did not exist
+ * yet" settles TRUE outright. The mirror does not hold: a tool committed before
+ * a turn is not proof the running process carried that build, so `false`
+ * requires the capability demonstrably LIVE in that same process, and the two
+ * turns that only have a commit timestamp behind them are `unproven`, not
+ * evidence for either side.
+ */
+test('🔴 every denial PROVEN FALSE is caught — three of them, on three capabilities', () => {
   const falseDenials = CORPUS.filter((t) => t.verdict === 'false');
-  assert.equal(falseDenials.length, 12, 'twelve turns denied a capability the registry held');
+  assert.equal(falseDenials.length, 3, 'three turns denied a capability proven live at the time');
   const missed = falseDenials.filter((t) => !readsAsCapabilityDenial(t.reply));
   assert.deepEqual(
     missed.map((t) => t.at),
     [],
     `false denials the detector would let through: ${missed.map((t) => t.reply.slice(0, 80))}`,
   );
+  // 🔴 AND NONE OF THE THREE IS LICENSED, so the licence check cannot silently
+  // skip the very turns the guard exists for. That is the one way this guard
+  // could be complete on paper and inert in production.
+  assert.deepEqual(
+    falseDenials.filter((t) => turnLicensedTheDenial(t.toolCalls)).map((t) => t.at),
+    [],
+    'a proven-false denial that the licence check would wave through',
+  );
+});
+
+/**
+ * The base rate the defect task asked for, stated the honest way round.
+ *
+ * ⚠️ 3 of 35 IS NOT "THE BUG IS SMALL". Two of the three are the instances that
+ * cost real time — one sent team-lead after a gating bug that did not exist, one
+ * made Jeff request a feature he already owned. A false denial is expensive
+ * precisely because it CLOSES the question; a true one costs nothing.
+ */
+test('MEASURED base rate: capability denials are mostly TRUE, and that is the finding', () => {
+  const denials = CORPUS.filter((t) => t.capabilityDenial);
+  const byVerdict = (v: string) => denials.filter((t) => t.verdict === v).length;
+  assert.equal(denials.length, 35);
+  assert.equal(byVerdict('true'), 25);
+  assert.equal(byVerdict('false'), 3);
+  assert.equal(byVerdict('unproven'), 2);
+  assert.equal(byVerdict('identity'), 2);
+  assert.equal(byVerdict('unclassified'), 3);
+});
+
+/**
+ * 🔴 THE FALSE CONFESSION, PINNED HERE BECAUSE IT NEARLY BECAME EVIDENCE.
+ *
+ * On 2026-08-24 Jedd said it had no tool to enable monitoring on an existing
+ * season. `add_season` was committed 26 minutes LATER, so the denial was true.
+ * Then, 43 minutes after the denial, Jedd used the newly-shipped tool and
+ * volunteered: *"My earlier 'I can't do this' was wrong — I had the tool all
+ * along."*
+ *
+ * **That retraction is false, and it is the same defect pointing backwards** —
+ * a confident assertion about its own past state that no tool gave it. It is
+ * more dangerous than the denial: a denial invites checking, whereas a
+ * confession is taken at face value, and this one sat in the log reading as
+ * proof of a false denial. It was believed here for an hour.
+ */
+test('the false CONFESSION is recorded, so nobody reads it as an instance again', () => {
+  const confession = CORPUS.find((t) => t.whyNotable);
+  assert.ok(confession, 'the 2026-08-24 add_season turn must stay annotated');
+  assert.equal(confession.verdict, 'true', 'the denial it retracts was TRUE when it was said');
 });
 
 /**
@@ -167,11 +267,28 @@ test('the identity denials are NOT this guard’s job and are left alone', () =>
   assert.equal(identity.length, 2);
 });
 
-test('a turn where a tool FAILED or was REFUSED is licensed, and is left alone', () => {
-  assert.equal(turnLicensedTheDenial([{ ok: false }]), true);
+test('a REFUSAL licenses the denial absolutely — the prompt says not to route around one', () => {
   assert.equal(turnLicensedTheDenial([{ ok: false, refused: true }]), true);
-  assert.equal(turnLicensedTheDenial([{ ok: true }, { ok: false }]), true);
-  // The defect's shape: every tool this turn succeeded, and the denial rests on
+  assert.equal(turnLicensedTheDenial([{ ok: true }, { ok: false, refused: true }]), true);
+});
+
+test('a CLEAN SWEEP of failures licenses it — the model was genuinely blocked', () => {
+  assert.equal(turnLicensedTheDenial([{ ok: false }]), true);
+  assert.equal(turnLicensedTheDenial([{ ok: false }, { ok: false }]), true);
+});
+
+/**
+ * 🔴 THE CASE THAT WAS WRONG UNTIL A TEST CAUGHT IT.
+ *
+ * The rule used to be "any failure licenses it", which waved through the
+ * 2026-08-26 16:25Z turn — four successful `homelab_read` calls, two failed, and
+ * then a false claim about the endpoint's paging. A guard that skips a third of
+ * the cases it exists for looks complete and is inert.
+ */
+test('🔴 a MIX of success and failure does NOT license it — something worked', () => {
+  assert.equal(turnLicensedTheDenial([{ ok: true }, { ok: false }]), false);
+  assert.equal(turnLicensedTheDenial([{ ok: false }, { ok: true }, { ok: false }]), false);
+  // The defect's plainest shape: everything worked, and the denial rests on
   // nothing but the model's belief about its own list.
   assert.equal(turnLicensedTheDenial([{ ok: true }]), false);
   assert.equal(turnLicensedTheDenial([]), false);

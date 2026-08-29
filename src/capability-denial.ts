@@ -161,23 +161,34 @@ export function readsAsCapabilityDenial(replyText: string): boolean {
 /**
  * Did something IN THIS TURN license the model to say it could not do the thing?
  *
- * A tool that FAILED or was REFUSED is direct evidence the model observed, and
- * the system prompt already tells it what to do with one: *"If a tool fails or
- * refuses, say so plainly… Do not look for another way around a refusal — the
- * refusal is the answer."*
+ * ── 🔴 A REFUSAL LICENSES IT ABSOLUTELY, AND NOT TO SAVE A MODEL CALL ────────
  *
- * 🔴 SO THE SECOND LOOK MUST NOT FIRE THERE, AND NOT MERELY TO SAVE A CALL.
- * Nudging the model to try again after a refusal would contradict a deliberate
- * rule and push it toward routing around the permission gate — turning a guard
- * against a wrong SENTENCE into pressure toward a wrong ACTION. That is a much
- * worse trade than the one this file is making.
+ * The system prompt is explicit: *"If a tool fails or refuses, say so plainly…
+ * Do not look for another way around a refusal — the refusal is the answer."*
+ * Nudging the model to look again after the permission gate has spoken would
+ * contradict a deliberate rule and push it toward routing AROUND that gate —
+ * turning a guard against a wrong SENTENCE into pressure toward a wrong ACTION.
+ * That is a far worse trade than the one this file is making, so a refused call
+ * ends the question whatever else happened in the turn.
  *
- * The denials this leaves in scope are exactly the ones that rest on the model's
- * belief about its own tool list, with nothing this turn to support it — which
- * is the defect.
+ * ── ⚠️ A FAILURE ONLY LICENSES IT IF NOTHING ELSE WORKED, AND THIS RULE WAS
+ *    WRONG UNTIL A TEST CAUGHT IT ────────────────────────────────────────────
+ *
+ * This used to read `toolCalls.some((c) => !c.ok)` — ANY failure licensed the
+ * denial. That waved through one of the three denials PROVEN false: on
+ * 2026-08-26 at 16:25Z the model called `homelab_read` six times, two failed and
+ * **four succeeded**, and it then reported its own choice of `limit` as the
+ * endpoint's boundary — *"items 16–28 are out of reach through this endpoint"* —
+ * when that tool's schema, in its context, offered `limit` up to 200.
+ *
+ * A guard whose skip condition covers a third of the cases it exists for is
+ * complete on paper and inert in production, and nothing about it would have
+ * looked wrong. So: a turn where something WORKED is not a turn where the model
+ * was blocked. Only a clean sweep of failures is evidence of an obstruction.
  */
 export function turnLicensedTheDenial(toolCalls: { ok: boolean; refused?: boolean }[]): boolean {
-  return toolCalls.some((c) => !c.ok || c.refused === true);
+  if (toolCalls.some((c) => c.refused === true)) return true;
+  return toolCalls.length > 0 && toolCalls.every((c) => !c.ok);
 }
 
 /**
