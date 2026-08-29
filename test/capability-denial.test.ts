@@ -130,6 +130,68 @@ test('an OUTCOME report does not fire, however much it sounds like a refusal', (
   }
 });
 
+/**
+ * 🔴 THE OVER-FIRE CASES THE CORPUS CANNOT SEE, AND THAT IS WHY THEY ARE PINNED
+ * BY HAND.
+ *
+ * The negation used to be `n'?t`, with no left boundary, so it matched the bare
+ * letters "nt" INSIDE ordinary words — and `(?:\w+\s+){0,4}` then reached a
+ * capability noun up to four words away. "torreNT", "curreNT", "clieNT", "seNT",
+ * "waNT", "differeNT", "perceNT" are all common in this domain.
+ *
+ * ⚠️ NOT ONE of the 262 corpus turns fires through that path, so the measured
+ * trigger rate and precision above were **structurally incapable** of detecting
+ * it — a metric can only see the inputs it was computed over, and the mutation
+ * that restores the loose form leaves every corpus assertion green. This test is
+ * the only thing standing between that regex and a guard that spends a model
+ * round on the word "torrent".
+ */
+test('🔴 the negation needs a left boundary — "torrent", "current", "want" must not fire', () => {
+  for (const innocent of [
+    'I want to give you access to the library',
+    'The torrent client has access to the indexer',
+    'The current way to watch it is on Max.',
+    'I sent you an invite; it should grant access shortly',
+    'That is an important way to think about it',
+    'Your account has access to all the tools you asked about',
+  ]) {
+    assert.equal(readsAsCapabilityDenial(innocent), false, `must not fire on: ${innocent}`);
+  }
+});
+
+test('the UNCONTRACTED forms fire too — "cannot" and "unable to" used to match nothing', () => {
+  // `\bnot\b` needs a boundary "cannot" does not supply, and `n't` needs an
+  // adjacent n+t. A detector where "can't" fires and "cannot" does not is a coin
+  // flip on the model's stylistic mood.
+  assert.equal(readsAsCapabilityDenial('I cannot access your watch history'), true);
+  assert.equal(readsAsCapabilityDenial('I am unable to reach the indexer list'), true);
+});
+
+test('"I\'ve got no …" fires — the branch written for it demanded a space and was inert', () => {
+  // Live turn, 2026-08-28: "I've got no per-user watch history to pull." No
+  // capability noun for the first alternative to reach, and the branch meant for
+  // the contraction read `I\s+(?:…|'?ve\s+got)`, which cannot match "I've".
+  assert.equal(readsAsCapabilityDenial("I've got no per-user watch history to pull."), true);
+  assert.equal(readsAsCapabilityDenial('I have no write tool for Prowlarr'), true);
+});
+
+/**
+ * 🔴 A ROLE STATEMENT IS TRUE BY CONSTRUCTION AND MUST NOT FIRE — TOMBSTONE.
+ *
+ * `owner-only` was an alternative here and is deliberately gone. `runTurn`
+ * filters the registry by `roleSatisfies` before the model is shown anything, so
+ * a guest saying a thing is owner-only is reporting a list it really does not
+ * have. There is nothing for a second look to find, and firing spent a round
+ * pushing a correctly-refusing model toward "use it" — the one direction this
+ * guard must never push. Do not re-add it.
+ */
+test('a plain owner-only refusal does not fire — nothing for a second look to find', () => {
+  assert.equal(
+    readsAsCapabilityDenial('No — that is owner-only, and this conversation is with a guest.'),
+    false,
+  );
+});
+
 test('MEASURED over all 262 real turns: what the detector actually does', () => {
   const fires = CORPUS.filter((t) => readsAsCapabilityDenial(t.reply));
   const labelled = CORPUS.filter((t) => t.capabilityDenial);
