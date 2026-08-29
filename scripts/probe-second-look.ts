@@ -171,26 +171,60 @@ async function main(): Promise<void> {
     ...Array.from({ length: reps }, () => ({ q: QUESTION, label: 'SUBJECT' })),
   ];
 
+  /**
+   * 🔴 ONE BAD TURN MUST NOT VOID THE RUN.
+   *
+   * A ten-rep run died on rep 0 and collected NOTHING: the model hit its
+   * `num_predict` budget with reasoning alone (`done_reason=length`), `llm.ts`
+   * threw as designed, and this loop had no handler — so twenty minutes of
+   * queued model time produced a stack trace instead of nine perfectly good
+   * data points. A measurement harness that is less fault-tolerant than the
+   * production loop it measures will keep throwing away its own evidence.
+   *
+   * ⚠️ A THROWN REP IS RECORDED AS `errored`, NOT SILENTLY DROPPED. Dropping it
+   * would quietly shrink the denominator, which is how a run of four reps
+   * reports "4 of 4" while having attempted six.
+   */
+  let errored = 0;
   for (const [i, { q, label }] of runs.entries()) {
     // A FRESH Agent per rep: one mutable history array per sender, so reusing
     // one would let each rep read the previous rep's answer.
     const agent = new Agent(config, llm, undefined, stubWrites(tools));
     const startedAt = Date.now();
-    const r = await agent.handle(config.ownerHandle, q);
+    const r = await agent.handle(config.ownerHandle, q).catch((e: unknown) => e as Error);
     const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
+    if (r instanceof Error) {
+      errored++;
+      console.error(`\n─── ${label} ${i} (${secs}s) — ⚠️ ERRORED, not a result: ${r.message}`);
+      if (label === 'CONTROL') {
+        console.error(
+          '🔴 THE CONTROL ERRORED. It has not shown the capability is reachable, so nothing below\n' +
+            '   can be read as a denial being FALSE. Re-run before quoting any number from it.',
+        );
+      }
+      continue;
+    }
     console.error(
       `\n─── ${label} ${i} (${secs}s) ─────────────────────────────────────────`,
     );
     console.error(`  Q      : ${q}`);
     console.error(`  tools  : ${r.toolCalls.map((c) => `${c.name}${c.ok ? '' : '!'}`).join(', ') || 'NONE'}`);
     if (r.secondLook) {
-      console.error(`  🔴 SECOND LOOK FIRED — answer changed: ${r.secondLook.changed}`);
+      const verdict = !r.secondLook.changed
+        ? 'SAME — it looked again and repeated itself verbatim'
+        : r.secondLook.stillDenies
+          ? 'REWORDED — changed the words and denied anyway. NOT a repair.'
+          : '🔴 WITHDRAWN — the denial was wrong and the second look caught it';
+      console.error(`  🔴 SECOND LOOK FIRED — ${verdict}`);
       console.error(`  WOULD HAVE SENT: ${r.secondLook.deniedText.replace(/\n/g, ' ')}`);
       console.error(`  SENT INSTEAD   : ${r.replyText.replace(/\n/g, ' ')}`);
     } else {
       console.error('  second look: did not fire');
       console.error(`  SENT   : ${r.replyText.replace(/\n/g, ' ')}`);
     }
+  }
+  if (errored > 0) {
+    console.error(`\n⚠️ ${errored} of ${runs.length} reps ERRORED and are not in any count above.`);
   }
 }
 
