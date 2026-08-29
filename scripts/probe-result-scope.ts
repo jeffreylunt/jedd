@@ -41,7 +41,7 @@
  *    identical one.
  */
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdtempSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent } from '../src/agent.js';
@@ -65,6 +65,9 @@ const QUESTION = 'Has tom watched anything yet';
 const CONTROL_QUESTION = 'Look at what Jeff has watched';
 
 const OUT = join(process.cwd(), 'data', `probe-result-scope-${Date.now()}.jsonl`);
+// Created UP FRONT. Appending lazily meant a wrong cwd threw AFTER the whole
+// preflight had passed and the first rep had already burned model time.
+mkdirSync(join(process.cwd(), 'data'), { recursive: true });
 
 function stubWrites(tools: Tool[]): Tool[] {
   return tools.map((t) =>
@@ -197,6 +200,15 @@ async function main(): Promise<void> {
     console.error('🔴 The BARE arm still carries a scope note — the ablation did not apply.');
     process.exit(1);
   }
+  // ⚠️ The ablation rest-spreads every tool, which copies `run` only because
+  // every Tool in this repo is an object literal. If one ever became a class
+  // instance the spread would drop `run` — and it is applied to BARE ONLY, so
+  // the CONTROL arm would silently get broken tools while the treatment arm kept
+  // working. That is the one harness failure that would look like a huge effect.
+  if (!bare.every((t) => typeof t.run === 'function')) {
+    console.error('🔴 The ablation destroyed a tool body in the BARE arm. Refusing to measure.');
+    process.exit(1);
+  }
   console.error(`[probe] arms differ by exactly ${noteCount} scope note(s) and nothing else`);
   console.error(`[probe] raw replies → ${OUT}`);
 
@@ -218,11 +230,35 @@ async function main(): Promise<void> {
   // 🔴 INTERLEAVED, not blocked. A model server that slows, warms or drifts over
   // an hour would otherwise load all of that drift onto whichever arm ran second.
   for (let i = 0; i < repsPerArm; i++) {
-    plan.push({ arm: 'BARE', q: QUESTION, tools: bare });
-    plan.push({ arm: 'SCOPED', q: QUESTION, tools: scoped });
+    /**
+     * 🔴 COUNTERBALANCED, and interleaving alone was NOT enough.
+     *
+     * Interleaving kills drift ACROSS the run. It does nothing about order
+     * WITHIN the pair: run A pushed BARE then SCOPED every time, so SCOPED was
+     * always the second call against a shared client and a server the BARE rep
+     * had just warmed, on prompts identical up to the tool result. Any
+     * prefix-cache or scheduling asymmetry landed on the treatment arm every
+     * single time, in the FAVOURABLE direction — the one structural way this
+     * harness could flatter the thing being tested.
+     *
+     * ⚠️ RUN A (2026-08-28, 9/10 → 0/10) PREDATES THIS. Its effect is far larger
+     * than warmth plausibly buys and the objective metric separated perfectly,
+     * but it is a real hole and the number should be re-taken here.
+     */
+    const pair = [
+      { arm: 'BARE' as const, q: QUESTION, tools: bare },
+      { arm: 'SCOPED' as const, q: QUESTION, tools: scoped },
+    ];
+    plan.push(...(i % 2 === 0 ? pair : [pair[1]!, pair[0]!]));
   }
   plan.push({ arm: 'CONTROL-SCOPED', q: CONTROL_QUESTION, tools: scoped });
 
+  /**
+   * Set only by a CONTROL rep that actually reached `homelab_read`. Consulted at
+   * the end, so a control that failed to do its job says so loudly instead of
+   * showing up as a zero in a table nobody reads.
+   */
+  let controlProved = false;
   const tally: Record<string, { reps: number; errored: number; reachedHistory: number }> = {
     'CONTROL-BARE': { reps: 0, errored: 0, reachedHistory: 0 },
     'CONTROL-SCOPED': { reps: 0, errored: 0, reachedHistory: 0 },
@@ -267,6 +303,19 @@ async function main(): Promise<void> {
       // not depend on anybody's reading of the prose.
       const reachedHistory = r.toolCalls.some((c) => c.name === 'homelab_read' && c.ok);
       if (reachedHistory) t.reachedHistory++;
+      /**
+       * 🔴 THE CONTROL'S PASS CONDITION IS "REACHED THE CAPABILITY", NOT "DID
+       * NOT THROW".
+       *
+       * It used to be the latter, which tests the wrong thing: a control that
+       * COMPLETES and denies, calling `homelab_read` zero times, printed no
+       * warning at all and appeared only as a number in the closing tally. The
+       * entire reason this control exists is that five clean "did not fire"
+       * results once meant nothing, because every read had failed EHOSTUNREACH
+       * and nobody had checked. Every other precondition here refuses to
+       * measure; this one merely reported.
+       */
+      if (step.arm.startsWith('CONTROL') && reachedHistory) controlProved = true;
       row = {
         i,
         arm: step.arm,
@@ -294,6 +343,15 @@ async function main(): Promise<void> {
   for (const [arm, v] of Object.entries(tally)) {
     console.error(
       `  ${arm.padEnd(7)} reps=${v.reps}  errored=${v.errored}  reached homelab_read=${v.reachedHistory}`,
+    );
+  }
+  if (!controlProved) {
+    console.error(
+      '\n🔴 NO CONTROL REP EVER REACHED `homelab_read`. The positive control did not do its job, so\n' +
+        '   nothing here shows the capability was reachable ON THE CONTROL\'S EVIDENCE and no denial\n' +
+        '   above can be called FALSE from it. Check whether any SUBJECT rep reached it — that is a\n' +
+        '   valid substitute and a stronger one, but it is a DIFFERENT artifact and has to be\n' +
+        '   reported as such. Do not write "positive control passed".',
     );
   }
   console.error(`\nRaw replies: ${OUT}`);
