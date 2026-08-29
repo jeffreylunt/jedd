@@ -206,11 +206,16 @@ export function turnLicensedTheDenial(toolCalls: { ok: boolean; refused?: boolea
  * true denial into a fabricated capability or a pointless call. The instruction
  * is to LOOK, and to keep the answer if looking confirms it — so the honest
  * denials in the 11% cost a round trip and nothing else.
+ *
+ * ⚠️ IT SAYS "THIS ASSISTANT", NOT "YOU TOLD THIS USER". It fires for guests
+ * too, and a guest has never been told any such thing — a note that opens with a
+ * false statement about the conversation it is in would be the model's own
+ * unsupported-assertion defect, written by us, in the fix for it.
  */
 export const SECOND_LOOK_NOTE =
   'Before that reply is sent: it tells the user something cannot be done. That is a claim about ' +
-  'YOUR TOOL LIST, and it is the one kind of claim you have been wrong about before — you have ' +
-  'told this user you had no tool for something that was in your list the whole time.\n' +
+  'YOUR TOOL LIST, and it is the one kind of claim this assistant has got wrong before — saying ' +
+  'it had no tool for something that was in its list the whole time.\n' +
   'A tool result describes THAT TOOL. It never describes the boundary of what you can do. If one ' +
   'tool returned something narrow, that bounds the tool, not you.\n' +
   'So read your tool list again now, all of it, including the general-purpose ones that do not ' +
