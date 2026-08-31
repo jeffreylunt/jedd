@@ -2,6 +2,11 @@
 
 A self-hosted agent that runs your homelab from a text message.
 
+> **Current deployment (v2.1.0, 2026-08-31):** running as the `jedd-v2` Docker container on `jeffs-MacBook-Pro.local` (192.168.1.68), webhook `http://127.0.0.1:18796/webhook` registered with BlueBubbles. Source at `~/dev/jedd-v2`, tag `v2.1.0`. Images published to `ghcr.io/jeffreylunt/jedd:X.Y`.
+>
+> To rebuild + restart: `cd ~/dev/jedd-v2 && docker compose up -d --build`
+> To watch logs:        `docker logs -f jedd-v2`
+
 Ask it for a film and it searches your indexers, picks a release that will
 actually finish, and adds it to Sonarr or Radarr. Ask it why live TV is
 stuttering and it measures the box before it touches anything. It answers on
@@ -201,9 +206,35 @@ connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission g
 
 ```bash
 npm install
-npm test        # 1286 tests, no network needed
+npm test        # 1411 tests, no network needed
 npm run chat    # talk to it on stdout
 ```
+
+### Cutting a release
+
+```bash
+# 1. make sure tests are green
+npm test
+
+# 2. tag the release
+git tag -a vX.Y.Z -m "vX.Y.Z — <one-line summary>"
+
+# 3. rebuild the image
+docker compose build
+
+# 4. (manually) tag and push to ghcr.io — see "Releases" below
+docker tag jedd-v2:local ghcr.io/jeffreylunt/jedd:X.Y.Z
+docker push ghcr.io/jeffreylunt/jedd:X.Y.Z
+
+# 5. restart the running container
+docker compose up -d
+```
+
+### Releases
+
+Versioned images are published to `ghcr.io/jeffreylunt/jedd:X.Y.Z`. Each tag corresponds to a `git tag` of the same name. The current image ID and SHA are visible with `docker inspect jedd-v2` — cross-reference against the git log to confirm the running container matches the tag you expect to be running.
+
+A change should not be deployed until it is on a tag: rolling from `git pull` is not supported, because the bind-mounted `data/` directory and the BlueBubbles webhook registration are persistent and a mid-flight process restart has to be deliberate.
 
 In the chat REPL, `sender:+15559998888` switches which identity you are speaking
 as. That is how you exercise the permission boundary by hand.
