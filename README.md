@@ -6,6 +6,7 @@ A self-hosted agent that runs your homelab from a text message.
 >
 > To rebuild + restart: `cd ~/dev/jedd-v2 && docker compose up -d --build`
 > To watch logs:        `docker logs -f jedd-v2`
+> Daily log sweep:       `com.jeff.jedd-issue-sweep` LaunchAgent runs at 03:00 MDT (09:00 UTC) and files GitHub issues for real problems the local model identifies in the last 24h.
 
 Ask it for a film and it searches your indexers, picks a release that will
 actually finish, and adds it to Sonarr or Radarr. Ask it why live TV is
@@ -235,6 +236,28 @@ docker compose up -d
 Versioned images are published to `ghcr.io/jeffreylunt/jedd:X.Y.Z`. Each tag corresponds to a `git tag` of the same name. The current image ID and SHA are visible with `docker inspect jedd-v2` — cross-reference against the git log to confirm the running container matches the tag you expect to be running.
 
 A change should not be deployed until it is on a tag: rolling from `git pull` is not supported, because the bind-mounted `data/` directory and the BlueBubbles webhook registration are persistent and a mid-flight process restart has to be deliberate.
+
+### Daily log sweep
+
+`com.jeff.jedd-issue-sweep` (LaunchAgent on the host) runs at 03:00 MDT / 09:00 UTC daily. It:
+
+1. Pulls the last 24h of `docker logs jedd-v2` filtered for `FATAL|ERR|UNKNOWN|timeout|fail|refused|threw|cannot|panic|denial=fail|denial=unlicensed`
+2. Pulls the last 24h of `data/audit.jsonl` — only entries with at least one failed tool call
+3. Sends both to Ollama (`qwen3.8:27b-mlx`) with a structured prompt; the model returns strict JSON: `[{title, body, severity, dedupe_key}]`
+4. Deduplicates against existing open issues by title (lowercase), and against a local `data/issue-sweep-state.jsonl` by `dedupe_key` for same-day collisions
+5. Opens new issues via `gh issue create --repo jeffreylunt/jedd --label auto-sweep` (the label is auto-created on first run)
+
+The model is told explicitly **not** to file an issue for the design-feature log lines (the `[notice]` 240s timeout line, the `[presence] stop typing … timeout (ignored; a reply is unaffected)` line, the `skipped rowid … outbound echo` lines, the boot banner) — they would be noise. Better to file nothing than to file noise.
+
+Manual run (does not respect the schedule):
+```bash
+bash ~/dev/jedd-v2/scripts/daily-issue-sweep.sh          # actually file
+bash ~/dev/jedd-v2/scripts/daily-issue-sweep.sh --dry-run # print what would be filed, do not file
+```
+
+Sweep log: `~/dev/jedd-v2/data/issue-sweep.log`. State log: `~/dev/jedd-v2/data/issue-sweep-state.jsonl`. LaunchAgent logs: `~/Library/Logs/opencode-stack/jedd-issue-sweep.{stdout,stderr}.log`.
+
+**The sweep requires `gh auth` to be valid on the host.** If you see `HTTP 401` in the sweep log, re-auth with `gh auth login -h github.com`.
 
 In the chat REPL, `sender:+15559998888` switches which identity you are speaking
 as. That is how you exercise the permission boundary by hand.
