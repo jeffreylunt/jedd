@@ -2,8 +2,19 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
+import { resetTransportBreaker } from '../src/media/arr.js';
 import { CHOICE_TTL_MS, ChoiceStore } from '../src/choices.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. The catalogue_search test in
+ * this file points both Sonarr and Radarr at `.invalid`, so a sibling file's
+ * transport failure would otherwise leave the breaker open and this test
+ * would observe the cool-down message rather than its own stubbed result.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 function tempFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'jedd-choice-')), 'choices.jsonl');

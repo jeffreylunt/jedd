@@ -443,6 +443,57 @@ export class Agent {
           continue;
         }
 
+        /**
+         * The tool-CHAIN gate. A write tool that depends on another tool's
+         * SUCCESS this turn is refused if that prior call failed.
+         *
+         * 🔴 THE 2026-08-31 TURN. `catalogue_search` reached Radarr and timed
+         * out at 20s; the model issued `add_movie` next anyway, with no
+         * `tmdbId` in hand, and the audit shows three calls in one turn
+         * (catalogue_search, add_movie, catalogue_search) — the third one
+         * paying another 20s for the same outcome. `add_movie`'s own guard
+         * ("A valid tmdbId is required. Search first.") DID fire on the
+         * middle call; the model had already heard it and ignored it. A
+         * description that says "search first" is read BEFORE selection and
+         * does not survive a half-second the model was convinced it knew the
+         * title.
+         *
+         * The fix here is structural: when a write tool is called that
+         * REQUIRES a successful prior search, and the prior search in THIS
+         * turn failed, the gate refuses — with the failure's reason quoted
+         * verbatim, so the model cannot confuse the refusal with a permission
+         * problem and route around it. The catalog is unreachable, the
+         * catalog is what the write needs, and there is no third tool that
+         * could substitute.
+         *
+         * ⚠️ ONE FAILURE, NOT "ANY FAILURE". A turn that searched AND got a
+         * clean "no match" must NOT be gated — that is a successful search
+         * with empty results, and the write path is correct. The gate fires
+         * only on a HARD failure (the catalogue was unreachable, the request
+         * timed out, the response could not be parsed).
+         *
+         * ⚠️ MOST RECENT catalogue_search, NOT ANY. A turn that searched,
+         * failed, succeeded, and then writes — the most recent result is
+         * the one that licenses the write. A `findLast` mirrors what a
+         * reader of the conversation would say happened LAST.
+         *
+         * ⚠️ THE WRITE TOOL'S OWN CHECK STILL RUNS. This gate fires BEFORE the
+         * tool runs, so an `add_movie` with a missing id is still caught
+         * downstream by "A valid tmdbId is required" — the two are layered,
+         * not exclusive.
+         */
+        const chainGate = chainRefusal(tool.name, toolCalls);
+        if (chainGate) {
+          toolCalls.push({ name: call.name, args: call.arguments, ok: false, refused: true });
+          history.push({
+            role: 'tool',
+            toolName: call.name,
+            toolCallId: call.id,
+            content: chainGate,
+          });
+          continue;
+        }
+
         let content: string;
         let succeeded: boolean;
         const startedAt = Date.now();
@@ -562,4 +613,56 @@ export class Agent {
     this.onTurn?.(record);
     return record;
   }
+}
+
+/**
+ * 🔴 THE CHAIN GATE.
+ *
+ * Returns a refusal message if the named tool is a write tool whose producer
+ * (`catalogue_search`) failed in this turn, OR returns null when there is no
+ * such prior failure.
+ *
+ * Which tools need a prior successful search:
+ *
+ *   add_movie  — takes a tmdbId; the only producer that supplies one is
+ *                catalogue_search (`add_movie` itself points this out in its
+ *                description and the `assertNamedProducersExist` invariant
+ *                catches a missing catalogue_search at boot).
+ *   add_series — same shape: a tvdbId from catalogue_search.
+ *
+ * Anything else is not in this list. `add_season` and `grab_release` read
+ * from the LIBRARY (a different question, `library_search`); the indexer
+ * tools and the homelab tools reach their own services directly.
+ *
+ * ⚠️ The gate is keyed on the MOST RECENT catalogue_search, not on "any
+ * catalogue_search". A turn that searched, failed, recovered and then writes
+ * has the most recent search's verdict governing, exactly the way a reader of
+ * the conversation would expect. (`findLast` walks the array from the end; on
+ * a turn with zero catalogue_search entries it returns `undefined`.)
+ *
+ * ⚠️ ONLY A HARD FAILURE (`ok: false`) GATES, not a successful "no match"
+ * result. A catalogue_search that ran and returned NO candidates is a clean
+ * answer — the write path's own logic ("title not in catalogue, do not
+ * invent one") handles it. The gate is for the unreachable case, where the
+ * tool that produces the id could not produce anything.
+ */
+const PRODUCED_BY_SEARCH = new Set(['add_movie', 'add_series']);
+const PRODUCER = 'catalogue_search';
+
+export function chainRefusal(toolName: string, priorCalls: ToolInvocation[]): string | null {
+  if (!PRODUCED_BY_SEARCH.has(toolName)) return null;
+  const lastSearch = [...priorCalls].reverse().find((c) => c.name === PRODUCER);
+  if (!lastSearch) return null;
+  if (lastSearch.ok !== false) return null;
+  // Quoting the prior failure verbatim so the model has the ORIGINAL signal
+  // (the "RADARR IS UNREACHABLE" sentence the search emitted) right next to
+  // the refusal. Two messages that point at the same cause, one from the
+  // search and one from the gate.
+  const why = lastSearch.error ?? 'catalogue_search failed earlier in this turn';
+  return (
+    `REFUSED: "${toolName}" requires a successful catalogue_search in this turn, but the most recent ` +
+    `catalogue_search failed — ${why} Nothing was added. Tell the user the ` +
+    `${toolName === 'add_movie' ? 'film' : 'show'} catalogue is unreachable, do not invent a result, and ask ` +
+    'whether to retry once the service is back.'
+  );
 }

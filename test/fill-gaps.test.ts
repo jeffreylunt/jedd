@@ -2,13 +2,25 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChoiceStore } from '../src/choices.js';
-import type { FetchImpl } from '../src/media/arr.js';
+import { resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import { makeFindGaps, makeGrabRelease, makeSearchEpisode } from '../src/tools/fill-gaps.js';
 import { buildTools } from '../src/tools/index.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. Several tests in this file
+ * exercise Sonarr failures (release search, queue, episodes), and the tools
+ * here reach the same `http://sonarr.invalid:8989/...` URL the whole test
+ * process uses. Without a reset the second test sees the breaker message from
+ * the first, and the assertion that pins "Sonarr answered with X" fails for a
+ * reason that has nothing to do with the test.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 const tempFile = () => join(mkdtempSync(join(tmpdir(), 'jedd-gaps-')), 'choices.jsonl');
 

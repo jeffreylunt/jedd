@@ -1,9 +1,21 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import type { FetchImpl } from '../src/media/arr.js';
+import { beforeEach, test } from 'node:test';
+import { resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import { makeCatalogueSearch } from '../src/tools/catalogue.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. Without this reset, the first
+ * test that triggers a transport failure (the `dead` routes) would leave the
+ * breaker open for `http://radarr.invalid:7878` and `http://sonarr.invalid:8989`,
+ * and the tests after it would never reach their `dead`/`json()` branches — they
+ * would observe the cool-down message instead. Same call site, different test,
+ * same shape as `media-arr.test.ts`.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 const ctx = (): ToolContext => ({
   role: 'guest',

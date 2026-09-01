@@ -133,8 +133,50 @@ export class ArrClient {
     this.timeoutMs = opts.timeoutMs ?? 20_000;
   }
 
+  /**
+   * 🔴 FAIL FAST WHILE A SERVICE IS KNOWN DOWN.
+   *
+   * `call()` carries a 20s per-request timeout, which is the right ceiling for
+   * one slow call. It is the WRONG ceiling for the second one when the first
+   * already failed: a Radarr that timed out 3 seconds ago is overwhelmingly
+   * likely to time out again in the same window, and the model that asks
+   * `catalogue_search` then `add_movie` then `catalogue_search` again — measured
+   * 2026-08-31, audit entry 1 + 2 — paid three 20s waits for the same outcome.
+   *
+   * The breaker is keyed on `baseUrl`, not on the `ArrClient` instance, because
+   * the existing call sites construct a fresh client per tool invocation
+   * (see `src/tools/catalogue.ts`) and a per-instance counter would observe
+   * exactly one failure before being discarded. Across the process the URL is
+   * stable, so the URL is the right scope.
+   *
+   * Only TRANSPORT failures trip it (the catch below). An HTTP 5xx is the
+   * service answering; it is a different signal and must not short-circuit a
+   * later call, because a service that 500ed once may be fine on the next
+   * request. A timeout, a refused connection, a host unreachable, a DNS failure
+   * — all of those describe a service that did not answer, and those are what
+   * the breaker records.
+   *
+   * ⚠️ COOLDOWN IS INTENTIONAL, AND THE NUMBER IS A CHOICE NOT A MEASUREMENT.
+   * 30s is what `qBittorrent`'s settle loops in `src/tools/qbit.ts` already use
+   * for transient-failure backoff in this same codebase, so the same window
+   * applies here. The breaker does NOT replace the per-call timeout — the
+   * FIRST failure still pays 20s, deliberately, because a single slow call is
+   * not the defect; the second and third are.
+   */
   private async call(path: string): Promise<{ ok: boolean; status: number; body: unknown; detail: string }> {
     const url = `${this.opts.baseUrl}${path}`;
+    const cooled = cooledDownFor(this.opts.baseUrl);
+    if (cooled) {
+      return {
+        ok: false,
+        status: 0,
+        body: null,
+        detail:
+          `${redactUrlSecrets(this.opts.baseUrl)} failed ${Math.round(cooled.elapsedMs / 1000)}s ago ` +
+          `(${cooled.detail}), so I am NOT retrying yet. The same call would time out again — ` +
+          'wait, or check the service, then try once.',
+      };
+    }
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
@@ -143,11 +185,13 @@ export class ArrClient {
       });
     } catch (e) {
       // 🔴 `.message` alone is the constant string "fetch failed" — see src/errors.ts.
+      const detail = `could not reach ${redactUrlSecrets(url)}: ${describeError(e, redactUrlSecrets)}`;
+      recordTransportFailure(this.opts.baseUrl, detail);
       return {
         ok: false,
         status: 0,
         body: null,
-        detail: `could not reach ${redactUrlSecrets(url)}: ${describeError(e, redactUrlSecrets)}`,
+        detail,
       };
     }
     let body: unknown = null;
@@ -951,4 +995,49 @@ async function withSeriesLock<T>(key: string, fn: () => Promise<T>): Promise<T> 
   } finally {
     if (seriesLocks.get(key) === mine) seriesLocks.delete(key);
   }
+}
+
+/**
+ * 🔴 THE BREAKER STATE. Per-baseUrl, the timestamp of the last TRANSPORT
+ * failure (timeout / ECONNREFUSED / EHOSTUNREACH / ENOTFOUND / …) and the
+ * message that came back. HTTP error responses are deliberately not recorded —
+ * they mean the service answered, which is a different signal.
+ *
+ * Keyed on `baseUrl` because that is the only identifier stable across the
+ * `ArrClient` instances the tools construct per call. Per-instance state
+ * would observe one failure and then be discarded; per-URL state covers the
+ * real failure pattern (catalogue_search → add_movie → catalogue_search in
+ * one turn), each constructing its own client.
+ */
+type LastTransportFailure = { at: number; detail: string };
+const lastTransportFailure = new Map<string, LastTransportFailure>();
+const FAIL_FAST_COOLDOWN_MS = 30_000;
+
+/**
+ * Visible for tests: returns the failure that is currently cooling down for a
+ * base URL, with the elapsed time, or null if the breaker is closed.
+ *
+ * `elapsedMs` lets a test assert the message names the right window without
+ * reaching for the clock.
+ */
+export function cooledDownFor(baseUrl: string): { elapsedMs: number; detail: string } | null {
+  const f = lastTransportFailure.get(baseUrl);
+  if (!f) return null;
+  const elapsedMs = Date.now() - f.at;
+  if (elapsedMs >= FAIL_FAST_COOLDOWN_MS) {
+    // Cooldown elapsed. Drop the entry so a future failure starts a fresh window
+    // rather than being measured from the original timestamp.
+    lastTransportFailure.delete(baseUrl);
+    return null;
+  }
+  return { elapsedMs, detail: f.detail };
+}
+
+/** Visible for tests: forget everything the breaker knows. */
+export function resetTransportBreaker(): void {
+  lastTransportFailure.clear();
+}
+
+function recordTransportFailure(baseUrl: string, detail: string): void {
+  lastTransportFailure.set(baseUrl, { at: Date.now(), detail });
 }

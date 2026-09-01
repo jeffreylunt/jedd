@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChoiceStore } from '../src/choices.js';
-import type { FetchImpl } from '../src/media/arr.js';
+import { resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import type { ExecImpl } from '../src/hp.js';
 import type { IrcEbooks } from '../src/media/irc-ebooks.js';
 import { byScore, swarmHealth, swarmRank, HEALTHY_SWARM_SEEDERS } from '../src/media/pick-release.js';
@@ -17,6 +17,15 @@ import { makeSearchAudiobook, makeSearchEbook } from '../src/tools/search-releas
 import { assertChoiceProducersExist } from '../src/tools/index.js';
 import type { Tool, ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. `makeCatalogueSearch` reaches
+ * the configured `*.invalid` URLs when its stub throws, and a sibling file's
+ * failure against the same URL would otherwise leak into the assertions here.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 /**
  * NOBODY IS ASKED WHICH TORRENT ANY MORE — AND THE ONE WE TAKE IS CHOSEN ON THE

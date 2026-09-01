@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { ArrClient, type FetchImpl } from '../src/media/arr.js';
+import { beforeEach, test } from 'node:test';
+import { ArrClient, resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. Without a per-test reset, a
+ * sibling file's transport failure would carry over and the failure-shaped
+ * tests here would observe the breaker message instead of their own stubbed
+ * response.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 /**
  * The write path, and the two defects measured in V1's production data on

@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import type { FetchImpl } from '../src/media/arr.js';
+import { beforeEach, test } from 'node:test';
+import { resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import { makeAddSeason } from '../src/tools/add-season.js';
 import { buildTools } from '../src/tools/index.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. `testConfig()` points Sonarr and
+ * Radarr at `*.invalid` URLs, and a sibling test file that exercises a transport
+ * failure opens the breaker for those exact URLs. Without a reset between
+ * tests, the pre-write `seasons()` read here would observe the breaker message
+ * rather than the stubbed response, and the assertions on what came back from
+ * Sonarr would fail for reasons that have nothing to do with the test.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 const ctx = (over: Partial<ToolContext> = {}): ToolContext => ({
   role: 'guest',
