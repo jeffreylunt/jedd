@@ -283,6 +283,20 @@ bash ~/dev/jedd-v2/scripts/weekly-fix-sweep.sh --issue 42            # process j
 
 Per-run log: `~/dev/jedd-v2/data/weekly-fix.log`. State log: `~/dev/jedd-v2/data/weekly-fix-state.jsonl`. LaunchAgent logs: `~/Library/Logs/opencode-stack/jedd-weekly-fix.{stdout,stderr}.log`.
 
+**Release cut.** If the sweep finishes with **zero open issues remaining** on the repo, the script then rebuilds the Docker image (`docker compose build`) and restarts the running container with it (`docker compose up -d`). The script does NOT tag or push to ghcr.io — that's a separate manual step (the daily-sweep / weekly-fix sweeps are read-write on GitHub but only publish to ghcr.io when you decide). Set `SKIP_RELEASE=1` in the environment to disable. The release cut only triggers when there are no open issues left, so a backlog of issues prevents unwanted rebuilds mid-cleanup.
+
+The full pipeline therefore looks like:
+
+```
+Sunday 03:00 MDT
+   └─ com.jeff.jedd-weekly-fix LaunchAgent
+        └─ weekly-fix-sweep.sh
+             ├─ list open issues on jeffreylunt/jedd
+             ├─ for each: weekly-fixer agent (MiniMax M3) → branch → npm test → PR → auto-merge
+             │   or verdict = RISKY_REVIEW | OUT_OF_SCOPE | TESTS_FAILED → comment, no PR
+             └─ if 0 open issues remain → docker compose build && docker compose up -d
+```
+
 In the chat REPL, `sender:+15559998888` switches which identity you are speaking
 as. That is how you exercise the permission boundary by hand.
 
