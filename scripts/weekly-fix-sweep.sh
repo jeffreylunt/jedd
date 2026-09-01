@@ -91,7 +91,7 @@ for i in issues:
 print(json.dumps(nums))
 ")
 
-[[ -z "$ISSUE_NUMBERS" || "$ISSUE_NUMBERS" == "[]" ]] && { echo "no issues to process"; exit 0; }
+[[ -z "$ISSUE_NUMBERS" || "$ISSUE_NUMBERS" == "[]" ]] && echo "no issues to process"
 
 # For each candidate, check whether there's already an open PR mentioning Closes #N
 declare -a TO_PROCESS
@@ -104,18 +104,19 @@ for n in $(echo "$ISSUE_NUMBERS" | python3 -c "import json,sys; print(' '.join(s
   fi
 done
 
-if [[ ${#TO_PROCESS[@]} -eq 0 ]]; then
-  echo "nothing new to fix"; exit 0
+if [[ "${#TO_PROCESS[@]}" -eq 0 ]]; then
+  echo "nothing new to fix"
 fi
 
-echo "will process ${#TO_PROCESS[@]} issue(s): ${TO_PROCESS[*]}"
+echo "will process ${#TO_PROCESS[@]:-0} issue(s): ${TO_PROCESS[*]:-}"
 [[ "$DRY_RUN" == "1" ]] && { echo "dry-run, exiting"; exit 0; }
 
 # Make sure auto-fix label exists
 gh label create "auto-fix" --repo "$REPO" --color "0e8a16" --description "Auto-PR filed by weekly-fix-sweep" >/dev/null 2>&1 || true
 
 # ── 2. For each issue: branch + run agent + push + PR + merge ──────────
-for n in "${TO_PROCESS[@]}"; do
+if [[ "${#TO_PROCESS[@]:-0}" -gt 0 ]]; then
+for n in "${TO_PROCESS[@]:-}"; do
   echo ""
   echo "── issue #$n ──"
 
@@ -234,6 +235,45 @@ for b in $(git branch --list 'auto-fix/*' 2>/dev/null); do
   echo "  cleanup local branch: $b"
   git branch -D "$b" 2>/dev/null
 done
+fi  # close: "if [[ TO_PROCESS is non-empty ]]"
+
+# ── 5. Release cut: if zero open issues remain, rebuild + restart image ──
 
 echo ""
 echo "weekly-fix sweep complete"
+
+# ── 5. Release cut: if zero open issues remain, rebuild + restart image ──
+OPEN_REMAINING=$(gh issue list --repo "$REPO" --state open --json number 2>/dev/null | python3 -c "
+import json, sys
+try: print(len(json.loads(sys.stdin.read())))
+except Exception: print('?')
+" 2>/dev/null)
+echo "open issues remaining after sweep: $OPEN_REMAINING"
+
+if [[ "$OPEN_REMAINING" == "0" && -z "${SKIP_RELEASE:-}" ]]; then
+  echo ""
+  echo "── release cut (no open issues remain) ──"
+  cd "$REPO_DIR"
+
+  # Count commits since the last tag, for the log
+  LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "(none)")
+  NEW_COMMITS=$(git rev-list --count "${LAST_TAG}..main" 2>/dev/null || echo "?")
+  echo "commits since last tag (${LAST_TAG}): ${NEW_COMMITS}"
+
+  echo "rebuilding image..."
+  if ! docker compose build 2>&1 | tail -5; then
+    echo "BUILD FAILED — skipping restart"
+  else
+    echo "restarting container with new image..."
+    if docker compose up -d 2>&1 | tail -5; then
+      sleep 3
+      HEALTH=$(docker inspect --format '{{.State.Health.Status}}' jedd-v2 2>/dev/null || echo "?")
+      echo "container health after restart: $HEALTH"
+      echo "RELEASE: image rebuilt and container running on it"
+    else
+      echo "RESTART FAILED — image is built but container may be down"
+    fi
+  fi
+else
+  echo "skipping release cut: $OPEN_REMAINING open issue(s) still exist (or SKIP_RELEASE is set)"
+fi
