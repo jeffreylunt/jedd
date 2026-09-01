@@ -7,6 +7,7 @@ A self-hosted agent that runs your homelab from a text message.
 > To rebuild + restart: `cd ~/dev/jedd-v2 && docker compose up -d --build`
 > To watch logs:        `docker logs -f jedd-v2`
 > Daily log sweep:       `com.jeff.jedd-issue-sweep` LaunchAgent runs at 03:00 MDT (09:00 UTC) and files GitHub issues for real problems the local model identifies in the last 24h.
+> Weekly auto-fix:       `com.jeff.jedd-weekly-fix` LaunchAgent runs Sunday 03:00 MDT (09:00 UTC); for each open issue it checks out a branch off `main`, runs the `weekly-fixer` agent (MiniMax M3), pushes a branch, opens a PR (ready-for-merge, not draft), and enables auto-merge.
 
 Ask it for a film and it searches your indexers, picks a release that will
 actually finish, and adds it to Sonarr or Radarr. Ask it why live TV is
@@ -257,7 +258,30 @@ bash ~/dev/jedd-v2/scripts/daily-issue-sweep.sh --dry-run # print what would be 
 
 Sweep log: `~/dev/jedd-v2/data/issue-sweep.log`. State log: `~/dev/jedd-v2/data/issue-sweep-state.jsonl`. LaunchAgent logs: `~/Library/Logs/opencode-stack/jedd-issue-sweep.{stdout,stderr}.log`.
 
-**The sweep requires `gh auth` to be valid on the host.** If you see `HTTP 401` in the sweep log, re-auth with `gh auth login -h github.com`.
+**The sweep requires `gh auth` to be valid on the host.** If you see `HTTP 401` in the sweep log, re-auth with `gh auth login --insecure-storage -h github.com` (the `--insecure-storage` flag writes the token to `~/.config/gh/hosts.yml` so SSH-launched processes can read it; the default keychain path is unreachable from non-GUI sessions).
+
+### Weekly auto-fix
+
+`com.jeff.jedd-weekly-fix` (LaunchAgent on the host) runs Sunday at 03:00 MDT / 09:00 UTC. For each open issue on the repo that does not already have an open PR:
+
+1. Fetches `origin/main`, creates a new branch `auto-fix/issue-<NUMBER>-<short-slug>` off it
+2. Invokes the `weekly-fixer` opencode agent (model `minimax/MiniMax-M3`) with the issue body + standing rules. The agent investigates the code, writes the minimum fix, runs `npm test` (must pass at the current count — 1425 as of this writing), commits (`fix #<NUMBER>: <summary>`), pushes the branch, and opens a PR
+3. The agent's last line of output is the PR URL — the script enables auto-merge on it (`gh pr merge --auto --squash`); if checks fail the PR stays open for manual review
+4. If `npm test` fails the agent returns `TESTS_FAILED` instead of a PR URL; the script then comments on the issue and skips
+
+**Standing rules baked into the agent:**
+- Never push to `main`, never force-push, never delete other branches
+- Never modify `data/`, `scripts/messages-poke.mjs`, secrets, or `.env`
+- All 1425 tests must pass before any commit/push
+
+Manual run (does not respect the schedule):
+```bash
+bash ~/dev/jedd-v2/scripts/weekly-fix-sweep.sh                       # process all open issues
+bash ~/dev/jedd-v2/scripts/weekly-fix-sweep.sh --dry-run             # list what would be processed
+bash ~/dev/jedd-v2/scripts/weekly-fix-sweep.sh --issue 42            # process just issue 42
+```
+
+Per-run log: `~/dev/jedd-v2/data/weekly-fix.log`. State log: `~/dev/jedd-v2/data/weekly-fix-state.jsonl`. LaunchAgent logs: `~/Library/Logs/opencode-stack/jedd-weekly-fix.{stdout,stderr}.log`.
 
 In the chat REPL, `sender:+15559998888` switches which identity you are speaking
 as. That is how you exercise the permission boundary by hand.
