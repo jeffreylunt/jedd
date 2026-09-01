@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { ArrClient, type FetchImpl } from '../src/media/arr.js';
+import { beforeEach, test } from 'node:test';
+import { ArrClient, resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import { pickBest, type Candidate } from '../src/media/matching.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL, AND THESE TESTS CANNOT READ IT
+ * OTHERWISE. `resetTransportBreaker()` clears every cooldown so the test order
+ * does not matter — the failure that opened the breaker in one test must not
+ * leak into the next, and any test that doesn't trigger a transport failure
+ * would otherwise inherit whatever a previous test left in the map.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 /** The matcher the tools use: comparative, never a results[0] fallback. */
 const match = (q: string, all: Candidate[]): Candidate[] => {
@@ -222,4 +233,147 @@ test('🔴 MONEYBALL is genuinely ambiguous in PRODUCTION data, not just in a fi
   assert.equal(movie.state, 'results');
   if (movie.state !== 'results') throw new Error('unreachable');
   assert.equal(movie.candidates[0]?.id, 60308);
+});
+
+// ── 🔴 FAIL FAST WHILE A SERVICE IS KNOWN DOWN ────────────────────────────────
+//
+// The 2026-08-31 audit entry pinned the shape: a catalogue_search against an
+// unreachable Radarr waited 20s, the model then issued two more calls in the
+// same turn, and EACH one waited 20s. The breaker addresses the second and
+// third, deliberately — the first failure still pays the full timeout, because
+// a single slow call is not the defect.
+
+const UNREACHABLE_URL = 'http://breaker-target.invalid:7878/radarr/api/v3';
+
+function breakerClient(fetchImpl: FetchImpl) {
+  return new ArrClient({ baseUrl: UNREACHABLE_URL, apiKey: 'k', fetchImpl }, 'movie');
+}
+
+test('🔴 the FIRST transport failure still pays the full timeout (does not silently swallow it)', async () => {
+  // A breaker that skipped the first failure would hide the signal: the model
+  // would be told "Radarr is fine, nothing matched" and the user's report would
+  // never say RADARR IS UNREACHABLE. This pins that the first call STILL
+  // reaches the fetchImpl and still surfaces the underlying error verbatim.
+  let called = 0;
+  const r = await breakerClient(async () => {
+    called++;
+    throw new Error('ECONNREFUSED');
+  }).catalogue('dune');
+  assert.equal(called, 1, 'the first call must reach the fetchImpl');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /could not reach/);
+});
+
+test('🔴 the SECOND transport failure within the cooldown does NOT reach fetchImpl', async () => {
+  // This is the actual repair: catalogue_search → add_movie → catalogue_search
+  // in one turn paid three 20s waits. After the first, the breaker must
+  // short-circuit and the fetchImpl must NOT be called.
+  let called = 0;
+  const c = breakerClient(async () => {
+    called++;
+    throw new Error('ECONNREFUSED');
+  });
+  await c.catalogue('dune');
+  assert.equal(called, 1, 'first call reaches fetchImpl');
+  const r = await c.catalogue('dune');
+  assert.equal(called, 1, 'second call is short-circuited by the breaker');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /NOT retrying yet/);
+});
+
+test('🔴 the breaker names the URL and the underlying cause, so the message is actionable', async () => {
+  // A breaker message that just said "temporarily unavailable" would leave the
+  // model guessing at which service was down. The message MUST name the URL and
+  // quote the original error so the operator can act on it without re-running.
+  const c = breakerClient(async () => {
+    throw Object.assign(new Error('connect EHOSTUNREACH 10.0.0.7:7878'), {
+      code: 'EHOSTUNREACH',
+      syscall: 'connect',
+      address: '10.0.0.7',
+      port: 7878,
+    });
+  });
+  const first = await c.catalogue('dune');
+  assert.equal(first.state, 'unknown');
+  const r = await c.catalogue('dune');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /breaker-target\.invalid/);
+  assert.match(r.detail, /EHOSTUNREACH/);
+});
+
+test('CONTROL: a SUCCESSFUL first call leaves the breaker closed for the second', async () => {
+  // The breaker is for TRANSPORT failures only. A 5xx is the service answering
+  // and must not poison later calls — a service that 500ed once may be fine on
+  // the next request. This pins both halves: an HTTP error does not trip the
+  // breaker, AND a successful call after an error resets the cool-down's logic.
+  let calls = 0;
+  const c = breakerClient(async () => {
+    calls += 1;
+    if (calls === 1) return json({}, 503);
+    return json([]);
+  });
+  const first = await c.catalogue('dune');
+  assert.equal(first.state, 'unknown', 'an HTTP 503 is unknown but does NOT trip the breaker');
+  const second = await c.catalogue('dune');
+  assert.equal(second.state, 'results', 'and the second call is allowed to reach fetchImpl');
+  assert.equal(calls, 2, 'every call goes through fetchImpl when the breaker is closed');
+});
+
+test('🔴 a transport failure from one URL does not poison a DIFFERENT URL', async () => {
+  // The breaker is keyed on baseUrl so a failing Radarr does not also block
+  // Sonarr — they are independent services. Without that, one service being
+  // down would short-circuit every other read on the same machine.
+  const radarrDown = new ArrClient(
+    { baseUrl: 'http://radarr-down.invalid:7878/radarr/api/v3', apiKey: 'k', fetchImpl: async () => { throw new Error('ECONNREFUSED'); } },
+    'movie',
+  );
+  const downResult = await radarrDown.catalogue('dune');
+  assert.equal(downResult.state, 'unknown');
+  const sonarrOk = new ArrClient(
+    { baseUrl: 'http://sonarr-up.invalid:8989/sonarr/api/v3', apiKey: 'k', fetchImpl: async () => json([]) },
+    'series',
+  );
+  const r = await sonarrOk.catalogue('breaking bad');
+  assert.equal(r.state, 'results', 'a different base URL is unaffected');
+});
+
+test('🔴 the breaker is OPEN after one transport failure and the message is short-circuited', async () => {
+  // Pin that the breaker exposes its state and that `cooledDownFor` is the
+  // read-side seam a future caller could use (e.g. a /health endpoint that
+  // says "Radarr is down, last error X"). Without this, the breaker would be
+  // a write-only side effect and a debug route would have to clear it first
+  // to even observe its open state.
+  const c = breakerClient(async () => {
+    throw new Error('ECONNREFUSED');
+  });
+  await c.catalogue('dune');
+  const { cooledDownFor } = await import('../src/media/arr.js');
+  const cooled = cooledDownFor(UNREACHABLE_URL);
+  assert.ok(cooled, 'after one failure the breaker is open');
+  assert.match(cooled!.detail, /ECONNREFUSED/);
+  assert.ok(cooled!.elapsedMs >= 0 && cooled!.elapsedMs < 30_000, 'elapsed time is within the cooldown window');
+});
+
+test('🔴 resetTransportBreaker closes the breaker so the next call goes through', async () => {
+  // The breaker is for the SECOND and third calls in a burst, not for forever.
+  // `resetTransportBreaker` is the public seam that closes the breaker — used
+  // in production by a periodic health check that re-tries the service after a
+  // quiet period, and by tests that need a clean slate. Pinning this means the
+  // breaker can be cleared and the next call reaches `fetchImpl` again.
+  const c = breakerClient(async () => {
+    throw new Error('ECONNREFUSED');
+  });
+  await c.catalogue('dune');
+  resetTransportBreaker();
+  let called = 0;
+  const fresh = breakerClient(async () => {
+    called += 1;
+    return json([]);
+  });
+  const r = await fresh.catalogue('dune');
+  assert.equal(called, 1, 'after a reset, fetchImpl is reached again');
+  assert.equal(r.state, 'results');
 });

@@ -2,10 +2,21 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { FollowupStore, MAX_ATTEMPTS } from '../src/followups.js';
 import { runDueFollowups } from '../src/followup-runner.js';
+import { resetTransportBreaker } from '../src/media/arr.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. The followup runner re-reads
+ * Sonarr/Radarr with the same base URLs the whole test process uses, and a
+ * prior test that triggered a transport failure would otherwise be observed
+ * here as "the breaker is open" rather than "Sonarr answered with X".
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 /**
  * "The user learns the outcome" — the defining requirement of the write path.

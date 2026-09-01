@@ -1,10 +1,20 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import type { FetchImpl } from '../src/media/arr.js';
+import { beforeEach, test } from 'node:test';
+import { resetTransportBreaker, type FetchImpl } from '../src/media/arr.js';
 import { bucket, MAX_SEGMENTS, parseShowSeasons, summariseShow } from '../src/media/seasons.js';
 import { makeLibrarySearch } from '../src/tools/library.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
+
+/**
+ * 🔴 THE TRANSPORT BREAKER IS PROCESS-GLOBAL. `library_search` reaches Sonarr
+ * with the URL `testConfig()` carries, and a sibling file's transport failure
+ * against the same URL would otherwise be observed here as the cool-down
+ * message rather than the stubbed response.
+ */
+beforeEach(() => {
+  resetTransportBreaker();
+});
 
 /** A Sonarr `/series` season row, in the shape the live instance actually returns. */
 const season = (n: number, files: number, total: number, monitored = true) => ({

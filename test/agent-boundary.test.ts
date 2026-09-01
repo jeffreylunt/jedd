@@ -333,3 +333,220 @@ test('the recorded error is BOUNDED — a page of JSON must not land in every tu
   const record = await new Agent(config, new OneToolLlm('probe'), undefined, [chatty]).handle(OWNER_HANDLE, 'check');
   assert.ok((record.toolCalls[0]?.error ?? '').length <= 300);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 THE TOOL-CHAIN GATE
+//
+// The 2026-08-31 turn: catalogue_search reached Radarr and timed out at 20s,
+// then the model called add_movie with no tmdbId, then called catalogue_search
+// AGAIN (and waited another 20s). The model was told "A valid tmdbId is
+// required. Search first." by add_movie's own guard and went around it.
+//
+// The fix: when a write tool whose id comes from catalogue_search is called
+// after a FAILED catalogue_search in this turn, the gate refuses — quoting
+// the original failure so the model cannot confuse the refusal with a
+// permission problem.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A model that asks for the listed tool names in order, then answers. */
+class SequentialLlm implements LlmClient {
+  readonly label = 'sequential';
+  readonly seen: LlmMessage[][] = [];
+  private n = 0;
+  constructor(private readonly sequence: string[]) {}
+  async chat(messages: LlmMessage[]): Promise<LlmReply> {
+    this.seen.push(structuredClone(messages));
+    const next = this.sequence[this.n++];
+    if (!next) return { text: 'done', toolCalls: [] };
+    return { text: '', toolCalls: [{ id: 'c' + this.n, name: next, arguments: { title: 'dune' } }] };
+  }
+}
+
+/** Two paired tools: a failing search and a write that consumes its result. */
+function searchAndAdder(searchOutcome: 'fails' | 'works' | 'no-match', adderRan: { ran: boolean }): Tool[] {
+  const search: Tool = {
+    name: 'catalogue_search',
+    description: 'search what could be added',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
+    async run() {
+      if (searchOutcome === 'fails') {
+        return {
+          ok: false,
+          content: 'Sonarr searched, but RADARR IS UNREACHABLE (could not reach the service), so I cannot say whether a FILM of this name exists.',
+        };
+      }
+      if (searchOutcome === 'no-match') return { ok: true, content: 'NO MATCH — searched 0 results.' };
+      return { ok: true, content: 'FILM — Dune (2021) tmdbId 438631.' };
+    },
+  };
+  const adder: Tool = {
+    name: 'add_movie',
+    description: 'add a film',
+    minRole: 'guest',
+    writes: true,
+    parameters: { type: 'object', properties: { tmdb_id: { type: 'number' }, title: { type: 'string' } }, required: ['tmdb_id', 'title'] },
+    async run() {
+      adderRan.ran = true;
+      return { ok: true, content: 'started' };
+    },
+  };
+  return [search, adder];
+}
+
+test('🔴 add_movie is REFUSED when the prior catalogue_search failed in this turn', async () => {
+  // The repair for the 2026-08-31 turn. The model has just been told Radarr is
+  // unreachable, and the next call must NOT be `add_movie` — it has no tmdbId
+  // and the catalogue it needed has no answer.
+  const adderRan = { ran: false };
+  const tools = searchAndAdder('fails', adderRan);
+  const llm = new SequentialLlm(['catalogue_search', 'add_movie']);
+  const record = await new Agent(config, llm, undefined, tools).handle(OWNER_HANDLE, 'add dune');
+
+  assert.equal(adderRan.ran, false, 'add_movie must not run after a failed search');
+  assert.equal(record.toolCalls.length, 2);
+  assert.equal(record.toolCalls[0]!.name, 'catalogue_search');
+  assert.equal(record.toolCalls[0]!.ok, false);
+  assert.equal(record.toolCalls[1]!.name, 'add_movie');
+  assert.equal(record.toolCalls[1]!.refused, true, 'the gate records a refusal, not a tool failure');
+  assert.equal(record.toolCalls[1]!.ok, false);
+});
+
+test('CONTROL: add_movie IS allowed when the prior catalogue_search succeeded', async () => {
+  // The gate is for the FAILURE case, not for "any catalogue_search". A clean
+  // "no match" or a clean "FILM — id N" must let add_movie through to its own
+  // checks — which is the existing behaviour.
+  const adderRan = { ran: false };
+  const tools = searchAndAdder('works', adderRan);
+  const llm = new SequentialLlm(['catalogue_search', 'add_movie']);
+  await new Agent(config, llm, undefined, tools).handle(OWNER_HANDLE, 'add dune');
+  assert.equal(adderRan.ran, true, 'a successful search still licenses the write');
+});
+
+test('CONTROL: add_movie IS allowed when the prior catalogue_search returned no match', async () => {
+  // "No match" is a successful search with an empty result. add_movie's own
+  // guard then refuses the missing id, but the chain gate does NOT fire —
+  // the gate is for "the catalogue could not answer", not "the catalogue
+  // answered with nothing".
+  const adderRan = { ran: false };
+  const tools = searchAndAdder('no-match', adderRan);
+  const llm = new SequentialLlm(['catalogue_search', 'add_movie']);
+  await new Agent(config, llm, undefined, tools).handle(OWNER_HANDLE, 'add dune');
+  assert.equal(adderRan.ran, true, '"no match" is a successful search — the gate does not fire');
+});
+
+test('🔴 the refusal message quotes the prior failure verbatim', async () => {
+  // The model needs the ORIGINAL signal (the "RADARR IS UNREACHABLE" sentence
+  // the search emitted) right next to the refusal. Two messages pointing at the
+  // same cause, so the model cannot confuse one for the other and cannot route
+  // around either.
+  const adderRan = { ran: false };
+  const tools = searchAndAdder('fails', adderRan);
+  const llm = new SequentialLlm(['catalogue_search', 'add_movie']);
+  await new Agent(config, llm, undefined, tools).handle(OWNER_HANDLE, 'add dune');
+
+  const lastToolMessage = llm.seen.at(-1)!.filter((m) => m.role === 'tool').at(-1)!;
+  assert.match(lastToolMessage.content, /REFUSED/);
+  assert.match(lastToolMessage.content, /RADARR IS UNREACHABLE/);
+});
+
+test('🔴 MOST RECENT search wins — a turn that fails then recovers can still write', async () => {
+  // The gate keys on the LAST catalogue_search, not "any". A turn that failed
+  // then recovered has the recent verdict governing, exactly the way a reader
+  // of the conversation would expect.
+  let searchCalls = 0;
+  const search: Tool = {
+    name: 'catalogue_search',
+    description: 'search',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      searchCalls++;
+      if (searchCalls === 1) return { ok: false, content: 'RADARR IS UNREACHABLE.' };
+      return { ok: true, content: 'FILM — Dune (2021) tmdbId 438631.' };
+    },
+  };
+  const adderRan = { ran: false };
+  const adder: Tool = {
+    name: 'add_movie',
+    description: 'add a film',
+    minRole: 'guest',
+    writes: true,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      adderRan.ran = true;
+      return { ok: true, content: 'started' };
+    },
+  };
+  const llm = new SequentialLlm(['catalogue_search', 'catalogue_search', 'add_movie']);
+  await new Agent(config, llm, undefined, [search, adder]).handle(OWNER_HANDLE, 'add dune');
+  assert.equal(adderRan.ran, true, 'a recovered search licenses the write');
+});
+
+test('🔴 add_series is also gated — same defect, same shape', async () => {
+  // The same dependency exists for add_series: the tvdbId comes from
+  // catalogue_search. Same defect, same fix.
+  const adderRan = { ran: false };
+  const search: Tool = {
+    name: 'catalogue_search',
+    description: 'search',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      return { ok: false, content: 'RADARR IS UNREACHABLE.' };
+    },
+  };
+  const adder: Tool = {
+    name: 'add_series',
+    description: 'add a show',
+    minRole: 'guest',
+    writes: true,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      adderRan.ran = true;
+      return { ok: true, content: 'started' };
+    },
+  };
+  const llm = new SequentialLlm(['catalogue_search', 'add_series']);
+  const record = await new Agent(config, llm, undefined, [search, adder]).handle(OWNER_HANDLE, 'add mr robot');
+  assert.equal(adderRan.ran, false);
+  assert.equal(record.toolCalls[1]!.refused, true);
+  const lastToolMessage = llm.seen.at(-1)!.filter((m) => m.role === 'tool').at(-1)!;
+  assert.match(lastToolMessage.content, /add_series/);
+  assert.match(lastToolMessage.content, /show catalogue is unreachable/);
+});
+
+test('CONTROL: a write tool with no producer dependency is NOT gated', async () => {
+  // The gate is targeted: only add_movie and add_series depend on
+  // catalogue_search. Other writes (add_season, add_audiobook, grab_release)
+  // read from the LIBRARY, not the catalogue of addable things, and must not
+  // be blocked by a catalogue_search failure.
+  const search: Tool = {
+    name: 'catalogue_search',
+    description: 'search',
+    minRole: 'guest',
+    writes: false,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      return { ok: false, content: 'RADARR IS UNREACHABLE.' };
+    },
+  };
+  const adderRan = { ran: false };
+  const adder: Tool = {
+    name: 'add_season',
+    description: 'turn on seasons of an OWNED show',
+    minRole: 'guest',
+    writes: true,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async run() {
+      adderRan.ran = true;
+      return { ok: true, content: 'started' };
+    },
+  };
+  const llm = new SequentialLlm(['catalogue_search', 'add_season']);
+  await new Agent(config, llm, undefined, [search, adder]).handle(OWNER_HANDLE, 'turn on season 3');
+  assert.equal(adderRan.ran, true, 'add_season does not depend on catalogue_search');
+});
