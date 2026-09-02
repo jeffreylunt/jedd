@@ -10,7 +10,8 @@
 #
 # SAFETY:
 #   - per-issue branch off main; never touches main directly
-#   - npm test must pass (1411/1411) before any push
+#   - npm test must pass with ZERO failures before any push. NOT a count:
+#     see the note above PROMPT for why a number here is a live hazard.
 #   - per-issue 30-minute hard cap on the agent invocation
 #   - whole-script 6-hour hard cap
 #   - skips issues that already have an open PR (avoids stacking)
@@ -143,12 +144,27 @@ for n in "${TO_PROCESS[@]:-}"; do
 
   # Run the agent with the per-issue timeout
   echo "  running agent for #$n..."
+  # ── 🔴 NEVER PUT A TEST COUNT IN THIS PROMPT ────────────────────────────────
+  #
+  # It said "does not pass at 1411/1411" until 2026-09-01, while the suite was
+  # at 1501. **This is an instruction to an LLM, not a shell conditional**, so
+  # the failure was not a clean always-fail — it was INDETERMINATE. One run can
+  # read the number literally and emit TESTS_FAILED on a green suite; another
+  # can read it as "the suite must be green" and carry on. A gate that fails
+  # RANDOMLY is worse than one that fails always, because nothing in its output
+  # distinguishes the two, so it cannot be diagnosed from its own logs.
+  #
+  # The count had drifted through 1218, 1286, 1411, 1425 and 1501 in this repo.
+  # Assert on the OUTCOME; a number here is a dated fact pretending to be a rule.
   PROMPT="GitHub issue #${n}: ${TITLE}
 
 Read the issue: gh issue view ${n} --repo ${REPO}
 Then fix it in this branch (\$BRANCH), commit, push, open a PR, and output the PR URL on the last line.
 
-If npm test does not pass at 1411/1411, output the literal line TESTS_FAILED instead of any PR URL.
+Run npm test. If ANY test fails -- the summary reports a non-zero \"fail\" count, or the
+command exits non-zero -- output the literal line TESTS_FAILED instead of any PR URL.
+Do NOT compare the result against a specific number of tests. The total changes every time
+a test is added, and a stale number here silently breaks this gate.
 
 Issue body:
 "
@@ -189,7 +205,7 @@ Issue body:
       # a comment on the issue and skip the PR.
       NOTE=$(echo "$AGENT_OUTPUT" | grep -v '^[[:space:]]*$' | sed -n '2,$p')
       case "$FIRST_LINE" in
-        TESTS_FAILED)   HEADER="🤖 weekly-fix-sweep attempted a fix but \`npm test\` did not pass at 1425/1425. No PR opened." ;;
+        TESTS_FAILED)   HEADER="🤖 weekly-fix-sweep attempted a fix but \`npm test\` did not pass. No PR opened." ;;
         RISKY_REVIEW)   HEADER="🤖 weekly-fix-sweep declined to auto-fix: change is in scope but too risky for an unattended PR." ;;
         OUT_OF_SCOPE)   HEADER="🤖 weekly-fix-sweep declined to auto-fix: change appears out of scope for jedd-v2." ;;
       esac

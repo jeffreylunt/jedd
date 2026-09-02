@@ -282,15 +282,25 @@ let that boundary depend on its caller having remembered.
 - **`cmd && echo "clean"`** tests the exit code, not your condition.
   `git status` exits 0 when the tree is dirty. Assert on the string:
   `[ -z "$(git status --porcelain)" ]`.
-- **A hardcoded count drifts, and it does not stay in prose.** `README.md`
-  carried *two different* stale test counts (1411 and 1425) against an actual
-  1501 — both corrected in b71a7ec. The same stale number had also reached an
-  **executable gate**: `scripts/weekly-fix-sweep.sh:151` instructs the
-  autonomous weekly-fix agent *"If npm test does not pass at 1411/1411, output
-  the literal line TESTS_FAILED instead of any PR URL"* — a condition that can
-  never be true again, so the sweep reports failure on a green suite. Found
-  2026-09-01; check whether it is still there before trusting that pipeline.
-  **Assert on the outcome (`fail 0`, exit code), never on a count.**
+- **🔴 NEVER WRITE A TEST COUNT DOWN. Assert on the outcome — `fail 0`, exit
+  code — never on a number.** This repo carried **five** different counts
+  (1218, 1286, 1411, 1425, 1501) across the README, the Dockerfile and
+  `scripts/weekly-fix-sweep.sh`, disagreeing with each other and with reality.
+  All were removed 2026-09-01; if you find you have written a new one, that is
+  this trap refiring.
+
+  The reason it earns a 🔴 rather than a shrug is where one of them ended up.
+  `scripts/weekly-fix-sweep.sh` told the autonomous weekly-fix agent *"If npm
+  test does not pass at 1411/1411, output TESTS_FAILED instead of any PR URL"* —
+  and **that line is a prompt to an LLM, not a shell conditional.** So it did
+  not fail cleanly and always. It failed **indeterminately**: one run may read
+  `1411/1411` literally against a 1501 suite and refuse to open a PR, the next
+  may read it as "the suite must be green" and proceed. A gate that fails at
+  random is worse than one that is reliably dead, because nothing in its output
+  tells the two apart, so it cannot be diagnosed from its own logs.
+
+  ⚠️ **A number is a dated fact. Writing one into an instruction turns it into a
+  rule that expires without telling anyone.**
 - **Backticks inside a double-quoted shell string** are command substitution and
   will eat your text. Build prose in a quoted heredoc.
 - **A green test on a file you never `git add`ed** ships nothing. `git add -u`

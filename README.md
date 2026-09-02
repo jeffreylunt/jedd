@@ -208,7 +208,7 @@ connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission g
 
 ```bash
 npm install
-npm test        # 1501 tests, no network needed
+npm test        # the full suite, no network needed
 npm run chat    # talk to it on stdout
 ```
 
@@ -272,7 +272,7 @@ Sweep log: `~/dev/jedd-v2/data/issue-sweep.log`. State log: `~/dev/jedd-v2/data/
 **Standing rules baked into the agent:**
 - Never push to `main`, never force-push, never delete other branches
 - Never modify `data/`, `scripts/messages-poke.mjs`, secrets, or `.env`
-- The full suite must pass before any commit/push (`npm test`, currently 1501)
+- The full suite must pass before any commit/push (`npm test`, zero failures)
 
 Manual run (does not respect the schedule):
 ```bash
