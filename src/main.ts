@@ -703,7 +703,7 @@ async function main(): Promise<void> {
           notice.arm(waited.queuedForMs);
           let r: TurnRecord;
           try {
-            r = await agent.handle(message.senderHandle, message.text);
+            r = await agent.handle(message.senderHandle, message.text, message.attachments);
           } finally {
             notice.disarm();
           }

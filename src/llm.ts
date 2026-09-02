@@ -11,6 +11,18 @@ export interface LlmToolCall {
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /**
+   * Images on a USER turn, as BARE base64 — no `data:` prefix, no wrapper.
+   *
+   * 🔴 THE ENCODING IS PART OF THE CONTRACT, AND GETTING IT WRONG IS SILENT.
+   * Ollama's `/api/chat` takes `messages[].images` as a plain array of base64
+   * strings; a `data:image/png;base64,…` string is accepted by the HTTP layer,
+   * fails to decode inside, and surfaces as the model simply never mentioning
+   * the picture. There is no error and no warning — the reply just reads like
+   * the image was never sent, which is indistinguishable from the model
+   * choosing not to talk about it.
+   */
+  images?: string[];
   /** Present on assistant messages that requested tools. */
   toolCalls?: LlmToolCall[];
   /** Present on tool messages: which call this answers. */
@@ -42,8 +54,62 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
         })),
       };
     }
+    /**
+     * ⚠️ `images` IS OMITTED WHEN EMPTY RATHER THAN SENT AS `[]`. An empty array
+     * on every text turn is a change to the request shape of every existing
+     * conversation in order to say nothing, and this stack has already shown
+     * (`tool_choice`) that it will silently ignore a field rather than complain
+     * about one — so a shape nobody needs is a shape nobody can verify.
+     */
+    if (m.role === 'user' && m.images?.length) {
+      return { role: m.role, content: m.content, images: m.images };
+    }
     return { role: m.role, content: m.content };
   });
+}
+
+/**
+ * The history, with images kept only on the most recent `keepTurns` turns
+ * that carry them.
+ *
+ * 🔴 AN IMAGE THAT STAYS IN HISTORY IS RE-SENT ON EVERY SUBSEQUENT CALL, AND
+ * THAT IS HOW `num_ctx` DIES QUIETLY.
+ *
+ * `num_ctx` is 16384 and is deliberately not raised — it is what keeps the model
+ * fully resident in VRAM (`size_vram === size`), and raising it is what produces
+ * 110-second turns. A vision turn costs on the order of a thousand tokens per
+ * image, so a conversation where someone sends a few photos would, left alone,
+ * spend its whole context re-describing pictures nobody is asking about any
+ * more. Worse, it would do it by DEGRADING — the oldest real messages fall out
+ * of the window first — so the symptom is Jedd forgetting the conversation, not
+ * an error anyone can trace back to here.
+ *
+ * ⚠️ KEEPS MORE THAN ONE TURN ON PURPOSE. Stripping down to just the current
+ * turn breaks the ordinary follow-up — "what about the one on the left?" — which
+ * is exactly the case this feature exists for. The default of 2 is the smallest
+ * number that lets a person ask a second question about a picture.
+ *
+ * ⚠️ COPIES; DOES NOT MUTATE. The agent's stored history keeps its images, so
+ * whether a turn can see a picture is decided per REQUEST and is reversible.
+ * Stripping in place would make it a one-way loss, and a later change to
+ * `keepTurns` would silently do nothing to conversations already in memory.
+ */
+export function boundHistoryImages(messages: LlmMessage[], keepTurns: number): LlmMessage[] {
+  let seen = 0;
+  const out = new Array<LlmMessage>(messages.length);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === 'user' && m.images?.length) {
+      seen += 1;
+      if (seen > keepTurns) {
+        const { images: _dropped, ...rest } = m;
+        out[i] = rest;
+        continue;
+      }
+    }
+    out[i] = m;
+  }
+  return out;
 }
 
 /**

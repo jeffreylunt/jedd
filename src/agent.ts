@@ -4,7 +4,8 @@ import type { Config } from './config.js';
 import type { ChoiceStore } from './choices.js';
 import type { FollowupStore } from './followups.js';
 import type { KindleRegistry } from './kindle.js';
-import type { LlmClient, LlmMessage } from './llm.js';
+import type { InboundAttachments } from './connector.js';
+import { boundHistoryImages, type LlmClient, type LlmMessage } from './llm.js';
 import type { HistoryStore } from './store.js';
 import { roleFor, roleSatisfies, type Role } from './permissions.js';
 import { ALL_TOOLS } from './tools/index.js';
@@ -206,6 +207,19 @@ function systemPrompt(config: Config, role: Role): string {
     'No preamble, no restating the question. If one word answers it, send one word.',
     'A list only when genuinely naming several things, one short line each, never nested.',
     '',
+    // 🔴 THE PICTURE IS NOT THE REQUEST. This is the whole design of inbound
+    // images: the same photo means "order this book" next to "get this" and
+    // "did you already add it?" next to "is this the one?". A model told only
+    // "you can see images" describes them, which is almost never what was
+    // wanted — someone who texts a photo of a book cover wants the book, not a
+    // paragraph about a book cover.
+    'Sometimes a message has an image on it. READ THE PICTURE AGAINST THE CONVERSATION, not on its',
+    'own: the words with it and what you were both just talking about are what say why they sent it.',
+    'If it is obvious what they want done, do it — call the tool, the same as if they had typed the',
+    'name. Only describe an image when describing it IS the request, or when you genuinely cannot',
+    'tell what they want, in which case ask one short question. Never claim to see an image you were',
+    'not given.',
+    '',
     // 🔴 MEASURED 2026-08-27: 43% of 238 real replies (data/history.jsonl)
     // carried at least one markdown construct — mostly **bold** (72) and
     // *italics* around titles (37), some inline `backticks` (7). iMessage has
@@ -278,6 +292,105 @@ function systemPrompt(config: Config, role: Role): string {
 }
 
 /**
+ * What the model is told about the pictures — and about the ones it is not
+ * getting.
+ *
+ * PURE, and separate from the agent for the usual reason: every sentence below
+ * is a promise about what Jedd says to a real person in a failure case, and a
+ * promise that needs a live BlueBubbles server to exercise is a promise nobody
+ * re-checks.
+ *
+ * 🔴 TROUBLE GOES IN A `system` NOTE, NOT INTO THE USER'S OWN WORDS.
+ *
+ * The tempting shortcut is to splice "(the photo could not be downloaded)" onto
+ * the end of what the person typed. That makes the transcript lie about what
+ * they said, and it puts machine-authored instructions inside the one turn the
+ * model is told to treat as coming from a human — which is the shape of every
+ * prompt-injection problem this codebase has otherwise been careful about.
+ *
+ * ⚠️ THE NOTE TELLS THE MODEL WHAT HAPPENED; IT DOES NOT DICTATE A REPLY. Jedd
+ * has a voice and a brevity budget, and a canned apology pasted through would
+ * break both. What must not happen is SILENCE — from the sender's side, a photo
+ * that vanishes without comment is identical to being ignored.
+ */
+export function composeImageTurn(
+  userText: string,
+  attachments: InboundAttachments | undefined,
+  limits: { maxCount: number },
+): { text: string; note?: string } {
+  const text = userText.trim();
+  if (!attachments) return { text };
+
+  const { images, trouble, overflow } = attachments;
+  const lines: string[] = [];
+
+  if (images.length) {
+    lines.push(
+      images.length === 1
+        ? `They attached one image (${images[0]!.name}), which is on this message and you can see it.`
+        : `They attached ${images.length} images (${images.map((i) => i.name).join(', ')}), ` +
+            'which are on this message and you can see them.',
+    );
+  }
+
+  for (const t of trouble) {
+    if (t.reason === 'unsupported') {
+      lines.push(
+        `An attachment came with this message that is not an image, so you cannot look at it: ` +
+          `${t.name} (${t.detail}). You can only see pictures.`,
+      );
+    } else if (t.reason === 'oversize') {
+      lines.push(
+        `An image came with this message that was too large to look at: ${t.name} (${t.detail}). ` +
+          'They could send a smaller one or describe it.',
+      );
+    } else {
+      /**
+       * 🔴 THE COMMON ONE, AND THE ONE MOST LIKELY TO BE MISREAD AS OUR BUG.
+       *
+       * Photos texted as MMS-over-SMS (green bubbles) frequently never sync to
+       * the Mac at all: the text part arrives and the image part does not, and a
+       * by-guid fetch comes back empty. That is a limitation of the bridge being
+       * a non-primary device, not something a retry fixes — so the note says what
+       * is true and what the person can actually do, rather than promising to
+       * try again.
+       */
+      lines.push(
+        `They attached an image you could NOT get: ${t.name} (${t.detail}). This usually means the ` +
+          'picture was sent as a text/SMS rather than iMessage and never reached this Mac. Tell ' +
+          'them their message arrived but the picture did not come through, and ask them to send ' +
+          'it again or just describe it. Do not pretend you saw it.',
+      );
+    }
+  }
+
+  if (overflow > 0) {
+    lines.push(
+      `${overflow} further image${overflow === 1 ? ' was' : 's were'} attached but not looked at — ` +
+        `you can only take ${limits.maxCount} at a time. Say so rather than implying you saw them all.`,
+    );
+  }
+
+  /**
+   * ⚠️ A TURN IS NEVER LEFT EMPTY. A captionless photo arrives with `text: ""`,
+   * and an empty user message is both a strange thing to hand a model and a
+   * useless thing to replay from `history.jsonl` after a restart. The marker is
+   * deliberately a plain description of what happened rather than an invented
+   * question — guessing at "what is this?" would put words in their mouth.
+   */
+  let out = text;
+  if (!out) {
+    if (images.length) {
+      out = images.length === 1 ? `(sent ${images[0]!.name}, no caption)` : `(sent ${images.length} images, no caption)`;
+    } else if (trouble.length) {
+      out = `(sent an attachment, no caption)`;
+    }
+  }
+
+  return lines.length ? { text: out, note: lines.join(' ') } : { text: out };
+}
+
+/**
  * The agent loop.
  *
  * There is no output filtering here. Enforcement happens at the tool boundary:
@@ -333,7 +446,11 @@ export class Agent {
    */
   private readonly inFlight = new Map<string, number>();
 
-  async handle(senderHandle: string, userText: string): Promise<TurnRecord> {
+  async handle(
+    senderHandle: string,
+    userText: string,
+    attachments?: InboundAttachments,
+  ): Promise<TurnRecord> {
     const role = roleFor(senderHandle, this.config);
     const inFlightKey = `${senderHandle}::${role}`;
     const already = this.inFlight.get(inFlightKey) ?? 0;
@@ -347,7 +464,7 @@ export class Agent {
     }
     this.inFlight.set(inFlightKey, already + 1);
     try {
-      return await this.runTurn(senderHandle, userText, role);
+      return await this.runTurn(senderHandle, userText, role, attachments);
     } finally {
       const left = (this.inFlight.get(inFlightKey) ?? 1) - 1;
       if (left <= 0) this.inFlight.delete(inFlightKey);
@@ -355,7 +472,12 @@ export class Agent {
     }
   }
 
-  private async runTurn(senderHandle: string, userText: string, role: Role): Promise<TurnRecord> {
+  private async runTurn(
+    senderHandle: string,
+    userText: string,
+    role: Role,
+    attachments?: InboundAttachments,
+  ): Promise<TurnRecord> {
     const tools = this.registry.filter((t) => roleSatisfies(role, t.minRole));
     const ctx: ToolContext = {
       role,
@@ -384,7 +506,34 @@ export class Agent {
       }
       this.histories.set(key, history);
     }
-    history.push({ role: 'user', content: userText });
+    /**
+     * 🔴 THE NOTE IS PUSHED BEFORE THE USER TURN, NOT AFTER.
+     *
+     * Order is the whole point: the model reads the note as context it already
+     * had when the message arrived, which is what it is. Pushed after, it reads
+     * as something that happened in response to the message — and a `system`
+     * turn arriving after a `user` turn is also the shape of an instruction
+     * injected mid-conversation, which is not what this is.
+     */
+    const composed = composeImageTurn(userText, attachments, { maxCount: this.config.images.maxCount });
+    if (composed.note) history.push({ role: 'system', content: composed.note });
+    history.push({
+      role: 'user',
+      content: composed.text,
+      /**
+       * ⚠️ The bytes live on the history entry, and `boundHistoryImages` decides
+       * per REQUEST how many of them travel. Storing them here and bounding at
+       * send time is what lets a follow-up question still see the picture while
+       * a long thread still cannot accumulate them.
+       */
+      ...(attachments?.images.length ? { images: attachments.images.map((i) => i.base64) } : {}),
+    });
+    // What gets LOGGED and replayed is the composed text — never the base64. See
+    // `HistoryStore`: it persists `userText`, a string, and replay rebuilds a
+    // plain `{role:'user', content}`. So images are per-process by construction
+    // and cannot survive a restart, which is correct: a stale picture presented
+    // as current context is the same defect as a stale tool reading.
+    userText = composed.text;
     ctx.userTurns = history
       .filter((m) => m.role === 'user')
       .map((m) => m.content)
@@ -399,7 +548,10 @@ export class Agent {
      * which is at most once per turn.
      */
     for (; steps < MAX_STEPS; steps++) {
-      const reply = await this.llm.chat(history, tools);
+      const reply = await this.llm.chat(
+        boundHistoryImages(history, this.config.images.historyTurns),
+        tools,
+      );
 
       if (reply.toolCalls.length === 0) {
         replyText = reply.text.trim();
