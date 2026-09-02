@@ -222,11 +222,17 @@ export function typeVerdict(mimeType: string, uti: string): 'image' | 'other' {
  * a rule nobody re-checks after they change it.
  *
  * ⚠️ AN ABSENT OR EMPTY ARRAY IS NOT AN ERROR AND NOT A REJECTION. It is the
- * ordinary shape of a plain text message, and it is ALSO the shape of the
- * dropped-MMS case (a green/SMS photo whose text part synced and whose image
- * part never did — the message arrives with `attachments: []`). Those two are
+ * ordinary shape of a plain text message, and it is equally the shape of a
+ * message whose attachment never reached this Mac at all. Those two are
  * indistinguishable from here, and must be: the caller knows whether it was
- * expecting an image, and this function does not.
+ * expecting an image, and this function does not. Anything that treated an
+ * empty array as a lost attachment would fire on every text message ever sent.
+ *
+ * ⚠️ Do NOT reintroduce the green-bubble/MMS reading of this. That failure is
+ * real but belongs to the **:1235** bridge (Jeff's personal Apple ID, which also
+ * carries forwarded SMS). Jedd is **:1234** and is iMessage-only — measured
+ * 2026-09-01, 200/200 recent messages and 68/68 chats report
+ * `service: "iMessage"`.
  */
 export function classifyAttachments(raw: unknown, limits: ImageLimits): ClassifiedAttachments {
   const list = Array.isArray(raw) ? raw : [];

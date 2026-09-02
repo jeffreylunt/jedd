@@ -58,10 +58,18 @@ test('🔴 an unfetchable image produces a note that says the picture did not ar
     LIMITS,
   );
   assert.ok(out.note);
-  assert.match(out.note, /did not come through|could NOT get/i);
+  assert.match(out.note, /did not|could NOT get/i);
   assert.match(out.note, /IMG_1\.HEIC/);
-  assert.match(out.note, /SMS/, 'the sender needs to know why, because a retry will not fix it');
   assert.match(out.note, /Do not pretend you saw it/i);
+  /**
+   * 🔴 IT MUST NOT DIAGNOSE A CAUSE. This asserted /SMS/ until 2026-09-01, when
+   * the MMS framing turned out to belong to the :1235 bridge — Jedd is :1234 and
+   * is iMessage-only (measured: 200/200 recent messages, 68/68 chats, all
+   * `service: "iMessage"`). Jedd was confidently telling people the cause of a
+   * problem they could not have had, and sending them to re-send over the
+   * channel they were already using.
+   */
+  assert.doesNotMatch(out.note, /SMS/i, 'we do not know the cause and must not invent one');
   assert.equal(out.text, 'can you read this', 'the question they asked still gets answered');
 });
 

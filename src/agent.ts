@@ -366,21 +366,31 @@ export function composeImageTurn(
       );
     } else {
       /**
-       * 🔴 THE COMMON ONE, AND THE ONE MOST LIKELY TO BE MISREAD AS OUR BUG.
+       * 🔴 NAMES NO CAUSE, BECAUSE WE DO NOT KNOW ONE.
        *
-       * Photos texted as MMS-over-SMS (green bubbles) frequently never sync to
-       * the Mac at all: the text part arrives and the image part does not, and a
-       * by-guid fetch comes back empty. That is a limitation of the bridge being
-       * a non-primary device, not something a retry fixes — so the note says what
-       * is true and what the person can actually do, rather than promising to
-       * try again.
+       * ⚠️ THIS SENTENCE USED TO DIAGNOSE THE FAILURE AS "sent as a text/SMS
+       * rather than iMessage", AND THAT WAS FALSE HERE. That failure is real,
+       * but it belongs to the **:1235** bridge — Jeff's personal Apple ID, which
+       * also carries his iPhone's forwarded SMS. **Jedd is :1234**, the bot
+       * account, and it is iMessage-only: measured 2026-09-01, all 200 most
+       * recent messages and all 68 chats on that server report
+       * `service: "iMessage"`, with no SMS traffic of any kind.
+       *
+       * So the old wording had Jedd confidently telling people the cause of a
+       * problem they could not have had — which is worse than saying nothing,
+       * because it sends them off to re-send over a channel they were already
+       * using.
+       *
+       * An unfetchable attachment here is an ordinary error: still uploading,
+       * the download failed, the file is missing on the server. It is a real
+       * branch and must never be silent, but it is not the headline risk and it
+       * does not get a confident explanation.
        */
       lines.push(
-        `They attached an image you could NOT get: ${label(t.name)} (${label(t.detail)}). This ` +
-          'usually means the ' +
-          'picture was sent as a text/SMS rather than iMessage and never reached this Mac. Tell ' +
-          'them their message arrived but the picture did not come through, and ask them to send ' +
-          'it again or just describe it. Do not pretend you saw it.',
+        `They attached an image you could NOT get: ${label(t.name)} (${label(t.detail)}). Their ` +
+          'message arrived but the picture did not — it may still have been uploading, or the ' +
+          'download failed. Tell them that plainly and ask them to send it again or describe it. ' +
+          'Do not guess at why, and do not pretend you saw it.',
       );
     }
   }
