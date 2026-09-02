@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import type { Connector, IncomingMessage, SendRecord } from '../connector.js';
+import type { Connector, IncomingAttachmentsHydrator, IncomingMessage, SendRecord } from '../connector.js';
 import { BlueBubblesClient } from './client.js';
 import { classifyPayload, type InboundVerdict } from './payload.js';
 import type { Presence } from './presence.js';
@@ -46,6 +46,16 @@ export interface ReceiverOptions {
    * the time.
    */
   threading?: ReplyThreading;
+  /**
+   * Turns the webhook's raw `attachments` array into fetched images.
+   *
+   * 🔴 INJECTED, NOT BUILT HERE, and optional. Downloading an attachment is an
+   * HTTP call with a password in it, and the receiver already has one job. More
+   * to the point: leaving it out is how every existing test of this class keeps
+   * working unchanged and how the shadow receiver stays incapable of pulling
+   * bytes it has no business pulling.
+   */
+  hydrateAttachments?: IncomingAttachmentsHydrator;
   log?: (line: string) => void;
 }
 
@@ -162,8 +172,43 @@ export class BlueBubblesReceiver {
 
     const run = handler ?? this.handler;
     if (!run) return;
+
+    /**
+     * 🔴 THE TURN RUNS EVEN IF THIS FAILS COMPLETELY.
+     *
+     * The hydrator already turns every download failure into a `trouble` entry
+     * rather than an exception, so this catch is for the case it cannot cover —
+     * a bug in the hydrator itself. Both paths end the same way, and that is the
+     * point: a photo that could not be fetched must never swallow the sentence
+     * it was sent with. Silence is the one outcome that is always wrong here,
+     * because from the sender's side it is identical to being ignored.
+     */
+    let message = verdict.message;
+    if (this.opts.hydrateAttachments) {
+      try {
+        const attachments = await this.opts.hydrateAttachments(verdict.attachmentsRaw);
+        if (attachments) message = { ...message, attachments };
+      } catch (e) {
+        this.log(`[bb] attachment hydration threw on ${verdict.dedupKey}: ${(e as Error).message}`);
+        message = {
+          ...message,
+          attachments: {
+            images: [],
+            trouble: [
+              {
+                reason: 'unfetchable',
+                name: 'the attachment',
+                detail: (e as Error).message,
+              },
+            ],
+            overflow: 0,
+          },
+        };
+      }
+    }
+
     try {
-      await run(verdict.message);
+      await run(message);
     } catch (e) {
       // A failing turn must not take the listener down or stop the next message.
       this.log(`[bb] handler threw on ${verdict.dedupKey}: ${(e as Error).message}`);

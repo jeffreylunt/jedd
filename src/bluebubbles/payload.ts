@@ -21,6 +21,16 @@ export type InboundVerdict =
       message: IncomingMessage;
       /** What dedup is keyed on. See `dedupKeyFor` for why this is not a composite. */
       dedupKey: string;
+      /**
+       * The webhook's `attachments` array, UNTOUCHED and UNFETCHED.
+       *
+       * 🔴 RAW ON PURPOSE. This module is pure — no I/O, no state — and turning
+       * an attachment into bytes is a network call. Classifying and downloading
+       * happen in the receiver, which already owns HTTP; keeping them out of
+       * here is what lets every rule below stay pinnable by a test with no
+       * server and no clock.
+       */
+      attachmentsRaw: unknown;
       rowid: number | null;
       guid: string | null;
       isFromMe: false;
@@ -164,7 +174,29 @@ export function classifyPayload(raw: unknown, selfIdentity?: string): InboundVer
     );
   }
 
-  if (!text.trim()) return skip('no text');
+  /**
+   * 🔴 AN ATTACHMENT-ONLY MESSAGE HAS NO TEXT, AND THIS LINE USED TO DROP IT.
+   *
+   * MEASURED 2026-09-01, both live and in BlueBubbles' own source: a photo sent
+   * with no caption arrives as `text: ""`. It is NOT the U+FFFC
+   * object-replacement character that Apple stores in `chat.db` — the server
+   * emits `message.universalText(true)`, and `sanitizeStr` strips U+FFFC in a
+   * loop and then trims, so by the time it reaches us there is nothing left.
+   * (`text` is `null` only when there is no attributedBody either.)
+   *
+   * So before this change, an inbound picture was indistinguishable from an
+   * empty message and was skipped as `'no text'` — silently, with the skip
+   * reason reading like a correct decision. **That guard, not a missing
+   * feature, is why Jedd had never once responded to a photo.**
+   *
+   * ⚠️ THE GUARD IS NARROWED, NOT REMOVED. A message with neither text nor
+   * attachments is still nothing to answer, and still skips. The emptiness test
+   * now asks "is there anything here at all", which is the question it was
+   * always standing in for.
+   */
+  const attachmentsRaw = data['attachments'];
+  const hasAttachments = Array.isArray(attachmentsRaw) && attachmentsRaw.length > 0;
+  if (!text.trim() && !hasAttachments) return skip('no text and no attachments');
   if (!senderHandle) return skip('no sender handle');
 
   const dedupKey = dedupKeyFor(rowid, guid);
@@ -181,6 +213,7 @@ export function classifyPayload(raw: unknown, selfIdentity?: string): InboundVer
     // not have to reach back into the verdict to find it.
     message: { senderHandle, text: text.trim(), ...(guid ? { sourceGuid: guid } : {}) },
     dedupKey,
+    attachmentsRaw,
     rowid,
     guid,
     isFromMe: false,

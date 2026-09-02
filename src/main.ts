@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, MAX_STEPS, type TurnRecord } from './agent.js';
+import { createImageHydrator } from './bluebubbles/attachments.js';
 import { BlueBubblesClient } from './bluebubbles/client.js';
 import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
@@ -9,6 +10,8 @@ import {
   presenceToken,
   sendToken,
   withPresence,
+  joinBurstText,
+  mergeAttachments,
   type IncomingMessage,
   type PresenceRecord,
   type SendRecord,
@@ -192,9 +195,35 @@ async function main(): Promise<void> {
           "other's questions, so every quote pointed at the wrong message. See threading.ts.",
   );
 
+  /**
+   * Inbound images.
+   *
+   * ⚠️ The BOUNDS live here, on the one object both the fetch and the burst
+   * joiner read. They were two numbers in two files during development and the
+   * per-turn cap and the per-message cap immediately disagreed — a burst was
+   * capped at one number and each message at another, so the effective limit was
+   * whichever ran last.
+   */
+  const imageLimits = {
+    maxWidth: config.images.maxWidth,
+    maxBytes: config.images.maxBytes,
+    maxCount: config.images.maxCount,
+  };
+  const hydrateAttachments = createImageHydrator({
+    baseUrl: config.bluebubbles.baseUrl,
+    password: config.bluebubbles.password,
+    limits: imageLimits,
+  });
+  console.error(
+    `[jedd] inbound images ON: up to ${imageLimits.maxCount} per turn, resized to ` +
+      `${imageLimits.maxWidth}px by the BlueBubbles server, ceiling ` +
+      `${Math.round(imageLimits.maxBytes / 1024 / 1024)} MB each.`,
+  );
+
   const receiver = new BlueBubblesReceiver({
     client,
     seen,
+    hydrateAttachments,
     // From the server, not from config: the loop guard must compare against the
     // account BlueBubbles is actually signed in as.
     selfIdentity: info.detectedIMessage,
@@ -573,9 +602,18 @@ async function main(): Promise<void> {
      * silently DROP any field added to it later, on the burst path only, with
      * nothing failing to compile.
      */
+    const merged = mergeAttachments(batch, imageLimits.maxCount);
     const message: IncomingMessage = {
       ...last,
-      text: batch.map((m) => m.text).join('\n'),
+      /**
+       * ⚠️ EMPTY TEXTS ARE FILTERED OUT, and that is new with images. A photo
+       * sent without a caption arrives as `text: ""`, so an unfiltered join
+       * turns "here" + photo into `"here\n"` — and a photo on its own into a
+       * bare newline, which is not an empty string and therefore survives every
+       * downstream emptiness check as though the person had typed something.
+       */
+      text: joinBurstText(batch),
+      ...(merged ? { attachments: merged } : {}),
       ...(last.sourceGuid ? {} : anchorFrom(batch)),
     };
     /**

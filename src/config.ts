@@ -116,6 +116,24 @@ export interface Config {
     /** The URL registered WITH BlueBubbles — must be reachable FROM it. */
     publicUrl: string;
   };
+  /**
+   * Bounds on inbound images. Every one of these is a knob on a path that
+   * reaches the model, so each has a working default and none is required.
+   */
+  images: {
+    /** Longest edge asked of BlueBubbles' server-side resize. */
+    maxWidth: number;
+    /** Hard ceiling, applied to the declared size AND to the bytes read. */
+    maxBytes: number;
+    /** Images one turn may carry, across a whole burst. */
+    maxCount: number;
+    /**
+     * How many recent image-bearing user turns keep their bytes when the request
+     * is built. See `stripStaleImages` in `agent.ts` — this is what stops a long
+     * thread from accumulating pictures until it blows `num_ctx`.
+     */
+    historyTurns: number;
+  };
   kindle: {
     smtpHost: string;
     smtpPort: number;
@@ -414,6 +432,24 @@ export function parseTurnTimeout(raw: string | undefined): number | undefined {
   return Math.min(MAX_TURN_TIMEOUT_MS, Math.max(MIN_TURN_TIMEOUT_MS, Math.round(n)));
 }
 
+/**
+ * A positive integer from the environment, or the default.
+ *
+ * ⚠️ NONSENSE FALLS BACK RATHER THAN COERCING, for the reason written out above
+ * `parseTurnTimeout`: `Number('')` is 0 and `Number('1024px')` is NaN, and a
+ * setting that reads as a number when it is not is how a deployment quietly
+ * acquires a value nobody chose. Here the nonsense readings would be an image
+ * ceiling of zero bytes — every photo rejected as oversize, on a build that
+ * looks configured.
+ */
+export function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return fallback;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.round(n);
+}
+
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
   // A hostname is deployment configuration; `.env` is authoritative and this
@@ -496,6 +532,12 @@ export function loadConfig(): Config {
         `http://${process.env.BLUEBUBBLES_WEBHOOK_HOST ?? '127.0.0.1'}:${
           process.env.BLUEBUBBLES_WEBHOOK_PORT ?? 18796
         }${process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook'}`,
+    },
+    images: {
+      maxWidth: parsePositiveInt(process.env.JEDD_IMAGE_MAX_WIDTH, 1024),
+      maxBytes: parsePositiveInt(process.env.JEDD_IMAGE_MAX_BYTES, 12 * 1024 * 1024),
+      maxCount: parsePositiveInt(process.env.JEDD_IMAGE_MAX_COUNT, 4),
+      historyTurns: parsePositiveInt(process.env.JEDD_IMAGE_HISTORY_TURNS, 2),
     },
     kindle: {
       smtpHost: process.env.KINDLE_SMTP_HOST ?? 'smtp.gmail.com',

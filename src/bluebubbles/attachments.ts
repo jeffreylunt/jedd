@@ -1,3 +1,4 @@
+import type { AttachmentTrouble, InboundAttachments, InboundImage } from '../connector.js';
 import type { FetchImpl } from './client.js';
 
 /**
@@ -423,4 +424,62 @@ async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array> 
     at += c.byteLength;
   }
   return out;
+}
+
+/**
+ * Turn a webhook's raw `attachments` array into fetched images plus the
+ * troubles worth saying out loud.
+ *
+ * 🔴 NEVER REJECTS, NEVER THROWS. A failure here must not take the turn with
+ * it. Someone who texts a photo AND a question has asked the question, and the
+ * worst available outcome is that the question goes unanswered because the
+ * picture would not download. Every failure becomes a `trouble` entry that the
+ * model is told about and can speak to.
+ *
+ * ⚠️ Images are fetched SEQUENTIALLY. Four parallel multi-megabyte transcodes
+ * would be four `sips` processes on the same Mac that is running the model, and
+ * the turn is not in a hurry — it is about to spend tens of seconds in
+ * inference.
+ */
+export function createImageHydrator(opts: {
+  baseUrl: string;
+  password: string;
+  limits?: ImageLimits;
+  fetchImpl?: FetchImpl;
+  timeoutMs?: number;
+}): (raw: unknown) => Promise<InboundAttachments | undefined> {
+  const limits = opts.limits ?? DEFAULT_IMAGE_LIMITS;
+  return async (raw: unknown) => {
+    const classified = classifyAttachments(raw, limits);
+    if (
+      classified.usable.length === 0 &&
+      classified.rejected.length === 0 &&
+      classified.overflow === 0
+    ) {
+      // The ordinary text message. Leave the field unset rather than attaching
+      // an empty record — see `InboundAttachments` on why absent and empty must
+      // not be distinguishable downstream.
+      return undefined;
+    }
+
+    const images: InboundImage[] = [];
+    const trouble: AttachmentTrouble[] = [...classified.rejected];
+
+    for (const att of classified.usable) {
+      const got = await fetchImage(att, {
+        baseUrl: opts.baseUrl,
+        password: opts.password,
+        limits,
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+        ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+      });
+      if (got.ok) {
+        images.push({ base64: got.base64, name: got.name, contentType: got.contentType });
+      } else {
+        trouble.push({ reason: got.reason, name: got.name, detail: got.detail });
+      }
+    }
+
+    return { images, trouble, overflow: classified.overflow };
+  };
 }
