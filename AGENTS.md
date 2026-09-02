@@ -55,6 +55,33 @@ where `ecosystem.config.cjs` ran `src/main.ts` through `tsx` straight off disk,
 so a restart shipped uncommitted edits. Under Docker that mechanism is gone.
 Read the Dockerfile, not that file, for how code reaches production.
 
+### Rebuilding
+
+```bash
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
+/usr/local/bin/docker compose up -d --build
+```
+
+🔴 **The `PATH` export is required, not decoration.** `~/.docker/config.json`
+sets `"credsStore": "desktop"`, and `docker-credential-desktop` lives in
+Docker.app's bundle and is **not on PATH**. Without it the build dies with:
+
+```
+failed to solve: error getting credentials - err: exec:
+"docker-credential-desktop": executable file not found in $PATH
+```
+
+Measured 2026-09-01 during this project's own deploy.
+
+🔴 **A recreate DESTROYS `docker logs` history.** Measured the same session: a
+turn failure timestamped `2026-09-02T04:34:27Z` was readable beforehand; after
+`docker compose up -d --build` the oldest line was `2026-09-02T05:02:17Z`, the
+new boot. The 04:34 line was gone.
+
+**So capture any log evidence you still need BEFORE you rebuild.** If you are
+diagnosing a failure and the fix is a rebuild, you are about to delete the
+evidence for the thing you are fixing.
+
 ### Proving what is actually running
 
 A boot line is **not** proof of which build you are on if older builds print it
@@ -255,8 +282,15 @@ let that boundary depend on its caller having remembered.
 - **`cmd && echo "clean"`** tests the exit code, not your condition.
   `git status` exits 0 when the tree is dirty. Assert on the string:
   `[ -z "$(git status --porcelain)" ]`.
-- **A prose number in a doc drifts.** `README.md` says "1411 tests"; the suite
-  is at 1501 as of d19cfb5. Trust `npm test`, not a sentence.
+- **A hardcoded count drifts, and it does not stay in prose.** `README.md`
+  carried *two different* stale test counts (1411 and 1425) against an actual
+  1501 — both corrected in b71a7ec. The same stale number had also reached an
+  **executable gate**: `scripts/weekly-fix-sweep.sh:151` instructs the
+  autonomous weekly-fix agent *"If npm test does not pass at 1411/1411, output
+  the literal line TESTS_FAILED instead of any PR URL"* — a condition that can
+  never be true again, so the sweep reports failure on a green suite. Found
+  2026-09-01; check whether it is still there before trusting that pipeline.
+  **Assert on the outcome (`fail 0`, exit code), never on a count.**
 - **Backticks inside a double-quoted shell string** are command substitution and
   will eat your text. Build prose in a quoted heredoc.
 - **A green test on a file you never `git add`ed** ships nothing. `git add -u`
@@ -274,10 +308,6 @@ let that boundary depend on its caller having remembered.
 
 Stated plainly so you know which lines to trust:
 
-- **I did not verify the `docker compose up -d --build` credential-helper
-  requirement**, or that recreating the container destroys `docker logs`
-  history. Both were reported to me by a teammate and are plausible; I ran no
-  build (Jedd is live). Treat as likely-but-unconfirmed.
 - **I did not exercise the release/tagging flow** in README "Cutting a
   release". I only read it.
 - **The `worthAnswering` skip list** (`src/bluebubbles/attachments.ts`) drops
