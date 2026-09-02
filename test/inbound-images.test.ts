@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { joinBurstText, mergeAttachments, type IncomingMessage } from '../src/connector.js';
-import { createImageHydrator } from '../src/bluebubbles/attachments.js';
+import { joinBurstText, mergeAttachmentsRaw, type IncomingMessage } from '../src/connector.js';
+import { createImageHydrator, worthAnswering } from '../src/bluebubbles/attachments.js';
 import { classifyPayload } from '../src/bluebubbles/payload.js';
 import type { FetchImpl } from '../src/bluebubbles/client.js';
 
@@ -191,65 +191,50 @@ function msg(over: Partial<IncomingMessage> = {}): IncomingMessage {
   return { senderHandle: '+18015550123', text: 'hi', ...over };
 }
 
-function withImages(n: number): IncomingMessage {
+function withRaw(n: number): IncomingMessage {
   return msg({
-    attachments: {
-      images: Array.from({ length: n }, (_, i) => ({
-        base64: 'AAAA',
-        name: `p${i}.png`,
-        contentType: 'image/png',
-      })),
-      trouble: [],
-      overflow: 0,
-    },
+    attachmentsRaw: Array.from({ length: n }, (_, i) => ({
+      guid: `g${Math.random()}-${i}`,
+      mimeType: 'image/png',
+      uti: 'public.png',
+      transferName: `p${i}.png`,
+      totalBytes: 10,
+    })),
   });
 }
 
 test('a burst with no attachments folds to undefined', () => {
-  assert.equal(mergeAttachments([msg(), msg()], 4), undefined);
+  assert.equal(mergeAttachmentsRaw([msg(), msg()]), undefined);
 });
 
-test('images from every message in the burst are collected', () => {
-  const merged = mergeAttachments([withImages(1), msg(), withImages(2)], 4);
+test('raw attachments from every message in the burst are concatenated', () => {
+  const merged = mergeAttachmentsRaw([withRaw(1), msg(), withRaw(2)]);
   assert.ok(merged);
-  assert.equal(merged.images.length, 3);
+  assert.equal(merged.length, 3);
 });
 
-test('🔴 the cap applies ACROSS the burst, not per message', () => {
-  // Four messages of two images each. Capped per message they all pass and eight
-  // arrive; the cap has to see the burst as one turn.
-  const merged = mergeAttachments([withImages(2), withImages(2), withImages(2), withImages(2)], 3);
+test('🔴 the cap is applied ONCE across the burst, BEFORE anything is fetched', async () => {
+  // Four messages of two images each. The old shape capped each message on its
+  // own, so eight files were downloaded and transcoded and six thrown away.
+  const merged = mergeAttachmentsRaw([withRaw(2), withRaw(2), withRaw(2), withRaw(2)]);
   assert.ok(merged);
-  assert.equal(merged.images.length, 3);
-  assert.equal(merged.overflow, 5, 'the ones we did not look at are COUNTED, not dropped silently');
-});
+  assert.equal(merged.length, 8, 'the merge itself does not cap — it hands the whole burst on');
 
-test('overflow already counted by a single message is carried, not lost', () => {
-  const m = msg({ attachments: { images: [], trouble: [], overflow: 2 } });
-  const merged = mergeAttachments([m, withImages(1)], 3);
-  assert.ok(merged);
-  assert.equal(merged.overflow, 2);
-  assert.equal(merged.images.length, 1);
-});
-
-test('trouble from every message in the burst is kept', () => {
-  const a = msg({
-    attachments: {
-      images: [],
-      trouble: [{ reason: 'unsupported', name: 'a.mov', detail: 'video/quicktime' }],
-      overflow: 0,
-    },
+  let fetches = 0;
+  const { hydrate } = hydrator(() => {
+    fetches += 1;
+    return png();
   });
-  const b = msg({
-    attachments: {
-      images: [],
-      trouble: [{ reason: 'oversize', name: 'b.png', detail: 'too big' }],
-      overflow: 0,
-    },
-  });
-  const merged = mergeAttachments([a, b], 4);
-  assert.ok(merged);
-  assert.equal(merged.trouble.length, 2);
+  const got = await hydrate(merged);
+  assert.ok(got);
+  assert.equal(got.images.length, 3, 'capped at maxCount');
+  assert.equal(got.overflow, 5, 'the ones not looked at are COUNTED, not dropped silently');
+  assert.equal(fetches, 3, 'the five over the cap were never downloaded at all');
+});
+
+test('a message that reported an empty attachments array still folds to a list', () => {
+  const merged = mergeAttachmentsRaw([msg({ attachmentsRaw: [] })]);
+  assert.deepEqual(merged, []);
 });
 
 test('🔴 a lone captionless photo does NOT become a bare newline', () => {
@@ -267,4 +252,74 @@ test('a caption on one message of a photo burst survives intact', () => {
 
 test('a genuine multi-line burst is still joined with newlines', () => {
   assert.equal(joinBurstText([msg({ text: 'one' }), msg({ text: 'two' })]), 'one\ntwo');
+});
+
+// ── the no-guid hole ─────────────────────────────────────────────────────────
+
+test('🔴 an attachment with no guid is rejected LOUDLY, not skipped in silence', async () => {
+  // Two emptiness tests that were allowed to disagree: classifyPayload said the
+  // message HAD attachments (length > 0), classifyAttachments said it had none.
+  // The turn then ran with no image, no trouble and — for a captionless photo —
+  // no text either. An attachment existed and nobody was told.
+  const { hydrate } = hydrator(() => png());
+  const got = await hydrate([{ mimeType: 'image/png', transferName: 'x.png' }]);
+  assert.ok(got, 'silence here is the exact defect this feature exists to prevent');
+  assert.equal(got.trouble[0]?.reason, 'unfetchable');
+  assert.equal(got.images.length, 0);
+});
+
+test('🔴 the response content-type is checked, not just the payload claim', async () => {
+  // Everything upstream trusts a type written by the sender's phone. An HTML
+  // login page served with a 200 was becoming base64 handed to a vision model.
+  const { hydrate } = hydrator(
+    () => new Response('<html>login</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+  );
+  const got = await hydrate([
+    { guid: 'g', mimeType: 'image/png', uti: 'public.png', transferName: 'a.png', totalBytes: 10 },
+  ]);
+  assert.ok(got);
+  assert.equal(got.images.length, 0);
+  assert.equal(got.trouble[0]?.reason, 'unsupported');
+});
+
+test('a content-type with parameters is still an image', async () => {
+  const { hydrate } = hydrator(
+    () =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg; charset=binary' },
+      }),
+  );
+  const got = await hydrate([
+    { guid: 'g', mimeType: 'image/jpeg', uti: 'public.jpeg', transferName: 'a.jpg', totalBytes: 10 },
+  ]);
+  assert.ok(got);
+  assert.equal(got.images.length, 1, 'exact-match on the whole header told people their photo was not an image');
+});
+
+// ── what is worth a model turn ───────────────────────────────────────────────
+
+test('🔴 a captionless voice memo does NOT cost a model turn', () => {
+  // It skipped in microseconds before this feature. A 25-790 second inference to
+  // say "I can only look at pictures" is a regression, not a courtesy.
+  assert.equal(
+    worthAnswering('', [{ guid: 'a', mimeType: 'audio/x-caf', uti: 'com.apple.coreaudio-format', transferName: 'Audio Message.caf' }], LIMITS),
+    false,
+  );
+});
+
+test('🔴 a captionless image that could NOT be fetched DOES get answered', () => {
+  // Here the sender believes they sent a picture, and silence is
+  // indistinguishable from being ignored.
+  assert.equal(worthAnswering('', [{ mimeType: 'image/png', transferName: 'x.png' }], LIMITS), true);
+});
+
+test('an oversize image with no caption is answered; text always is', () => {
+  assert.equal(
+    worthAnswering('', [{ guid: 'g', mimeType: 'image/png', uti: 'public.png', transferName: 'b.png', totalBytes: 999999 }], LIMITS),
+    true,
+  );
+  assert.equal(worthAnswering('what is this', [{ guid: 'v', mimeType: 'video/mp4', uti: 'public.mpeg-4', transferName: 'c.mp4' }], LIMITS), true);
+  assert.equal(worthAnswering('hello', undefined, LIMITS), true);
+  assert.equal(worthAnswering('', undefined, LIMITS), false);
 });

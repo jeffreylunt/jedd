@@ -63,14 +63,27 @@ export interface IncomingMessage {
    */
   sourceGuid?: string;
   /**
-   * Images and attachment troubles that came with this message.
+   * Whatever the transport reported as attached, UNFETCHED and untouched.
    *
-   * 🔴 OPTIONAL BECAUSE IT IS A TRANSPORT CAPABILITY, not because it is
+   * 🔴 RAW, AND IT TRAVELS THROUGH THE QUEUE THIS WAY ON PURPOSE.
+   *
+   * Downloading used to happen in the receiver, before the message was even
+   * submitted. That put a multi-megabyte transfer and a `sips` transcode on the
+   * Mac in front of three things that must not wait for it: the read receipt and
+   * typing indicator (whose stated job is to land *as Jedd picks the message
+   * up*), the 5-second burst settle (a photo slower than that missed the burst
+   * its own caption was in, so the caption got answered with no picture), and
+   * `StillWorkingNotice`, which is not armed yet — making the download window
+   * pure silence.
+   *
+   * Carrying the raw array instead keeps ingest cheap and pure, and moves the
+   * fetch inside the turn where the presence signals are already up.
+   *
+   * ⚠️ OPTIONAL BECAUSE IT IS A TRANSPORT CAPABILITY, not because it is
    * decoration — the same reasoning as `sourceGuid` directly above. A terminal
-   * has no attachments and says so by leaving this unset; it does not get to
-   * pretend an empty list is a considered answer.
+   * has no attachments and says so by leaving this unset.
    */
-  attachments?: InboundAttachments;
+  attachmentsRaw?: unknown;
 }
 
 /**
@@ -322,38 +335,27 @@ export type IncomingAttachmentsHydrator = (
  * pictures belong to that one turn too — someone who sends three photos and then
  * "which of these?" has asked one question about three images.
  *
- * 🔴 THE CAP IS ENFORCED ACROSS THE WHOLE BURST, NOT PER MESSAGE. Enforcing it
- * per message is the version that looks right and is not: four messages of four
- * images each would each pass their own check and arrive as sixteen, which is
- * how a bounded thing becomes unbounded without any single guard being wrong.
+ * 🔴 CONCATENATES THE *UNFETCHED* ARRAYS, SO THE CAP IS APPLIED ONCE, HERE,
+ * BEFORE ANY BYTES MOVE.
  *
- * ⚠️ Images past the cap are COUNTED as overflow, never dropped silently. The
- * count is what lets Jedd say "you sent seven, I looked at the first four" —
- * which is a true sentence, where saying nothing implies he looked at all seven.
+ * This used to merge already-fetched images, and that placed the cap after the
+ * work it was meant to bound: four messages of four images each were each
+ * capped correctly on their own, so sixteen files were downloaded, transcoded by
+ * the Mac and base64'd — and then twelve were discarded. A cap downstream of the
+ * expense bounds only what the model sees, which was never the part that hurt.
+ *
+ * Merging first means `classifyAttachments` sees the whole burst as one turn and
+ * refuses the extras before they are fetched at all.
  */
-export function mergeAttachments(
-  batch: IncomingMessage[],
-  maxCount: number,
-): InboundAttachments | undefined {
-  const images: InboundImage[] = [];
-  const trouble: AttachmentTrouble[] = [];
-  let overflow = 0;
+export function mergeAttachmentsRaw(batch: IncomingMessage[]): unknown[] | undefined {
+  const out: unknown[] = [];
   let any = false;
-
   for (const m of batch) {
-    const a = m.attachments;
-    if (!a) continue;
+    if (m.attachmentsRaw === undefined) continue;
     any = true;
-    trouble.push(...a.trouble);
-    overflow += a.overflow;
-    for (const img of a.images) {
-      if (images.length >= maxCount) overflow += 1;
-      else images.push(img);
-    }
+    if (Array.isArray(m.attachmentsRaw)) out.push(...m.attachmentsRaw);
   }
-
-  if (!any) return undefined;
-  return { images, trouble, overflow };
+  return any ? out : undefined;
 }
 
 /**

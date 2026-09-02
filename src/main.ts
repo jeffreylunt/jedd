@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { Agent, MAX_STEPS, type TurnRecord } from './agent.js';
-import { createImageHydrator } from './bluebubbles/attachments.js';
+import { createImageHydrator, worthAnswering } from './bluebubbles/attachments.js';
 import { BlueBubblesClient } from './bluebubbles/client.js';
 import { Presence } from './bluebubbles/presence.js';
 import { BlueBubblesConnector, BlueBubblesReceiver, parseSendAudience } from './bluebubbles/receiver.js';
@@ -11,7 +11,7 @@ import {
   sendToken,
   withPresence,
   joinBurstText,
-  mergeAttachments,
+  mergeAttachmentsRaw,
   type IncomingMessage,
   type PresenceRecord,
   type SendRecord,
@@ -223,7 +223,6 @@ async function main(): Promise<void> {
   const receiver = new BlueBubblesReceiver({
     client,
     seen,
-    hydrateAttachments,
     // From the server, not from config: the loop guard must compare against the
     // account BlueBubbles is actually signed in as.
     selfIdentity: info.detectedIMessage,
@@ -602,7 +601,7 @@ async function main(): Promise<void> {
      * silently DROP any field added to it later, on the burst path only, with
      * nothing failing to compile.
      */
-    const merged = mergeAttachments(batch, imageLimits.maxCount);
+    const mergedRaw = mergeAttachmentsRaw(batch);
     const message: IncomingMessage = {
       ...last,
       /**
@@ -613,9 +612,22 @@ async function main(): Promise<void> {
        * downstream emptiness check as though the person had typed something.
        */
       text: joinBurstText(batch),
-      ...(merged ? { attachments: merged } : {}),
+      ...(mergedRaw ? { attachmentsRaw: mergedRaw } : {}),
       ...(last.sourceGuid ? {} : anchorFrom(batch)),
     };
+    /**
+     * ⚠️ A voice memo, a contact card or a GamePigeon move with no text is a
+     * message Jedd was always silent about, and it must not start costing a
+     * 25–790 second turn to say "I can only look at pictures". Decided from the
+     * raw payload, so nothing has been downloaded at this point.
+     */
+    if (!worthAnswering(message.text, message.attachmentsRaw, imageLimits)) {
+      console.error(
+        `[jedd] skipped ${message.senderHandle}: an attachment-only message with nothing I can look at`,
+      );
+      return;
+    }
+
     /**
      * 🔴 CAPTURED AT ENTRY, NOT READ AT LOG TIME.
      *
@@ -701,9 +713,38 @@ async function main(): Promise<void> {
            * message MOST likely to feel ignored.
            */
           notice.arm(waited.queuedForMs);
+
+          /**
+           * 🔴 THE DOWNLOAD HAPPENS HERE, INSIDE THE TURN — not at ingest.
+           *
+           * By this line the read receipt has been sent, the typing indicator is
+           * up, the burst has settled and `notice` is armed, so a slow transfer
+           * looks like Jedd thinking rather than Jedd ignoring someone. It also
+           * means the per-turn cap is applied to the WHOLE burst before a single
+           * byte is fetched.
+           *
+           * ⚠️ It cannot throw: `createImageHydrator` turns every failure into a
+           * `trouble` entry. The catch is for a bug in the hydrator itself, and
+           * it ends the same way on purpose — a picture that will not download
+           * must never swallow the sentence it was sent with.
+           */
+          let attachments;
+          try {
+            attachments = await hydrateAttachments(message.attachmentsRaw);
+          } catch (e) {
+            console.error(`[jedd] 🔴 attachment hydration threw: ${(e as Error).message}`);
+            attachments = {
+              images: [],
+              trouble: [
+                { reason: 'unfetchable' as const, name: 'the attachment', detail: (e as Error).message },
+              ],
+              overflow: 0,
+            };
+          }
+
           let r: TurnRecord;
           try {
-            r = await agent.handle(message.senderHandle, message.text, message.attachments);
+            r = await agent.handle(message.senderHandle, message.text, attachments);
           } finally {
             notice.disarm();
           }

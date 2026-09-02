@@ -442,12 +442,22 @@ export function parseTurnTimeout(raw: string | undefined): number | undefined {
  * ceiling of zero bytes — every photo rejected as oversize, on a build that
  * looks configured.
  */
-export function parsePositiveInt(raw: string | undefined, fallback: number): number {
+export function parsePositiveInt(
+  raw: string | undefined,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
   const trimmed = (raw ?? '').trim();
   if (!trimmed) return fallback;
   const n = Number(trimmed);
   if (!Number.isFinite(n) || n <= 0) return fallback;
-  return Math.round(n);
+  /**
+   * ⚠️ CLAMPED AT THE TOP TOO, the same as `parseTurnTimeout` above. Without it
+   * `JEDD_IMAGE_MAX_BYTES=999999999` is accepted and `readCapped` will buffer
+   * every one of those bytes in memory before deciding anything — a ceiling that
+   * is the absence of a ceiling, on a build that looks configured.
+   */
+  return Math.min(max, Math.round(n));
 }
 
 export function loadConfig(): Config {
@@ -534,10 +544,10 @@ export function loadConfig(): Config {
         }${process.env.BLUEBUBBLES_WEBHOOK_PATH ?? '/webhook'}`,
     },
     images: {
-      maxWidth: parsePositiveInt(process.env.JEDD_IMAGE_MAX_WIDTH, 1024),
-      maxBytes: parsePositiveInt(process.env.JEDD_IMAGE_MAX_BYTES, 12 * 1024 * 1024),
-      maxCount: parsePositiveInt(process.env.JEDD_IMAGE_MAX_COUNT, 4),
-      historyTurns: parsePositiveInt(process.env.JEDD_IMAGE_HISTORY_TURNS, 2),
+      maxWidth: parsePositiveInt(process.env.JEDD_IMAGE_MAX_WIDTH, 1024, 4096),
+      maxBytes: parsePositiveInt(process.env.JEDD_IMAGE_MAX_BYTES, 12 * 1024 * 1024, 64 * 1024 * 1024),
+      maxCount: parsePositiveInt(process.env.JEDD_IMAGE_MAX_COUNT, 4, 16),
+      historyTurns: parsePositiveInt(process.env.JEDD_IMAGE_HISTORY_TURNS, 2, 8),
     },
     kindle: {
       smtpHost: process.env.KINDLE_SMTP_HOST ?? 'smtp.gmail.com',

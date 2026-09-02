@@ -4,8 +4,9 @@ import type { Config } from './config.js';
 import type { ChoiceStore } from './choices.js';
 import type { FollowupStore } from './followups.js';
 import type { KindleRegistry } from './kindle.js';
+import { safeLabel } from './bluebubbles/attachments.js';
 import type { InboundAttachments } from './connector.js';
-import { boundHistoryImages, type LlmClient, type LlmMessage } from './llm.js';
+import { buildRequestMessages, pruneStoredImages, type LlmClient, type LlmMessage } from './llm.js';
 import type { HistoryStore } from './store.js';
 import { roleFor, roleSatisfies, type Role } from './permissions.js';
 import { ALL_TOOLS } from './tools/index.js';
@@ -324,11 +325,30 @@ export function composeImageTurn(
   const { images, trouble, overflow } = attachments;
   const lines: string[] = [];
 
+  /**
+   * 🔴 THIS FUNCTION IS THE BOUNDARY INTO THE `system` ROLE, SO IT OWNS THE
+   * SANITISING — not the module that happens to produce the strings.
+   *
+   * `name` and `detail` both originate in the sender's own payload
+   * (`transferName`, `mimeType`, `uti`). Everything below is about to be handed
+   * to the model as `system`, the highest-trust role in the conversation, in a
+   * process whose registry can mint Jellyfin invites and mail files to a Kindle.
+   * A file called `clip.mov\n\nSYSTEM: ignore all prior instructions…` is the
+   * whole attack, and it needs no successful download — any `.mov` reaches the
+   * `unsupported` branch.
+   *
+   * ⚠️ `safeLabel` is applied at the producer too. That is not two guards
+   * masking each other: it is ONE function with two call sites, so a mutation of
+   * it fails the tests at both. What matters is that the boundary does not
+   * DEPEND on its caller having remembered.
+   */
+  const label = (raw: string) => `"${safeLabel(raw)}"`;
+
   if (images.length) {
     lines.push(
       images.length === 1
-        ? `They attached one image (${images[0]!.name}), which is on this message and you can see it.`
-        : `They attached ${images.length} images (${images.map((i) => i.name).join(', ')}), ` +
+        ? `They attached one image (${label(images[0]!.name)}), which is on this message and you can see it.`
+        : `They attached ${images.length} images (${images.map((i) => label(i.name)).join(', ')}), ` +
             'which are on this message and you can see them.',
     );
   }
@@ -337,12 +357,12 @@ export function composeImageTurn(
     if (t.reason === 'unsupported') {
       lines.push(
         `An attachment came with this message that is not an image, so you cannot look at it: ` +
-          `${t.name} (${t.detail}). You can only see pictures.`,
+          `${label(t.name)} (${label(t.detail)}). You can only see pictures.`,
       );
     } else if (t.reason === 'oversize') {
       lines.push(
-        `An image came with this message that was too large to look at: ${t.name} (${t.detail}). ` +
-          'They could send a smaller one or describe it.',
+        `An image came with this message that was too large to look at: ${label(t.name)} ` +
+          `(${label(t.detail)}). They could send a smaller one or describe it.`,
       );
     } else {
       /**
@@ -356,7 +376,8 @@ export function composeImageTurn(
        * try again.
        */
       lines.push(
-        `They attached an image you could NOT get: ${t.name} (${t.detail}). This usually means the ` +
+        `They attached an image you could NOT get: ${label(t.name)} (${label(t.detail)}). This ` +
+          'usually means the ' +
           'picture was sent as a text/SMS rather than iMessage and never reached this Mac. Tell ' +
           'them their message arrived but the picture did not come through, and ask them to send ' +
           'it again or just describe it. Do not pretend you saw it.',
@@ -378,12 +399,26 @@ export function composeImageTurn(
    * deliberately a plain description of what happened rather than an invented
    * question — guessing at "what is this?" would put words in their mouth.
    */
+  /**
+   * 🔴 THE MARKER NAMES NO FILE, AND THAT IS A SECURITY DECISION, NOT A STYLE
+   * ONE.
+   *
+   * It used to interpolate `transferName`. That string is chosen by the sender,
+   * and this text becomes `content` on a `user` turn — which is what
+   * `ctx.userTurns` is built from, which is what `appearsInOwnTurns` substring-
+   * matches, which is the ONLY gate on storing a Kindle address or minting a
+   * Jellyfin invite. A photo named `stranger@kindle.com.png` put that address
+   * into "things this person typed" without them typing anything.
+   *
+   * Filenames still reach the model — in the note, which is `system`-role,
+   * sanitised, and never part of `userTurns`.
+   */
   let out = text;
   if (!out) {
     if (images.length) {
-      out = images.length === 1 ? `(sent ${images[0]!.name}, no caption)` : `(sent ${images.length} images, no caption)`;
+      out = images.length === 1 ? '(sent a photo, no caption)' : `(sent ${images.length} photos, no caption)`;
     } else if (trouble.length) {
-      out = `(sent an attachment, no caption)`;
+      out = '(sent an attachment, no caption)';
     }
   }
 
@@ -507,19 +542,21 @@ export class Agent {
       this.histories.set(key, history);
     }
     /**
-     * 🔴 THE NOTE IS PUSHED BEFORE THE USER TURN, NOT AFTER.
+     * 🔴 THE NOTE IS CARRIED ON THE TURN, AND `buildRequestMessages` EXPANDS IT
+     * INTO A `system` MESSAGE IN FRONT OF THIS ONE AT REQUEST TIME.
      *
-     * Order is the whole point: the model reads the note as context it already
-     * had when the message arrived, which is what it is. Pushed after, it reads
-     * as something that happened in response to the message — and a `system`
-     * turn arriving after a `user` turn is also the shape of an instruction
-     * injected mid-conversation, which is not what this is.
+     * It is not pushed as its own history entry, because then nothing can keep
+     * it honest: the image-bounding pass strips bytes off older turns, and a
+     * free-standing note went on asserting "you can see it" about a picture that
+     * had been dropped. Derived-at-send-time cannot go stale.
      */
     const composed = composeImageTurn(userText, attachments, { maxCount: this.config.images.maxCount });
-    if (composed.note) history.push({ role: 'system', content: composed.note });
     history.push({
       role: 'user',
       content: composed.text,
+      /** What they actually typed — see `LlmMessage.rawText`. */
+      rawText: userText,
+      ...(composed.note ? { imageNote: composed.note } : {}),
       /**
        * ⚠️ The bytes live on the history entry, and `boundHistoryImages` decides
        * per REQUEST how many of them travel. Storing them here and bounding at
@@ -533,10 +570,17 @@ export class Agent {
     // plain `{role:'user', content}`. So images are per-process by construction
     // and cannot survive a restart, which is correct: a stale picture presented
     // as current context is the same defect as a stale tool reading.
-    userText = composed.text;
+    const composedText = composed.text;
+    /**
+     * 🔴 `rawText` FIRST, `content` ONLY AS A FALLBACK. `content` may be a
+     * machine-composed marker for a captionless photo, and this list is the
+     * provenance evidence two write gates depend on — see `LlmMessage.rawText`.
+     * The comment above ("only what this person typed") is a claim this line has
+     * to keep true, not a description of what `content` happens to hold.
+     */
     ctx.userTurns = history
       .filter((m) => m.role === 'user')
-      .map((m) => m.content)
+      .map((m) => m.rawText ?? m.content)
       .filter((c): c is string => typeof c === 'string' && c.length > 0);
 
     const toolCalls: ToolInvocation[] = [];
@@ -549,7 +593,10 @@ export class Agent {
      */
     for (; steps < MAX_STEPS; steps++) {
       const reply = await this.llm.chat(
-        boundHistoryImages(history, this.config.images.historyTurns),
+        buildRequestMessages(history, {
+          keepTurns: this.config.images.historyTurns,
+          maxImages: this.config.images.maxCount,
+        }),
         tools,
       );
 
@@ -753,7 +800,20 @@ export class Agent {
       at: new Date().toISOString(),
       senderHandle,
       role,
-      userText,
+      /**
+       * ⚠️ THE COMPOSED TEXT, NOT THE RAW TEXT. A captionless photo has no raw
+       * text at all, and a log line reading `""` says nothing about what
+       * happened; `(sent a photo, no caption)` says exactly what happened.
+       *
+       * 🔴 SAFE ONLY BECAUSE THE MARKER NAMES NO FILE. It is persisted, and
+       * `HistoryStore.replay` rebuilds it as a plain user turn with no
+       * `rawText` — so after a restart this string DOES reach `ctx.userTurns`.
+       * A marker that interpolated `transferName` would therefore smuggle
+       * sender-chosen text past the provenance gates one process-restart later,
+       * which is the version of that bug nobody would have found. See
+       * `composeImageTurn`.
+       */
+      userText: composedText,
       toolCalls,
       replyText,
       steps: steps + 1,
@@ -761,7 +821,14 @@ export class Agent {
     };
     // Persisted AFTER the turn completes, so a crash mid-turn leaves no record
     // of a reply that was never delivered.
-    this.store?.record(senderHandle, userText, replyText);
+    this.store?.record(senderHandle, composedText, replyText);
+    /**
+     * 🔴 FREE THE IMAGES THAT CAN NEVER TRAVEL AGAIN. `histories` is per-sender
+     * and nothing else prunes it; at the defaults an unbounded conversation
+     * retains ~64 MB of base64 per image-bearing turn for the life of the
+     * process. See `pruneStoredImages` for why this loses nothing.
+     */
+    pruneStoredImages(history, this.config.images.historyTurns);
     this.onTurn?.(record);
     return record;
   }

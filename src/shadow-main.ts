@@ -11,7 +11,7 @@ import { ChoiceStore } from './choices.js';
 import { KindleRegistry } from './kindle.js';
 import { HistoryStore } from './store.js';
 import { buildTools } from './tools/index.js';
-import type { IncomingMessage } from './connector.js';
+import { joinBurstText, type IncomingMessage } from './connector.js';
 import { BURST_SETTLE_MS, sleep, TurnQueue } from './turn-queue.js';
 
 /**
@@ -121,7 +121,14 @@ async function main(): Promise<void> {
       const started = Date.now();
       const senderHandle = batch[batch.length - 1]!.senderHandle;
       try {
-        const record = await agent.handle(senderHandle, batch.map((m) => m.text).join('\n'));
+        /**
+         * ⚠️ `joinBurstText`, NOT A LOCAL JOIN. `classifyPayload` now delivers
+         * attachment-only messages, whose `text` is `""` — so a hand-rolled
+         * `join('\n')` here turns a lone photo into a BARE NEWLINE and runs a
+         * full model turn on whitespace. The shadow path takes no hydrator (it
+         * must not pull bytes), but it inherits the narrowed guard either way.
+         */
+        const record = await agent.handle(senderHandle, joinBurstText(batch));
         // 🔴 The reply is WRITTEN, never sent. This is the whole point of the mode.
         console.error(
           `[shadow] turn ${turn} from ${senderHandle}: ` +

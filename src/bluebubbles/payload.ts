@@ -211,7 +211,12 @@ export function classifyPayload(raw: unknown, selfIdentity?: string): InboundVer
     // `sourceGuid` is what a threaded reply anchors to. It is the same `guid`
     // reported alongside — carried on the message itself so the send path does
     // not have to reach back into the verdict to find it.
-    message: { senderHandle, text: text.trim(), ...(guid ? { sourceGuid: guid } : {}) },
+    message: {
+      senderHandle,
+      text: text.trim(),
+      ...(guid ? { sourceGuid: guid } : {}),
+      ...(hasAttachments ? { attachmentsRaw } : {}),
+    },
     dedupKey,
     attachmentsRaw,
     rowid,
