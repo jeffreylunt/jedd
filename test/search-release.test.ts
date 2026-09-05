@@ -177,14 +177,23 @@ test('a partly-unfetchable result set says how many were dropped', async () => {
   assert.match(r.content, /1 more had no infoHash or download link and cannot be fetched/);
 });
 
-test('🔴 a row with a download link is NOT counted as dropped — it is resolvable', async () => {
-  // The distinction the wording above now carries, asserted rather than implied.
+test('🔴 a row with a download link is KEPT and offered, not counted as dropped', async () => {
+  /**
+   * ⚠️ ASSERTS THE BEHAVIOUR, NOT THE ABSENCE OF A STRING. The first version of
+   * this test only said the "dropped" note was absent — which is ALSO true under
+   * the old code, where the row is discarded and the note is worded differently.
+   * It was green on the code it exists to reject.
+   */
   const r = await run(
     async () =>
-      json([release({ infoHash: HASH_A }), release({ infoHash: 'nope', downloadUrl: 'http://prowlarr/proxy/1' })]),
+      json([
+        release({ title: 'Copy A', infoHash: HASH_A }),
+        release({ title: 'Copy B', infoHash: 'nope', downloadUrl: 'http://prowlarr/proxy/1' }),
+      ]),
     { query: 'x' },
   );
   assert.equal(r.ok, true);
+  assert.match(r.content, /Copy B/, 'the resolvable row must reach the person');
   assert.doesNotMatch(r.content, /had no infoHash or download link/);
 });
 

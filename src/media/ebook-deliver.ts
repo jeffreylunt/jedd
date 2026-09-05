@@ -266,6 +266,13 @@ async function fetchViaIrc(subject: EbookDeliverSubject, deps: DeliverDeps, mayB
 
 /** Prowlarr/qBittorrent: is it on disk yet, and if so read it off hp. */
 async function fetchViaTorrent(subject: EbookDeliverSubject, deps: DeliverDeps): Promise<Got> {
+  /**
+   * ⚠️ REACHABLE ONLY IF SOMEONE BREAKS AN ORDERING INVARIANT. `send_ebook`
+   * resolves the hash ABOVE both the grab and the subject it builds here, so a
+   * prowlarr subject always carries one. `EbookDeliverSubject` has no
+   * `downloadUrl`, so a follow-up persisted with an empty hash could never
+   * recover — keep the resolve above the subject construction.
+   */
   if (!subject.infoHash) {
     return { state: 'failed', detail: 'that pick did not carry a torrent hash, so it cannot be fetched.' };
   }

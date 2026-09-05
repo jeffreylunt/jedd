@@ -25,6 +25,11 @@ import { isValidInfoHash, magnetFor } from './prowlarr.js';
  * command line, the same discipline as `isValidContainerName`. That validation
  * is the entire defence on this identity, and `magnetFor` refuses rather than
  * trusting its caller.
+ *
+ * ⚠️ 2026-09-04: the hash may now arrive from a REDIRECT HEADER rather than a
+ * JSON field — see `resolveMagnet` in `prowlarr.ts`. Nothing above changes; the
+ * input is more obviously third-party than it was, which is why `namesExactly`
+ * below stopped being a substring test.
  */
 
 export type GrabOutcome =
@@ -45,6 +50,40 @@ export interface GrabInput {
   category: string;
   savePath?: string;
   exec?: ExecImpl;
+}
+
+/**
+ * Does this magnet name THIS torrent and only this torrent?
+ *
+ * ── 🔴 A SUBSTRING TEST WAS NOT A SECOND OPINION ─────────────────────────────
+ *
+ * This used to be `supplied.includes(infoHash)`, which reads the same
+ * unstructured string the same loose way that `resolveMagnet` used to, so the
+ * two "independent" checks were one check and failed together. A magnet can
+ * carry a valid 40-hex decoy inside its DISPLAY NAME:
+ *
+ *     magnet:?dn=xt=urn:btih:<hash A>&xt=urn:btih:<hash B>
+ *
+ * `includes(A)` is true, and a client downloads B.
+ *
+ * ⚠️ Note `''.includes('')` is true, so the old form was VACUOUSLY satisfied by
+ * an empty hash — fenced only by the `isValidInfoHash` guard above, which is now
+ * the single thing standing between a stored `infoHash: ''` and this check.
+ *
+ * So parse it, require exactly one `xt`, and compare that ONE value. A magnet we
+ * cannot parse or that names two torrents is not rejected outright — we simply
+ * do not adopt it, and build our own from the hash we already validated.
+ */
+function namesExactly(magnetUri: string, infoHash: string): boolean {
+  if (!magnetUri.startsWith('magnet:') || !isValidInfoHash(infoHash)) return false;
+  let xts: string[];
+  try {
+    xts = new URL(magnetUri).searchParams.getAll('xt');
+  } catch {
+    return false;
+  }
+  if (xts.length !== 1) return false;
+  return xts[0]!.toLowerCase() === `urn:btih:${infoHash.toLowerCase()}`;
 }
 
 /** Single-quote for the remote shell. The magnet is ours, but quote it anyway. */
@@ -102,8 +141,7 @@ export async function grabTorrent(input: GrabInput): Promise<GrabOutcome> {
    * one we validated, so a mismatched or hostile URI cannot ride along.
    */
   const supplied = input.magnetUri ?? '';
-  const matchesHash = supplied.toLowerCase().includes(input.infoHash.toLowerCase());
-  const magnet = supplied.startsWith('magnet:') && matchesHash
+  const magnet = namesExactly(supplied, input.infoHash)
     ? supplied
     : magnetFor(input.infoHash, input.title);
 

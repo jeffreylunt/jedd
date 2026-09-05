@@ -8,8 +8,10 @@
  * V1 saw `pending_count: 1` and a torrent that never materialised. So a release
  * is only usable if it carries an `infoHash`, and the grab builds its own magnet.
  *
- * A release without one is therefore not a candidate at all, and saying so is
- * more useful than offering something that cannot be fetched.
+ * ⚠️ UPDATED 2026-09-04: a release without one in the JSON is STILL a candidate,
+ * because `downloadUrl` REDIRECTS to a magnet that carries the hash — see
+ * `resolveMagnet`. What remains true is the sentence above it: qBittorrent is
+ * never handed a URL. It is handed a magnet, and the resolve happens here.
  *
  * ── ⚠️ PROWLARR IS SLOW AND HAMMERING IT MAKES THINGS WORSE ──────────────────
  *
@@ -103,12 +105,31 @@ export type MagnetResolution =
  * scheme is `magnet:`, which no HTTP client can fetch. The redirect is the
  * payload, not a step on the way to one.
  *
- * ⚠️ THE HASH IS VALIDATED HERE, before anything sees it. It comes from a
- * third-party indexer via a redirect header and it ends up on a privileged
- * shell command line; `grabTorrent` re-checks that the magnet contains the hash
- * it was given, so a hostile Location cannot smuggle a different torrent past
- * both.
+ * ── 🔴 THE MAGNET IS PARSED, NOT PATTERN-MATCHED, AND THAT IS A SECURITY RULE ─
+ *
+ * The Location header is third-party text that decides what gets downloaded
+ * into somebody's library, and it reaches a privileged shell command line.
+ *
+ * An earlier version read the hash with an UNANCHORED regex over the whole
+ * string, and `grabTorrent` corroborated it with a bare substring test. Both
+ * read the same unstructured string the same loose way, so they were ONE check,
+ * and this got past them:
+ *
+ *     magnet:?dn=xt=urn:btih:<40 hex A>&xt=urn:btih:<40 hex B>
+ *
+ * The decoy A lives inside the DISPLAY NAME. It is valid 40 hex, so it passed
+ * validation, and it appears in the string, so it passed the substring check —
+ * while the single real `xt` names B, which is what a client downloads. It would
+ * have reported STARTED, and nothing in V2 would ever have noticed: the
+ * audiobook path has no follow-up and no status check.
+ *
+ * So: parse the URL, require EXACTLY ONE `xt`, and anchor the hash pattern to
+ * that parameter's whole value. More than one `xt` is refused rather than
+ * guessed at — a magnet naming two torrents is not a magnet we understand.
  */
+/** A real magnet with 21 trackers is ~1.5 KB. This is a sanity bound, not a spec. */
+const MAX_MAGNET_CHARS = 8192;
+
 export async function resolveMagnet(
   downloadUrl: string,
   fetchImpl?: FetchImpl,
@@ -121,19 +142,50 @@ export async function resolveMagnet(
   } catch (e) {
     return { state: 'unknown', detail: `could not ask Prowlarr where the release points (${(e as Error).message})` };
   }
+  // A 200 carrying a Location is not a redirect. Only 3xx means "it is over there".
+  if (res.status < 300 || res.status >= 400) {
+    return {
+      state: 'unknown',
+      detail: `Prowlarr answered http ${res.status} rather than redirecting, so there is no magnet to read.`,
+    };
+  }
   const location = res.headers?.get?.('location') ?? '';
   if (!location) {
     return {
       state: 'unknown',
-      detail: `Prowlarr answered http ${res.status} with no redirect, so there is no magnet to read.`,
+      detail: `Prowlarr answered http ${res.status} with no Location header, so there is no magnet to read.`,
     };
   }
   if (!location.startsWith('magnet:')) {
     return { state: 'unknown', detail: 'Prowlarr redirected somewhere that is not a magnet.' };
   }
-  const found = /xt=urn:btih:([A-Za-z0-9]+)/i.exec(location)?.[1] ?? '';
+  /**
+   * ⚠️ It goes verbatim onto an ssh argv. A real magnet with 21 trackers is
+   * ~1.5 KB; anything near ARG_MAX is not a magnet, it is a denial of service.
+   */
+  if (location.length > MAX_MAGNET_CHARS) {
+    return { state: 'unknown', detail: `the magnet is ${location.length} characters, which is not a magnet.` };
+  }
+  let xts: string[];
+  try {
+    xts = new URL(location).searchParams.getAll('xt');
+  } catch {
+    return { state: 'unknown', detail: 'Prowlarr redirected to something that does not parse as a URL.' };
+  }
+  if (xts.length !== 1) {
+    return {
+      state: 'unknown',
+      detail:
+        xts.length === 0
+          ? 'the magnet names no torrent at all.'
+          : `the magnet names ${xts.length} different torrents, so which one it means is UNKNOWN.`,
+    };
+  }
+  // 🔴 ANCHORED to the whole parameter value. An unanchored match here is the
+  // decoy hole described above.
+  const found = /^urn:btih:([A-Fa-f0-9]{40})$/.exec(xts[0]!)?.[1] ?? '';
   // Read before the guard: the type predicate narrows the failing branch away.
-  const shown = found.slice(0, 48);
+  const shown = xts[0]!.slice(0, 48);
   if (!isValidInfoHash(found)) {
     return { state: 'unknown', detail: `the magnet carries "${shown}", which is not a valid infoHash.` };
   }
@@ -176,8 +228,9 @@ export class ProwlarrClient {
   /**
    * One search. No retry loop — see the backoff note above.
    *
-   * Releases without a usable `infoHash` are discarded and COUNTED, so "nothing
-   * found" and "found things we cannot fetch" stay distinguishable.
+   * Releases with NEITHER an `infoHash` nor a `downloadUrl` are discarded and
+   * COUNTED, so "nothing found" and "found things we cannot fetch" stay
+   * distinguishable. One with a link is kept and resolved at grab time.
    */
   async search(term: string, category: number): Promise<SearchResult> {
     const url =

@@ -187,6 +187,16 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
       // `deliverEbook` finds the file by hash. Resolving twice, or resolving
       // only for the grab, would leave the delivery looking for ''.
       let infoHash = String(value['infoHash'] ?? '');
+      /**
+       * ⚠️ A LOCAL, NOT A WRITE BACK INTO `value`.
+       *
+       * `value` is `picked.option.value` — the object the ChoiceStore still
+       * holds in memory. Writing the resolved magnet into it mutated live state
+       * that is never re-appended to `choices.jsonl`, so memory and the file
+       * diverged, and the stale pair outlived the turn for the choice TTL.
+       * Nothing needs it outside this function.
+       */
+      let magnetUri = typeof value['magnetUri'] === 'string' ? value['magnetUri'] : undefined;
       if (source === 'prowlarr' && !infoHash) {
         const downloadUrl = typeof value['downloadUrl'] === 'string' ? value['downloadUrl'] : '';
         const resolved = downloadUrl
@@ -199,14 +209,14 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
           );
         }
         infoHash = resolved.infoHash;
-        value['magnetUri'] = resolved.magnetUri;
+        magnetUri = resolved.magnetUri;
       }
       if (source === 'prowlarr') {
         const grab = await grabTorrent({
           adminSshHost: ctx.config.adminSshHost,
           qbitBaseUrl: ctx.config.qbittorrent.baseUrl,
           infoHash,
-          ...(typeof value['magnetUri'] === 'string' ? { magnetUri: value['magnetUri'] } : {}),
+          ...(magnetUri ? { magnetUri } : {}),
           title,
           category: 'ebooks',
           exec: ctx.exec,

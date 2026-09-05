@@ -147,6 +147,74 @@ test('🔴 a hostile redirect cannot smuggle a different torrent past the grab',
   assert.equal(commands.filter((c) => c.includes('torrents/add')).length, 0);
 });
 
+/**
+ * 🔴 THE DECOY. MALFORMED WAS NEVER THE DANGEROUS CASE.
+ *
+ * The test above feeds an 8-character hash, which the length check alone
+ * refuses — it exercises MALFORMED and never WELL-FORMED-BUT-WRONG, which is
+ * the shape that actually gets through.
+ *
+ * A magnet may carry a valid 40-hex hash inside ANOTHER parameter's value. With
+ * an unanchored regex, `resolveMagnet` reads the decoy out of `dn=` and
+ * validates it; `grabTorrent`'s corroborating check is a bare substring test, so
+ * the decoy satisfies that too. Two checks reading the same unstructured string
+ * the same loose way are ONE check, and they fail together:
+ *
+ *     validated aaaa… while the single real xt param says bbbb…
+ *
+ * qBittorrent obeys the `xt`, so torrent B lands in /downloads/audiobooks and
+ * the host cron moves it into Audiobookshelf. Nothing in V2 ever notices: the
+ * audiobook path has no follow-up and no status check, so the substitution is
+ * invisible and reported as STARTED.
+ */
+test('🔴 a VALID-LOOKING decoy hash inside dn= cannot substitute the torrent', async () => {
+  /**
+   * ⚠️ THE PROPERTY IS "NO MISMATCH", NOT "REFUSE IT".
+   *
+   * This magnet is well formed — it has exactly ONE `xt`, and the decoy is only
+   * a display name. Reading the real torrent and downloading the real torrent is
+   * the CORRECT outcome; refusing it would be over-fitting to the exploit.
+   *
+   * What must never happen again is the two halves disagreeing: validating the
+   * decoy while qBittorrent obeys the `xt`. So the assertion is that the hash
+   * handed to the client is the one that was validated, and is NOT the decoy.
+   */
+  const DECOY = 'a'.repeat(40);
+  const REAL = 'b'.repeat(40);
+  const evil = `magnet:?dn=xt=urn:btih:${DECOY}&xt=urn:btih:${REAL}&tr=udp%3A%2F%2Fevil%3A1337`;
+  const { exec, commands } = ssh();
+  const r = await makeAddAudiobook(async () => redirectTo(evil)).run({ choice: 1 }, ctxNoHash(exec));
+  assert.equal(r.ok, true, r.content);
+  const add = commands.find((c) => c.includes('torrents/add'))!;
+  assert.ok(add, 'the well-formed magnet should still be usable');
+  // The decoy must never be what we thought we were fetching.
+  assert.doesNotMatch(add.toLowerCase(), new RegExp(`hashes=${DECOY}`), 'the decoy must not be adopted');
+  assert.match(add.toLowerCase(), new RegExp(REAL), 'the real xt is what reaches the client');
+});
+
+test('🔴 REGRESSION: the hash we VALIDATE is the hash the client is given', async () => {
+  // The exploit was a mismatch between those two, invisible because the audiobook
+  // path has no follow-up and no status check to notice it.
+  const DECOY = 'a'.repeat(40);
+  const REAL = 'b'.repeat(40);
+  const { exec, commands } = ssh();
+  await makeAddAudiobook(async () =>
+    redirectTo(`magnet:?dn=xt=urn:btih:${DECOY}&xt=urn:btih:${REAL}`),
+  ).run({ choice: 1 }, ctxNoHash(exec));
+  const prio = commands.find((c) => c.includes('topPrio'));
+  // topPrio is addressed BY HASH — if it names the decoy it is a silent no-op
+  // against a torrent that was never added, which is how the mismatch hid.
+  if (prio) assert.doesNotMatch(prio.toLowerCase(), new RegExp(DECOY));
+});
+
+test('🔴 a magnet carrying MORE THAN ONE xt is refused rather than guessed at', async () => {
+  const { exec, commands } = ssh();
+  const two = `magnet:?xt=urn:btih:${'a'.repeat(40)}&xt=urn:btih:${'b'.repeat(40)}`;
+  const r = await makeAddAudiobook(async () => redirectTo(two)).run({ choice: 1 }, ctxNoHash(exec));
+  assert.equal(r.ok, false);
+  assert.equal(commands.filter((c) => c.includes('torrents/add')).length, 0);
+});
+
 test('CONTROL: a pick that already HAS an infoHash still grabs without any resolve', async () => {
   const { exec } = ssh();
   let fetched = 0;

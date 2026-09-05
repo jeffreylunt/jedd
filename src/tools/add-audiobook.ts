@@ -1,6 +1,6 @@
 import { resolveOfKind } from '../choices.js';
 import { grabTorrent } from '../media/grab.js';
-import { resolveMagnet, type FetchImpl } from '../media/prowlarr.js';
+import { isValidInfoHash, resolveMagnet, type FetchImpl } from '../media/prowlarr.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -39,13 +39,19 @@ import { fail, ok, type Tool } from './types.js';
  *
  * Returns the pair to grab with, or a sentence saying why not.
  */
-async function magnetFor(
+async function resolveForPick(
   value: Record<string, unknown>,
   fetchImpl?: FetchImpl,
 ): Promise<{ ok: true; infoHash: string; magnetUri?: string } | { ok: false; detail: string }> {
-  const infoHash = String(value['infoHash'] ?? '');
+  /**
+   * ⚠️ VALIDATED, NOT MERELY PRESENT. `choices.jsonl` is durable and predates
+   * this change, so a stored hash can be anything. A truthy-but-invalid one used
+   * to short-circuit the resolve and dead-end at `grabTorrent`'s refusal — with a
+   * `downloadUrl` sitting right there that would have worked.
+   */
+  const stored = value['infoHash'];
   const magnetUri = typeof value['magnetUri'] === 'string' ? value['magnetUri'] : undefined;
-  if (infoHash) return { ok: true, infoHash, ...(magnetUri ? { magnetUri } : {}) };
+  if (isValidInfoHash(stored)) return { ok: true, infoHash: stored, ...(magnetUri ? { magnetUri } : {}) };
 
   const downloadUrl = typeof value['downloadUrl'] === 'string' ? value['downloadUrl'] : '';
   if (!downloadUrl) {
@@ -108,7 +114,7 @@ export function makeAddAudiobook(fetchImpl?: FetchImpl): Tool {
     if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
 
     const title = String(picked.option.value['title'] ?? picked.option.label);
-    const resolved = await magnetFor(picked.option.value, fetchImpl);
+    const resolved = await resolveForPick(picked.option.value, fetchImpl);
     if (!resolved.ok) {
       // 🔴 A FAILURE TO RESOLVE IS NOT A FINDING THAT THE BOOK DOES NOT EXIST.
       return fail(
