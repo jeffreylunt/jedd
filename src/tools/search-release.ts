@@ -551,7 +551,16 @@ function makeReleaseSearch(
           band: swarmRank(r.seeders),
           format: isAudio ? 0 : formatScore(r.title),
           seeders: r.seeders,
-          value: { source: 'prowlarr', infoHash: r.infoHash, title: r.title, ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}) },
+          value: {
+            source: 'prowlarr',
+            infoHash: r.infoHash,
+            title: r.title,
+            ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}),
+            // 🔴 Carried so the consumer can RESOLVE a release that has no
+            // infoHash yet. Without this the pick reaches the grab with nothing
+            // to fetch — see resolveMagnet in prowlarr.ts.
+            ...(r.downloadUrl ? { downloadUrl: r.downloadUrl } : {}),
+          },
         }));
 
       const merged = mergeSources(torrentOffers, ircOffers);
@@ -622,7 +631,7 @@ function makeReleaseSearch(
       // Found-but-unfetchable is reported: "nothing found" and "found things we
       // cannot fetch" are different answers.
       if (found.state === 'results' && found.discarded) {
-        notes.push(`${found.discarded} more had no infoHash and cannot be fetched`);
+        notes.push(`${found.discarded} more had no infoHash or download link and cannot be fetched`);
       }
       if (wrongWork.length) notes.push(`${wrongWork.length} that are not that book left out`);
       if (prowlarrNote) notes.push(prowlarrNote);

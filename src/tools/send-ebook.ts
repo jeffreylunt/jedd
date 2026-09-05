@@ -1,6 +1,7 @@
 import { resolveOfKind } from '../choices.js';
 import { deliverEbook } from '../media/ebook-deliver.js';
 import { grabTorrent, type MountMap } from '../media/grab.js';
+import { resolveMagnet, type FetchImpl } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { MailSender } from '../media/kindle-send.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
@@ -43,11 +44,15 @@ export interface SendEbookDeps {
    * build is a DIFFERENT OBJECT, not the same object in a different mood.
    */
   onlySendTo?: string;
+  /** Test seam for resolving a magnet from a Prowlarr download link. */
+  fetchImpl?: FetchImpl;
   /** The IRC source, when this deployment has one. */
   irc?: IrcEbooks;
 }
 
 export function makeSendEbook(deps: SendEbookDeps): Tool {
+  // The resolve seam. Production uses the real `fetch`; tests inject.
+  const fetchImpl: FetchImpl | undefined = deps.fetchImpl;
   return {
     name: 'send_ebook',
     description:
@@ -178,12 +183,30 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
        */
 
       // ── start the fetch ──────────────────────────────────────────────────
+      // 🔴 Resolved BEFORE the grab and reused for the subject below, because
+      // `deliverEbook` finds the file by hash. Resolving twice, or resolving
+      // only for the grab, would leave the delivery looking for ''.
+      let infoHash = String(value['infoHash'] ?? '');
+      if (source === 'prowlarr' && !infoHash) {
+        const downloadUrl = typeof value['downloadUrl'] === 'string' ? value['downloadUrl'] : '';
+        const resolved = downloadUrl
+          ? await resolveMagnet(downloadUrl, fetchImpl)
+          : ({ state: 'unknown', detail: 'that release carries neither an infoHash nor a download link.' } as const);
+        if (resolved.state === 'unknown') {
+          return fail(
+            `COULD NOT FETCH — ${resolved.detail} Nothing was sent. Say that this particular copy ` +
+              'could not be started, NOT that the book is unavailable.',
+          );
+        }
+        infoHash = resolved.infoHash;
+        value['magnetUri'] = resolved.magnetUri;
+      }
       if (source === 'prowlarr') {
-        const infoHash = String(value['infoHash'] ?? '');
         const grab = await grabTorrent({
           adminSshHost: ctx.config.adminSshHost,
           qbitBaseUrl: ctx.config.qbittorrent.baseUrl,
           infoHash,
+          ...(typeof value['magnetUri'] === 'string' ? { magnetUri: value['magnetUri'] } : {}),
           title,
           category: 'ebooks',
           exec: ctx.exec,
@@ -196,7 +219,7 @@ export function makeSendEbook(deps: SendEbookDeps): Tool {
         source,
         title,
         ...(source === 'prowlarr'
-          ? { infoHash: String(value['infoHash'] ?? '') }
+          ? { infoHash }
           : { command: String(value['command'] ?? ''), bot: String(value['bot'] ?? '') }),
       } as const;
 

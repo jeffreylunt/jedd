@@ -44,7 +44,10 @@ export const CATEGORY = { ebook: 7020, audiobook: 3030 } as const;
 
 export interface Release {
   title: string;
-  /** 40 hex characters. The ONLY thing that makes a release grabbable. */
+  /**
+   * 40 hex characters — or **the empty string**, meaning it must be RESOLVED
+   * from `downloadUrl` before this release can be grabbed. See `resolveMagnet`.
+   */
   infoHash: string;
   /**
    * The release's OWN magnet URI when it has one.
@@ -55,9 +58,86 @@ export interface Release {
    * full magnet for these indexers.
    */
   magnetUri?: string;
+  /**
+   * Prowlarr's own download link for this release.
+   *
+   * 🔴 IT IS NOT A TORRENT FILE — IT IS A 301 TO A MAGNET, AND THAT IS THE
+   * WHOLE POINT. Measured 2026-09-04: every 1337x row publishes NO `infoHash`
+   * in the JSON, and its `downloadUrl` redirects to a full magnet carrying the
+   * hash AND 21 trackers. 8 of 8 rows, two different searches.
+   *
+   * ⚠️ Kept even for releases that already have an `infoHash`, so the resolve
+   * path is available rather than being an inference about which indexer we are
+   * talking to.
+   */
+  downloadUrl?: string;
   seeders: number;
   sizeBytes: number;
   indexer: string;
+}
+
+/** What `resolveMagnet` came back with. A failure to LOOK is never a "no". */
+export type MagnetResolution =
+  | { state: 'magnet'; magnetUri: string; infoHash: string }
+  | { state: 'unknown'; detail: string };
+
+/**
+ * Turn a Prowlarr `downloadUrl` into a magnet, by reading where it POINTS.
+ *
+ * ── 🔴 THIS IS THE FIX FOR "THE BOOK IS NOT ON THE INDEXERS" ─────────────────
+ *
+ * Prowlarr publishes `infoHash` for The Pirate Bay and NOT for 1337x. Measured
+ * 2026-09-04:
+ *
+ *     "Dungeon Crawler Carl"         6 rows, all 1337x,      0 with infoHash
+ *     "Project Hail Mary Andy Weir"  3 rows,                 1 with infoHash (TPB)
+ *     "Red Rising Pierce Brown"      8 rows,                 3 with infoHash (all TPB)
+ *
+ * Dungeon Crawler Carl is carried ONLY by 1337x, so the entire series was
+ * unfetchable and the tool truthfully reported that nothing could be fetched.
+ *
+ * The redirect target carries the hash and the indexer's trackers, which is
+ * strictly better than a synthesized `xt=urn:btih:` relying on DHT alone.
+ *
+ * ⚠️ `redirect: 'manual'` IS LOAD BEARING. Following it throws — the target
+ * scheme is `magnet:`, which no HTTP client can fetch. The redirect is the
+ * payload, not a step on the way to one.
+ *
+ * ⚠️ THE HASH IS VALIDATED HERE, before anything sees it. It comes from a
+ * third-party indexer via a redirect header and it ends up on a privileged
+ * shell command line; `grabTorrent` re-checks that the magnet contains the hash
+ * it was given, so a hostile Location cannot smuggle a different torrent past
+ * both.
+ */
+export async function resolveMagnet(
+  downloadUrl: string,
+  fetchImpl?: FetchImpl,
+  timeoutMs = 30_000,
+): Promise<MagnetResolution> {
+  const doFetch = fetchImpl ?? ((u: string, i?: RequestInit) => fetch(u, i));
+  let res: Response;
+  try {
+    res = await doFetch(downloadUrl, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    return { state: 'unknown', detail: `could not ask Prowlarr where the release points (${(e as Error).message})` };
+  }
+  const location = res.headers?.get?.('location') ?? '';
+  if (!location) {
+    return {
+      state: 'unknown',
+      detail: `Prowlarr answered http ${res.status} with no redirect, so there is no magnet to read.`,
+    };
+  }
+  if (!location.startsWith('magnet:')) {
+    return { state: 'unknown', detail: 'Prowlarr redirected somewhere that is not a magnet.' };
+  }
+  const found = /xt=urn:btih:([A-Za-z0-9]+)/i.exec(location)?.[1] ?? '';
+  // Read before the guard: the type predicate narrows the failing branch away.
+  const shown = found.slice(0, 48);
+  if (!isValidInfoHash(found)) {
+    return { state: 'unknown', detail: `the magnet carries "${shown}", which is not a valid infoHash.` };
+  }
+  return { state: 'magnet', magnetUri: location, infoHash: found };
 }
 
 export type SearchResult =
@@ -131,10 +211,27 @@ export class ProwlarrClient {
     let discarded = 0;
     const releases: Release[] = [];
     for (const r of rows as Record<string, unknown>[]) {
-      const infoHash = r['infoHash'];
-      if (!isValidInfoHash(infoHash)) {
-        // Not grabbable: qBittorrent cannot fetch it, so offering it would be a
-        // choice the user cannot actually have.
+      /**
+       * 🔴 "NO infoHash" NO LONGER MEANS "NOT GRABBABLE" — THE PREMISE WAS
+       * OVERTURNED BY MEASUREMENT, 2026-09-04. See `resolveMagnet`.
+       *
+       * This used to discard every row without an `infoHash`, on the reasoning
+       * that qBittorrent cannot fetch a Prowlarr URL. That reasoning is still
+       * true and the conclusion was still wrong: the `downloadUrl` REDIRECTS to
+       * a magnet, and reading a redirect is something WE do here, not something
+       * qBittorrent has to do in its netns.
+       *
+       * The cost of the old rule was total for some content — Dungeon Crawler
+       * Carl is carried only by 1337x, which publishes no `infoHash`, so the
+       * whole series was invisible and the tool said so honestly.
+       *
+       * ⚠️ A row with NEITHER is still discarded. What narrowed is the
+       * definition of unfetchable, not the rule that we do not offer choices
+       * nobody can take.
+       */
+      const infoHash = isValidInfoHash(r['infoHash']) ? r['infoHash'] : '';
+      const downloadUrl = typeof r['downloadUrl'] === 'string' ? r['downloadUrl'] : '';
+      if (!infoHash && !downloadUrl) {
         discarded += 1;
         continue;
       }
@@ -142,6 +239,7 @@ export class ProwlarrClient {
       releases.push({
         title: String(r['title'] ?? ''),
         infoHash,
+        ...(downloadUrl ? { downloadUrl } : {}),
         ...(guid.startsWith('magnet:') ? { magnetUri: guid } : {}),
         seeders: Number(r['seeders'] ?? 0),
         sizeBytes: Number(r['size'] ?? 0),
@@ -152,7 +250,8 @@ export class ProwlarrClient {
       return {
         state: 'none',
         detail: discarded
-          ? `Prowlarr returned ${discarded} result(s), but none carried an infoHash, so none can be fetched.`
+          ? `Prowlarr returned ${discarded} result(s), but none carried an infoHash OR a download link, ` +
+            'so none can be fetched.'
           : 'Prowlarr found nothing for that search.',
       };
     }
