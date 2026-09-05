@@ -2,8 +2,10 @@ import { byScore, describeSwarm, swarmHealth, swarmRank } from '../media/pick-re
 import {
   CATEGORY,
   GRAPHIC_AUDIO,
+  isValidInfoHash,
   ProwlarrClient,
   rankAudiobooks,
+  resolveMagnet,
   rankReleases,
   type FetchImpl,
   type Release,
@@ -23,6 +25,9 @@ import {
 import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
 import { resolveOfKind } from '../choices.js';
 import { fail, ok, type Tool } from './types.js';
+
+/** Bounded: each attempt is a request against a client that warns about hammering. */
+const MAX_RESOLVE_ATTEMPTS = 3;
 
 /**
  * The PRODUCERS for `add_audiobook` and `send_ebook`.
@@ -574,7 +579,66 @@ function makeReleaseSearch(
        */
       const wrongWork = work ? merged.filter((o) => o.work === WORK_MATCH.NOT_THIS_WORK) : [];
       const candidates = work ? merged.filter((o) => o.work !== WORK_MATCH.NOT_THIS_WORK) : merged;
-      const top = candidates.slice(0, 5);
+      let top = candidates.slice(0, 5);
+
+      /**
+       * ═══ MAKE THE AUTO-PICK GRABBABLE BY CONSTRUCTION ══════════════════════
+       *
+       * 🔴 A REGRESSION THE 1337x FIX INTRODUCED, AND THE INVARIANT IT BROKE.
+       *
+       * Unfetchable releases used to be dropped BEFORE ranking, so whatever
+       * ranked top could always be grabbed. Keeping the RESOLVABLE ones removed
+       * that guarantee without removing the sentence that depended on it: the
+       * tool says *"I took the healthiest swarm myself"* and the grab can then
+       * fail on that very release, while a good copy sits one row down. To the
+       * person testing it, a confident pick that will not fetch reads as "the
+       * fix did not work".
+       *
+       * So the chosen release is RESOLVED HERE, walking down until one answers.
+       *
+       * ⚠️ ONLY WHEN A WORK IS PINNED, AND THAT CONDITION IS THE WHOLE SAFETY OF
+       * IT. Every candidate has been scored as a COPY OF THE SAME BOOK, so
+       * moving down the list answers "which copy" — explicitly not the person's
+       * decision. On the unpinned path the candidates are DIFFERENT WORKS, and
+       * walking down there would quietly fetch a different book; that path still
+       * resolves at grab time, where a failure is reported rather than routed
+       * around.
+       *
+       * ⚠️ Bounded. Each attempt is a request against a service whose own client
+       * warns about hammering, and a page of dead links should not become a
+       * page of requests.
+       */
+      if (work && top.length > 0) {
+        const tried: string[] = [];
+        let resolvedTop: Offer | undefined;
+        for (const offer of top.slice(0, MAX_RESOLVE_ATTEMPTS)) {
+          const v = offer.value;
+          if (v['source'] !== 'prowlarr' || isValidInfoHash(v['infoHash'])) {
+            resolvedTop = offer;
+            break;
+          }
+          const downloadUrl = typeof v['downloadUrl'] === 'string' ? v['downloadUrl'] : '';
+          if (!downloadUrl) continue;
+          const got = await resolveMagnet(downloadUrl, fetchImpl);
+          if (got.state === 'magnet') {
+            // Recorded on the option itself, so the consumer grabs what was
+            // actually checked rather than resolving a second time.
+            resolvedTop = { ...offer, value: { ...v, infoHash: got.infoHash, magnetUri: got.magnetUri } };
+            break;
+          }
+          tried.push(`${offer.label.split(' — ')[0]} (${got.detail})`);
+        }
+        if (!resolvedTop) {
+          return ok(
+            `COULD NOT FETCH — "${describeWork(work)}" is on the indexers, but none of the ` +
+              `${tried.length} copy(ies) tried could be turned into something the download client ` +
+              `can take: ${tried.slice(0, 3).join('; ')}. Say the copies could not be started — do ` +
+              'NOT say the book does not exist, and do not offer one of these anyway.',
+          );
+        }
+        // The resolved one leads; the rest stay as alternatives.
+        top = [resolvedTop, ...top.filter((o) => o !== resolvedTop && o.value !== resolvedTop.value)];
+      }
 
       /**
        * Everything was found and everything we can fetch is dead. Same two-zeros

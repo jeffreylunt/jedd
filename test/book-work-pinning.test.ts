@@ -737,3 +737,118 @@ test('🔴 a one-item WHICH BOOK does not claim the query "matches more than one
   assert.match(r.content, /^WHICH BOOK — /);
   assert.doesNotMatch(r.content, /matches more than one book/);
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 A CONFIDENT PICK MUST BE ONE WE CAN ACTUALLY FETCH.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Releases that could not be fetched used to be dropped BEFORE ranking, so the
+ * auto-pick was grabbable by construction. Keeping the resolvable ones (the
+ * 1337x fix) quietly removed that guarantee: `top[0]` can now be a release whose
+ * resolve fails at grab time, and the tool has already said *"I took the
+ * healthiest swarm myself"*.
+ *
+ * That reads as "the fix did not work" to the person testing it, while a
+ * perfectly good copy sits at `top[1]`.
+ *
+ * ⚠️ THE WALK IS ONLY LEGITIMATE BECAUSE A WORK IS PINNED. Every candidate here
+ * is a COPY OF THE SAME BOOK, so moving down the list answers "which copy",
+ * which is explicitly not the person's decision. On the unpinned path the
+ * candidates are DIFFERENT WORKS and walking down would grab a different book —
+ * see the control below.
+ */
+const OL_ONE_DCC = {
+  docs: [
+    { key: '/works/OL24848242W', title: 'The Dungeon Anarchist’s Cookbook', author_name: ['Matt Dinniman'], first_publish_year: 2021, edition_count: 5 },
+  ],
+};
+
+/** Two copies of the SAME book; neither publishes an infoHash. */
+const TWO_COPIES = [
+  { title: 'The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman [broken]', downloadUrl: 'http://prowlarr/broken', seeders: 40, size: 900 * 1024 ** 2, indexer: '1337x' },
+  { title: 'The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman [good]', downloadUrl: 'http://prowlarr/good', seeders: 14, size: 900 * 1024 ** 2, indexer: '1337x' },
+];
+
+const GOOD_MAGNET = `magnet:?xt=urn:btih:${'f'.repeat(40)}&dn=good`;
+const resolveOnlyGood = (async (url: string, init?: RequestInit) => {
+  if (String(url).includes('/api/v1/search')) return json(TWO_COPIES);
+  if (String(url).includes('/good')) {
+    return { ok: false, status: 301, headers: { get: () => GOOD_MAGNET } } as unknown as Response;
+  }
+  // The better-seeded copy cannot be resolved at all.
+  throw new Error('ECONNRESET');
+}) as FetchImpl;
+
+test('🔴 the auto-pick walks past a release that cannot be resolved', async () => {
+  const r = await makeSearchAudiobook(resolveOnlyGood, openLibrary(OL_ONE_DCC)).run(
+    { query: DCC_QUERY },
+    ctx(),
+  );
+  assert.equal(r.ok, true, r.content);
+  assert.match(r.content, /^CHOSE — /);
+  assert.match(r.content, /\[good\]/, 'the copy it can actually fetch is the one chosen');
+  assert.doesNotMatch(r.content, /\[broken\]/, 'the better-seeded but unfetchable copy is not claimed');
+});
+
+test('🔴 a pick that has been resolved carries its hash, so the grab cannot fail on it', async () => {
+  const path = tempFile();
+  await makeSearchAudiobook(resolveOnlyGood, openLibrary(OL_ONE_DCC)).run(
+    { query: DCC_QUERY },
+    ctx({ choices: new ChoiceStore(path) }),
+  );
+  const stored = new ChoiceStore(path).resolve(JEFF, 1);
+  assert.ok(stored.ok);
+  if (!stored.ok) throw new Error('unreachable');
+  assert.equal(stored.option.value['infoHash'], 'f'.repeat(40), 'the chosen option is grabbable by construction');
+});
+
+test('🔴 when NOTHING resolves it says so, and does not claim a choice it cannot honour', async () => {
+  const noneResolve = (async (url: string) => {
+    if (String(url).includes('/api/v1/search')) return json(TWO_COPIES);
+    throw new Error('ECONNRESET');
+  }) as FetchImpl;
+  const r = await makeSearchAudiobook(noneResolve, openLibrary(OL_ONE_DCC)).run({ query: DCC_QUERY }, ctx());
+  assert.doesNotMatch(r.content, /^CHOSE — /, 'nothing may be presented as chosen');
+  assert.match(r.content, /COULD NOT FETCH|could not be fetched/i);
+});
+
+test('🔴 CONTROL: the UNPINNED path does NOT walk down — those are different books', async () => {
+  /**
+   * The safety condition on the walk above, asserted rather than described.
+   *
+   * With no pinned work the candidates are DIFFERENT WORKS, not copies of one,
+   * so silently moving to the next one would fetch a book nobody asked for —
+   * the Anarchist Cookbook failure with the roles reversed. This path must still
+   * hand back the list and ask, resolving only what the person actually picks.
+   */
+  let resolves = 0;
+  const impl = (async (url: string) => {
+    if (String(url).includes('/api/v1/search')) return json(TWO_COPIES);
+    resolves += 1;
+    return { ok: false, status: 301, headers: { get: () => GOOD_MAGNET } } as unknown as Response;
+  }) as FetchImpl;
+
+  // openLibraryDown => no work can be pinned => the degraded, asking path.
+  const r = await makeSearchAudiobook(impl, openLibraryDown()).run({ query: DCC_QUERY }, ctx());
+  assert.match(r.content, /^FOUND /, 'the unpinned path asks');
+  assert.equal(resolves, 0, 'nothing may be resolved before the person has chosen a book');
+});
+
+test('🔴 the walk is BOUNDED — a page of dead links is not a page of requests', async () => {
+  const many = Array.from({ length: 10 }, (_, i) => ({
+    title: `The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman copy${i}`,
+    downloadUrl: `http://prowlarr/x${i}`,
+    seeders: 30 - i,
+    size: 900 * 1024 ** 2,
+    indexer: '1337x',
+  }));
+  let attempts = 0;
+  const impl = (async (url: string) => {
+    if (String(url).includes('/api/v1/search')) return json(many);
+    attempts += 1;
+    throw new Error('ECONNRESET');
+  }) as FetchImpl;
+  await makeSearchAudiobook(impl, openLibrary(OL_ONE_DCC)).run({ query: DCC_QUERY }, ctx());
+  assert.ok(attempts <= 3, `resolved ${attempts} times; the walk must be bounded`);
+});
