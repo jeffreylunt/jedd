@@ -10,7 +10,16 @@ import {
 } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
-import { indexerTerm, matchWork, pinWork, relevantWorks, WORK_MATCH, type Work } from '../media/book-work.js';
+import {
+  indexerTerm,
+  matchWork,
+  pinWork,
+  relevantWorks,
+  significantTitleTokens,
+  tokens,
+  WORK_MATCH,
+  type Work,
+} from '../media/book-work.js';
 import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
 import { resolveOfKind } from '../choices.js';
 import { fail, ok, type Tool } from './types.js';
@@ -63,6 +72,19 @@ import { fail, ok, type Tool } from './types.js';
  * provenance in `value.source`. The model never decides which fetcher runs —
  * `send_ebook` switches on the stored value, in code.
  */
+/**
+ * Does what they SAID name this book — every significant word of it?
+ *
+ * The gate on auto-pinning a lone catalogue survivor. Deliberately containment
+ * rather than a score: a threshold invites tuning, and the question here is not
+ * "how close is this" but "did they say it".
+ */
+function namesTheWork(query: string, work: Work): boolean {
+  const asked = new Set(tokens(query));
+  const title = significantTitleTokens(work.title);
+  return title.length > 0 && title.every((t) => asked.has(t));
+}
+
 function makeReleaseSearch(
   medium: 'audiobook' | 'ebook',
   fetchImpl?: FetchImpl,
@@ -273,30 +295,45 @@ function makeReleaseSearch(
           const plausible = relevantWorks(query, found.works).slice(0, 5);
           if (!work && plausible.length === 0) {
             workNote = `the book catalogue returned nothing that looks like "${query}"`;
-          } else if (!work && plausible.length === 1) {
+          } else if (!work && plausible.length === 1 && namesTheWork(query, plausible[0]!)) {
             /**
-             * 🔴 ONE SURVIVOR IS AN ANSWER, NOT A QUESTION. Measured 2026-09-04.
+             * 🔴 ONE SURVIVOR THE QUERY ACTUALLY NAMES IS AN ANSWER, NOT A
+             * QUESTION. Measured 2026-09-04.
              *
              * `pinWork` needs the query to BE the title; a query that names the
              * SERIES and the book never is one. So Jeff's *"the 2nd dungeon
-             * crawler Carl book, 'The anarchists cookbook'"* fell here, and the
-             * tool asked *"WHICH BOOK — this matches more than one book"* above
-             * a list containing exactly one. The question is false as written
-             * and costs a round trip to answer nothing.
+             * crawler Carl book, 'The anarchists cookbook'"* fell through to the
+             * ask, and the tool asked *"WHICH BOOK — this matches more than one
+             * book"* above a list containing exactly one. The question is false
+             * as written and costs a round trip to answer nothing.
              *
-             * ⚠️ WHAT THAT QUESTION WAS PROTECTING, since removing a confirmation
-             * step deserves the check: not much, and nothing that is gone now. A
-             * wrong pin cannot buy the wrong book — `matchWork` refuses every
-             * release that is not a copy of this work, and the NOT THE BOOK
-             * branch below then explicitly forbids offering one instead. And the
-             * CHOSE reply NAMES the work, so a wrong settle reaches the person
-             * as a sentence they can contradict rather than as silence.
+             * ⚠️ THE `namesTheWork` GATE IS THE WHOLE SAFETY OF THIS BRANCH, AND
+             * THE OBVIOUS VERSION WITHOUT IT WAS NOT SAFE.
+             *
+             * `relevantWorks` admits a work on ONE shared token, author tokens
+             * included — it decides what is worth putting in a list a person
+             * READS, which is a display-grade judgement. This branch turns it
+             * into a purchase-grade one: the CHOSE reply below ends *"Call
+             * add_audiobook now with choice 1"*, and that consumer grabs
+             * immediately, so the settle and the download land in the SAME turn.
+             * The person does not get to see the book's name first. The ask this
+             * replaces was the last checkpoint, so what replaces it has to be
+             * stronger than one coincidental word — a lone survivor sharing only
+             * `cookbook` must still ask, and does.
              *
              * Measured over 34 queries — the 16 real ones in the audit log plus
-             * 18 written to break it — this fired 4 times and was right 4 times,
-             * while every vague query that must NOT auto-pin (*"that hobbit
-             * book"*, *"the new sanderson one"*) kept more than one candidate and
-             * still asks.
+             * 18 written to break it — AS SHIPPED, with the gate on:
+             *
+             *     pinWork already settled it   16
+             *     AUTO-PIN here                 2   both correct
+             *     one survivor, GATED to ask    1
+             *     two or more, asks            12
+             *     no candidates at all          3
+             *
+             * ⚠️ Ungated it would have fired 4 times, also all correct. The gate
+             * costs two of those a round trip and buys the guarantee that this
+             * branch cannot settle a book nobody named. That trade is deliberate:
+             * the failure it prevents ends in a download.
              */
             work = plausible[0];
           } else if (!work) {
@@ -318,9 +355,21 @@ function makeReleaseSearch(
                 value: { work: w as unknown as Record<string, unknown> },
               })),
             });
+            /**
+             * ⚠️ THE ONE-CANDIDATE WORDING IS NOT COSMETIC. This branch can still
+             * be reached with a single option — when the survivor is one the
+             * query does not actually name — and "matches more than one book"
+             * above a list of one is simply false. A question that misdescribes
+             * itself teaches the reader to skim the next one.
+             */
+            const head =
+              plausible.length === 1
+                ? `WHICH BOOK — the book catalogue is not sure "${query}" is this one, and nothing ` +
+                  'has been searched for yet:'
+                : `WHICH BOOK — "${query}" matches more than one book and nothing has been searched ` +
+                  'for yet:';
             return ok(
-              `WHICH BOOK — "${query}" matches more than one book and nothing has been searched for ` +
-                `yet:\n${plausible.map((w, i) => `  ${i + 1}. ${describeWork(w)}`).join('\n')}\n` +
+              `${head}\n${plausible.map((w, i) => `  ${i + 1}. ${describeWork(w)}`).join('\n')}\n` +
                 'Ask which one they meant. When they answer, call this same tool again with the same ' +
                 'query and their number as `choice` — it will then choose the best release itself. ' +
                 'If NONE of these is the book they want, say so plainly and ask for the author, then ' +

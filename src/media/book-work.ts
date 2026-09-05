@@ -161,32 +161,14 @@ const NOISE = new Set(
 );
 
 /**
- * Everything that is not a letter or a digit is a separator in a filename —
- * EXCEPT an apostrophe, which is removed instead.
+ * Every way a catalogue or a release group writes an apostrophe.
  *
- * ── 🔴 AN APOSTROPHE IS NOT A WORD BOUNDARY, AND SPLITTING ON ONE HID A BOOK ─
- *
- * Found by running the matcher, 2026-09-04. Open Library spells the work with a
- * CURLY apostrophe and every indexer drops it entirely:
- *
- *     'The Dungeon Anarchist’s Cookbook'  split ->  … anarchist | s | cookbook
- *     'The Dungeon Anarchists Cookbook'   split ->  … anarchists | cookbook
- *
- * `anarchist` is not `anarchists`, so the work's own title token was MISSING
- * from the filename of the one release that IS the book, and `matchWork` refused
- * it as "does not name" the work. The tool then reported the book "does not
- * appear to be on the indexers" — a coverage gap we manufactured, about a
- * release sitting right there at 14 seeders.
- *
- * Removing it lands both spellings on `anarchists`. Four of five real possessive
- * titles were refused before this; the fifth passed only because the release's
- * series name repeated the word that the possessive had eaten.
- *
- * ⚠️ THIS IS NOT A STEMMER AND MUST NOT BECOME ONE. It removes a character that
- * carries no identity; it does not decide that two different words mean the same
- * thing. `matchWork`'s whole value is that it refuses near misses, and the
- * numbered volumes of one series are the near misses it exists to catch.
+ * ⚠️ ONE LIST, USED BY BOTH SITES. The defect this exists for was two places
+ * disagreeing about punctuation; two copies of the class would let them
+ * silently diverge again the first time one is edited.
  */
+const APOSTROPHES = /['\u2018\u2019\u02BC\u00B4`]/g;
+
 /**
  * The form of a name to SEND to an indexer.
  *
@@ -205,25 +187,80 @@ const NOISE = new Set(
  *
  * ⚠️ This is for the WIRE only. `describeWork` still shows the title the way the
  * catalogue spells it, because that is the half a person reads.
+ *
+ * ⚠️ KNOWN LIMIT, UNMEASURED: this glues ELISIONS as well as possessives, so
+ * `L’Étranger` goes out as `LÉtranger` where indexers tend to write
+ * `L Etranger`. The 0→1 measurement above is a possessive; the elision class
+ * runs the other way and nobody has counted it. Fix it when a real search
+ * misses, not on a hunch about French titles.
  */
 export function indexerTerm(s: string): string {
-  return s.replace(/['’ʼ]/g, '');
+  return s.replace(APOSTROPHES, '');
 }
 
+/**
+ * Everything that is not a letter or a digit is a separator in a filename —
+ * EXCEPT an apostrophe, which is removed, and a possessive `s` orphaned by one,
+ * which is joined back on.
+ *
+ * ── 🔴 AN APOSTROPHE IS NOT A WORD BOUNDARY, AND SPLITTING ON ONE HID A BOOK ─
+ *
+ * Found by running the matcher, 2026-09-04. Open Library spells the work with a
+ * CURLY apostrophe and indexers write the same possessive THREE ways:
+ *
+ *     'The Dungeon Anarchist’s Cookbook'   (catalogue)
+ *     'The Dungeon Anarchists Cookbook'    (apostrophe dropped)
+ *     'The Dungeon Anarchist s Cookbook'   (apostrophe became a space)
+ *
+ * Splitting on the apostrophe produced `anarchist` for the first and
+ * `anarchists` for the second, so `matchWork` refused the one release that IS
+ * the book as "does not name" the work, and the tool reported that the book was
+ * not on the indexers — a coverage gap we manufactured about a release sitting
+ * right there at 14 seeders.
+ *
+ * ⚠️ THE THIRD SPELLING IS WHY THE BARE `s` IS RE-JOINED, and it was a
+ * regression introduced by the first version of this fix. It is not imagined:
+ * this repo's own live-captured fixture carries it — `An A Z of JRR Tolkien s
+ * The Hobbit by Sarah Oliver EPUB`. Removing the apostrophe alone fixes spelling
+ * two and breaks spelling three, with the identical user-visible symptom.
+ *
+ * ⚠️ THIS IS NOT A STEMMER AND MUST NOT BECOME ONE. It joins a token that is
+ * LITERALLY the single letter `s` onto the word before it; it never removes a
+ * suffix from a word that has one, and it never decides two different words are
+ * the same word. `matchWork`'s whole value is that it refuses near misses, and
+ * the numbered volumes of one series are the near misses it exists to catch —
+ * there is a control test for exactly that, on a possessive title.
+ */
 export function tokens(s: string): string[] {
-  return s
+  const split = s
     .toLowerCase()
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/['’ʼ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(APOSTROPHES, '')
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
+
+  const out: string[] = [];
+  for (const t of split) {
+    if (t === 's' && out.length > 0) out[out.length - 1] += 's';
+    else out.push(t);
+  }
+  return out;
 }
 
 /** The tokens that carry meaning: not noise, not a bare initial, not a year. */
 function significant(ts: string[]): string[] {
   return ts.filter((t) => t.length > 1 && !NOISE.has(t) && !/^(19|20)\d{2}$/.test(t));
 }
+
+/**
+ * The words of a TITLE that carry identity — the same filter `matchWork` uses on
+ * a work's title, exported so a caller cannot drift from it.
+ */
+export function significantTitleTokens(title: string): string[] {
+  return significant(tokens(title));
+}
+
 
 /**
  * A person's surname, as it appears in a filename.
@@ -357,7 +394,10 @@ export function matchWork(releaseTitle: string, work: Work): WorkMatch {
   if (BUNDLE.test(releaseTitle)) {
     return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a collection or box set, not this one book' };
   }
-  if (isSeriesPosition(releaseTitle, titleTokens)) {
+  // 🔴 NORMALISED, NOT RAW. The phrase is built from normalised title tokens, so
+  // testing it against the raw name let a release that KEPT the apostrophe walk
+  // past the volume guard: `Carl’s Doomsday Scenario 3` scored CLEAN.
+  if (isSeriesPosition(ts.join(' '), titleTokens)) {
     return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a numbered volume of the series, not this book' };
   }
 

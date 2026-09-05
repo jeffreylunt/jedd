@@ -428,3 +428,67 @@ test('🔴 CONTROL: loosening the apostrophe does NOT let a different volume thr
     );
   }
 });
+
+/**
+ * 🔴 THE THREE SPELLINGS OF ONE POSSESSIVE, AND THE THIRD ONE BIT.
+ *
+ * Removing the apostrophe fixed `Anarchist’s` vs `Anarchists` and BROKE
+ * `Anarchist s` — indexers render the same possessive all three ways, and this
+ * repo's own live-captured fixture already contained the third:
+ * `An A Z of JRR Tolkien s The Hobbit by Sarah Oliver EPUB`. Refusing that
+ * spelling produces the identical user-visible symptom as the bug being fixed —
+ * "the book is not on the indexers", about a release sitting right there.
+ *
+ * So a bare `s` left over from the split is joined onto the word before it.
+ * That is adjacency, not stemming: it needs the literal separated `s`, and it
+ * never removes a suffix from a word that has one.
+ */
+test('🔴 POSSESSIVE: all THREE indexer spellings land on the same tokens', () => {
+  const curly = tokens('The Dungeon Anarchist’s Cookbook');
+  assert.deepEqual(tokens('The Dungeon Anarchists Cookbook'), curly, 'apostrophe dropped');
+  assert.deepEqual(tokens('The Dungeon Anarchist s Cookbook'), curly, 'apostrophe became a space');
+  assert.deepEqual(tokens("The Dungeon Anarchist's Cookbook"), curly, 'straight apostrophe');
+});
+
+test('🔴 POSSESSIVE: the space spelling is not refused either', () => {
+  const spaced = 'The Dungeon Anarchist s Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman (Audiobook)';
+  const m = matchWork(spaced, ANARCHISTS_COOKBOOK);
+  assert.notEqual(m.score, WORK_MATCH.NOT_THIS_WORK, `refused the same book, spelled differently: ${m.reason}`);
+});
+
+/**
+ * 🔴 A REAL CONTROL FOR THE TOKENISER CHANGE — the one above is a null control.
+ *
+ * `The Butcher's Masquerade` is refused whatever the tokeniser does, because its
+ * title shares nothing with book 03. It therefore cannot observe identity
+ * getting weaker, and a control that cannot fail is not a control.
+ *
+ * The near miss this change actually creates is a numbered volume of the SAME
+ * possessive title — and it was real: `isSeriesPosition` built its phrase from
+ * NORMALISED title tokens and tested it against the RAW release name, so a
+ * release that KEPT the apostrophe walked straight past the volume guard.
+ *
+ *     work: Carl’s Doomsday Scenario
+ *     rel:  Carl’s Doomsday Scenario 3 — scored CLEAN, i.e. auto-pickable
+ */
+const DOOMSDAY: Work = {
+  key: '/works/OL24848193W',
+  title: 'Carl’s Doomsday Scenario',
+  authors: ['Matt Dinniman'],
+  firstPublishYear: 2021,
+  editionCount: 3,
+};
+
+test('🔴 CONTROL: a numbered volume of the SAME possessive title is still refused', () => {
+  for (const spelling of [
+    'Carl’s Doomsday Scenario 3 - Matt Dinniman',
+    'Carls Doomsday Scenario 3 - Matt Dinniman',
+    'Carl s Doomsday Scenario 3 - Matt Dinniman',
+  ]) {
+    assert.equal(
+      matchWork(spelling, DOOMSDAY).score,
+      WORK_MATCH.NOT_THIS_WORK,
+      `${spelling} is volume 3, not this book — the volume guard must see it however it is spelled`,
+    );
+  }
+});

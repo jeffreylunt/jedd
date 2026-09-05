@@ -688,3 +688,52 @@ test("🔴 a person's own apostrophe is stripped too, when no work could be pinn
   const term = decodeURIComponent(new URL(search).searchParams.get('query') ?? '');
   assert.equal(term, 'Carls Doomsday Scenario');
 });
+
+/**
+ * 🔴 A SINGLE SURVIVOR IS ONLY AN ANSWER IF THE QUERY ACTUALLY NAMES IT.
+ *
+ * `relevantWorks` admits a work on ONE shared token, author tokens included —
+ * it was built to decide what is worth putting in a list a person will read, and
+ * that is a display-grade predicate. Auto-pinning turns it into a purchase-grade
+ * one, and the CHOSE reply ends "Call add_audiobook now with choice 1", so the
+ * grab happens in the SAME turn: the person sees the book's name at best
+ * alongside the download, not before it. The ask branch really was the last
+ * checkpoint, so what replaces it has to be stronger than one coincidental word.
+ *
+ * The gate is containment: every significant word of the candidate's title must
+ * appear in what they actually said. It keeps the measured win — the DCC query
+ * contains every word of the book's title — and refuses a lone survivor that
+ * merely shares `cookbook`.
+ */
+const OL_ONE_IRRELEVANT = {
+  docs: [
+    { key: '/works/OLX1W', title: 'The Complete Cookbook for Young Chefs', author_name: ['America’s Test Kitchen Kids'], first_publish_year: 2018, edition_count: 4 },
+  ],
+};
+
+test('🔴 ONE CANDIDATE: a lone survivor the query does NOT name is not pinned', async () => {
+  const r = await makeSearchAudiobook(dccProwlarr, openLibrary(OL_ONE_IRRELEVANT)).run(
+    { query: DCC_QUERY },
+    ctx(),
+  );
+  assert.doesNotMatch(
+    r.content,
+    /^CHOSE — /,
+    'one shared word is not enough to settle a book and start a download',
+  );
+  // It ASKS instead — the candidate may appear, as a question rather than an answer.
+  assert.match(r.content, /^WHICH BOOK — /);
+  assert.match(r.content, /Nothing is downloading yet|Do NOT ask about torrents/);
+});
+
+test('🔴 a one-item WHICH BOOK does not claim the query "matches more than one book"', async () => {
+  // The gate above can still produce a single-candidate ask, and the old wording
+  // was false on its face there. Saying something untrue in the same breath as
+  // asking for help is how a person learns to stop reading the question.
+  const r = await makeSearchAudiobook(dccProwlarr, openLibrary(OL_ONE_IRRELEVANT)).run(
+    { query: DCC_QUERY },
+    ctx(),
+  );
+  assert.match(r.content, /^WHICH BOOK — /);
+  assert.doesNotMatch(r.content, /matches more than one book/);
+});
