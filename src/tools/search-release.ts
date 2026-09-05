@@ -10,7 +10,7 @@ import {
 } from '../media/prowlarr.js';
 import type { IrcEbooks } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
-import { matchWork, pinWork, relevantWorks, WORK_MATCH, type Work } from '../media/book-work.js';
+import { indexerTerm, matchWork, pinWork, relevantWorks, WORK_MATCH, type Work } from '../media/book-work.js';
 import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
 import { resolveOfKind } from '../choices.js';
 import { fail, ok, type Tool } from './types.js';
@@ -137,11 +137,28 @@ function makeReleaseSearch(
     parameters: {
       type: 'object',
       properties: {
+        /**
+         * 🔴 THE SERIES NAME IS NAMED HERE BECAUSE DROPPING IT IS THE MEASURED
+         * DEFECT — see the block comment above the series test in
+         * `book-work-pinning.test.ts` for the turn this comes from.
+         *
+         * The old text asked for "Title and author if known" and never mentioned
+         * a series, so a request that named one arrived here with it removed and
+         * searched for a different, real book. Every DCC release on the index is
+         * named `<Title> (Dungeon Crawler Carl NN) by Matt Dinniman`, which makes
+         * the series the single most identifying token available — and the
+         * example is a series example now, because an example is the part of a
+         * description a model actually copies.
+         */
         query: {
           type: 'string',
-          description: isAudio
-            ? 'Title and author if known, e.g. "Project Hail Mary Andy Weir". Do NOT include the word "audiobook".'
-            : 'Title and author if known, e.g. "Project Hail Mary Andy Weir". Do NOT include the word "book".',
+          description:
+            'What they said the book IS: title, plus the SERIES name and the author whenever they ' +
+            'mentioned either — e.g. "Project Hail Mary Andy Weir", or "The Dungeon Anarchists ' +
+            'Cookbook Dungeon Crawler Carl". 🔴 If they named a series, KEEP IT: series names are ' +
+            'how these releases are titled, and a title alone can be a different real book. Never ' +
+            'drop a word they gave you to tidy the query. Do NOT include the word ' +
+            `"${isAudio ? 'audiobook' : 'book'}".`,
         },
         choice: {
           type: 'number',
@@ -256,6 +273,32 @@ function makeReleaseSearch(
           const plausible = relevantWorks(query, found.works).slice(0, 5);
           if (!work && plausible.length === 0) {
             workNote = `the book catalogue returned nothing that looks like "${query}"`;
+          } else if (!work && plausible.length === 1) {
+            /**
+             * 🔴 ONE SURVIVOR IS AN ANSWER, NOT A QUESTION. Measured 2026-09-04.
+             *
+             * `pinWork` needs the query to BE the title; a query that names the
+             * SERIES and the book never is one. So Jeff's *"the 2nd dungeon
+             * crawler Carl book, 'The anarchists cookbook'"* fell here, and the
+             * tool asked *"WHICH BOOK — this matches more than one book"* above
+             * a list containing exactly one. The question is false as written
+             * and costs a round trip to answer nothing.
+             *
+             * ⚠️ WHAT THAT QUESTION WAS PROTECTING, since removing a confirmation
+             * step deserves the check: not much, and nothing that is gone now. A
+             * wrong pin cannot buy the wrong book — `matchWork` refuses every
+             * release that is not a copy of this work, and the NOT THE BOOK
+             * branch below then explicitly forbids offering one instead. And the
+             * CHOSE reply NAMES the work, so a wrong settle reaches the person
+             * as a sentence they can contradict rather than as silence.
+             *
+             * Measured over 34 queries — the 16 real ones in the audit log plus
+             * 18 written to break it — this fired 4 times and was right 4 times,
+             * while every vague query that must NOT auto-pin (*"that hobbit
+             * book"*, *"the new sanderson one"*) kept more than one candidate and
+             * still asks.
+             */
+            work = plausible[0];
           } else if (!work) {
             /**
              * 🔴 THE ONE QUESTION WORTH ASKING, AND IT IS ABOUT BOOKS.
@@ -334,7 +377,14 @@ function makeReleaseSearch(
        * Project Hail Mary cases — the canonical term is the same string in a
        * different order, so nothing changes for them.
        */
-      const term = work ? `${work.title} ${work.authors.slice(0, 1).join('')}`.trim() : query;
+      /**
+       * 🔴 `indexerTerm` IS NOT COSMETIC — see its note in `book-work.ts`. The
+       * catalogue's curly apostrophe returns ZERO from Prowlarr for a book that
+       * is plainly there, and it reaches this line straight off `work.title`.
+       */
+      const term = indexerTerm(
+        work ? `${work.title} ${work.authors.slice(0, 1).join('')}`.trim() : query,
+      );
 
       const [ircFound, found] = await Promise.all([
         hasIrc

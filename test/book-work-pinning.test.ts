@@ -513,3 +513,178 @@ test('🔴 search_audiobook pins the work too — one factory, one rule', async 
   assert.doesNotMatch(r.content, /Corey Olsen/);
   assert.match(r.content, /Call add_audiobook now with choice 1/);
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 A CATALOGUE THAT NARROWS TO ONE BOOK HAS ANSWERED THE QUESTION.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Both fixtures below are REAL, captured 2026-09-04.
+ *
+ * Jeff, live: *"can you add the 2nd dungeon crawler Carl book to audio booth.
+ * 'The anarchists cookbook'"*. When the series name reaches the query at all,
+ * Open Library returns exactly ONE work. The old code could not pin it — the
+ * query is not the title — so it asked *"WHICH BOOK — this matches more than one
+ * book"* and listed ONE option. That question is false on its face, and it costs
+ * a round trip to answer something nothing was uncertain about.
+ *
+ * ⚠️ WHY THIS IS SAFE TO PIN, having checked what the question was protecting.
+ * A wrong pin does NOT buy the wrong book: `matchWork` refuses every release
+ * that is not a copy of the pinned work, and the tool then reports NOT THE BOOK
+ * and is told not to offer any of them. And the CHOSE reply NAMES the work it
+ * settled on, so a wrong settle is visible to the person rather than silent.
+ * Measured over 34 queries (the 16 real ones in the audit log plus 18 built to
+ * break it), this branch fired 4 times and was right 4 times; the vague ones
+ * that must NOT auto-pin — "that hobbit book", "the new sanderson one" — all
+ * kept more than one candidate and still ask.
+ */
+
+/** The real Open Library response once the series name survives into the query. */
+const OL_ONE_CANDIDATE = {
+  docs: [
+    { key: '/works/OL24848242W', title: 'The Dungeon Anarchist’s Cookbook', author_name: ['Matt Dinniman'], first_publish_year: 2021, edition_count: 5 },
+  ],
+};
+
+/** The real Prowlarr rows for "Dungeon Crawler Carl", verbatim, with seeders. */
+const DCC_ROWS = [
+  ['The Butchers Masquerade (Dungeon Crawler Carl 05) by Matt Dinniman (Audiobook)(Fiction)', 37],
+  ['This Inevitable Ruin (Dungeon Crawler Carl 07) by Matt Dinniman (Audiobook)(Fiction)', 36],
+  ['Dungeon Crawler Carl (Dungeon Crawler Carl 01) by Matt Dinniman (Audiobook)(Fiction)', 36],
+  ['Carls Doomsday Scenario (Dungeon Crawler Carl 02) by Matt Dinniman (Audiobook)(Fiction)', 32],
+  ['The Gate of the Feral Gods (Dungeon Crawler Carl 04) by Matt Dinniman (Audiobook)(Fiction)', 28],
+  ['The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman (Audiobook)(Fiction)', 14],
+].map(([t, s], i) => rel(t as string, s as number, i));
+
+const dccProwlarr: FetchImpl = async () => json(DCC_ROWS);
+const DCC_QUERY = 'dungeon crawler carl anarchists cookbook';
+
+test('🔴 ONE CANDIDATE: the catalogue settled it, so it is PINNED and nobody is asked', async () => {
+  const r = await makeSearchAudiobook(dccProwlarr, openLibrary(OL_ONE_CANDIDATE)).run(
+    { query: DCC_QUERY },
+    ctx(),
+  );
+  assert.equal(r.ok, true);
+  assert.doesNotMatch(r.content, /WHICH BOOK/, 'a list of one is not a question worth asking');
+  assert.match(r.content, /^CHOSE — /);
+  // 🔴 And it NAMES the book it settled on, which is what makes a wrong settle
+  // visible to the person instead of silent.
+  assert.match(r.content, /The Dungeon Anarchist’s Cookbook by Matt Dinniman, 2021/);
+});
+
+test('🔴 ONE CANDIDATE: the book Jeff asked for is chosen over FIVE better-seeded volumes', async () => {
+  /**
+   * This is the whole point of pinning, and it is the case the apostrophe defect
+   * broke: book 03 has 14 seeders and every other volume of the same series by
+   * the same author has more. On swarm health alone the answer is book 05 with
+   * 37. Identity has to win, and before the `tokens` fix NOTHING won — the right
+   * release was refused along with the wrong ones and the tool reported the book
+   * was not on the indexers.
+   */
+  const r = await makeSearchAudiobook(dccProwlarr, openLibrary(OL_ONE_CANDIDATE)).run(
+    { query: DCC_QUERY },
+    ctx(),
+  );
+  assert.match(r.content, /Dungeon Anarchists Cookbook \(Dungeon Crawler Carl 03\)/);
+  assert.doesNotMatch(r.content, /Butchers Masquerade/, 'the best-seeded volume is NOT the book');
+  assert.doesNotMatch(r.content, /Inevitable Ruin/);
+  assert.match(r.content, /that are not that book left out/, 'and the filter says how many it dropped');
+});
+
+test('🔴 CONTROL: TWO plausible candidates still ask, so the pin did not swallow the question', async () => {
+  const r = await makeSearchEbook(hobbitProwlarr, undefined, openLibrary(OL_AMBIGUOUS)).run(
+    { query: 'that dune book' },
+    ctx(),
+  );
+  assert.match(r.content, /^WHICH BOOK — /);
+  assert.match(r.content, /1\. Dune by Frank Herbert, 1965/);
+  assert.match(r.content, /2\. Dune Messiah by Frank Herbert, 1969/);
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 THE SERIES NAME IS THE TOKEN THE MODEL THREW AWAY.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The real failure, from the audit log, 2026-09-04:
+ *
+ *     user:  "Yo fool can you add the 2nd dungeon crawler Carl book to audio
+ *             booth. “The anarchists cookbook”"
+ *     call:  search_audiobook({ query: "The Anarchist Cookbook" })
+ *     reply: "Nothing came back … Prowlarr found no audiobook release for it."
+ *
+ * *Dungeon Crawler Carl* was in the same sentence and never reached the tool.
+ * `The Anarchist Cookbook` is a REAL, DIFFERENT book — William F. Powell, 1971 —
+ * so `pinWork` matched it exactly, canonicalised it, and every stage downstream
+ * behaved correctly about the wrong subject. A near miss on a real entity is far
+ * worse than a miss.
+ *
+ * Measured against live Prowlarr the same day:
+ *     "The Anarchist Cookbook"          ->  0 results
+ *     "Dungeon Crawler Carl"            ->  6, including book 03 at 14 seeders
+ *     "The Dungeon Anarchists Cookbook" ->  1, the exact book
+ *
+ * The releases are named `<Title> (Dungeon Crawler Carl NN) by Matt Dinniman`,
+ * so the SERIES is the highest-value token on the whole index — and the old
+ * description asked only for "Title and author", never naming a series at all.
+ * This is prompt text, and it is the half that runs.
+ */
+test('🔴 the query description tells the model to keep the SERIES name', () => {
+  for (const tool of [makeSearchAudiobook(), makeSearchEbook()]) {
+    const q = (tool.parameters as { properties: Record<string, { description: string }> })
+      .properties['query']!.description;
+    assert.match(q, /series/i, `${tool.name} never mentions a series, so nothing asks for one`);
+    // The example carries the rule where the model actually reads it.
+    assert.match(q, /Dungeon Crawler Carl/, `${tool.name} should show a series in its example`);
+  }
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 THE APOSTROPHE HAD TO COME OFF THE SEARCH TERM TOO, NOT JUST THE MATCHER.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Caught by running the fixed flow end to end against the REAL services rather
+ * than trusting the unit tests, 2026-09-04. Fixing `tokens` made the matcher
+ * accept the release — and the flow still reported NONE, because the term handed
+ * to Prowlarr is the work's title as the CATALOGUE spells it, curly apostrophe
+ * and all, and the indexers do not carry that spelling. Measured, same minute,
+ * one variable:
+ *
+ *     "The Dungeon Anarchist’s Cookbook Matt Dinniman"  ->  0 results
+ *     "The Dungeon Anarchists Cookbook Matt Dinniman"   ->  1 result
+ *
+ * Two sites, one character. Fixing either alone still yields "the book is not on
+ * the indexers" about a book that is.
+ */
+test('🔴 the term SENT to the indexers carries no apostrophe', async () => {
+  const seen: string[] = [];
+  const capture: FetchImpl = async (url: string) => {
+    seen.push(url);
+    return json([]);
+  };
+  await makeSearchAudiobook(capture, openLibrary(OL_ONE_CANDIDATE)).run({ query: DCC_QUERY }, ctx());
+
+  const search = seen.find((u) => u.includes('/api/v1/search'));
+  assert.ok(search, 'Prowlarr was never searched');
+  const term = decodeURIComponent(new URL(search).searchParams.get('query') ?? '');
+  assert.ok(term.length > 0, 'a search ran with no term at all');
+  assert.doesNotMatch(term, /['’ʼ]/, `the indexers were asked for ${JSON.stringify(term)}`);
+  // 🔴 And it is still the PINNED work being searched for, not the raw phrasing.
+  assert.match(term, /Dungeon Anarchists Cookbook/);
+  assert.match(term, /Dinniman/);
+});
+
+test("🔴 a person's own apostrophe is stripped too, when no work could be pinned", async () => {
+  // The catalogue is unreachable here, so the term is the raw query — which is
+  // exactly where a typed apostrophe would reach Prowlarr unaltered.
+  const seen: string[] = [];
+  const capture: FetchImpl = async (url: string) => {
+    seen.push(url);
+    return json([]);
+  };
+  await makeSearchAudiobook(capture, openLibraryDown()).run({ query: "Carl's Doomsday Scenario" }, ctx());
+  const search = seen.find((u) => u.includes('/api/v1/search'))!;
+  const term = decodeURIComponent(new URL(search).searchParams.get('query') ?? '');
+  assert.equal(term, 'Carls Doomsday Scenario');
+});
