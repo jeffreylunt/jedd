@@ -150,11 +150,22 @@ test('🔴 an unconfigured Prowlarr is UNKNOWN and says it is not an absence', a
   assert.equal(called, false);
 });
 
-test('CONTROL: a real empty result IS a finding — NONE, not UNKNOWN', async () => {
+test('CONTROL: a real empty result IS a finding — NOT FOUND, not UNKNOWN', async () => {
+  /**
+   * 🪦 THIS USED TO ASSERT `/^NONE/`. The premise — an empty answer from a
+   * reachable indexer is a FINDING and must not be dressed up as a failure to
+   * look — is unchanged and is what the two assertions below still pin. Only
+   * the head word moved: `NONE` was read back to Jeff as *"Prowlarr has no
+   * audiobook release for it"*, and the head is the part of this string a model
+   * paraphrases. `NOT FOUND` says the same thing about OUR search without
+   * saying it about the world.
+   */
   const r = await run(async () => json([]), { query: 'x' });
   assert.equal(r.ok, true);
-  assert.match(r.content, /^NONE/);
+  assert.match(r.content, /^NOT FOUND/);
   assert.doesNotMatch(r.content, /UNKNOWN/);
+  // 🔴 And it must not have become the claim it replaced.
+  assert.match(r.content, /NOT a finding that the audiobook does not exist/);
 });
 
 test('found-but-unfetchable is reported distinctly from found-nothing', async () => {

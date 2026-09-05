@@ -632,7 +632,9 @@ test('🔴 IRC "no matches" reaches the model as an ABSENCE, not as a bot that w
   );
 
   assert.equal(r.ok, true);
-  assert.match(r.content, /NONE/, 'both sources were read and both are empty');
+  // 🪦 This used to assert `/NONE/`. Same contract, renamed head: see the
+  // tombstone in `search-release.test.ts` on the NONE -> NOT FOUND rename.
+  assert.match(r.content, /NOT FOUND/, 'both sources were read and both are empty');
   assert.match(r.content, /no matches/i, "the bot's own finding must survive the merge");
   assert.doesNotMatch(
     r.content,

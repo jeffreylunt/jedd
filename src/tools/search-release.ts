@@ -9,17 +9,19 @@ import {
   rankReleases,
   type FetchImpl,
   type Release,
+  type SearchResult,
 } from '../media/prowlarr.js';
-import type { IrcEbooks } from '../media/irc-ebooks.js';
+import type { IrcEbooks, IrcSearchOutcome } from '../media/irc-ebooks.js';
 import type { IrcResult } from '../media/irc-protocol.js';
 import {
-  indexerTerm,
   matchWork,
   pinWork,
   relevantWorks,
+  searchTerms,
   significantTitleTokens,
   tokens,
   WORK_MATCH,
+  type SearchTerm,
   type Work,
 } from '../media/book-work.js';
 import { describeWork, OpenLibraryClient, type OpenLibraryOptions } from '../media/openlibrary.js';
@@ -432,25 +434,91 @@ function makeReleaseSearch(
        * different order, so nothing changes for them.
        */
       /**
-       * 🔴 `indexerTerm` IS NOT COSMETIC — see its note in `book-work.ts`. The
-       * catalogue's curly apostrophe returns ZERO from Prowlarr for a book that
-       * is plainly there, and it reaches this line straight off `work.title`.
+       * ═══ THE QUERY LADDER ═════════════════════════════════════════════════
+       *
+       * 🔴 ONE QUERY FORM WAS ONE CHANCE, AND A MISS CAME BACK AS AN ABSENCE.
+       *
+       * Jedd, live, 2026-09-04: *"Found the right book — The Dungeon Anarchist's
+       * Cookbook by Matt Dinniman — but Prowlarr still has no audiobook release
+       * for it. Want me to try it as an ebook instead?"* The release was on
+       * 1337x at 14 seeders the whole time. Worse than a plain miss: it is
+       * stated as settled fact AND offered a fallback, which retires the
+       * question — Jeff would reasonably conclude the audiobook does not exist.
+       *
+       * See `searchTerms` in `book-work.ts` for the measured form sensitivity.
+       * The rungs are ways of asking for THE SAME BOOK, most specific first, and
+       * rung one is exactly the term this code sent before — so **a search that
+       * works today still costs exactly one request**, and only a search that
+       * would otherwise have reported a false absence pays for the rest.
+       *
+       * ⚠️ "IT WORKED" IS NOT "PROWLARR RETURNED ROWS". The measured failure
+       * returned three rows, none of them an audiobook of that book. So the
+       * ladder climbs on ZERO USABLE CANDIDATES — after the category, the
+       * GraphicAudio preference, the dead-swarm filter and the identity filter —
+       * because each of those zeros is one the next rung might not have.
+       *
+       * ⚠️ IT DOES NOT CLIMB PAST AN `unknown`. An indexer that could not be
+       * reached is a failure to LOOK, not a zero; asking a failing service two
+       * more questions answers nothing and walks straight into the per-indexer
+       * backoff its own client warns about. That branch reports UNKNOWN exactly
+       * as it did before.
        */
-      const term = indexerTerm(
-        work ? `${work.title} ${work.authors.slice(0, 1).join('')}`.trim() : query,
-      );
+      const rungs = searchTerms(query, work);
+      const wantsGraphic = args['graphic_audio'] === true;
+      const client = ctx.config.prowlarr.apiKey
+        ? new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl })
+        : undefined;
 
-      const [ircFound, found] = await Promise.all([
-        hasIrc
-          ? irc!.search(term)
-          : Promise.resolve({ state: 'none' as const, detail: 'IRC is not enabled here.' }),
-        ctx.config.prowlarr.apiKey
-          ? new ProwlarrClient({ ...ctx.config.prowlarr, fetchImpl }).search(
-              term,
-              isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
-            )
-          : Promise.resolve({ state: 'none' as const, detail: 'Prowlarr is not configured here.' } as const),
-      ]);
+      /**
+       * ⚠️ IRC IS ASKED ONCE, CONCURRENTLY WITH THE FIRST RUNG, ON THE FIRST
+       * RUNG'S TERM. It is a different index with different matching — `@search`
+       * across filenames a bot is holding — while the ladder exists for how
+       * Prowlarr tokenises a title. Walking it against IRC as well would
+       * multiply a connect-plus-search latency that already dominates this tool,
+       * inside a guest-facing turn.
+       */
+      const ircPromise: Promise<IrcSearchOutcome> = hasIrc
+        ? irc!.search(rungs[0]!.term)
+        : Promise.resolve({ state: 'none' as const, detail: 'IRC is not enabled here.' });
+
+      const attempts: Attempt[] = [];
+      let ircSettled: IrcSearchOutcome | undefined;
+      for (const rung of rungs) {
+        const result: SearchResult = client
+          ? await client.search(rung.term, isAudio ? CATEGORY.audiobook : CATEGORY.ebook)
+          : { state: 'none', detail: 'Prowlarr is not configured here.' };
+        const attempt = evaluate(rung, result, { isAudio, wantsGraphic, work });
+        attempts.push(attempt);
+        if (attempt.candidates.length > 0) break;
+        if (result.state === 'unknown') break;
+        // IRC was asked concurrently with rung one, so this costs nothing it has
+        // not already spent. If a bot is holding the book there is nothing left
+        // for a broader torrent search to find.
+        ircSettled ??= await ircPromise;
+        if (ircSettled.state === 'ok' && ircSettled.results.length > 0) break;
+      }
+      const ircFound = ircSettled ?? (await ircPromise);
+
+      /**
+       * The rung that ANSWERED — or, when none did, THE MOST INFORMATIVE FAILURE
+       * rather than the first one.
+       *
+       * ⚠️ THAT ORDER IS NOT COSMETIC. A rung that returned five copies of the
+       * WRONG volume knows something a rung that returned nothing does not, and
+       * the branches below split on exactly that: "none of these is that book"
+       * names what it found and shows it, while "nothing matched" cannot. Taking
+       * the first rung unconditionally would throw the richer finding away and
+       * report the thinner one.
+       *
+       * Either way EVERY rung that ran travels with the report: what was tried
+       * is the difference between "not found" and "does not exist".
+       */
+      const best =
+        attempts.find((a) => a.candidates.length > 0) ??
+        attempts.find((a) => a.before > 0) ??
+        attempts[0]!;
+      const { found, before, releases, deadCount } = best;
+      const tried = describeAttempts(attempts);
 
       let ircOffers: Offer[] = [];
       let ircNote = '';
@@ -473,22 +541,34 @@ function makeReleaseSearch(
         prowlarrNote = `the torrent indexers could not be reached (${found.detail})`;
       }
       /**
-       * 🔴 AN ABSENCE REPORT MUST NAME WHAT WAS NOT REACHED.
+       * 🔴 AN ABSENCE REPORT MUST NAME WHAT WAS NOT REACHED — AND NOW ALSO WHAT
+       * WAS ASKED.
        *
        * Reporting "NONE" while IRC was unreachable states a finding of absence
        * on the strength of one source — the same two-zeros error this file
-       * guards everywhere else, just moved up a level. The note travels with the
-       * NONE so the model can say "and I could not reach the other source",
-       * rather than implying the book does not exist.
+       * guards everywhere else, just moved up a level.
+       *
+       * 🔴 AND THE SAME ERROR LIVED IN THE WORDING ITSELF. This branch used to
+       * hand the model `NONE — Prowlarr found nothing for that search.`, which
+       * came back to Jeff as *"Prowlarr still has no audiobook release for it"*
+       * — our search's zero, restated as the world's. So the forms that were
+       * tried are named, and the model is told in as many words that this is a
+       * search that missed and NOT a book that is absent.
        */
       if (found.state === 'none' && ircOffers.length === 0) {
-        return ok(`NONE — ${found.detail}${ircNote ? ` (${ircNote})` : ''}`);
+        return ok(
+          `NOT FOUND — I asked the indexers ${attempts.length} different way(s) about this and none ` +
+            // 🔴 THE INDEXER'S OWN DETAIL SURVIVES. It is what separates "nothing
+            // came back" from "things came back that nothing can fetch", and
+            // dropping it into a generic miss would merge two different findings.
+            `of them matched: ${tried}. ${found.detail}${ircNote ? ` (${ircNote})` : ''}\n` +
+            '🔴 That is OUR SEARCH failing to find it, NOT a finding that the ' +
+            `${medium} does not exist. Tell them which forms were tried and that none matched. Do ` +
+            `NOT say there is no ${medium} release, do NOT say it is not on the indexers, and do ` +
+            'NOT settle the question by offering something else instead — if you offer an ' +
+            'alternative, say in the same breath that the search may simply have missed it.',
+        );
       }
-
-      const wantsGraphic = args['graphic_audio'] === true;
-      const all = found.state === 'results' ? found.releases : [];
-      const before = all.length;
-      const releases = isAudio ? all.filter((r) => isGraphicAudio(r) === wantsGraphic) : all;
 
       /**
        * 🔴 A FILTER THAT REMOVED EVERYTHING IS NOT "NOTHING EXISTS".
@@ -501,7 +581,8 @@ function makeReleaseSearch(
       if (releases.length === 0 && ircOffers.length === 0) {
         return ok(
           `${ircNote ? `[${ircNote}] ` : ''}` +
-            `FILTERED OUT — found ${before} ${medium} release(s) for "${query}", but ` +
+            `FILTERED OUT — found ${before} ${medium} release(s) for "${query}" (searched ${tried}), ` +
+            'but ' +
             (wantsGraphic
               ? 'NONE of them are GraphicAudio dramatisations. Say so and ask whether an ordinary ' +
                 'reading is fine.'
@@ -509,66 +590,7 @@ function makeReleaseSearch(
         );
       }
 
-      /**
-       * 🔴 A DEAD TORRENT IS NEVER A CANDIDATE NOW THAT NOBODY IS ASKED.
-       *
-       * While a person picked from a list, a 0-seeder release at the bottom was
-       * merely a bad option they would not take. A comparator that picks
-       * silently can take it, and the Fringe pool is what that costs: 60 hours,
-       * zero bytes. So it is FILTERED, and counted rather than dropped quietly —
-       * "found nothing" and "found only things that will never finish" are
-       * different answers. IRC offers are unaffected: a DCC transfer has no
-       * swarm to be dead.
-       */
-      const alive = releases.filter((r) => swarmHealth(r.seeders) !== 'dead');
-      const deadCount = releases.length - alive.length;
-
-      /**
-       * 🔴 THE AUDIOBOOK RANKER IS THE ONE WITH A QUALITY KEY UNDER THE BAND.
-       *
-       * `rankReleases` orders on the band and then on seeders, which — with no
-       * third key — is the same ORDER as sorting on seeders alone. That makes
-       * its band decorative on its own, and a decorative rule is one nobody
-       * notices deleting. `rankAudiobooks` puts `unabridged` UNDER the band, so
-       * an abridged copy that people are actually seeding beats an unabridged
-       * one that nobody is — which is the whole rule, stated where it bites.
-       *
-       * ⚠️ It had NO caller in the repo until now: written, tested, unused. That
-       * is the same shape as `add_audiobook` shipping with no producer.
-       *
-       * Ebooks keep `rankReleases` because their quality key is FORMAT, and
-       * `interleave` below applies it across both sources at once.
-       */
-      /**
-       * ⚠️ THE `.slice(0, 5)` THAT USED TO BE HERE HAS MOVED BELOW THE WORK
-       * SCORING, AND THAT IS A FIX RATHER THAN TIDYING.
-       *
-       * Truncating to five on SEEDERS before identity is considered would let
-       * the defect survive its own fix on a busier title: five well-seeded
-       * guides at the top and the novel sixth, cut before anything asked whether
-       * it was the book. Measured on the Hobbit the novel came fourth, which is
-       * inside five — by luck, not by design.
-       */
-      const torrentOffers: Offer[] = (isAudio ? rankAudiobooks(alive, { wantGraphicAudio: wantsGraphic }) : rankReleases(alive))
-        .map((r) => ({
-          label: describe(r),
-          work: work ? matchWork(r.title, work).score : WORK_MATCH.PARTIAL,
-          band: swarmRank(r.seeders),
-          format: isAudio ? 0 : formatScore(r.title),
-          seeders: r.seeders,
-          value: {
-            source: 'prowlarr',
-            infoHash: r.infoHash,
-            title: r.title,
-            ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}),
-            // 🔴 Carried so the consumer can RESOLVE a release that has no
-            // infoHash yet. Without this the pick reaches the grab with nothing
-            // to fetch — see resolveMagnet in prowlarr.ts.
-            ...(r.downloadUrl ? { downloadUrl: r.downloadUrl } : {}),
-          },
-        }));
-
-      const merged = mergeSources(torrentOffers, ircOffers);
+      const merged = mergeSources(best.offers, ircOffers);
 
       /**
        * ═══ STAGE TWO: WHICH COPY ═══════════════════════════════════════════
@@ -652,9 +674,9 @@ function makeReleaseSearch(
        */
       if (merged.length === 0) {
         return ok(
-          `ALL DEAD — found ${releases.length} ${medium} release(s) for "${query}" and every one has ` +
-            'NO seeders, so none of them would ever finish. Nothing was chosen. Say so; do not say ' +
-            'nothing was found.',
+          `ALL DEAD — found ${releases.length} ${medium} release(s) for "${query}" (searched ` +
+            `${tried}) and every one has NO seeders, so none of them would ever finish. Nothing was ` +
+            'chosen. Say so; do not say nothing was found.',
         );
       }
 
@@ -669,12 +691,23 @@ function makeReleaseSearch(
        * where the filter was doing its job.
        */
       if (top.length === 0 && work) {
+        /**
+         * ⚠️ THIS USED TO END *"tell them the book itself does not appear to be
+         * on the indexers"*, AND THAT SENTENCE WAS THE SAME LIE ONE BRANCH OVER.
+         *
+         * The ladder has now asked in every form it knows, and this is still
+         * only evidence that OUR searches did not turn up a copy. A search that
+         * missed and a book that is absent are indistinguishable from here, so
+         * the report says what was tried and stops short of the claim.
+         */
         return ok(
-          `NOT THE BOOK — searching "${query}" returned ${merged.length} ${medium} release(s), and ` +
-            `none of them is a copy of "${describeWork(work)}". They are things like: ` +
+          `NOT THE BOOK — I searched ${attempts.length} way(s) (${tried}) and the ` +
+            `${merged.length} ${medium} release(s) that came back are not copies of ` +
+            `"${describeWork(work)}". They are things like: ` +
             `${wrongWork.slice(0, 3).map((o) => `${o.label.split(' — ')[0]} (${o.work === WORK_MATCH.NOT_THIS_WORK ? 'not that book' : 'partial'})`).join('; ')}. ` +
-            'Tell them the book itself does not appear to be on the indexers — do NOT offer any of ' +
-            'these instead, and do not say nothing was found.',
+            'Say that none of what these searches turned up is that book, and name the forms that ' +
+            'were tried. Do NOT say the book is not on the indexers and do NOT say nothing was ' +
+            'found — neither is something this can tell. Do NOT offer any of these instead.',
         );
       }
 
@@ -698,6 +731,18 @@ function makeReleaseSearch(
         notes.push(`${found.discarded} more had no infoHash or download link and cannot be fetched`);
       }
       if (wrongWork.length) notes.push(`${wrongWork.length} that are not that book left out`);
+      /**
+       * 🔴 A RESULT THAT ONLY A BROADER FORM FOUND SAYS SO. The first form
+       * finding nothing is exactly the state that used to be reported as "no
+       * release exists"; when a later rung rescues it, that is worth seeing in
+       * the transcript rather than being smoothed away.
+       */
+      if (best !== attempts[0]) {
+        notes.push(
+          `the first ${attempts.length - 1} way(s) of asking found nothing — this came from ` +
+            `searching ${best.rung.form} ("${best.rung.term}")`,
+        );
+      }
       if (prowlarrNote) notes.push(prowlarrNote);
       if (ircNote) notes.push(ircNote);
       const suffix = notes.length ? ` (${notes.join('; ')})` : '';
@@ -813,6 +858,128 @@ function humanSize(bytes: number): string {
   const gb = bytes / 1024 ** 3;
   if (gb >= 1) return `${gb.toFixed(1)} GB`;
   return `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`;
+}
+
+/**
+ * ── ONE RUNG OF THE QUERY LADDER, ALREADY FILTERED ──────────────────────────
+ *
+ * Everything the caller needs to decide whether this rung ANSWERED and, if no
+ * rung did, to report honestly what each one came back with.
+ */
+interface Attempt {
+  rung: SearchTerm;
+  found: SearchResult;
+  /** What the indexers returned, before any filter of ours. */
+  before: number;
+  /** After the GraphicAudio preference — the population the notes count from. */
+  releases: Release[];
+  deadCount: number;
+  /** Ranked, identity-scored, dead swarms removed. Wrong works still included. */
+  offers: Offer[];
+  /**
+   * 🔴 THE LADDER'S STOP CONDITION, AND IT IS DELIBERATELY NOT "ROWS CAME
+   * BACK". These are the offers that survived the identity filter — the ones a
+   * person could actually be given. A rung that returns five copies of a
+   * different book has found nothing, and the measured defect is exactly that
+   * shape: three results, none of them the audiobook that was asked for.
+   *
+   * ⚠️ Torrent-only, by construction. IRC is asked once rather than per rung,
+   * so folding it in here would make the stop condition depend on a source the
+   * ladder is not walking.
+   */
+  candidates: Offer[];
+}
+
+/** One rung's worth of Prowlarr: search results in, filtered offers out. */
+function evaluate(
+  rung: SearchTerm,
+  found: SearchResult,
+  o: { isAudio: boolean; wantsGraphic: boolean; work?: Work },
+): Attempt {
+  const all = found.state === 'results' ? found.releases : [];
+  const releases = o.isAudio ? all.filter((r) => isGraphicAudio(r) === o.wantsGraphic) : all;
+  /**
+   * 🔴 A DEAD TORRENT IS NEVER A CANDIDATE NOW THAT NOBODY IS ASKED.
+   *
+   * While a person picked from a list, a 0-seeder release at the bottom was
+   * merely a bad option they would not take. A comparator that picks silently
+   * can take it, and the Fringe pool is what that costs: 60 hours, zero bytes.
+   * So it is FILTERED, and counted rather than dropped quietly — "found
+   * nothing" and "found only things that will never finish" are different
+   * answers. IRC offers are unaffected: a DCC transfer has no swarm to be dead.
+   */
+  const alive = releases.filter((r) => swarmHealth(r.seeders) !== 'dead');
+
+  /**
+   * 🔴 THE AUDIOBOOK RANKER IS THE ONE WITH A QUALITY KEY UNDER THE BAND.
+   *
+   * `rankReleases` orders on the band and then on seeders, which — with no
+   * third key — is the same ORDER as sorting on seeders alone. That makes its
+   * band decorative on its own, and a decorative rule is one nobody notices
+   * deleting. `rankAudiobooks` puts `unabridged` UNDER the band, so an abridged
+   * copy that people are actually seeding beats an unabridged one that nobody
+   * is — which is the whole rule, stated where it bites.
+   *
+   * Ebooks keep `rankReleases` because their quality key is FORMAT, and the
+   * merge comparator applies it across both sources at once.
+   *
+   * ⚠️ THERE IS NO `.slice(0, 5)` HERE, AND THAT IS A FIX RATHER THAN TIDYING.
+   * Truncating to five on SEEDERS before identity is considered would let the
+   * defect survive its own fix on a busier title: five well-seeded guides at
+   * the top and the novel sixth, cut before anything asked whether it was the
+   * book. Measured on the Hobbit the novel came fourth — inside five by luck,
+   * not by design. The cut happens after the identity filter, in the caller.
+   */
+  const offers: Offer[] = (
+    o.isAudio ? rankAudiobooks(alive, { wantGraphicAudio: o.wantsGraphic }) : rankReleases(alive)
+  ).map((r) => ({
+    label: describe(r),
+    work: o.work ? matchWork(r.title, o.work).score : WORK_MATCH.PARTIAL,
+    band: swarmRank(r.seeders),
+    format: o.isAudio ? 0 : formatScore(r.title),
+    seeders: r.seeders,
+    value: {
+      source: 'prowlarr',
+      infoHash: r.infoHash,
+      title: r.title,
+      ...(r.magnetUri ? { magnetUri: r.magnetUri } : {}),
+      // 🔴 Carried so the consumer can RESOLVE a release that has no infoHash
+      // yet. Without this the pick reaches the grab with nothing to fetch —
+      // see resolveMagnet in prowlarr.ts.
+      ...(r.downloadUrl ? { downloadUrl: r.downloadUrl } : {}),
+    },
+  }));
+
+  return {
+    rung,
+    found,
+    before: all.length,
+    releases,
+    deadCount: releases.length - alive.length,
+    offers,
+    candidates: o.work ? offers.filter((x) => x.work !== WORK_MATCH.NOT_THIS_WORK) : offers,
+  };
+}
+
+/**
+ * 🔴 WHAT WAS ASKED, AND WHAT EACH ASKING CAME BACK WITH.
+ *
+ * This string is the whole difference between *"there is no audiobook release"*
+ * and *"three ways of searching did not turn one up"*. It names the FORM in
+ * words and the TERM verbatim, so a person reading the reply can see the search
+ * that ran and try one it did not.
+ */
+function describeAttempts(attempts: Attempt[]): string {
+  return attempts.map((a) => `${a.rung.form} — "${a.rung.term}" → ${outcome(a)}`).join('; ');
+}
+
+function outcome(a: Attempt): string {
+  if (a.found.state === 'unknown') return 'could not be reached';
+  if (a.before === 0) return 'nothing at all';
+  if (a.candidates.length > 0) return `${a.candidates.length} usable`;
+  if (a.releases.length === 0) return `${a.before} result(s), all of them the wrong GraphicAudio kind`;
+  if (a.deadCount === a.releases.length) return `${a.before} result(s), every swarm dead`;
+  return `${a.before} result(s), none a copy of that book`;
 }
 
 interface Offer {

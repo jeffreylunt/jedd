@@ -199,6 +199,117 @@ export function indexerTerm(s: string): string {
 }
 
 /**
+ * ── 🔴 ONE QUERY FORM IS ONE CHANCE, AND THE FORM WE PREFER MISSES ──────────
+ *
+ * A ladder of ways to ask for the SAME book, most specific first. The caller
+ * walks it and stops at the first rung that yields a candidate; the rest are
+ * never sent.
+ *
+ * The defect, MEASURED live against Prowlarr 2026-09-04 — same indexers, same
+ * minutes, the *only* variable being how the title was spelt:
+ *
+ *     "The Dungeon Anarchist’s Cookbook"   3 results, NONE an audiobook
+ *     "The Dungeon Anarchists Cookbook"    0 results
+ *     "Dungeon Anarchists Cookbook"        1 result  <- IS the audiobook
+ *     "Dungeon Crawler Carl Anarchist"     4 results, one of them the audiobook
+ *
+ * **The apostrophe and the leading article each break the match on their own,
+ * and the exact title the catalogue resolves to is the single form that finds
+ * nothing.** Jedd told Jeff *"Prowlarr still has no audiobook release for it"*
+ * about a release sitting at 14 seeders, and then offered an ebook instead —
+ * which retires the question. An absence in OUR search is not an absence in the
+ * world, and one query form makes the two impossible to tell apart.
+ *
+ * ── WHY "STRIP THE PUNCTUATION" IS NOT A RUNG OF ITS OWN ────────────────────
+ *
+ * It is applied to EVERY rung instead. `indexerTerm` already removes
+ * apostrophes unconditionally, on its own measurement (0 results vs 1 for the
+ * same title), so a rung that put the curly form back on the wire would spend a
+ * whole request — Prowlarr answers in 35-45 s cold — on a spelling already
+ * measured to return nothing.
+ *
+ * ── WHY THE LADDER IS THREE RUNGS AND NOT SIX ──────────────────────────────
+ *
+ * Every rung is a request against a service that warns about hammering, and
+ * five searches in one turn produced timeouts in a probe on 2026-09-04. Rung 1
+ * is exactly the term this code sent before, so **a search that works today
+ * still costs exactly one request**; only a search that would otherwise have
+ * reported a false absence pays for the extra ones.
+ *
+ * ⚠️ DUPLICATE RUNGS ARE DROPPED, so a title with no leading article and no
+ * author does not ask the same question twice.
+ *
+ * ⚠️ THE BROAD RUNGS ARE SAFE ONLY BECAUSE OF `matchWork`. Rungs 2 and 3 drop
+ * words, which means they match MORE things — including other books. Nothing
+ * here decides identity: every release a rung returns is still scored against
+ * the pinned work and refused if it is not a copy of it. Do not use this ladder
+ * anywhere that filter does not run afterwards.
+ */
+export interface SearchTerm {
+  /** What goes on the wire. */
+  term: string;
+  /** How to describe this rung to a person, so a miss can name what it tried. */
+  form: string;
+}
+
+/** Only the leading one, and only when a word survives it. */
+const LEADING_ARTICLE = /^(the|a|an)\s+(?=\S)/i;
+
+/**
+ * The longest significant word of a title, as a stand-in for the rarest one.
+ *
+ * ⚠️ AN ADMITTED PROXY. Rarity would need a corpus nobody has here; length
+ * correlates with it well enough that `anarchists` wins over `dungeon` and
+ * `cookbook` in the case this was built for. It is only ever used to BROADEN a
+ * search whose narrower forms already found nothing, and what it returns is
+ * still filtered for identity, so being wrong costs a request rather than a
+ * wrong book.
+ */
+function mostDistinctiveWord(title: string): string {
+  let best = '';
+  for (const t of significantTitleTokens(title)) if (t.length > best.length) best = t;
+  return best;
+}
+
+export function searchTerms(query: string, work?: Work): SearchTerm[] {
+  const out: SearchTerm[] = [];
+  const add = (raw: string, form: string): void => {
+    const term = indexerTerm(raw).replace(/\s+/g, ' ').trim();
+    if (!term) return;
+    if (out.some((o) => o.term.toLowerCase() === term.toLowerCase())) return;
+    out.push({ term, form });
+  };
+
+  if (!work) {
+    /**
+     * 🔴 NO WORK PINNED MEANS NO IDENTITY FILTER AFTERWARDS, so this half of the
+     * ladder stops one rung short. The third rung is built out of a CATALOGUE
+     * title and author; without a pin there is neither, and broadening a raw
+     * phrase with nothing checking what comes back is how a different book gets
+     * offered as though it were the one that was asked for.
+     */
+    add(query, 'what they said');
+    add(query.replace(LEADING_ARTICLE, ''), 'what they said, without the leading "the"');
+    return out;
+  }
+
+  const author = work.authors[0] ?? '';
+  add(`${work.title} ${author}`.trim(), 'the title and the author');
+  add(work.title.replace(LEADING_ARTICLE, ''), 'the title alone, without the leading "the"');
+  const distinctive = mostDistinctiveWord(work.title);
+  const last = surname(author);
+  if (distinctive && last) add(`${last} ${distinctive}`, 'the author and the most distinctive word of the title');
+  /**
+   * ⚠️ NEVER EMPTY. A title that is nothing but punctuation would otherwise
+   * hand the caller no rungs at all, and a loop over no rungs reports the same
+   * "found nothing" as a search that ran — a zero manufactured by this function
+   * rather than by an indexer.
+   */
+  if (out.length === 0) out.push({ term: query.trim(), form: 'what they said' });
+  return out;
+}
+
+/**
  * Everything that is not a letter or a digit is a separator in a filename —
  * EXCEPT an apostrophe, which is removed, and a possessive `s` orphaned by one,
  * which is joined back on.
