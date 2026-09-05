@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { ChoiceStore } from '../src/choices.js';
 import { searchTerms } from '../src/media/book-work.js';
+import type { IrcEbooks } from '../src/media/irc-ebooks.js';
 import type { FetchImpl } from '../src/media/prowlarr.js';
 import { makeSearchAudiobook, makeSearchEbook } from '../src/tools/search-release.js';
 import type { ToolContext } from '../src/tools/types.js';
@@ -41,9 +42,13 @@ import { testConfig } from './helpers.js';
  * answers ONE exact term and nothing else. A tool that asks once cannot reach
  * it; a tool that walks a ladder can.
  *
- * ⚠️ MUTATION-CHECKED. Collapsing `searchTerms` to `return [out[0]!]` — one
- * query form, the code as it was — turns the three ladder tests below RED and
- * leaves the two controls green, which is the point of having the controls.
+ * ⚠️ MUTATION-CHECKED, and the numbers are counted rather than guessed.
+ * Collapsing `searchTerms` to one query form — the code as it was — turns
+ * **10 of these 19 RED**, and leaves BOTH controls green, which is the point of
+ * having the controls: a matcher that returned everything would satisfy §1 and
+ * fail `CONTROL NEGATIVE`, and one that returned nothing would fail
+ * `CONTROL POSITIVE`. Section 6's fixes are mutation-checked one at a time in
+ * the same way, each caught by exactly one test.
  */
 
 const tempFile = () => join(mkdtempSync(join(tmpdir(), 'jedd-ladder-')), 'choices.jsonl');
@@ -299,4 +304,122 @@ test('the ebook half of the factory walks the same ladder', async () => {
   ).run({ query: 'The Dungeon Anarchists Cookbook' }, ctx());
   assert.ok(seen.length > 1, 'search_ebook asked only once');
   assert.match(r.content, /^CHOSE — /);
+});
+
+// ═══ 6. WHAT CODE REVIEW FOUND ═════════════════════════════════════════════
+//
+// Four defects the first version of the ladder shipped with. Each is pinned
+// here because each one re-manufactured the finding this whole change exists
+// to stop making.
+
+const ircDouble = (results: unknown[]): IrcEbooks =>
+  ({
+    rosterHas: () => true,
+    async search() {
+      return results.length
+        ? { state: 'ok' as const, results, detail: '' }
+        : { state: 'none' as const, detail: 'IRC found nothing.' };
+    },
+    async fetch() {
+      return { state: 'failed' as const, detail: 'not used here' };
+    },
+  }) as unknown as IrcEbooks;
+
+const ircResult = (title: string) => ({
+  title,
+  bot: 'somebot',
+  command: `!somebot ${title}`,
+  ext: '.epub',
+  sizeBytes: 3 * 1024 ** 2,
+});
+
+test('🔴 a rung that was NEVER SENT is not reported as a rung that found nothing', async () => {
+  /**
+   * With no Prowlarr configured — a real deployment, since `search_ebook` runs
+   * on IRC alone — the loop used to synthesise a "none" per rung and the reply
+   * listed three terms it had never put on a wire, under "tell them which forms
+   * were tried". A manufactured account of work performed, inside the branch
+   * that exists to stop this file manufacturing findings.
+   */
+  let called = false;
+  const r = await makeSearchEbook(
+    async () => {
+      called = true;
+      return json([]);
+    },
+    ircDouble([]),
+    openLibrary(OL_DCC03),
+  ).run(
+    { query: 'The Dungeon Anarchists Cookbook' },
+    { ...ctx(), config: testConfig({ readOnly: false, prowlarr: { baseUrl: 'http://p.invalid', apiKey: '' } }) },
+  );
+  assert.equal(called, false, 'nothing should have been searched');
+  assert.match(r.content, /NOT SEARCHED/);
+  assert.match(r.content, /1 different way\(s\)/, 'it must not claim three searches it did not run');
+  assert.doesNotMatch(r.content, /dinniman anarchists/, 'a term that never went on a wire is not a term that was tried');
+});
+
+test('🔴 IRC holding a STUDY GUIDE does not stop the ladder one rung short of the book', async () => {
+  /**
+   * The Prowlarr side of the loop stops on candidates that survived `matchWork`
+   * precisely because rows are not answers. The IRC side stopped on raw rows,
+   * so a bot holding `Exploring …` ended the search — the original defect with
+   * the source swapped, and the real book sitting on the next rung.
+   */
+  const seen: string[] = [];
+  const r = await makeSearchEbook(
+    onlyAnswers('Dungeon Anarchists Cookbook', [{ ...DCC03, title: 'The Dungeon Anarchists Cookbook by Matt Dinniman.epub' }], seen),
+    ircDouble([ircResult('Exploring The Dungeon Anarchists Cookbook by Corey Olsen.epub')]),
+    openLibrary(OL_DCC03),
+  ).run({ query: 'The Dungeon Anarchists Cookbook' }, ctx());
+
+  assert.ok(seen.length > 1, `the ladder stopped on the guide: ${JSON.stringify(seen)}`);
+  assert.match(r.content, /^CHOSE — /);
+  assert.match(r.content, /Dungeon Anarchists Cookbook by Matt Dinniman\.epub/);
+});
+
+test('CONTROL: IRC holding THE BOOK does stop the ladder — the rungs are not walked for nothing', async () => {
+  const seen: string[] = [];
+  const r = await makeSearchEbook(
+    onlyAnswers('never matches', [DCC03], seen),
+    ircDouble([ircResult('The Dungeon Anarchists Cookbook - Matt Dinniman.epub')]),
+    openLibrary(OL_DCC03),
+  ).run({ query: 'The Dungeon Anarchists Cookbook' }, ctx());
+  assert.equal(seen.length, 1, `IRC had the book and the ladder kept asking: ${JSON.stringify(seen)}`);
+  assert.match(r.content, /^CHOSE — /);
+  assert.match(r.content, /via IRC/);
+});
+
+test('🔴 an indexer that fails on a LATER rung is still UNKNOWN, not "not found"', async () => {
+  /**
+   * `best` prefers a rung that returned rows, and an unreachable rung returned
+   * none — so keying the UNKNOWN branch on `best` swallowed an indexer that
+   * failed on rung two entirely. The head said NOT FOUND while one of the
+   * searches it named had never completed. A failure to LOOK outranks a failure
+   * to find, whichever rung it happened on.
+   */
+  let calls = 0;
+  const r = await makeSearchAudiobook(async () => {
+    calls += 1;
+    if (calls === 1) return json([]);
+    throw new Error('ECONNREFUSED');
+  }, openLibrary(OL_DCC03)).run({ query: 'The Dungeon Anarchists Cookbook' }, ctx());
+
+  assert.equal(calls, 2, 'it should stop at the failing rung');
+  assert.equal(r.ok, false);
+  assert.match(r.content, /^UNKNOWN/);
+  assert.match(r.content, /could not be reached/, 'and it names which form failed');
+});
+
+test('🔴 a query that survives punctuation-stripping as NOTHING still yields a rung', async () => {
+  // `indexerTerm` removes apostrophes, so "'''" produced zero rungs and the
+  // caller destructured attempts[0] and threw. An invariant asserted in a
+  // comment above a branch that skipped it is worse than no invariant.
+  assert.equal(searchTerms("'''").length, 1);
+  const r = await makeSearchAudiobook(async () => json([]), openLibrary({ docs: [] })).run(
+    { query: "'''" },
+    ctx(),
+  );
+  assert.equal(r.ok, true);
+  assert.match(r.content, /^NOT FOUND/);
 });

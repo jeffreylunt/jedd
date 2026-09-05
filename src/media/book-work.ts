@@ -290,20 +290,25 @@ export function searchTerms(query: string, work?: Work): SearchTerm[] {
      */
     add(query, 'what they said');
     add(query.replace(LEADING_ARTICLE, ''), 'what they said, without the leading "the"');
-    return out;
+  } else {
+    const author = work.authors[0] ?? '';
+    add(`${work.title} ${author}`.trim(), 'the title and the author');
+    add(work.title.replace(LEADING_ARTICLE, ''), 'the title alone, without the leading "the"');
+    const distinctive = mostDistinctiveWord(work.title);
+    const last = surname(author);
+    if (distinctive && last) {
+      add(`${last} ${distinctive}`, 'the author and the most distinctive word of the title');
+    }
   }
 
-  const author = work.authors[0] ?? '';
-  add(`${work.title} ${author}`.trim(), 'the title and the author');
-  add(work.title.replace(LEADING_ARTICLE, ''), 'the title alone, without the leading "the"');
-  const distinctive = mostDistinctiveWord(work.title);
-  const last = surname(author);
-  if (distinctive && last) add(`${last} ${distinctive}`, 'the author and the most distinctive word of the title');
   /**
-   * ⚠️ NEVER EMPTY. A title that is nothing but punctuation would otherwise
-   * hand the caller no rungs at all, and a loop over no rungs reports the same
-   * "found nothing" as a search that ran — a zero manufactured by this function
-   * rather than by an indexer.
+   * ⚠️ NEVER EMPTY, ON EITHER PATH — AND THE EARLY `return` THAT USED TO SIT IN
+   * THE FIRST BRANCH MEANT THIS DID NOT HOLD.
+   *
+   * `indexerTerm` strips apostrophes, so a query of nothing but `'''` produced
+   * zero rungs; the caller then destructured `attempts[0]` and threw. An
+   * invariant asserted in a comment above a branch that skips it is worse than
+   * no invariant, because the caller trusts it.
    */
   if (out.length === 0) out.push({ term: query.trim(), form: 'what they said' });
   return out;

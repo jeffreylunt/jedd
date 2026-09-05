@@ -425,9 +425,15 @@ function makeReleaseSearch(
        *                                             Sanderson EPUB, 30 seeders
        *
        * Scoring releases from a search that was never about the pinned work is
-       * an identity filter applied to the wrong population. Asking a second time
-       * would hammer Prowlarr (see its backoff note), so the ONE search it gets
-       * is the one about the right book.
+       * an identity filter applied to the wrong population, so the searches that
+       * run are about the pinned work.
+       *
+       * 🪦 This used to end *"so the ONE search it gets is the one about the
+       * right book"*. The measurement above is unchanged and still the reason
+       * the term is built from the WORK; what died is the "one" — a single form
+       * of a single term turned out to be how a book that is plainly there gets
+       * reported as absent. See the query ladder below for what replaced it and
+       * for why it is still bounded.
        *
        * ⚠️ Where the query already named the book — the measured Hobbit, Dune and
        * Project Hail Mary cases — the canonical term is the same string in a
@@ -484,18 +490,49 @@ function makeReleaseSearch(
       const attempts: Attempt[] = [];
       let ircSettled: IrcSearchOutcome | undefined;
       for (const rung of rungs) {
-        const result: SearchResult = client
-          ? await client.search(rung.term, isAudio ? CATEGORY.audiobook : CATEGORY.ebook)
-          : { state: 'none', detail: 'Prowlarr is not configured here.' };
-        const attempt = evaluate(rung, result, { isAudio, wantsGraphic, work });
+        /**
+         * 🔴 A RUNG THAT WAS NEVER SENT IS NOT A RUNG THAT FOUND NOTHING.
+         *
+         * With no Prowlarr configured — a real deployment, since `search_ebook`
+         * runs on IRC alone — the loop used to synthesise a `none` per rung and
+         * the reply then listed three terms it had never put on a wire, under
+         * *"tell them which forms were tried"*. That is a manufactured account
+         * of work performed, inside the branch that exists to stop this file
+         * manufacturing findings. So the attempt records that it was NOT
+         * SEARCHED, and there is exactly one of it.
+         */
+        if (!client) {
+          attempts.push(
+            evaluate(rung, { state: 'none', detail: 'Prowlarr is not configured here.' }, {
+              isAudio,
+              wantsGraphic,
+              work,
+              searched: false,
+            }),
+          );
+          break;
+        }
+        const result: SearchResult = await client.search(
+          rung.term,
+          isAudio ? CATEGORY.audiobook : CATEGORY.ebook,
+        );
+        const attempt = evaluate(rung, result, { isAudio, wantsGraphic, work, searched: true });
         attempts.push(attempt);
         if (attempt.candidates.length > 0) break;
         if (result.state === 'unknown') break;
-        // IRC was asked concurrently with rung one, so this costs nothing it has
-        // not already spent. If a bot is holding the book there is nothing left
-        // for a broader torrent search to find.
+        /**
+         * IRC was asked concurrently with rung one, so this costs nothing it has
+         * not already spent. If a bot is holding THE BOOK there is nothing left
+         * for a broader torrent search to find.
+         *
+         * 🔴 IDENTITY-FILTERED, NOT `results.length > 0`. The Prowlarr side of
+         * this loop stops on candidates that survived `matchWork` precisely
+         * because rows are not answers; stopping on RAW IRC rows would let a bot
+         * holding a study guide end the ladder one rung short of the book, which
+         * is the original defect with the source swapped.
+         */
         ircSettled ??= await ircPromise;
-        if (ircSettled.state === 'ok' && ircSettled.results.length > 0) break;
+        if (ircHolds(ircSettled, work)) break;
       }
       const ircFound = ircSettled ?? (await ircPromise);
 
@@ -532,13 +569,25 @@ function makeReleaseSearch(
         }
       }
 
-      // 🔴 An unreachable indexer is UNKNOWN — a failure to LOOK is not a finding
-      // of absence. But with IRC offers in hand it is a PARTIAL result, not a
-      // dead end, so it degrades to a note instead of taking the whole tool down.
+      /**
+       * 🔴 An unreachable indexer is UNKNOWN — a failure to LOOK is not a finding
+       * of absence. But with IRC offers in hand it is a PARTIAL result, not a
+       * dead end, so it degrades to a note instead of taking the whole tool down.
+       *
+       * ⚠️ IT IS ASKED OF EVERY RUNG, NOT OF `best`. `best` prefers a rung that
+       * returned rows, and an unreachable rung returned none — so keying this on
+       * `best.found` swallowed an indexer that failed on rung two entirely: no
+       * UNKNOWN, no note, and a reply whose head said NOT FOUND while one of the
+       * searches it named had never completed. A failure to look outranks a
+       * failure to find no matter which rung it happened on.
+       */
+      const unreachable = attempts
+        .map((a) => a.found)
+        .find((f): f is Extract<SearchResult, { state: 'unknown' }> => f.state === 'unknown');
       let prowlarrNote = '';
-      if (found.state === 'unknown') {
-        if (ircOffers.length === 0) return fail(`UNKNOWN — ${found.detail}`);
-        prowlarrNote = `the torrent indexers could not be reached (${found.detail})`;
+      if (unreachable) {
+        if (ircOffers.length === 0) return fail(`UNKNOWN — ${unreachable.detail} (asked ${tried})`);
+        prowlarrNote = `the torrent indexers could not be reached (${unreachable.detail})`;
       }
       /**
        * 🔴 AN ABSENCE REPORT MUST NAME WHAT WAS NOT REACHED — AND NOW ALSO WHAT
@@ -631,7 +680,9 @@ function makeReleaseSearch(
        * page of requests.
        */
       if (work && top.length > 0) {
-        const tried: string[] = [];
+        // Named apart from the ladder's `tried` above: this one is copies we
+        // failed to turn into a magnet, not query forms we asked.
+        const unfetchable: string[] = [];
         let resolvedTop: Offer | undefined;
         for (const offer of top.slice(0, MAX_RESOLVE_ATTEMPTS)) {
           const v = offer.value;
@@ -648,14 +699,15 @@ function makeReleaseSearch(
             resolvedTop = { ...offer, value: { ...v, infoHash: got.infoHash, magnetUri: got.magnetUri } };
             break;
           }
-          tried.push(`${offer.label.split(' — ')[0]} (${got.detail})`);
+          unfetchable.push(`${offer.label.split(' — ')[0]} (${got.detail})`);
         }
         if (!resolvedTop) {
           return ok(
-            `COULD NOT FETCH — "${describeWork(work)}" is on the indexers, but none of the ` +
-              `${tried.length} copy(ies) tried could be turned into something the download client ` +
-              `can take: ${tried.slice(0, 3).join('; ')}. Say the copies could not be started — do ` +
-              'NOT say the book does not exist, and do not offer one of these anyway.',
+            `COULD NOT FETCH — "${describeWork(work)}" is on the indexers (found by asking ` +
+              `${tried}), but none of the ${unfetchable.length} copy(ies) tried could be turned ` +
+              `into something the download client can take: ${unfetchable.slice(0, 3).join('; ')}. ` +
+              'Say the copies could not be started — do NOT say the book does not exist, and do ' +
+              'not offer one of these anyway.',
           );
         }
         // The resolved one leads; the rest stay as alternatives.
@@ -737,9 +789,13 @@ function makeReleaseSearch(
        * release exists"; when a later rung rescues it, that is worth seeing in
        * the transcript rather than being smoothed away.
        */
-      if (best !== attempts[0]) {
+      if (best !== attempts[0] && best.candidates.length > 0) {
+        // ⚠️ GATED ON `best` HAVING ACTUALLY PRODUCED CANDIDATES, and counted by
+        // this rung's POSITION rather than by how many ran. Without the gate the
+        // note fires on the "most informative failure" fallback and credits a
+        // rung for a release it never returned — an IRC offer, say.
         notes.push(
-          `the first ${attempts.length - 1} way(s) of asking found nothing — this came from ` +
+          `the first ${attempts.indexOf(best)} way(s) of asking found nothing — this came from ` +
             `searching ${best.rung.form} ("${best.rung.term}")`,
         );
       }
@@ -792,10 +848,12 @@ function makeReleaseSearch(
        * the design.
        */
       if (work) {
-        const best = top[0]!;
+        // Named apart from the `best` ATTEMPT above: that one is a query form,
+        // this one is a release.
+        const bestOffer = top[0]!;
         return ok(
           `CHOSE — "${describeWork(work)}" is the book, and among the ${top.length} release(s) that ` +
-            `are copies of it I took the healthiest swarm myself: ${best.label}${suffix}.\n` +
+            `are copies of it I took the healthiest swarm myself: ${bestOffer.label}${suffix}.\n` +
             'Do NOT list releases and do NOT ask which torrent they want — that choice is already ' +
             `made and it is not theirs. Call ${consumer} now with choice 1. Nothing is ` +
             `${isAudio ? 'downloading' : 'being sent'} yet.`,
@@ -869,6 +927,12 @@ function humanSize(bytes: number): string {
 interface Attempt {
   rung: SearchTerm;
   found: SearchResult;
+  /**
+   * 🔴 DID THIS TERM ACTUALLY GO ON A WIRE. A rung that was never sent must
+   * never be reported as a rung that came back empty — see the no-client branch
+   * in the loop.
+   */
+  searched: boolean;
   /** What the indexers returned, before any filter of ours. */
   before: number;
   /** After the GraphicAudio preference — the population the notes count from. */
@@ -894,7 +958,7 @@ interface Attempt {
 function evaluate(
   rung: SearchTerm,
   found: SearchResult,
-  o: { isAudio: boolean; wantsGraphic: boolean; work?: Work },
+  o: { isAudio: boolean; wantsGraphic: boolean; work?: Work; searched: boolean },
 ): Attempt {
   const all = found.state === 'results' ? found.releases : [];
   const releases = o.isAudio ? all.filter((r) => isGraphicAudio(r) === o.wantsGraphic) : all;
@@ -953,6 +1017,7 @@ function evaluate(
   return {
     rung,
     found,
+    searched: o.searched,
     before: all.length,
     releases,
     deadCount: releases.length - alive.length,
@@ -974,6 +1039,7 @@ function describeAttempts(attempts: Attempt[]): string {
 }
 
 function outcome(a: Attempt): string {
+  if (!a.searched) return 'NOT SEARCHED';
   if (a.found.state === 'unknown') return 'could not be reached';
   if (a.before === 0) return 'nothing at all';
   if (a.candidates.length > 0) return `${a.candidates.length} usable`;
@@ -1065,6 +1131,21 @@ function ircOffer(r: IrcResult, work?: Work): Offer {
     // and reconstructing it from the label would be the classic way to break it.
     value: { source: 'irc', command: r.command, bot: r.bot, title: r.title },
   };
+}
+
+/**
+ * Is a bot holding A COPY OF THE PINNED WORK — the IRC half of the ladder's
+ * stop condition, scored exactly the way the torrent half is.
+ *
+ * 🔴 NOT `results.length > 0`. `matchWork` is what separates a copy of the book
+ * from a study guide with the same words in its filename, and a stop condition
+ * that skips it ends the search on the guide.
+ */
+function ircHolds(outcome: IrcSearchOutcome, work?: Work): boolean {
+  if (outcome.state !== 'ok') return false;
+  return outcome.results.some(
+    (r) => !work || ircOffer(r, work).work !== WORK_MATCH.NOT_THIS_WORK,
+  );
 }
 
 /** Any positive count banded `healthy`; see `Offer.band` for why IRC gets one. */
