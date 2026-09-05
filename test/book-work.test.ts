@@ -358,3 +358,73 @@ test('the helpers do what the rules above assume', () => {
     'hobbit', 'or', 'there', 'and', 'back', 'again', 'the',
   ]);
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 A POSSESSIVE IN THE TITLE MADE THE BOOK UNREACHABLE.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Found while verifying the Dungeon Crawler Carl fix, 2026-09-04, by running
+ * the matcher rather than reading it. Open Library spells the work with a
+ * CURLY apostrophe — `The Dungeon Anarchist’s Cookbook` — and every indexer
+ * drops it: `The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03)`.
+ *
+ *     tokens('The Dungeon Anarchist’s Cookbook') -> the dungeon anarchist s cookbook
+ *     tokens('The Dungeon Anarchists Cookbook')  -> the dungeon anarchists cookbook
+ *
+ * `anarchist` is not `anarchists`, so the title token is MISSING from the
+ * filename and the release is refused as "does not name" the work — the one
+ * release that IS the book, refused by the filter meant to protect it.
+ *
+ * ⚠️ THE FAILURE IS SILENT AND IT LOOKS LIKE A COVERAGE GAP. The tool reports
+ * NOT THE BOOK and says the book "does not appear to be on the indexers", about
+ * a release sitting right there. Measured across real catalogue spellings, FOUR
+ * of five possessive titles were refused; the fifth passed only by luck, because
+ * the release's series name happens to repeat the word (`Dungeon Crawler Carl`
+ * supplies the `carl` that `Carl’s` lost).
+ *
+ * The fix is in `tokens`: an apostrophe is REMOVED rather than split on, so both
+ * spellings land on the same token. It is deliberately not a stemmer — nothing
+ * here should start deciding that two different words are the same word.
+ */
+
+/** Real Prowlarr rows, captured live 2026-09-04 for "Dungeon Crawler Carl". */
+const DCC_03 = 'The Dungeon Anarchists Cookbook (Dungeon Crawler Carl 03) by Matt Dinniman (Audiobook)(Fiction)';
+const DCC_05 = 'The Butchers Masquerade (Dungeon Crawler Carl 05) by Matt Dinniman (Audiobook)(Fiction)';
+const DCC_07 = 'This Inevitable Ruin (Dungeon Crawler Carl 07) by Matt Dinniman (Audiobook)(Fiction)';
+
+const ANARCHISTS_COOKBOOK: Work = {
+  key: '/works/OL24848242W',
+  title: 'The Dungeon Anarchist’s Cookbook',
+  authors: ['Matt Dinniman'],
+  firstPublishYear: 2021,
+  editionCount: 5,
+};
+
+test('🔴 POSSESSIVE: the release that IS the book is not refused for dropping the apostrophe', () => {
+  const m = matchWork(DCC_03, ANARCHISTS_COOKBOOK);
+  assert.notEqual(
+    m.score,
+    WORK_MATCH.NOT_THIS_WORK,
+    `the one release that is this book was refused: ${m.reason}`,
+  );
+});
+
+test('🔴 POSSESSIVE: an apostrophe is removed, not split on, so both spellings agree', () => {
+  assert.deepEqual(tokens('The Dungeon Anarchist’s Cookbook'), tokens('The Dungeon Anarchists Cookbook'));
+  // The straight apostrophe is the same case and arrives from other catalogues.
+  assert.deepEqual(tokens("Carl's Doomsday Scenario"), tokens('Carls Doomsday Scenario'));
+});
+
+test('🔴 CONTROL: loosening the apostrophe does NOT let a different volume through', () => {
+  // The whole risk of touching the tokeniser is that identity gets weaker. The
+  // other numbered volumes of the SAME series by the SAME author must still be
+  // refused — that is the filter doing the job the pin exists for.
+  for (const other of [DCC_05, DCC_07]) {
+    assert.equal(
+      matchWork(other, ANARCHISTS_COOKBOOK).score,
+      WORK_MATCH.NOT_THIS_WORK,
+      `${other} is a different book and must stay refused`,
+    );
+  }
+});

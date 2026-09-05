@@ -160,12 +160,62 @@ const NOISE = new Set(
     'the a an of and or in on to for with').split(/\s+/),
 );
 
-/** Everything that is not a letter or a digit is a separator in a filename. */
+/**
+ * Everything that is not a letter or a digit is a separator in a filename —
+ * EXCEPT an apostrophe, which is removed instead.
+ *
+ * ── 🔴 AN APOSTROPHE IS NOT A WORD BOUNDARY, AND SPLITTING ON ONE HID A BOOK ─
+ *
+ * Found by running the matcher, 2026-09-04. Open Library spells the work with a
+ * CURLY apostrophe and every indexer drops it entirely:
+ *
+ *     'The Dungeon Anarchist’s Cookbook'  split ->  … anarchist | s | cookbook
+ *     'The Dungeon Anarchists Cookbook'   split ->  … anarchists | cookbook
+ *
+ * `anarchist` is not `anarchists`, so the work's own title token was MISSING
+ * from the filename of the one release that IS the book, and `matchWork` refused
+ * it as "does not name" the work. The tool then reported the book "does not
+ * appear to be on the indexers" — a coverage gap we manufactured, about a
+ * release sitting right there at 14 seeders.
+ *
+ * Removing it lands both spellings on `anarchists`. Four of five real possessive
+ * titles were refused before this; the fifth passed only because the release's
+ * series name repeated the word that the possessive had eaten.
+ *
+ * ⚠️ THIS IS NOT A STEMMER AND MUST NOT BECOME ONE. It removes a character that
+ * carries no identity; it does not decide that two different words mean the same
+ * thing. `matchWork`'s whole value is that it refuses near misses, and the
+ * numbered volumes of one series are the near misses it exists to catch.
+ */
+/**
+ * The form of a name to SEND to an indexer.
+ *
+ * ── 🔴 THE SAME CHARACTER, THE SECOND PLACE IT HIDES A BOOK ──────────────────
+ *
+ * Fixing `tokens` alone was not enough, and only running the flow end to end
+ * against the real services showed it. The term handed to Prowlarr is the work's
+ * title AS THE CATALOGUE SPELLS IT, and Open Library spells possessives with a
+ * curly apostrophe that no indexer carries. Measured 2026-09-04, one variable:
+ *
+ *     "The Dungeon Anarchist’s Cookbook Matt Dinniman"  ->  0 results
+ *     "The Dungeon Anarchists Cookbook Matt Dinniman"   ->  1 result
+ *
+ * So the matcher and the search have to agree about punctuation, or the flow
+ * reports "not on the indexers" at whichever of the two sites is still wrong.
+ *
+ * ⚠️ This is for the WIRE only. `describeWork` still shows the title the way the
+ * catalogue spells it, because that is the half a person reads.
+ */
+export function indexerTerm(s: string): string {
+  return s.replace(/['’ʼ]/g, '');
+}
+
 export function tokens(s: string): string[] {
   return s
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[̀-ͯ]/g, '')
+    .replace(/['’ʼ]/g, '')
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
 }
