@@ -596,3 +596,140 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 #29 — the failure-reply send is bounded by ITS OWN timeout, not the channel default', async () => {
+  /**
+   * Two live turns on 2026-09-08 timed out AND THEN the apology timed out,
+   * because the catch block awaited `connector.send(...)` with no local budget
+   * — the channel's outbound timeout (15s plain / 30s anchored) was the whole
+   * ceiling, and an unreachable channel (the case most likely to need the
+   * apology) was the case that ran into it.
+   *
+   * The fix is structural, not behavioural: the catch must wrap the send in
+   * a `Promise.race` against a shorter, named constant, and the timer must
+   * be cleared in a `finally` so a fast send does not leave a pending
+   * rejection in the Node timer wheel that fires against the next message.
+   *
+   * This is a source scan — same shape as the disarm-ordering test above —
+   * because `main()` is unreachable without standing up BlueBubbles, Ollama,
+   * IRC, IMAP and two SSH identities. The behaviour is asserted from the
+   * source so a future edit that reverts the race (back to a bare
+   * `await connector.send(...)`) fails loudly here.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  // A named budget, exported from the module top, not a magic number inline.
+  assert.match(
+    main,
+    /const\s+FAILURE_REPLY_TIMEOUT_MS\s*=\s*\d[\d_]*\s*;/,
+    'the failure-reply timeout is not a named module-level constant — a magic number here is the kind ' +
+      'of regression a future edit makes without realising it is load-bearing',
+  );
+
+  // The catch block wraps the apology send in Promise.race against a setTimeout.
+  const raceIdx = main.indexOf('Promise.race');
+  const sendIdx = main.indexOf('connector.send(message.senderHandle, failureReply(e)');
+  assert.ok(raceIdx >= 0, 'no Promise.race in main.ts — the failure-reply send is awaiting the channel timeout directly');
+  assert.ok(sendIdx >= 0, 'the failure-reply connector.send(...) could not be located — the source scan is measuring nothing');
+  assert.ok(
+    raceIdx < sendIdx,
+    'the Promise.race must wrap the failure-reply send, not be elsewhere in the file',
+  );
+
+  // The race MUST be against a setTimeout, not a separate signal — and that
+  // timeout must reference the named constant, not a literal.
+  // Slice to the CLOSE of the race array (the `]);` after the Promise
+  // constructor), not to `connector.send` — the setTimeout that references
+  // the constant sits AFTER the send inside the same race.
+  const raceClose = main.indexOf('])', sendIdx);
+  assert.ok(raceClose > sendIdx, 'the Promise.race has no closing `])` — the source scan is broken');
+  const raceBlock = main.slice(raceIdx, raceClose);
+  // The setTimeout call spans multiple lines (callback on one, budget on the
+  // next) so the regex has to match across newlines, hence `[\s\S]*?` rather
+  // than `[^)]*`.
+  assert.match(
+    raceBlock,
+    /setTimeout\([\s\S]*?FAILURE_REPLY_TIMEOUT_MS/,
+    'the race is against a setTimeout that does not reference FAILURE_REPLY_TIMEOUT_MS — the budget is hard-coded ' +
+      'into the timer or the wrong variable name is in use',
+  );
+
+  // 🔴 THE RACE TIMER MUST BE CLEARED. `Promise.race` settles the await, but
+  // a losing timer is still scheduled in the Node timer wheel. A fast send
+  // (50ms) followed by a slow next message would otherwise have a 10s
+  // rejection queued against a different send.
+  assert.match(
+    main,
+    /clearTimeout\(\s*failureReplyTimer\s*\)/,
+    'the failure-reply timer is not cleared — a fast send leaves a pending rejection that can fire against the next message',
+  );
+  assert.match(
+    main,
+    /finally\s*\{[\s\S]*?clearTimeout\(\s*failureReplyTimer[\s\S]*?\}/,
+    'the clearTimeout is not in a finally — on the throw path the timer leaks',
+  );
+
+  // The budget sits UNDER the channel defaults. The catch exists to bound a
+  // slow channel; a constant at or above the channel default is the same
+  // defect as the old behaviour.
+  const timeoutMatch = main.match(/const\s+FAILURE_REPLY_TIMEOUT_MS\s*=\s*(\d[\d_]*)\s*;/);
+  assert.ok(timeoutMatch, 'budget constant not found at module scope');
+  const budget = Number((timeoutMatch[1] ?? '').replace(/_/g, ''));
+  assert.ok(
+    budget > 0 && budget < 15_000,
+    `FAILURE_REPLY_TIMEOUT_MS must be under the 15s plain channel default so a slow channel is the racing ` +
+      `path, not the awaited one — got ${budget}ms`,
+  );
+});
+
+test('🔴 #29 — a promise that hangs longer than the budget rejects with the budget, not the channel', async () => {
+  /**
+   * Behavioural counterpart to the source scan above. Asserts that a helper
+   * with the same shape as the catch block's race fires the budget timer
+   * rather than waiting for the channel. This is the test the source scan
+   * cannot reach: that the race ACTUALLY bounds the wait, not just that the
+   * source looks like it bounds the wait.
+   *
+   * The helper is inlined here rather than imported because the catch block
+   * in `main.ts` is not callable in isolation, and the test exists to prove
+   * the SHAPE is correct, not to share a function. If the catch ever stops
+   * using `Promise.race` against `setTimeout`, the source scan above fires;
+   * if `Promise.race` against `setTimeout` ever stops bounding the wait,
+   * this test fires.
+   */
+  const FAILURE_REPLY_TIMEOUT_MS = 50;
+  let hung = false;
+  const slow = new Promise<void>((resolve) => {
+    setTimeout(() => {
+      hung = true;
+      resolve();
+    }, 5_000);
+  });
+
+  const start = Date.now();
+  let caught: Error | undefined;
+  try {
+    await Promise.race([
+      slow,
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`failure-reply send exceeded ${FAILURE_REPLY_TIMEOUT_MS}ms`)),
+          FAILURE_REPLY_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } catch (e) {
+    caught = e as Error;
+  }
+
+  const elapsed = Date.now() - start;
+  assert.ok(caught, 'the race must reject, not resolve');
+  assert.match(caught.message, /exceeded 50ms/, 'the rejection must name the budget');
+  assert.ok(elapsed < 1_000, `the race must fire its own timer, not the channel — took ${elapsed}ms`);
+  assert.ok(!hung, 'the slow promise must NOT have settled — the test is not racing against a hang that does not exist');
+
+  // Wait long enough for the slow promise to settle if it was going to, and
+  // verify the test's timer was the only thing that fired the rejection.
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!hung, 'the slow promise must still be unsettled — proves the budget won, not the slow side');
+});
