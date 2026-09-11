@@ -596,3 +596,112 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// ISSUE #17 — THE FAILURE-NOTIFICATION PATH ITSELF MUST NOT TIME OUT.
+// ──────────────────────────────────────────────────────────────────────────
+//
+// A turn that throws AND cannot deliver its own apology is the silent bot, the
+// defect this whole family of tests exists to prevent. The wiring below is the
+// last defence: the apology goes through a deadline-bounded send so the catch
+// cannot itself hang the handler, and a plain-text fallback tries once more
+// with a tighter deadline. These are source-scan tests for the same reason the
+// ones above are: this catch sits inside `main()` and is unreachable from a
+// unit test that boots BlueBubbles.
+
+test('🔴 #17 the failure-notification send is BOUNDED — it cannot inherit the connector’s 15s/30s abort', async () => {
+  /**
+   * The defect was a turn that timed out AND could not deliver its own apology:
+   * `connector.send` hit BlueBubbles' own 15/30s abort on top of a turn already
+   * exhausted. Two stacked timeouts where one was meant to be the answer.
+   * Asserting the apology goes through `sendWithDeadline` is the smallest
+   * statement that bounds the catch.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  // The apology is the call whose second argument is `failureReply(e)`. It must
+  // be wrapped in `sendWithDeadline` — an unwrapped `await connector.send(...,
+  // failureReply(e), ...)` is the defect.
+  const apologyIdx = main.indexOf('failureReply(e)');
+  assert.ok(apologyIdx >= 0, 'no failureReply(e) call in main.ts — the catch no longer apologises');
+  // Look BACKWARDS for the nearest `sendWithDeadline(` opening before the call.
+  const before = main.lastIndexOf('sendWithDeadline(', apologyIdx);
+  assert.ok(
+    before >= 0 && before > main.lastIndexOf(';', apologyIdx - 200),
+    'the failureReply apology must be wrapped in sendWithDeadline — without it the catch inherits the connector abort',
+  );
+  // And it must name a finite deadline, not the connector's own timeout.
+  assert.match(
+    main.slice(before, apologyIdx + 200),
+    /sendWithDeadline\([\s\S]*?FAILURE_NOTIFY_TIMEOUT_MS/,
+    'the apology must use the bounded deadline constant, not the connector timeout',
+  );
+});
+
+test('🔴 #17 a plain-text fallback tries once more when even the apology times out', async () => {
+  /**
+   * The contract is "a turn that dies always sends a message". When the
+   * `failureReply` send loses the race, the catch must STILL try something — a
+   * short plain-text "try a shorter request" with its own tighter deadline.
+   * Without the fallback, the bug fix above reduces a 30s hang to a 10s hang
+   * and Jeff still gets nothing.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  // The fallback must follow the failure-notification catch and use a TIGHTER
+  // deadline than the apology (its own constant, not the same one).
+  const apologyTimeout = main.indexOf('FAILURE_NOTIFY_TIMEOUT_MS');
+  assert.ok(apologyTimeout >= 0, 'no apology deadline constant — fix #17 is not wired');
+  const fallbackTimeout = main.indexOf('FAILURE_FALLBACK_TIMEOUT_MS');
+  assert.ok(fallbackTimeout >= 0, 'no fallback deadline constant — the fallback path is missing');
+  assert.ok(fallbackTimeout > apologyTimeout, 'the fallback must come AFTER the apology timeout in source order');
+
+  // And the fallback sends plain (no sourceGuid) — that is what makes it bypass
+  // the 30s ANCHORED_SEND_TIMEOUT_MS that the issue describes.
+  const fallbackSend = main.indexOf("connector.send(message.senderHandle, '⚠️ that one timed out");
+  assert.ok(fallbackSend >= 0, 'no plain-text fallback send found — the catch has no last-ditch attempt');
+  const fallbackSlice = main.slice(fallbackSend, fallbackSend + 300);
+  assert.ok(
+    !/,\s*message\.sourceGuid\s*,/.test(fallbackSlice.slice(0, fallbackSlice.indexOf(')'))),
+    'the fallback must be PLAIN (no sourceGuid) — anchoring routes through the 30s Private API path',
+  );
+  // The `sendWithDeadline(` opening sits BEFORE the `connector.send(` call, so
+  // the slice has to start there. Walk back to the nearest opening paren of
+  // `sendWithDeadline(` and assert the constant falls inside the same call.
+  const opening = main.lastIndexOf('sendWithDeadline(', fallbackSend);
+  assert.ok(opening >= 0, 'the fallback must be wrapped in sendWithDeadline');
+  const callText = main.slice(opening, fallbackSend + 300);
+  assert.match(
+    callText,
+    /sendWithDeadline\([\s\S]*?FAILURE_FALLBACK_TIMEOUT_MS/,
+    'the fallback must use its own bounded deadline, not the same constant as the apology',
+  );
+});
+
+test('🔴 #17 both deadlines are SHORTER than the connector’s own plain-send abort', async () => {
+  /**
+   * The whole point of bounding the apology send is to keep the catch from
+   * hanging the handler. `BlueBubblesClient.timeoutMs` defaults to 15_000 and
+   * the anchored send uses 30_000. If either deadline is at or above those
+   * numbers, the catch can still hold the handler open for that long — which
+   * is verbatim the defect.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  const notifyMatch = /FAILURE_NOTIFY_TIMEOUT_MS\s*=\s*(\d[\d_]*)/.exec(main);
+  const fallbackMatch = /FAILURE_FALLBACK_TIMEOUT_MS\s*=\s*(\d[\d_]*)/.exec(main);
+  assert.ok(notifyMatch, 'FAILURE_NOTIFY_TIMEOUT_MS constant is missing');
+  assert.ok(fallbackMatch, 'FAILURE_FALLBACK_TIMEOUT_MS constant is missing');
+
+  const notify = Number(notifyMatch![1]!.replace(/_/g, ''));
+  const fallback = Number(fallbackMatch![1]!.replace(/_/g, ''));
+
+  // The connector's plain send uses 15_000 (see BlueBubblesClient.timeoutMs).
+  assert.ok(
+    notify < 15_000,
+    `FAILURE_NOTIFY_TIMEOUT_MS (${notify}) must be shorter than the connector's 15s plain-send abort, otherwise the catch can hang for that long`,
+  );
+  assert.ok(
+    fallback < notify,
+    `FAILURE_FALLBACK_TIMEOUT_MS (${fallback}) must be tighter than FAILURE_NOTIFY_TIMEOUT_MS (${notify}) — a wider fallback buys nothing`,
+  );
+  assert.ok(fallback > 0, 'a deadline of 0 would fire on every working send');
+});

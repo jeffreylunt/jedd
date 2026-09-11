@@ -75,6 +75,65 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * 🔴 THE FAILURE-NOTIFICATION SEND HAS ITS OWN DEADLINE — AND ITS OWN FALLBACK.
+ *
+ * Issue #17 measured a turn that timed out AND could not deliver its own apology:
+ * the failure-notification send hit BlueBubbles' own 15/30s abort on top of a
+ * turn already on its last leg. Two stacked timeouts where one was meant to be the
+ * answer. So the apology is raced against a SHORTER deadline of our own
+ * (`FAILURE_NOTIFY_TIMEOUT_MS`), and if even that loses the catch tries a
+ * minimal plain-text message with a TIGHTER deadline (`FAILURE_FALLBACK_TIMEOUT_MS`).
+ *
+ * ── WHY BOTH ARE SHORTER THAN THE CONNECTOR'S OWN ABORT ──────────────────────
+ *
+ * `BlueBubblesClient`'s plain send uses `this.timeoutMs` = 15s and the anchored
+ * send uses `ANCHORED_SEND_TIMEOUT_MS` = 30s. The fallback MUST be shorter than
+ * the plain abort — that is the only way to make sure the catch cannot itself
+ * hold the handler open for 15s while the person who texted is reading nothing.
+ * 10s for the apology leaves room for a real BlueBubbles to answer; 5s for the
+ * fallback is the smallest window that still tolerates a slow request without
+ * becoming "every turn with a wedged transport sends a second apology".
+ *
+ * ⚠️ NOT ENV-TUNABLE. A knob here is the same trap `LLM_TURN_TIMEOUT_MS` used to
+ * be: a value nobody can predict, applied on the path most likely to fail at
+ * 3am. If a deployment needs different numbers, it can fork; the shipped values
+ * are what is tested.
+ */
+const FAILURE_NOTIFY_TIMEOUT_MS = 10_000;
+const FAILURE_FALLBACK_TIMEOUT_MS = 5_000;
+
+/**
+ * Race a promise against a deadline. If the deadline wins, the returned promise
+ * rejects with `Error("<what> timed out after <ms>ms")`; the underlying promise
+ * keeps running in the background and its eventual settlement is discarded.
+ *
+ * 🔴 THE SAME SHAPE `kindle-mailbox.ts` USES INTERNALLY. It is reproduced here
+ * rather than imported because that copy is intentionally file-private — the
+ * IMAP reader is the only place its semantics are exercised today, and an
+ * abstraction across one call site would obscure the contract more than it
+ * would share. The catch in `handleBurst` is the second caller, and it deserves
+ * the same pattern spelled out next to it.
+ *
+ * ⚠️ DOES NOT CANCEL THE LOSING PROMISE. The connector does not accept an
+ * `AbortSignal`, and the underlying `fetch` in `BlueBubblesClient` is owned by
+ * that layer; we cannot reach in to abort it. The loser simply resolves (or
+ * rejects) later, in the background, and its result is dropped.
+ */
+async function sendWithDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -820,10 +879,52 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * ── 🔴 THE SEND HERE IS BOUNDED, AND NOT BY THE CONNECTOR'S OWN TIMEOUT ─
+         *
+         * If the failure that killed the turn was a hung BlueBubbles — the exact
+         * shape that produces "send reported failure AND the apology itself
+         * timed out" — the connector's send will hit ITS OWN 15/30s abort, and
+         * the catch wraps that abort with yet another 15/30s. That is two stacked
+         * timeouts where one was meant to be the answer. The mitigation is to
+         * race the apology against a SHORTER deadline of our own so the catch
+         * cannot itself hold the handler open, and to try a minimal plain-text
+         * fallback if even that loses.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await sendWithDeadline(
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          FAILURE_NOTIFY_TIMEOUT_MS,
+          'failure-notification send',
+        );
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+        /**
+         * 🔴 LAST-DITCH FALLBACK, AND IT IS NOT NEGOTIABLE.
+         *
+         * The contract is "a turn that dies always sends a message". When the
+         * apologetic `failureReply` cannot be delivered — the cascading timeout
+         * the issue is about — the catch must STILL try something rather than
+         * log and fall silent. A short, plain-text "try a shorter request" via
+         * the same transport, with its own tighter deadline, is the smallest
+         * thing that can satisfy that promise without depending on the same
+         * state (LLM reachable, full connector capable) that just failed.
+         *
+         * ⚠️ PLAIN, NOT ANCHORED. Anchoring routes through the Private API and
+         * hits the 30s `ANCHORED_SEND_TIMEOUT_MS` — the very timeout the issue
+         * describes. A plain send is the one BlueBubbles sends fast or fails
+         * fast on, and is exactly what the issue means by "via the raw transport".
+         */
+        try {
+          await sendWithDeadline(
+            connector.send(message.senderHandle, '⚠️ that one timed out — try a shorter request'),
+            FAILURE_FALLBACK_TIMEOUT_MS,
+            'failure-notification fallback',
+          );
+        } catch (fallbackErr) {
+          console.error(
+            `[jedd] turn ${turn} fallback also failed: ${(fallbackErr as Error).message}`,
+          );
+        }
       }
     } finally {
       /**
