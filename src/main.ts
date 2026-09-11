@@ -23,6 +23,7 @@ import {
 } from './turn-notice.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
+import { describeError, redactUrlSecrets } from './errors.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
 import { JfagoClient } from './jfago.js';
@@ -775,7 +776,14 @@ async function main(): Promise<void> {
       }
     } catch (e) {
       // A failing turn must not stop the next message arriving.
-      console.error(`[jedd] turn ${turn} THREW: ${(e as Error).message}`);
+      //
+      // 🔴 `.message` IS NOT ENOUGH. A `fetch()` that fails to reach Ollama
+      // throws the constant string `"fetch failed"`, which names nothing —
+      // the actionable diagnosis (e.g. `EHOSTUNREACH 10.0.0.10:11434`) is in
+      // `e.cause`. `describeError` walks the chain and produces one line a
+      // person can act on; `redactUrlSecrets` keeps API keys out of the log,
+      // because turn records are persisted and credentials must not leak.
+      console.error(`[jedd] turn ${turn} THREW: ${describeError(e, redactUrlSecrets)}`);
       /**
        * ⚠️ BELT AND BRACES. `withPresence` rethrows, so `agent.handle`'s own
        * `finally` has already disarmed this on every path that reaches here —
