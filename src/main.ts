@@ -18,6 +18,7 @@ import {
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
+  sendFailureReport,
   StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
 } from './turn-notice.js';
@@ -820,8 +821,15 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * 🔴 ISSUE #18: the apology must NOT share the turn's wait or routing.
+         * `sendFailureReport` sends PLAIN (no `inReplyTo` — the apology is not a
+         * reply) and races the send against its own short, independent timer, so
+         * a turn killed by Ollama's 900s budget cannot take the apology with it
+         * down BlueBubbles' 30s anchored path. See `turn-notice.ts` for the full
+         * reasoning and the measured failure that produced the issue.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await sendFailureReport(connector, message.senderHandle, failureReply(e));
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
