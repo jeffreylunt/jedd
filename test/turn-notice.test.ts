@@ -5,9 +5,11 @@ import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
   failureReply,
+  FAILURE_REPORT_TIMEOUT_MS,
   isModelTimeout,
   MAX_NOTICES,
   ModelTimeoutError,
+  sendFailureReport,
   StillWorkingNotice,
   parseStillWorkingMs,
   STILL_WORKING_AFTER_MS,
@@ -579,11 +581,24 @@ test('🔴 the shipped turn body disarms the notice BEFORE it sends, and apologi
   assert.ok(arm < disarm, 'the notice is disarmed before it is armed');
   assert.ok(disarm < send, 'the notice is disarmed AFTER the reply is sent — a note can land after the answer');
 
-  // And the failure path says something, using the classifier rather than a literal.
-  assert.match(body, /connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/, 'the turn catch no longer apologises with failureReply');
+  // And the failure path says something, using the classifier rather than a literal —
+  // and routes it through `sendFailureReport`, the helper that owns the independent
+  // timeout, instead of `connector.send` directly (issue #18).
+  assert.match(
+    body,
+    /sendFailureReport\(\s*connector,\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the turn catch no longer apologises with failureReply',
+  );
   assert.ok(
     body.indexOf('notice.arm(') < body.indexOf('failureReply(e)'),
     'the catch must come after the arm — otherwise this scan is matching the wrong block',
+  );
+  // The catch must not anchor the apology to the original message. Anchoring
+  // routes through BlueBubbles' Private API with a 30s timeout — the very path
+  // most likely to share the cause with the turn that failed.
+  assert.ok(
+    !/sendFailureReport\([^)]*,\s*[^)]*,\s*[^)]*,\s*message\.sourceGuid/.test(body),
+    'the failure report is anchored to the original message — issue #18 cascade',
   );
 });
 
@@ -594,5 +609,117 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
     /notice\.arm\(waited\.queuedForMs\)/,
     'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
       'restarts the clock at zero — the exact case this is for',
+  );
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// ISSUE #18: the failure-report send must not share the turn's wait or routing.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A connector whose `send` resolves on demand or hangs forever. Hangs are the
+ * shape this helper exists for, so they are tested first; a fast send that
+ * succeeds is the boring control.
+ */
+function controllableConnector(behavior: 'fast' | 'hang'): {
+  connector: import('../src/connector.js').Connector;
+  sent: { to: string; text: string; inReplyTo?: string }[];
+} {
+  const sent: { to: string; text: string; inReplyTo?: string }[] = [];
+  const connector: import('../src/connector.js').Connector = {
+    name: 'fake',
+    async send(to, text, inReplyTo) {
+      sent.push({ to, text, inReplyTo });
+      if (behavior === 'fast') return;
+      // A hang the test will short-circuit by exceeding the race timeout.
+      await new Promise(() => {});
+    },
+    markRead: () => false,
+    async withTyping<T>(_to: string, fn: () => Promise<T>) {
+      return fn();
+    },
+    async listen() {
+      // The failure-report helper never calls `listen`, so this is the minimum
+      // shape that satisfies the Connector contract — it must not throw on import.
+    },
+  };
+  return { connector, sent };
+}
+
+test('🔴 ISSUE #18: a fast failure-report send completes within the timeout', async () => {
+  const { connector, sent } = controllableConnector('fast');
+  await sendFailureReport(connector, '+15551234567', 'apology text');
+  assert.equal(sent.length, 1, 'the apology went out');
+  assert.equal(sent[0]?.text, 'apology text');
+  assert.equal(sent[0]?.to, '+15551234567');
+  assert.equal(sent[0]?.inReplyTo, undefined, 'sent PLAIN, not anchored — see #18');
+});
+
+test('🔴 ISSUE #18: a hanging send is cut off by the INDEPENDENT timeout, not by anything shared', async () => {
+  /**
+   * The defect: a turn that died on its own AbortController took the apology
+   * with it because they shared that controller. Here the apology must be
+   * rejected by THIS helper's timer (a fresh one), inside its own timeout,
+   * even though the connector never resolves.
+   */
+  const { connector, sent } = controllableConnector('hang');
+  const startedAt = Date.now();
+  const err = await sendFailureReport(connector, '+15551234567', 'apology', 50).then(
+    () => null,
+    (e: unknown) => e as Error,
+  );
+  const elapsed = Date.now() - startedAt;
+
+  assert.ok(err instanceof Error, 'the hanging send is rejected');
+  assert.match((err as Error).message, /timed out after 50ms/, 'and the message names the helper timeout');
+  assert.ok(elapsed < 1_000, `the helper gave up in ${elapsed}ms, not in any longer window`);
+  assert.equal(sent.length, 1, 'the connector WAS called — only the wait was bounded');
+  assert.equal(sent[0]?.inReplyTo, undefined, 'the apology was sent PLAIN, not anchored');
+});
+
+test('🔴 CONTROL: a failure-report send that throws immediately propagates the ORIGINAL error, not a timeout', async () => {
+  /**
+   * Without this control, a `sendFailureReport` that races against the timer on
+   * EVERYTHING — even a connector that has already failed — would turn every
+   * real BlueBubbles error into "timed out after 10000ms", and the log would
+   * name the wrong cause. The original error is the diagnosis; the helper is
+   * only here to bound the wait.
+   */
+  const connector: import('../src/connector.js').Connector = {
+    name: 'fake',
+    async send() {
+      throw new Error('send failed: BlueBubbles 500');
+    },
+    markRead: () => false,
+    async withTyping<T>(_to: string, fn: () => Promise<T>) {
+      return fn();
+    },
+    async listen() {
+      // never called by sendFailureReport
+    },
+  };
+
+  const err = await sendFailureReport(connector, '+15551234567', 'apology', 5_000).then(
+    () => null,
+    (e: unknown) => e as Error,
+  );
+  assert.ok(err instanceof Error);
+  assert.match((err as Error).message, /BlueBubbles 500/, 'the connector error survives, not the helper timeout');
+});
+
+test('🔴 the default timeout is short — a dead transport is named quickly, not at 15s', () => {
+  /**
+   * The number is part of the design, not a knob. Lowering it turns the failure
+   * path into the path that races the next turn; raising it makes the helper a
+   * copy of the anchored-send timeout it was added to replace. Both directions
+   * have measurable consequences and this test pins the choice.
+   */
+  assert.ok(
+    FAILURE_REPORT_TIMEOUT_MS <= 15_000,
+    `a ${FAILURE_REPORT_TIMEOUT_MS}ms failure-report timeout is longer than the plain-send timeout (15s) it sits under`,
+  );
+  assert.ok(
+    FAILURE_REPORT_TIMEOUT_MS >= 1_000,
+    'sub-second: a real send on a slow link would race its own timer',
   );
 });

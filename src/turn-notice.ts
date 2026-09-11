@@ -2,7 +2,10 @@
  * ══════════════════════════════════════════════════════════════════════════
  * A TURN THAT IS SLOW OR DEAD HAS TO SAY SO. SILENCE IS NOT AN ANSWER.
  * ══════════════════════════════════════════════════════════════════════════
- *
+ */
+import type { Connector } from './connector.js';
+
+/**
  * ── THE DEFECT, MEASURED TWICE LIVE 2026-08-26 ──────────────────────────────
  *
  * Jeff asked *"Give me the other 14"* and got NOTHING. No reply, no error, no
@@ -33,6 +36,20 @@
  * death (a turn that dies after the notice is silent again from there on), and a
  * message on death does not close the wait (15 minutes of nothing, then a text).
  * Both, or neither is worth much.
+ *
+ * ── 🔴 A THIRD FAILURE, AND THE SUBJECT OF #18 ────────────────────────────────
+ *
+ * Issue #18: a turn that hit its own abort timeout then had its apology share
+ * the same wait. The log was
+ *
+ *     [jedd] turn N THREW: The operation was aborted due to timeout
+ *     [jedd] turn N could not even report the failure: The operation was aborted due to timeout
+ *
+ * — the same second message, telling the user nothing twice. `sendFailureReport`
+ * below closes that: it owns its own fresh timer and races the apology against
+ * it, so the apology cannot die the way the turn did. Sending PLAIN keeps it
+ * off the anchored-send path, which has a 30s Private-API timeout and is the
+ * most likely route for the same failure to recur.
  *
  * ── 🔴 WHY THE TIMEOUT IS CLASSIFIED FROM THE SIGNAL, NOT THE ERROR NAME ─────
  *
@@ -120,6 +137,85 @@ export function failureReply(e: unknown): string {
     );
   }
   return 'Something went wrong on my end and I could not answer that. It has been logged — worth trying again in a moment.';
+}
+
+/**
+ * The default cap on the failure-report send.
+ *
+ * 🔴 SHORT ON PURPOSE. The apology is one short sentence and the wire it goes
+ * down is the same one the next turn is going to need. Ten seconds is long
+ * enough that a real send on a slow link still finishes; short enough that a
+ * dead transport is named inside the same log line rather than dragging the
+ * process to its connector's 30-second anchored timeout and pretending nothing
+ * happened.
+ *
+ * Not exported as `LLM_TURN_TIMEOUT_MS`-style config: this number has no reason
+ * to vary by deployment, and the failure path is exactly the one nobody wants to
+ * tune live.
+ */
+export const FAILURE_REPORT_TIMEOUT_MS = 10_000;
+
+/**
+ * Send the failure-report apology through the connector with an INDEPENDENT,
+ * short-lived timeout.
+ *
+ * ── 🔴 WHAT THIS IS FOR, AND WHAT IT IS NOT FOR (#18) ────────────────────────
+ *
+ * The catch in `main.ts` uses this instead of `connector.send` directly,
+ * because the failure-report must NOT inherit any timeout, abort signal, or
+ * routing from the turn that just died.
+ *
+ * Measured 2026-08-26: a turn whose model call was killed by its 900s timer
+ * threw a `ModelTimeoutError`, the catch took over, and the apology itself
+ * timed out on its own BlueBubbles send — so the user got nothing either time,
+ * and the log showed two `aborted due to timeout` lines back to back. The issue
+ * read the cascade as a shared `AbortController`; the actual shape is broader.
+ * Any condition that kills the turn can kill the apology the same way, because
+ * the apology goes down the same wire, to the same host, with the same
+ * timeout. Sharing ANY of that — the AbortController, the timeout, or even the
+ * ROUTING — turns the failure path into a second failure on the same cause.
+ *
+ *   ─ The abort signal. The promise that just rejected cannot supply one; this
+ *     helper builds its own `setTimeout` so the rejection it raises cannot be
+ *     the same one the turn raised.
+ *
+ *   ─ The routing. The apology is NOT a reply to the original message. The
+ *     catch used to pass `message.sourceGuid` to `connector.send`, which made
+ *     it an anchored send: BlueBubbles' Private API, helper-bundle-dependent,
+ *     with a 30s timeout instead of 15s. That path is the one most likely to
+ *     share a cause with the turn that failed, so the apology is now sent
+ *     PLAIN — no `inReplyTo`, no Private API, no helper dependency.
+ *
+ *   ─ The connector state. `Connector` is passed in, not constructed here, so
+ *     an audience-suppressed handle is still suppressed on the apology — and
+ *     threading still records it as having answered the message — exactly as it
+ *     does on the success path. The fix is in the WAIT, not in the gate.
+ *
+ * ⚠️ The race is `Promise.race`, not `AbortSignal.timeout`. The connector does
+ * not accept a signal, so we cannot cancel its work — we can only stop waiting
+ * for it. The `setTimeout` is local to this call and `clearTimeout`'d on
+ * settle, so the helper leaves no pending timer.
+ */
+export async function sendFailureReport(
+  connector: Connector,
+  toHandle: string,
+  text: string,
+  timeoutMs: number = FAILURE_REPORT_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      connector.send(toHandle, text),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`failure-report send timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
