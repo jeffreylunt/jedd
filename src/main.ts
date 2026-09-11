@@ -821,7 +821,46 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        /**
+         * 🔴 THE FAILURE-REPORT SEND HAS ITS OWN SHORT, INDEPENDENT TIMEOUT.
+         *
+         * The LLM turn has its 15-minute budget, and the apology inherits
+         * BlueBubbles' own timeout (15s plain / 30s anchored). Both can fail:
+         * a hung BlueBubbles stalls the catch for that whole window, and from
+         * the phone "still typing" and "the bot is dead" are the same
+         * observation. The issue this closes measured it twice — turn 1
+         * threw on the model's `AbortController`, and the catch's apology
+         * then ALSO aborted on BlueBubbles' own timer, so the user got
+         * nothing.
+         *
+         * The non-LLM half of the fix was already in place: `failureReply` is a
+         * pure function in `turn-notice.ts` and never calls the model. This is
+         * the OTHER half — a much shorter budget, distinct from either of the
+         * two above, so a hung transport logs and gives up rather than eats
+         * the catch's whole window. 10s is plenty for an apology that is
+         * actually going to land (BlueBubbles is normally 1–2s); sitting on
+         * it for the full transport budget is the regression we are sealing.
+         *
+         * ⚠️ Timer cleared in `finally`, so the success path doesn't leak an
+         * unhandled rejection ten seconds later. `unref()` is hygiene: a timer
+         * on an error path must not be what holds the process open at
+         * shutdown.
+         */
+        let reportTimer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+            new Promise<never>((_, reject) => {
+              reportTimer = setTimeout(
+                () => reject(new Error('failure-report send exceeded 10s')),
+                10_000,
+              );
+              reportTimer.unref?.();
+            }),
+          ]);
+        } finally {
+          if (reportTimer) clearTimeout(reportTimer);
+        }
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }

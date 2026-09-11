@@ -596,3 +596,54 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 the failure-report send is raced against its OWN short timeout — a hung transport must not silence the apology', async () => {
+  /**
+   * The catch in `main.ts` used to await `connector.send(failureReply(e), …)`
+   * unconditionally, so a hung BlueBubbles (or any other transport that hit its
+   * own 15–30s budget) turned the catch itself into silence — the very invariant
+   * it exists to uphold ("a turn that dies always sends a message") collapsed on
+   * the failure path.
+   *
+   * The fix wraps the apology send in a `Promise.race` against a short timer
+   * (~10s), distinct from both the LLM turn budget and BlueBubbles' own budget.
+   * This test asserts the wiring: the apology send is raced, and the timer is
+   * far shorter than either of the two budgets it replaces for the catch's
+   * purposes.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const failureIdx = main.indexOf('failureReply(e)');
+  assert.ok(failureIdx >= 0, 'the catch could not be located — this scan is measuring nothing');
+
+  // The catch must wrap its apology send in a Promise.race — otherwise the
+  // contract this whole block exists to uphold is violated the moment the
+  // transport is slow.
+  const raceStart = main.lastIndexOf('Promise.race', failureIdx);
+  assert.ok(raceStart >= 0 && raceStart < failureIdx, 'the failure-report send is not raced against a timeout');
+
+  // And the racing timer must be MUCH shorter than the LLM turn budget (15
+  // minutes) or the transport's own timeout (15–30s). Anything ≥ 30s is the
+  // regression we are sealing: a hang that still gets the full transport
+  // window is not "short" by any reading.
+  const raceSlice = main.slice(raceStart, failureIdx + 400);
+  // 🔴 Match ACROSS NEWLINES. The setTimeout spans multiple lines (the
+  // rejection closure, then the duration), so a `[^)]*` would stop at the
+  // first `)` inside the arrow body and miss the duration entirely.
+  const ms = raceSlice.match(/setTimeout\([\s\S]*?,\s*(\d[\d_]*)\s*,/);
+  assert.ok(ms, 'no setTimeout duration could be parsed from the race — this scan is now measuring nothing');
+  const value = Number(ms[1].replace(/_/g, ''));
+  assert.ok(
+    Number.isFinite(value) && value > 0 && value <= 15_000,
+    `the failure-report timeout must be at most 15s, got ${value}ms`,
+  );
+
+  // The timer is cleared in a finally so a successful send does not leak an
+  // unhandled rejection ten seconds later. Without it, the next unrelated
+  // UnhandledPromiseRejection in the log is unprovable: was it THIS catch or
+  // something else? "Clear the timer" is a one-line guard against a future
+  // mystery.
+  assert.ok(
+    /clearTimeout\(reportTimer\)/.test(raceSlice),
+    'the failure-report timer is never cleared — a successful send will leak an unhandled rejection',
+  );
+});
