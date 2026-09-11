@@ -123,6 +123,69 @@ export function failureReply(e: unknown): string {
 }
 
 /**
+ * ── 🔴 8 SECONDS, AND THE NUMBER IS FOR THE FAILURE PATH, NOT THE HAPPY PATH ─
+ *
+ * The death-and-apology send goes through `BlueBubblesConnector.sendReporting`,
+ * which uses the client's default 15-second timeout. That is the right budget
+ * for a real reply: a slow-but-fine BlueBubbles deserves the room, and threading
+ * already takes longer than 15s on the anchored route (30s, separately).
+ *
+ * It is the WRONG budget for the apology. Two reasons:
+ *
+ *   1. The user has already waited the model timeout — up to 900s on the
+ *      shipped default — before this call is even made. Adding 15s of silence
+ *      on top of that is not a "short retry", it is a second disappearance.
+ *
+ *   2. The failure-reporting path shares the same HTTP transport (and frequently
+ *      the same network conditions) that just caused the turn to die. Measured
+ *      2026-09-09 in issue #39: the model timed out, then the apology timed out
+ *      on the same upstream, then nothing was said. A budget of 15s meant the
+ *      user got the same "The operation was aborted due to timeout" twice, both
+ *      invisible to them.
+ *
+ * 8 seconds is the value, and it is the value chosen against the BlueBubbles
+ * client's measured normal ack (well under one second on the LAN) rather than
+ * against the pathology. A second number here would be guessing; this one is
+ * "half of the existing send budget, with plenty of headroom for the common
+ * case, and a tenth of the wait the user just sat through on the way in".
+ */
+export const FAILURE_REPORT_TIMEOUT_MS = 8_000;
+
+/**
+ * Bound a promise by an INDEPENDENT timer, not the LLM's controller and not the
+ * BlueBubbles client's own timeout.
+ *
+ * ── 🔴 WHY THIS EXISTS RATHER THAN PASSING `AbortSignal.timeout` THROUGH ─────
+ *
+ * `connector.send` does not take an `AbortSignal`. Threading one through the
+ * `Connector` interface would change every transport (stdout, test, shadow,
+ * BlueBubbles) for the benefit of one call site. A `Promise.race` here bounds
+ * the wait at the level that matters — the catch block — without making the
+ * seam carry a parameter it never otherwise uses.
+ *
+ * ⚠️ THE LOSING TIMER IS CLEARED. Without `clearTimeout`, a resolved promise
+ * would leave its racing timer alive until the original `ms` elapsed, and on a
+ * long-running bot that is a steady drip of cleared-on-resolve handles. Trivial
+ * leak; visible to `process._getActiveHandles()`.
+ *
+ * ⚠️ THE TIMER IS UNREF'D. The catch sits inside a turn handler that returns
+ * to `listen()`, so a pending failure-report timer must not hold the process
+ * open on shutdown.
+ */
+export function withShortTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+      timer.unref?.();
+    }),
+  ]);
+}
+
+/**
  * ── 🔴 240 SECONDS, AND THE NUMBER IS MEASURED, NOT PICKED ───────────────────
  *
  * From the durable log (`data/jedd.log`, 110 completed turns):
