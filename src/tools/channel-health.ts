@@ -231,7 +231,19 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    //
+    // The most common cause is the stream-checker script (a cron job or
+    // systemd timer on hp) not having run, so the file is missing because
+    // its PRODUCER is missing — not because jedd-v2 cannot read it. Surface
+    // a hint about WHERE to look so the operator has something actionable
+    // beside exit_code=1.
+    return {
+      ok: false,
+      detail:
+        `could not read ${resultsPath} on hp. The stream-checker script on hp ` +
+        `(a cron job or systemd timer) may not be running — check \`crontab -l\` ` +
+        `or the relevant systemd timer on hp. ${renderOutcome(results)}`,
+    };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
