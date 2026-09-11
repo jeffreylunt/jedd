@@ -18,6 +18,7 @@ import {
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
+  sendFailureWithRetry,
   StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
 } from './turn-notice.js';
@@ -821,7 +822,16 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await sendFailureWithRetry(connector, message.senderHandle, failureReply(e), message.sourceGuid, {
+          onAttemptFailed: (attempt, total, err) =>
+            console.error(
+              `[jedd] turn ${turn} failure reply attempt ${attempt}/${total} did not deliver: ${err.message} — retrying`,
+            ),
+          onAttemptRecovered: (attempt, total) =>
+            console.error(
+              `[jedd] turn ${turn} failure reply recovered on attempt ${attempt}/${total} after the transport was briefly unresponsive`,
+            ),
+        });
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
