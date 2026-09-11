@@ -145,6 +145,33 @@ export function failureReply(e: unknown): string {
 export const STILL_WORKING_AFTER_MS = 240_000;
 
 /**
+ * 🔴 A TURN THAT DIES ALWAYS SENDS A MESSAGE — AND THAT SEND MUST NOT DIE TOO.
+ *
+ * Measured twice live 2026-09-10: two consecutive turns (`turn 1`, `turn 2`)
+ * timed out at the model and the apology send itself then timed out with
+ * `The operation was aborted due to timeout`. The catch in `main.ts` did its
+ * job and printed `[jedd] turn N could not even report the failure`, but the
+ * sender's phone got nothing either time. The defect the boot banner promises
+ * to close — "a turn that dies always sends a message" — held only as long as
+ * the apology's send was healthy.
+ *
+ * `STILL_WORKING_AFTER_MS` answers the wait (a turn still alive). This one
+ * answers the death (a turn already dead and the catch is its only chance).
+ * They are not interchangeable: a wait-answer that fires AFTER the death is
+ * silently meaningless, and a death-answer that waits minutes for the
+ * transport is exactly the gap measured above.
+ *
+ * Sized to clear a normal round-trip on a healthy server (the apology is a
+ * single BlueBubbles `message/text` call) and give up before the next queued
+ * message starts to feel ignored. Sits OUTSIDE the connector's own 15s ceiling
+ * on purpose: that ceiling is what fired in the live incident, so making the
+ * apology wait for it again does not close the gap — and the gap is the whole
+ * defect. Sized to a hair under the connector ceiling so the catch can name its
+ * OWN deadline in the log when the transport is the slow one.
+ */
+export const FAILURE_REPLY_TIMEOUT_MS = 8_000;
+
+/**
  * `JEDD_STILL_WORKING_MS` -> ms, or `undefined` for the measured default.
  *
  * 🔴 IT IS OVERRIDABLE FOR ONE REASON: OTHERWISE IT CANNOT BE EXERCISED. At
