@@ -123,6 +123,97 @@ export function failureReply(e: unknown): string {
 }
 
 /**
+ * The structural shape of a send path — the minimum `sendFailureWithRetry`
+ * needs to do its job. `BlueBubblesConnector` satisfies this (and is what
+ * `main.ts` actually passes), so this stays decoupled from the connector and
+ * the connector stays decoupled from this file.
+ */
+export interface FailSend {
+  send: (toHandle: string, text: string, inReplyTo?: string) => Promise<void>;
+}
+
+export interface SendFailureOptions {
+  /** Total attempts including the first. Default `3` — see the function. */
+  attempts?: number;
+  /** Gap between attempts in ms. Default `2000`. */
+  gapMs?: number;
+  /** Injected for tests; production gets `sleep` from `turn-queue.ts`. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Fired for every attempt that throws EXCEPT the last (which surfaces as the throw). */
+  onAttemptFailed?: (attempt: number, total: number, err: Error) => void;
+  /** Fired ONLY when an attempt after the first succeeds. */
+  onAttemptRecovered?: (attempt: number, total: number) => void;
+}
+
+/**
+ * Deliver the failure reply, retrying briefly because BlueBubbles can be briefly
+ * unresponsive for the same reason the turn failed — and a person who got a
+ * timeout should not also get silence when the apology is the only thing they
+ * will ever see.
+ *
+ * ── 🔴 MEASURED LIVE 2026-09-08, ISSUE #27 ───────────────────────────────────
+ *
+ * Two turns for the same sender both threw a model timeout AND the apology for
+ * the timeout ALSO timed out at the same transport. The correlated
+ * presence/typing-indicator timeouts on those turns are what fingered the
+ * transport as the failure mode — and a 15-second socket is not "the bot is
+ * switched off", it is "BlueBubbles is degraded for a moment". A small retry
+ * covers that moment without covering anything else.
+ *
+ * 🔴 SAME GATE, NOT A SECOND CHANNEL. The retry goes through the connector's
+ * `send`, so `JEDD_SEND_TO` still applies — a handle outside the audience is
+ * suppressed here exactly as it is on the success path. This does not become a
+ * way to text someone we may not, even when the model call failed.
+ *
+ * 🔴 SMALL WINDOW. The defect is intermittent transport degradation that
+ * recovers in seconds. Three attempts at 2-second spacing is the shape of the
+ * measurement (two failures in 24 h, not "stuck for an hour"); a larger window
+ * would land on top of the same unresponsive socket and waste a turn's worth
+ * of apology.
+ *
+ * ⚠️ THROWS AFTER THE LAST ATTEMPT. The caller still has its own log line, so a
+ * totally-failed-to-report is still on the record — the change here is that
+ * "totally failed" now means three timeouts in a row, not one.
+ *
+ * The seams are injected so the retries can be exercised in a test without
+ * spending real seconds; the production call supplies the real ones.
+ */
+export async function sendFailureWithRetry(
+  send: FailSend,
+  toHandle: string,
+  text: string,
+  sourceGuid: string | undefined,
+  opts: SendFailureOptions = {},
+): Promise<void> {
+  const total = opts.attempts ?? 3;
+  const gap = opts.gapMs ?? 2_000;
+  const sleeper = opts.sleep ?? defaultSleep;
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= total; attempt += 1) {
+    try {
+      await send.send(toHandle, text, sourceGuid);
+      // The retry worked — say so, so the operator can see when the transport
+      // is the difference between a reply and a silence, and the log line
+      // tells them it had to be retried rather than going out clean.
+      if (attempt > 1) opts.onAttemptRecovered?.(attempt, total);
+      return;
+    } catch (e) {
+      lastErr = e as Error;
+      if (attempt < total) {
+        opts.onAttemptFailed?.(attempt, total, lastErr);
+        await sleeper(gap);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/** Production sleep. `setTimeout` here is fine because a turn has already thrown. */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
  * ── 🔴 240 SECONDS, AND THE NUMBER IS MEASURED, NOT PICKED ───────────────────
  *
  * From the durable log (`data/jedd.log`, 110 completed turns):

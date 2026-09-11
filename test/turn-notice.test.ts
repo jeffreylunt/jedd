@@ -8,6 +8,7 @@ import {
   isModelTimeout,
   MAX_NOTICES,
   ModelTimeoutError,
+  sendFailureWithRetry,
   StillWorkingNotice,
   parseStillWorkingMs,
   STILL_WORKING_AFTER_MS,
@@ -580,10 +581,224 @@ test('🔴 the shipped turn body disarms the notice BEFORE it sends, and apologi
   assert.ok(disarm < send, 'the notice is disarmed AFTER the reply is sent — a note can land after the answer');
 
   // And the failure path says something, using the classifier rather than a literal.
-  assert.match(body, /connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/, 'the turn catch no longer apologises with failureReply');
+  // Issue #27: the apology goes through `sendFailureWithRetry`, which still
+  // routes through `connector.send` — see the wiring assertion below for the
+  // retry. The point of THIS assertion is unchanged: the apology text comes
+  // from `failureReply`, not from a hardcoded sentence.
+  assert.match(body, /failureReply\(e\)/, 'the turn catch no longer apologises with failureReply');
+  assert.match(
+    body,
+    /sendFailureWithRetry\(\s*connector,\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the failure reply must go through the retry — see issue #27',
+  );
   assert.ok(
     body.indexOf('notice.arm(') < body.indexOf('failureReply(e)'),
     'the catch must come after the arm — otherwise this scan is matching the wrong block',
+  );
+});
+
+test('🔴 the failure reply goes through a RETRY, not a single send — issue #27', async () => {
+  /**
+   * The catch in `main.ts` used to make one attempt and log silence if it
+   * failed. Two turns for the same sender (issue #27) timed out on the model
+   * AND timed out on the apology, leaving the person with nothing. The repair
+   * is a small retry around the apology, going through the SAME `connector.send`
+   * so the audience gate (`JEDD_SEND_TO`) is unchanged.
+   *
+   * Without this scan a mutation back to a bare `connector.send(...)` would
+   * pass every other assertion in this file.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const catchBody = main.slice(
+    main.indexOf('SILENCE IS NEVER THE RIGHT ANSWER TO A MESSAGE'),
+    main.indexOf('🔴 ONE REPLY ANSWERED ALL OF THEM'),
+  );
+  assert.ok(catchBody.length > 0, 'the failure catch could not be located — this scan is now measuring nothing');
+
+  // The catch routes the apology through `sendFailureWithRetry`, not a bare send.
+  assert.match(
+    catchBody,
+    /sendFailureWithRetry\(\s*connector,\s*message\.senderHandle,\s*failureReply\(e\),\s*message\.sourceGuid/,
+    'the failure reply must go through sendFailureWithRetry — a single send left issue #27 unresolved',
+  );
+});
+
+test('🔴 sendFailureWithRetry retries when the first attempt throws, and stops once it lands', async () => {
+  /**
+   * Behaviour test for the helper. Issue #27 was that a single failure
+   * swallowed the apology silently; this asserts the retry actually fires.
+   * The structural seam is what lets this run without standing up BlueBubbles.
+   */
+
+  // First attempt throws, second succeeds: must NOT throw, must sleep once,
+  // must announce the recovery.
+  {
+    let calls = 0;
+    const recovered: number[] = [];
+    const failed: number[] = [];
+    await sendFailureWithRetry(
+      {
+        send: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error('The operation was aborted due to timeout');
+        },
+      },
+      '+1',
+      't',
+      'g',
+      {
+        attempts: 3,
+        gapMs: 0,
+        sleep: async () => undefined,
+        onAttemptFailed: (a) => failed.push(a),
+        onAttemptRecovered: (a) => recovered.push(a),
+      },
+    );
+    assert.equal(calls, 2, 'the retry happened');
+    assert.deepEqual(failed, [1], 'the first attempt was reported as failed');
+    assert.deepEqual(recovered, [2], 'the second attempt was reported as the recovery');
+  }
+
+  // All attempts throw: must throw after `attempts` tries, must sleep between
+  // each pair, must report the LAST error.
+  {
+    let calls = 0;
+    const failed: number[] = [];
+    let thrown: unknown = null;
+    try {
+      await sendFailureWithRetry(
+        {
+          send: async () => {
+            calls += 1;
+            throw new Error(`attempt ${calls}`);
+          },
+        },
+        '+1',
+        't',
+        'g',
+        {
+          attempts: 3,
+          gapMs: 0,
+          sleep: async () => undefined,
+          onAttemptFailed: (a) => failed.push(a),
+        },
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    assert.equal(calls, 3, 'all attempts ran');
+    assert.deepEqual(failed, [1, 2], 'every failure except the last is reported — the last surfaces as the throw');
+    assert.match((thrown as Error).message, /attempt 3/, 'the last error is the one that surfaces');
+  }
+
+  // First attempt succeeds: must NOT sleep, must NOT report a recovery (the
+  // first attempt is not a "recovery" — it is the ordinary case).
+  {
+    let calls = 0;
+    const failed: number[] = [];
+    const recovered: number[] = [];
+    await sendFailureWithRetry(
+      { send: async () => {
+          calls += 1;
+        } },
+      '+1',
+      't',
+      'g',
+      {
+        attempts: 3,
+        gapMs: 0,
+        sleep: async () => {
+          throw new Error('a retry would have slept — and there was no retry');
+        },
+        onAttemptFailed: (a) => failed.push(a),
+        onAttemptRecovered: (a) => recovered.push(a),
+      },
+    );
+    assert.equal(calls, 1, 'no retry on first-try success');
+    assert.deepEqual(failed, [], 'no failure was reported');
+    assert.deepEqual(recovered, [], 'first-try success is not announced as a recovery');
+  }
+
+  // The retry respects `attempts: 1` — i.e. the cap is honoured, not silently
+  // raised back to the default. A mutation that ignored `opts.attempts` would
+  // silently turn the "no retries" knob into "three retries" and this is the
+  // assertion that catches it.
+  {
+    let calls = 0;
+    try {
+      await sendFailureWithRetry(
+        {
+          send: async () => {
+            calls += 1;
+            throw new Error('nope');
+          },
+        },
+        '+1',
+        't',
+        'g',
+        {
+          attempts: 1,
+          gapMs: 0,
+          sleep: async () => undefined,
+        },
+      );
+    } catch {
+      /* expected */
+    }
+    assert.equal(calls, 1, 'attempts: 1 means exactly one try');
+  }
+
+  // The retry actually waits between attempts — a mutation that dropped the
+  // `await sleeper(gap)` would have all three attempts land on top of the same
+  // dead socket and waste the apology.
+  {
+    const order: string[] = [];
+    await sendFailureWithRetry(
+      {
+        send: async () => {
+          order.push('send');
+          throw new Error('nope');
+        },
+      },
+      '+1',
+      't',
+      'g',
+      {
+        attempts: 3,
+        gapMs: 5,
+        sleep: async (ms) => {
+          order.push(`sleep ${ms}`);
+        },
+        onAttemptFailed: () => undefined,
+      },
+    ).catch(() => undefined);
+    assert.deepEqual(order, ['send', 'sleep 5', 'send', 'sleep 5', 'send'], 'a sleep separates each attempt');
+  }
+});
+
+test('🔴 the helper sends through the SAME send path the success reply uses — the audience gate is shared', async () => {
+  /**
+   * A retry that bypassed `connector.send` — e.g. by talking to the client
+   * directly, or by constructing a parallel transport — would skip
+   * `JEDD_SEND_TO` and text people we may not. The fix to issue #27 must
+   * NOT introduce that hole.
+   *
+   * The helper takes a structural `send`, so what we actually check is what
+   * `main.ts` PASSES — and the source scan above confirms it passes
+   * `connector`, whose `send` is the same gate `r.replyText` goes through.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /sendFailureWithRetry\(\s*connector,\s*message\.senderHandle,\s*failureReply\(e\),\s*message\.sourceGuid/,
+    'the catch must hand `connector` to the retry — anything else skips the audience gate',
+  );
+  // And `r.replyText` goes through the same connector (the success path). The
+  // two sends sharing a connector is what keeps the audience gate one gate.
+  assert.match(
+    main,
+    /connector\.send\(message\.senderHandle,\s*r\.replyText,\s*message\.sourceGuid,\s*sent\)/,
+    'the success-path send is the comparator — both must go through `connector.send`',
   );
 });
 
