@@ -177,6 +177,39 @@ export function makeCheckStatus(fetchImpl?: FetchImpl, now: () => Date = () => n
       '"is <title> downloading?" — pass the title only to narrow the same answer. This reads the ' +
       'Sonarr/Radarr queue live; it is the only place that knows, so use it instead of guessing from ' +
       'earlier messages.',
+    /**
+     * 🔴 THE MEASURED FALSE DENIAL, ANSWERED AT THE POINT WHERE IT IS MADE.
+     *
+     * Live, 2026-09-02, from a guest: check_status returned a STALLED row, and
+     * the model said *"but I don't have a way to re-search a film for a new
+     * one, so I can't swap it out myself."* Same shape as the
+     * `jellyfin_sessions` denial — a narrow result was read as the boundary of
+     * the system — and the `unlicensedDenial` counter flagged it as the
+     * detector says it should.
+     *
+     * The middle sentence is load-bearing. "The release is stalled" is the
+     * exact observation the model generalised from, so the note has to refuse
+     * that specific inference by name — a scope line that only states what the
+     * tool covers leaves the wrong step unaddressed.
+     *
+     * ⚠️ ONLY `catalogue_search` IS NAMED, deliberately. It carries the same
+     * `needsAnyService: ['sonarr', 'radarr']` as this tool, so the post-filter
+     * rule in `registerable()` sees it as co-registered — naming `add_movie`
+     * here would refuse to boot on a Sonarr-only deploy (radarr down) and in
+     * the `readOnly: true` test config (write tools filtered). The other
+     * add-side tools are reachable from the catalogue result the model already
+     * has in its context.
+     */
+    scopeNote:
+      'SCOPE OF THIS RESULT — the LIVE QUEUE only. Each row is one queue item, with its status ' +
+      'and how it was measured (the arr reports "ok/downloading" while the client is actually ' +
+      'stopped; that is what a STOPPED row is). It does NOT cover whether the queue item is ' +
+      'salvageable, and a STALLED, STOPPED or IMPORT-BLOCKED row is NOT "nothing can be done": ' +
+      'a stalled or stopped release can be swapped for a new one by removing it and re-adding the ' +
+      'title via catalogue_search followed by the right ADD step (the film-add tool with the ' +
+      'existing tmdb_id; the series-add tool with the existing tvdb_id; the season-add tool for an ' +
+      'extra season of a show already in the library). The owner can also force-test the indexers ' +
+      'if the same stuck release keeps coming back.',
     minRole: 'guest',
     writes: false,
     parameters: {
