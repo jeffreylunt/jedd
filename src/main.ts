@@ -75,6 +75,22 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * 🔴 THE FAILURE-REPLY SENDS ON A SHORTER, INDEPENDENT BUDGET.
+ *
+ * The channel-level outbound timeout is 15s plain / 30s anchored — and if the
+ * channel is what caused the model timeout in the first place (the live failure
+ * on 2026-09-08 was BlueBubbles' Private API stalling on an unreachable reply
+ * target), the apology inherits the same wall-clock budget and times out the
+ * same way. From the phone, a turn whose catch logs "could not even report the
+ * failure" is exactly the silence the apology was meant to prevent — see #29.
+ *
+ * Sized at 10s: clearly under both channel bounds (so a slow path is the failure
+ * case, not the racing path), but long enough that a legitimate slow send on a
+ * healthy channel is not racing itself.
+ */
+const FAILURE_REPLY_TIMEOUT_MS = 10_000;
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -806,6 +822,7 @@ async function main(): Promise<void> {
        * cannot be delivered either, and throwing from a catch block would take
        * out the handler that keeps the NEXT message working.
        */
+      let failureReplyTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         /**
          * 🔴 THE WORDING IS `failureReply`'s, NOT A LITERAL HERE, AND THAT IS
@@ -821,9 +838,38 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await Promise.race([
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          new Promise<never>((_, reject) => {
+            failureReplyTimer = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `failure-reply send exceeded ${FAILURE_REPLY_TIMEOUT_MS}ms — the outbound channel did not answer in time, so the apology did not go out`,
+                  ),
+                ),
+              FAILURE_REPLY_TIMEOUT_MS,
+            );
+          }),
+        ]);
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+      } finally {
+        /**
+         * 🔴 CLEAR THE RACE TIMER, NOT JUST RELY ON PROMISE.RACE.
+         *
+         * `Promise.race` settles the AWAIT on the first resolution, but the
+         * losing timer is still scheduled in the Node timer wheel. If the
+         * connector.send resolves at 50ms, the 10s rejection is still pending;
+         * on a slow event loop it could fire later, against a send the caller
+         * thinks is already done — or, worse, against the next message's
+         * outbound call. `unref()` keeps it from holding the process open but
+         * does not un-schedule the callback.
+         */
+        if (failureReplyTimer) {
+          clearTimeout(failureReplyTimer);
+          failureReplyTimer = undefined;
+        }
       }
     } finally {
       /**
