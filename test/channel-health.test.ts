@@ -194,6 +194,29 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.match(res.content, /NOT\s+"no channels are working"/);
 });
 
+test('🔴 a MISSING results file is named as such and points the operator at the timer, not "could not read"', async () => {
+  /**
+   * Without this, every "Is live TV working" while the checker is down renders
+   * the same opaque `could not read … exit_code=1` and the operator has no
+   * next action. Naming the cause (the file does not exist) and the next step
+   * (check the check-streams timer/cron on hp) gives the question a way out
+   * of UNKNOWN instead of retiring it.
+   *
+   * The exec stub's "No such file or directory" stderr is the same shape
+   * stat(1) emits when the file is absent — what would appear on a real run.
+   */
+  const { impl } = execStub(MTIME, { resultsExit: 1 });
+  const res = await channelHealth.run({}, ctx(impl));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /does not exist at \/tmp\/check-streams-results\.txt on hp/);
+  assert.match(res.content, /check-streams script may not be scheduled/);
+  assert.match(res.content, /cron job \/ systemd timer on hp/);
+  // Control: a missing file MUST NOT be rendered as the generic "could not read"
+  // — that wording would mean a permission or transport problem, not "the
+  // checker did not write this", and the next action is different.
+  assert.doesNotMatch(res.content, /could not read \/tmp\/check-streams-results\.txt on hp/);
+});
+
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
   const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
   const res = await channelHealth.run({}, ctx(impl));

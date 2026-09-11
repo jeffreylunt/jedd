@@ -231,7 +231,20 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    //
+    // "No such file or directory" on stderr names ONE cause (the checker did
+    // not write what we are looking for, for whatever reason) and the operator
+    // is the only one who can fix it. Naming the cause in the failure gives
+    // them the next action — check the check-streams timer/cron on hp — so the
+    // question does not retire into UNKNOWN every time it is asked.
+    const missing = /No such file or directory/i.test(results.stderr);
+    const detail = missing
+      ? `the stream checker's results file does not exist at ${resultsPath} on hp — the ` +
+        `check-streams script may not be scheduled, may have stopped running, or may be ` +
+        `writing to a different path. Check its cron job / systemd timer on hp. ` +
+        `(ssh: ${renderOutcome(results)})`
+      : `could not read ${resultsPath} on hp: ${renderOutcome(results)}`;
+    return { ok: false, detail };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
