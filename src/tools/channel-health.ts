@@ -7,7 +7,7 @@ import {
   QUERY_NAMES,
   type QueryName,
 } from '../media/dispatcharr-queries.js';
-import { renderOutcome, runOnHp, type ExecImpl } from '../hp.js';
+import { renderOutcome, runOnHp, type ExecImpl, type ShellOutcome } from '../hp.js';
 import { hourMinute12 } from './sports-fixture.js';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
@@ -226,12 +226,64 @@ export interface StreamCheckSnapshot {
 
 export type StreamCheckRead = { ok: true; snapshot: StreamCheckSnapshot } | { ok: false; detail: string };
 
+/**
+ * Classify a failed read of the stream-check results file.
+ *
+ * 🔴 DISTINGUISH FAILURE MODES THE FIRST TWO LINES WOULD OTHERWISE LOSE.
+ *
+ * `renderOutcome` always includes stderr, but the durable record of a failed
+ * tool call takes only the first two lines (`agent.ts: firstLines`). A bare
+ * `exit_code=1` therefore persists in the audit log with the actual reason
+ * dropped, and an operator looking at tomorrow's "checker hasn't run" ticket
+ * cannot tell whether the file was missing, permissions were wrong, or the
+ * host was unreachable. Each has a different fix on hp:
+ *
+ *   - File missing       → run the checker, fix the cron, check the script's log
+ *   - Permission denied  → fix the file's mode or the ssh account the read runs as
+ *   - Host unreachable   → check that hp is up and ssh is working
+ *
+ * Unknown stderr shapes fall through to `renderOutcome` so nothing is lost.
+ */
+export function classifyResultsReadFailure(path: string, outcome: ShellOutcome): string {
+  const stderr = outcome.stderr.trim();
+  // Both `stat` and `cat` on Linux write "No such file or directory" to stderr
+  // when the path does not exist, so a single regex catches either case.
+  if (/No such file or directory/i.test(stderr)) {
+    return (
+      `the stream checker has not produced ${path} on hp yet — the file does not exist ` +
+      `(checker has not run, was cleaned out of /tmp, or its cron is broken). ` +
+      `Run it manually or check its cron entry on hp.`
+    );
+  }
+  if (/Permission denied/i.test(stderr)) {
+    return (
+      `${path} exists on hp but is not readable by the user running this command — ` +
+      `check its permissions and the user the unprivileged ssh account runs as.`
+    );
+  }
+  // Empty stderr AND empty stdout with a non-zero exit is the fingerprint of
+  // an ssh transport failure: the command never reached the remote side. The
+  // exit code 255 is ssh's reserved value for "ssh itself errored", but we
+  // match on the empty streams rather than on a number so this also covers
+  // `runOnHp`'s fallback for a non-numeric error.code.
+  if (!stderr && !outcome.stdout.trim() && outcome.exitCode !== 0) {
+    const exitSuffix = outcome.timedOut ? ', TIMED OUT' : '';
+    return (
+      `could not reach host hp at all (exit_code=${outcome.exitCode}${exitSuffix}). ` +
+      `This is NOT a missing-file problem — it looks like an ssh transport failure ` +
+      `(host down, key refused, DNS). Check that hp is up and the ssh key is accepted.`
+    );
+  }
+  // Unknown shape — fall back to the full rendered outcome so nothing is lost.
+  return `could not read ${path} on hp: ${renderOutcome(outcome)}`;
+}
+
 export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<StreamCheckRead> {
   const resultsPath = config.checkStreamsResultsPath;
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    return { ok: false, detail: classifyResultsReadFailure(resultsPath, results) };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
@@ -356,8 +408,7 @@ export const channelHealth: Tool = {
        * reads as a total Live TV outage.
        */
       return fail(
-        `Per-channel health is UNKNOWN — this is NOT "no channels are working". The stream checker ` +
-          `may not have run. ${read.detail}`,
+        `Per-channel health is UNKNOWN — this is NOT "no channels are working". ${read.detail}`,
       );
     }
     const { rows, unparsed, ageSeconds, when } = read.snapshot;
