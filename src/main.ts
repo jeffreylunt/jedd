@@ -75,6 +75,24 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * Hard upper bound on the time spent telling the sender that their turn died.
+ *
+ * 🔴 SHORT, AND THE NUMBER IS THE WHOLE POINT. The catch in `handleBurst` races
+ * the apology through `Promise.race` against a `setTimeout` of this many ms,
+ * because the failure notification's own deadline is otherwise inherited from
+ * whichever path `connector.send` happens to take today — and that path has
+ * already been measured silently killing it. A turn that dies must say so
+ * promptly, and a hung BlueBubbles must not be allowed to hold the handler open
+ * waiting for an apology that is going to time out anyway.
+ *
+ * ⚠️ DELIBERATELY NOT THE TURN'S BUDGET. `TURN_TIMEOUT_MS` is 900 seconds; the
+ * whole reason this catch exists is that the turn-level abort already fired, so
+ * the failure notification has to be on its own short clock. Anything close to
+ * the turn budget re-introduces the silence the notice was supposed to prevent.
+ */
+const FAILURE_NOTIFY_TIMEOUT_MS = 10_000;
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -821,7 +839,49 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        /**
+         * 🔴 THE FAILURE NOTIFICATION HAS ITS OWN SHORT TIMEOUT, AND IT IS ON
+         * ITS OWN SIGNAL — NOT INHERITED, NOT THE TURN'S.
+         *
+         * The turn-level abort has already fired by the time control reaches
+         * here, so the LLM's `AbortController` cannot be what kills the
+         * apology. But the send it would otherwise call shares a path that
+         * has been measured silently killing it: two turns within 24h, each
+         * timed out at the LLM level and then timed out again on the
+         * notification send, leaving the sender with nothing — the exact
+         * silence the boot-time `[notice]` line promises to prevent.
+         *
+         * Two changes close it:
+         *
+         *   1. The send is PLAIN — no third argument — so the connector
+         *      never routes through BlueBubbles' Private API (30s ceiling,
+         *      and the helper-bundle-absent case that 500s on every retry).
+         *      The apology answers a turn that just died; anchoring it to
+         *      the message it answers is meaningless, and the anchored path
+         *      is exactly the slow one.
+         *
+         *   2. The send is RACED against a `setTimeout` of
+         *      `FAILURE_NOTIFY_TIMEOUT_MS`. A hung BlueBubbles cannot keep
+         *      this handler open waiting for an apology that is going to
+         *      time out anyway — and the racing `setTimeout` itself owns a
+         *      distinct `unref`'d timer, so a pending failure notification
+         *      cannot hold the process alive either.
+         */
+        await Promise.race([
+          connector.send(message.senderHandle, failureReply(e)),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `the failure notification did not complete within ${FAILURE_NOTIFY_TIMEOUT_MS}ms`,
+                  ),
+                ),
+              FAILURE_NOTIFY_TIMEOUT_MS,
+            );
+            t.unref?.();
+          }),
+        ]);
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
