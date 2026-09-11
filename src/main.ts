@@ -805,6 +805,29 @@ async function main(): Promise<void> {
        * ⚠️ And it is itself wrapped: if BlueBubbles is what failed, the apology
        * cannot be delivered either, and throwing from a catch block would take
        * out the handler that keeps the NEXT message working.
+       *
+       * ── 🔴 THE APOLOGY IS FIRE-AND-FORGET, AND THIS IS THE WHOLE FIX. ───────
+       *
+       * Measured live 2026-09-10: a model timeout and the apology `await` both
+       * hit "The operation was aborted due to timeout" within the same turn,
+       * because the failure-reply send goes through BlueBubbles and BlueBubbles
+       * is exactly what the model was waiting on — so the apology waited its
+       * own 30s anchored timeout inside this `catch`, and the NEXT message
+       * arriving in those 30s sat unprocessed. The user got NO message and the
+       * sender looked at a bot that had been switched off.
+       *
+       * Awaiting here ties the failure path to the same transport that just
+       * failed. The promise below is started and not awaited: the catch returns
+       * immediately, the next message is handled on its own clock, and the
+       * apology itself runs to its own outcome — which may still be a timeout,
+       * and is logged the same way it used to be, but no longer blocks the
+       * handler that keeps the queue draining.
+       *
+       * ⚠️ The `try/catch` stays as a belt-and-braces guard against a
+       * synchronous throw from `connector.send`. Every shipped connector
+       * declares `send` async, so the catch is unreachable in practice — kept
+       * because removing it costs nothing and leaving it out is a landmine the
+       * day somebody adds a connector that throws on entry.
        */
       try {
         /**
@@ -821,9 +844,13 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        // 🔴 ONE LINE ON PURPOSE: the source-scan test in `turn-notice.test.ts`
+        // matches `connector.send(... failureReply(e)` literally — see the
+        // comment on that regex. Splitting this across lines breaks the match
+        // silently. Keep it single-line.
+        connector.send(message.senderHandle, failureReply(e), message.sourceGuid).catch((sendErr) => console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`));
       } catch (sendErr) {
-        console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+        console.error(`[jedd] turn ${turn} could not even enqueue the failure reply: ${(sendErr as Error).message}`);
       }
     } finally {
       /**
