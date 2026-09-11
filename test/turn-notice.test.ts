@@ -596,3 +596,116 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE DEATH'S SEND: a turn that died must still send SOMETHING, and the send
+// must not be permitted to die for the same reason the turn did. Measured
+// live on 2026-09-09 (#31): two consecutive turns, model timeout + apology
+// timeout, both invisible to the user.
+// ──────────────────────────────────────────────────────────────────────────
+
+const FAILURE_REPLY_TIMEOUT_RE = /FAILURE_REPLY_TIMEOUT_MS\s*=\s*(\d[\d_]*)/;
+
+test('🔴 the failure-reporting send is raced against an independent timer, not the BlueBubbles inner one', async () => {
+  /**
+   * The catch in `main.ts` was awaiting `connector.send` bare, and the
+   * BlueBubbles client's own 15s `AbortSignal.timeout` was the line that fired
+   * under load — `aborted due to timeout`, same sentence as the model call
+   * above it, two aborted sends and a silent sender. The fix is structural:
+   * wrap the apology send in `Promise.race` against an untied timer whose
+   * value is this file's own number, not whatever the transport happens to be
+   * using.
+   *
+   * Source scan, in the style of the SIGTERM and wiring tests above: the
+   * catch is unreachable from outside `main()` (it stands up BlueBubbles,
+   * Ollama, IRC, IMAP and two SSH identities before it is reached), and the
+   * only way to keep the apology from regressing to `await connector.send`
+   * is to read the source — a regression to that line leaves every other
+   * `failureReply` assertion green, and the silent sender is exactly the
+   * defect the boot banner promises to close.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = main.slice(main.indexOf('const handleBurst ='), main.indexOf('🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE'));
+  assert.ok(body.length > 0, 'the turn body could not be located — this scan is now measuring nothing');
+
+  assert.match(
+    body,
+    /Promise\.race\(\s*\[\s*connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the apology send is not wrapped in a race; on a stalled transport the catch hangs on connector.send ' +
+      'and the sender is silent — exactly the live defect this races against',
+  );
+  assert.match(
+    body,
+    /new Promise<never>\(\s*\(_, reject\)\s*=>\s*\{[\s\S]*?setTimeout\([\s\S]*?FAILURE_REPLY_TIMEOUT_MS\b/,
+    'the race has only the connector on one side — there is no timer opponent to win',
+  );
+  assert.match(
+    body,
+    /could not even report the failure/,
+    'the failure log line is missing; this scan is now measuring nothing',
+  );
+  assert.doesNotMatch(
+    body,
+    /await connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the catch is back to awaiting connector.send bare — the live defect reproduces',
+  );
+});
+
+test('🔴 FAILURE_REPLY_TIMEOUT_MS is above the inner BlueBubbles ceiling, never below', async () => {
+  /**
+   * The default `BlueBubblesClient.timeoutMs` is 15_000. Sizing the apology
+   * race below that would race the send out under a BlueBubbles that was
+   * about to succeed — the exact path the apology most needs to land. Below
+   * 60 seconds because anything past that is no longer an apology, it is a
+   * stuck turn.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const m = main.match(FAILURE_REPLY_TIMEOUT_RE);
+  assert.ok(m, 'the apology timeout is not a named constant any more');
+  const ms = Number(m![1]!.replaceAll('_', ''));
+  assert.ok(Number.isFinite(ms) && ms >= 1_000, `the apology timeout (${ms}ms) is too short to clear a healthy server`);
+  assert.ok(
+    ms >= 15_000,
+    `the apology timeout (${ms}ms) is below the BlueBubbles default (15_000ms) — ` +
+      'a slow-but-alive BlueBubbles would lose on the path where the apology most needs to land',
+  );
+  assert.ok(
+    ms <= 60_000,
+    `the apology timeout (${ms}ms) swallows a real failure — silence past a minute is no longer an apology, ` +
+      'it is a stuck turn',
+  );
+});
+
+test('🔴 the apology timer cannot hold the process open (it is unref-ed) and any of its kinds still wins the race', async () => {
+  /**
+   * Two properties at once, both of them structural because the catch sits
+   * inside `main()` and is unreachable from here.
+   *
+   * (a) `t.unref?.()` is called on the race timer — without it, the apology's
+   *     own deadline would keep the event loop alive after a SIGTERM, and a
+   *     shutdown-in-progress would refuse to exit. Wired up the same way the
+   *     presence timers are, for the same reason.
+   * (b) The race promise type is `Promise<never>` with `(resolve, reject)`,
+   *     NOT `Promise<void>` with a resolver and a timer that doesn't reject —
+   *     a `Promise<void>` that resolves on the timer fires as "fine" and
+   *     `Promise.race` accepts it as the winning side, which the live defect
+   *     would have us ship again in different clothes.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /new Promise<never>\(\s*\(_, reject\)/,
+    'the race opponent is `(resolve, reject)` — `Promise<void>` would resolve as "fine" on the timer and the ' +
+      'apology would lose anyway',
+  );
+  assert.match(
+    main,
+    /setTimeout\(\s*(?:\(\)\s*=>\s*)?reject\(/,
+    'the timer rejects — without that, the race opponent is a timeout that never fires and the apology is still bare',
+  );
+  assert.match(
+    main,
+    /t\.unref\?\.()/,
+    'the apology timer is not unref-ed — a stuck race could keep the process alive past SIGTERM',
+  );
+});
