@@ -596,3 +596,45 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 the failure-report send is bounded by an INDEPENDENT, short timeout — not the BlueBubbles default', async () => {
+  /**
+   * Source scan for issue #44: the catch that sends the apology used to inherit
+   * whatever timeout the transport layer carried (15s plain / 30s anchored).
+   * When the model endpoint and BlueBubbles degrade together — the exact
+   * pattern measured twice in 24h — the apology inherits the same 15s wall and
+   * the user gets zero feedback, violating "a turn that dies always sends a
+   * message". The fix is a dedicated, SHORTER race on this one call.
+   *
+   * Two assertions:
+   *
+   *   1. The catch wraps `connector.send(..., failureReply(e), ...)` in a
+   *      `withTimeout(...)` call. If the wrapping disappears, the catch
+   *      reverts to inheriting the BlueBubbles budget and this scan should
+   *      fail loud.
+   *
+   *   2. The constant is BELOW the BlueBubbles client's default (15s). A
+   *      `FAILURE_SEND_TIMEOUT_MS` of 30s would satisfy the first assertion
+   *      while reintroducing the bug on anchored sends, which carry a 30s
+   *      ceiling — so the bound has to be asserted separately.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  const wrapped = main.match(
+    /withTimeout\(\s*connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\),\s*[\s\S]*?message\.sourceGuid\s*\),\s*FAILURE_SEND_TIMEOUT_MS/,
+  );
+  assert.ok(
+    wrapped,
+    'the failure send is not wrapped in withTimeout(..., FAILURE_SEND_TIMEOUT_MS, ...) — ' +
+      'a degraded transport will inherit its own timeout and the sender will get no apology',
+  );
+
+  const constantMatch = main.match(/const FAILURE_SEND_TIMEOUT_MS\s*=\s*(\d[\d_]*)/);
+  assert.ok(constantMatch, 'FAILURE_SEND_TIMEOUT_MS is not declared as a numeric constant');
+  const ms = Number(constantMatch[1].replaceAll('_', ''));
+  assert.ok(
+    Number.isFinite(ms) && ms > 0 && ms < 15_000,
+    `FAILURE_SEND_TIMEOUT_MS=${ms} is not strictly below the BlueBubbles client's 15s default — ` +
+      'an apology on a degraded transport would still hit the inherited 15s wall and the sender would get nothing',
+  );
+});

@@ -75,6 +75,55 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * The shortest reasonable budget for the failure-reply send.
+ *
+ * ── 🔴 WHY THE APOLOGY GETS ITS OWN SHORT CAP, AND NOT THE BLUEBUBBLES DEFAULT ──
+ *
+ * Measured 2026-09-10 (issue #44): two turns threw a model timeout, and the
+ * `connector.send` carrying the apology then THREW THE SAME WAY — `The
+ * operation was aborted due to timeout`, because the failure send inherits the
+ * `BlueBubblesClient.call` timeout (15s plain / 30s anchored). The user saw
+ * NOTHING on either turn, which is the exact invariant the catch exists to
+ * uphold: *a turn that dies always sends a message; a timeout says it timed
+ * out.*
+ *
+ * The BlueBubbles budget is the right one for a normal reply (15s is what a
+ * healthy transport needs; 30s covers the anchored Private API path). It is
+ * the WRONG one for the apology — the apology is the LAST CHANCE to satisfy
+ * the invariant, and a degraded transport should give up on it FAST so the
+ * catch can log and return to listening for the next message, not hang on a
+ * send that may never finish.
+ *
+ * 10s: above the timeout of any healthy transport, so a working apology is not
+ *      artificially cut short; below the BlueBubbles client's own 15s, so a
+ *      degraded transport trips the race before the inherited budget does.
+ */
+const FAILURE_SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * Race a promise against a timer. Rejects with a named error if the timer
+ * fires first; clears the timer if the promise wins.
+ *
+ * Mirrors the local helper in `kindle-mailbox.ts` rather than lifting it to a
+ * shared util: the two callers want different rejection messages and the
+ * failure path is small enough that one indirection is not paying for itself.
+ */
+async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms}ms`)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -820,8 +869,21 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * ⚠️ RACED AGAINST `FAILURE_SEND_TIMEOUT_MS`, AND NOT AGAINST THE
+         * BLUEBUBBLES CLIENT'S OWN BUDGET. See the constant for the measured
+         * reason (issue #44): when the model endpoint is degraded the transport
+         * tends to be degraded too, the apology inherits the same 15s/30s
+         * timeout, and the user gets zero feedback. The 10s race gives a
+         * degraded transport a shorter window to surrender on — long enough
+         * that a healthy send is never artificially cut, short enough that the
+         * catch returns to listening before the user decides Jedd is down.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await withTimeout(
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          FAILURE_SEND_TIMEOUT_MS,
+          'failure-send',
+        );
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
