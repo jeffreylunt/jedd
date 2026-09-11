@@ -196,6 +196,36 @@ function epoch(line: string | undefined): number | null {
 }
 
 /**
+ * Build the detail string for a failed results-file read. The common cause in
+ * the wild is that the stream-checker cron / systemd timer on hp has stopped
+ * writing the file (issue #54). `stat` and `cat` both end their stderr with
+ * "No such file or directory" on Linux, and the generic "could not read
+ * …: exit_code=1" message does not point the operator at that — so a missing
+ * file gets its own diagnostic that names the cause and the remediation. Any
+ * other failure (permission denied, ssh transport error, container down)
+ * keeps the raw ssh outcome so the operator can still see the actual error.
+ *
+ * 🔴 THE TRIGGER IS THE STDERR WORDING ON PURPOSE. The detection only widens
+ * the diagnostic for the case where the file is genuinely absent; every other
+ * failure mode still flows through `renderOutcome` unchanged. A check based on
+ * the exit code alone would fold permission errors and ssh failures into the
+ * "stream checker is dead" branch — which is exactly the misdiagnosis this
+ * helper exists to prevent.
+ */
+export function missingOrGenericDetail(path: string, results: { exitCode: number; stdout: string; stderr: string; timedOut: boolean }): string {
+  if (/\bno such file or directory\b/i.test(results.stderr)) {
+    return (
+      `The stream checker may not have run: ${path} does not exist on hp. The cron job or ` +
+      `systemd timer that is supposed to write this file appears to be dead, so per-channel ` +
+      `health is UNKNOWN until it is restored. Check the stream-checker unit on hp ` +
+      `(e.g. \`systemctl status\`, \`journalctl -u <stream-checker>\`, or \`crontab -l\` on ` +
+      `the user that owns the cron) to find out why.`
+    );
+  }
+  return `could not read ${path} on hp: ${renderOutcome(results)}`;
+}
+
+/**
  * 🔴 ONE READER, TWO TOOLS. `sports_fixture` JOINS HEALTH ONTO ITS CHANNELS.
  *
  * Jeff: *"if there is more than one channel a game or event is on, the bot should
@@ -231,7 +261,7 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    return { ok: false, detail: missingOrGenericDetail(resultsPath, results) };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
@@ -356,8 +386,7 @@ export const channelHealth: Tool = {
        * reads as a total Live TV outage.
        */
       return fail(
-        `Per-channel health is UNKNOWN — this is NOT "no channels are working". The stream checker ` +
-          `may not have run. ${read.detail}`,
+        `Per-channel health is UNKNOWN — this is NOT "no channels are working". ${read.detail}`,
       );
     }
     const { rows, unparsed, ageSeconds, when } = read.snapshot;

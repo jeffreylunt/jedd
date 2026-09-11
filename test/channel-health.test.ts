@@ -194,6 +194,54 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.match(res.content, /NOT\s+"no channels are working"/);
 });
 
+test('🔴 a missing results file names the stream-checker cron, not just a generic ssh error (issue #54)', async () => {
+  /**
+   * This is the failure mode seen on hp when the cron / systemd timer that
+   * writes `/tmp/check-streams-results.txt` is dead. `cat: No such file or
+   * directory` is what stat and cat both emit on Linux, and the existing test
+   * stub already exercises that stderr. The generic "could not read …
+   * exit_code=1" message does not tell the operator WHERE to look, so
+   * `readStreamCheck` widens only this case into a diagnostic that names the
+   * stream checker and the operator commands to investigate.
+   */
+  const { impl } = execStub(MTIME, { resultsExit: 1 });
+  const res = await channelHealth.run({}, ctx(impl));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN/);
+  assert.match(res.content, /NOT\s+"no channels are working"/);
+  assert.match(res.content, /does not exist on hp/);
+  assert.match(res.content, /stream checker/i);
+  assert.match(res.content, /cron|systemd timer/);
+  assert.match(res.content, /systemctl status|journalctl|crontab/);
+  // And it must NOT have left the old generic diagnostic in place alongside the
+  // new one — that would re-introduce the noise this branch exists to remove.
+  assert.doesNotMatch(res.content, /could not read .* on hp: exit_code=/);
+});
+
+test('a results-file failure that is NOT "missing" still shows the raw ssh diagnostic', async () => {
+  /**
+   * CONTROL for the missing-file branch above: detection keys on the stderr
+   * wording on purpose. A permission failure, an ssh transport error, or any
+   * other read failure must still get the verbose `renderOutcome` so the
+   * operator sees the actual cause — not a false "the stream checker is dead"
+   * diagnosis pointing them at a cron that is, in fact, fine.
+   */
+  const stderr = 'cat: /tmp/check-streams-results.txt: Permission denied';
+  const impl: ExecImpl = (_f, args, _o, cb) => {
+    if ((args[args.length - 1] ?? '').includes('check-streams-results.txt')) {
+      return cb({ code: 1 }, '', stderr);
+    }
+    return cb({ code: 127 }, '', 'unexpected command');
+  };
+  const res = await channelHealth.run({}, ctx(impl));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /Permission denied/);
+  assert.match(res.content, /exit_code=1/);
+  // The missing-file branch must NOT have fired.
+  assert.doesNotMatch(res.content, /does not exist on hp/);
+  assert.doesNotMatch(res.content, /stream checker/i);
+});
+
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
   const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
   const res = await channelHealth.run({}, ctx(impl));
