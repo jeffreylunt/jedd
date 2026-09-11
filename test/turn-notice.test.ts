@@ -5,9 +5,11 @@ import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
   failureReply,
+  FAILURE_REPLY_TIMEOUT_MS,
   isModelTimeout,
   MAX_NOTICES,
   ModelTimeoutError,
+  sendFailureWithTimeout,
   StillWorkingNotice,
   parseStillWorkingMs,
   STILL_WORKING_AFTER_MS,
@@ -580,7 +582,26 @@ test('🔴 the shipped turn body disarms the notice BEFORE it sends, and apologi
   assert.ok(disarm < send, 'the notice is disarmed AFTER the reply is sent — a note can land after the answer');
 
   // And the failure path says something, using the classifier rather than a literal.
-  assert.match(body, /connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/, 'the turn catch no longer apologises with failureReply');
+  assert.match(body, /failureReply\(e\)/, 'the turn catch no longer names the failure reply');
+  assert.match(
+    body,
+    /sendFailureWithTimeout\(/,
+    'the catch must use the bounded, fire-and-forget failure-reply helper — a bare connector.send inherits the turn\'s controller',
+  );
+  // ⚠️ Plain, not anchored. The catch's send closure is `(handle, text) => connector.send(handle, text)` —
+  // exactly two arguments. Passing `message.sourceGuid` to it would route the
+  // apology through BlueBubbles' Private API, which can stall 120s and then 500 —
+  // exactly the failure mode this catch exists for.
+  assert.match(
+    body,
+    /=>\s*connector\.send\(\s*handle,\s*text\s*\)/,
+    'the catch\'s send closure is `(handle, text) => connector.send(handle, text)` — three-arg forms route through the Private API',
+  );
+  assert.equal(
+    /connector\.send\(\s*handle,\s*text\s*,\s*handle\.senderHandle/.test(body),
+    false,
+    'a closure that captures `message.sourceGuid` would re-introduce anchoring on the failure path',
+  );
   assert.ok(
     body.indexOf('notice.arm(') < body.indexOf('failureReply(e)'),
     'the catch must come after the arm — otherwise this scan is matching the wrong block',
@@ -594,5 +615,142 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
     /notice\.arm\(waited\.queuedForMs\)/,
     'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
       'restarts the clock at zero — the exact case this is for',
+  );
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE FAILURE PATH: fire-and-forget timeout, plain, and independently bounded
+// ──────────────────────────────────────────────────────────────────────────
+//
+// These exist for issue #33: a turn killed by its LLM budget also took the
+// apology down with it, because the catch path reused the same controller.
+// `sendFailureWithTimeout` is the catch's only path to the sender now; every
+// assertion below pins the shape that closes the defect.
+
+test('🔴 a failure-reply send that completes returns its own result, untouched by the timer', async () => {
+  const sent: { handle: string; text: string }[] = [];
+  await sendFailureWithTimeout(
+    async (handle, text) => {
+      sent.push({ handle, text });
+    },
+    '+18015550123',
+    'I am sorry, ask for a shorter list',
+    1_000,
+  );
+  assert.deepEqual(sent, [{ handle: '+18015550123', text: 'I am sorry, ask for a shorter list' }]);
+});
+
+test('🔴 a hanging failure-reply send is REJECTED at its own deadline, not the caller\'s', async () => {
+  /**
+   * Measured live 2026-09-10: the catch was throwing the same abort that killed
+   * the turn, because both shared one controller. The fix replaces that shared
+   * controller with this one. Without this assertion, a refactor that drops
+   * the inner `Promise.race` would still pass every other test in this file —
+   * "the catch resolves quickly when BlueBubbles hangs" is a property nothing
+   * else in the test suite can observe.
+   */
+  let release!: () => void;
+  const blocked = new Promise<void>((r) => {
+    release = r;
+  });
+  const start = Date.now();
+  const err = await sendFailureWithTimeout(
+    (_h, _t) => blocked as unknown as Promise<void>,
+    '+18015550123',
+    'this will time out',
+    50,
+  ).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  const elapsed = Date.now() - start;
+  release();
+  assert.ok(err instanceof Error, 'a hanging send must reject, not resolve — silence is the defect');
+  assert.match((err as Error).message, /failure-reply send aborted after 50ms/);
+  assert.ok(elapsed < 500, `expected ~50ms, took ${elapsed}ms — the timer did not win the race`);
+  assert.ok(elapsed >= 40, `expected at least 50ms but got ${elapsed}ms — the timer fired before its budget`);
+});
+
+test('🔴 a failure-reply send that REJECTS propagates the original error, not the timer\'s', async () => {
+  /**
+   * The catch's log line names the failure the SEND produced, not the
+   * timer-replacement the helper would otherwise compose on top of a delay the
+   * caller cannot afford. Both are honest; only one is what was actually wrong.
+   */
+  const err = await sendFailureWithTimeout(
+    async () => {
+      throw new Error('BlueBubbles refused the send (http 500)');
+    },
+    '+18015550123',
+    'apology',
+    1_000,
+  ).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof Error);
+  assert.match((err as Error).message, /BlueBubbles refused the send \(http 500\)/);
+});
+
+test('🔴 a fast inner send is NOT replaced by the timeout — the race goes to whoever wins', async () => {
+  /**
+   * CONTROL for the timer-rejection test above. Without this, a helper that
+   * rejects on EVERY call passes both: the timer case and the "always rejects"
+   * case look the same in any single test.
+   */
+  let calls = 0;
+  await sendFailureWithTimeout(
+    async () => {
+      calls += 1;
+    },
+    '+18015550123',
+    'apology',
+    5_000,
+  );
+  assert.equal(calls, 1, 'the inner send must run exactly once when it beats the timer');
+});
+
+test('🔴 the failure-reply budget sits well UNDER the 900s turn budget and the 15s BlueBubbles ceiling', () => {
+  /**
+   * Measured against the existing constants:
+   *   `TURN_TIMEOUT_MS`         = 900_000  (`llm.ts`)
+   *   `BlueBubblesClient` default `timeoutMs` = 15_000  (`client.ts`)
+   *
+   * The failure-reply budget MUST be below both, or the catch path inherits the
+   * very ceiling that just killed the turn it is trying to apologise for. The
+   * default comes from `FAILURE_REPLY_TIMEOUT_MS` — failing this assertion means
+   * someone widened the ceiling and forgot the lower bound.
+   */
+  assert.ok(FAILURE_REPLY_TIMEOUT_MS < 15_000, 'failure-reply budget must be below the BlueBubbles ceiling');
+  assert.ok(FAILURE_REPLY_TIMEOUT_MS < 900_000, 'failure-reply budget must be below the turn budget — the whole point');
+  assert.ok(FAILURE_REPLY_TIMEOUT_MS >= 1_000, 'a sub-second budget defeats the purpose of having one');
+});
+
+test('🔴 the catch in main.ts is fire-and-forget — it does not await the failure reply', async () => {
+  /**
+   * Source scan, in the same style as `the shipped turn body disarms the notice
+   * BEFORE it sends` above. The catch's send must NOT block on the apology's
+   * promise, because every queue lane is held until `run` resolves. Awaiting
+   * a 15s send here turns one thrown turn into 15s of lane silence on the next
+   * message — measurable, but unobservable in any test that does not exercise
+   * this seam specifically.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const catchStart = main.indexOf('could not even report');
+  assert.ok(catchStart >= 0, 'the catch log line could not be found — this scan is now measuring nothing');
+  // Walk backwards to find the line above the catch block that fires the send.
+  // That line MUST start with `void sendFailureWithTimeout(`, not `await`.
+  const window = main.slice(Math.max(0, catchStart - 1_000), catchStart);
+  assert.match(
+    window,
+    /void\s+sendFailureWithTimeout\(/,
+    'the failure-reply send is awaited — the catch will hold the queue lane for as long as the apology takes',
+  );
+  // And there is no surrounding `try`/`await`. An `await` between the throw
+  // and the void promise is the same defect wrapped differently.
+  assert.equal(
+    /\bawait\s+sendFailureWithTimeout\(/.test(window),
+    false,
+    'an `await sendFailureWithTimeout(...)` exists between the throw and the catch — that awaits the apology',
   );
 });

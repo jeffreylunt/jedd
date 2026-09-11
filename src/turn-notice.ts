@@ -123,6 +123,74 @@ export function failureReply(e: unknown): string {
 }
 
 /**
+ * 🔴 THE OWN BUDGET FOR THE FAILURE REPLY, AND ITS OWN TIMER.
+ *
+ * The catch path in `main.ts` exists for exactly the case where the turn's own
+ * 900s controller has already fired and the model endpoint is the thing that's
+ * sick. Reusing the turn's controller here would inherit the timeout that just
+ * killed the turn, and the user would see "could not even report the failure"
+ * for the same reason the turn died — measurable live 2026-09-10:
+ *
+ *   [jedd] turn N THREW: The operation was aborted due to timeout
+ *   [jedd] turn N could not even report the failure: The operation was aborted
+ *
+ * Two failures of the same kind for one message is what `failureReply` exists to
+ * prevent. The fix has three parts, and they have to land together:
+ *
+ *   1. A fresh timer in the catch, not the turn's controller. This constant is
+ *      it. It is well under the 15s ceiling BlueBubbles already runs the
+ *      success path on, so the failure reply gives up faster than the ordinary
+ *      send does — and the catch that names its own timeout is the catch whose
+ *      timeout does not have to be inherited from anywhere.
+ *   2. The send is NOT anchored. `message.sourceGuid` is omitted so the apology
+ *      never routes through BlueBubbles' Private API (which can stall 120s and
+ *      then 500 — exactly the failure mode this catch is for; see
+ *      `client.sendText`).
+ *   3. The send is fire-and-forget. `connector.send` is not awaited inside the
+ *      catch — the catch resolves immediately, the queue releases this sender's
+ *      lane, and the next message gets handled in this turn's place. The actual
+ *      send promise still lives until the timer fires, with `unref` so it
+ *      cannot keep the process alive.
+ */
+export const FAILURE_REPLY_TIMEOUT_MS = 10_000;
+
+type FailureSender = (handle: string, text: string) => Promise<void>;
+
+/**
+ * Send a `failureReply` with its OWN timer, independent of anything else in the
+ * turn's call stack. The promise rejects when the inner send rejects, OR when
+ * `ms` ms elapse — whichever comes first. The caller decides whether to await
+ * (the catch path intentionally does not — see the constant's block comment).
+ *
+ * ⚠️ The timer is `unref`'d. A pending failure-reply send is a pending HTTP
+ * fetch that nobody is awaiting; if the process is otherwise ready to exit
+ * (shutdown after a SIGINT, or a clean exit on a lone shadow), the timer must
+ * not hold it open — a 10s tail to a turn that already died is not useful.
+ *
+ * ⚠️ The timeout REJECTS rather than resolving. A silent resolution on timeout
+ * would let the fire-and-forget caller log nothing, and "we told them" reading
+ * as "we said nothing" is the exact defect this exists to prevent.
+ */
+export function sendFailureWithTimeout(
+  send: FailureSender,
+  handle: string,
+  text: string,
+  ms: number = FAILURE_REPLY_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`failure-reply send aborted after ${ms}ms`)),
+      ms,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([send(handle, text), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
  * ── 🔴 240 SECONDS, AND THE NUMBER IS MEASURED, NOT PICKED ───────────────────
  *
  * From the durable log (`data/jedd.log`, 110 completed turns):
