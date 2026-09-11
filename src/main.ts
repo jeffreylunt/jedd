@@ -75,6 +75,34 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * The timeout for the failure-reply send, in milliseconds.
+ *
+ * ── 🔴 LONGER THAN THE NORMAL SEND PATH, AND THE REASON IT EXISTS ────────────
+ *
+ * The normal `client.call` budget is 15s (plain) or 30s (anchored), and is
+ * correct for the reply path: a healthy BlueBubbles answers in well under a
+ * second, and a hung BlueBubbles is a hung bot that should fail fast.
+ *
+ * The failure-reply is different. It runs after a turn has already died —
+ * typically at the full 900-second turn budget — and the sender has waited for
+ * it. Measured live 2026-09 (issue #28): two consecutive turns timed out AND
+ * then failed to send their failure notification with
+ * "The operation was aborted due to timeout", so the user received NOTHING.
+ *
+ * The most likely common cause is the same condition that aborted the turn
+ * affecting BlueBubbles too (a slow network, the server under load), so the
+ * failure-reply gets a generous 60s budget: four times the normal plain-send
+ * ceiling. It is also plumbed through `client.sendText` as an EXPLICIT,
+ * DETACHED timeout so nothing in the parent catch chain — including any signal
+ * from the model call's controller — can short-circuit it before its time.
+ *
+ * 🔴 This is NOT a fix for BlueBubbles being broken. If BB is unreachable the
+ * send still fails and the user still hears nothing — we just gave it four
+ * times the chance to fail.
+ */
+const FAILURE_REPLY_TIMEOUT_MS = 60_000;
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -820,8 +848,19 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * ⚠️ THE FAILURE-REPLY GETS ITS OWN DETACHED TIMEOUT. See
+         * `FAILURE_REPLY_TIMEOUT_MS` above — the issue this fixes (#28) was the
+         * apology itself timing out on the normal 15s budget while the sender
+         * was still owed a reply.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await connector.send(
+          message.senderHandle,
+          failureReply(e),
+          message.sourceGuid,
+          undefined,
+          FAILURE_REPLY_TIMEOUT_MS,
+        );
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }

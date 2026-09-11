@@ -32,8 +32,13 @@ export interface Connector {
    * ⚠️ Optional, and the absent case is REAL, not a shortcut: a follow-up
    * ("that download finished") answers no incoming message at all, and must
    * never be anchored to a stale one.
+   *
+   * `timeoutMs`, when present, overrides the transport's default send budget
+   * and is used by the failure-reply path to give the apology a dedicated,
+   * detached timeout independent of any state that aborted the turn — see the
+   * call site in `main.ts` and `FAILURE_REPLY_TIMEOUT_MS`.
    */
-  send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void>;
+  send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord, timeoutMs?: number): Promise<void>;
   /** Begin delivering messages. Resolves when the source is exhausted. */
   listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void>;
 
@@ -163,7 +168,7 @@ export class StdoutConnector implements Connector {
     this.currentSender = defaultSender;
   }
 
-  async send(toHandle: string, text: string, _inReplyTo?: string, record?: SendRecord): Promise<void> {
+  async send(toHandle: string, text: string, _inReplyTo?: string, record?: SendRecord, _timeoutMs?: number): Promise<void> {
     // A terminal cannot quote a message, and says so rather than leaving the
     // record undefined and making an absent capability look like a lost one.
     if (record) {
@@ -219,7 +224,7 @@ export class TestConnector implements Connector {
 
   constructor(private readonly script: IncomingMessage[] = []) {}
 
-  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void> {
+  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord, _timeoutMs?: number): Promise<void> {
     this.sent.push({ to: toHandle, text, inReplyTo });
     if (record) {
       record.anchored = false;

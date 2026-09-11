@@ -596,3 +596,44 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 the failure-reply send gets a DEDICATED, longer timeout — issue #28', async () => {
+  /**
+   * Issue #28: two turns in 24h timed out at the full 900s budget AND THEN the
+   * failure-reply send itself timed out at the normal 15s ceiling, so the
+   * sender received nothing. The fix is to give the apology its own detached
+   * budget, plumbed as an explicit 5th argument to `connector.send`. This scan
+   * pins that contract so a future cleanup that "simplifies" the call back to
+   * the default 15s has a red test in front of it.
+   *
+   * Without this guard the test passes against a `connector.send(...)` call
+   * that drops the timeout argument — the failure-reply would silently fall
+   * back to the 15s default and reproduce the bug.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  // 1. The constant exists and is LARGER than the normal send budget (15s plain
+  // / 30s anchored). 60s is the chosen value; lower it without thinking and
+  // this is the line that fails.
+  assert.match(
+    main,
+    /FAILURE_REPLY_TIMEOUT_MS\s*=\s*60_000/,
+    'FAILURE_REPLY_TIMEOUT_MS is missing or no longer 60s — issue #28 was the failure-reply timing out at 15s',
+  );
+
+  // 2. The failure-reply catch ACTUALLY uses it. Slice from the constant
+  // declaration to the catch that logs "could not even report the failure",
+  // and assert the constant appears between them. This covers the layout in
+  // both shapes the call site has taken: `connector.send(handle, …, ts)` on
+  // one line or split across several.
+  const constantAt = main.indexOf('FAILURE_REPLY_TIMEOUT_MS =');
+  const catchLogAt = main.indexOf('could not even report the failure');
+  assert.ok(constantAt >= 0, 'FAILURE_REPLY_TIMEOUT_MS is not declared');
+  assert.ok(catchLogAt > constantAt, 'the catch log line could not be located');
+  const catchBody = main.slice(constantAt, catchLogAt);
+  assert.match(
+    catchBody,
+    /connector\.send\([\s\S]*?failureReply\(e\)[\s\S]*?FAILURE_REPLY_TIMEOUT_MS/,
+    'the failure-reply send is no longer passing an explicit, detached timeout',
+  );
+});
