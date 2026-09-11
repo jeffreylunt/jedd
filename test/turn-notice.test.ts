@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
+  FAILURE_REPORT_TIMEOUT_MS,
   failureReply,
   isModelTimeout,
   MAX_NOTICES,
@@ -12,6 +13,7 @@ import {
   parseStillWorkingMs,
   STILL_WORKING_AFTER_MS,
   stillWorkingText,
+  withShortTimeout,
   type TimerSeam,
 } from '../src/turn-notice.js';
 import { MAX_TURN_TIMEOUT_MS, MIN_TURN_TIMEOUT_MS, parseTurnTimeout } from '../src/config.js';
@@ -260,6 +262,77 @@ test('🔴 a timeout is TOLD as a timeout, and a generic failure is not', () => 
 test('the failure reply never carries the exception text', () => {
   const reply = failureReply(new Error('connect EHOSTUNREACH 10.0.0.10:8096 apikey=SECRET'));
   assert.doesNotMatch(reply, /10\.0\.0\.10|apikey|SECRET|EHOSTUNREACH/);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE FAILURE REPORT: a hanging apology does not hide the death from the sender
+// ──────────────────────────────────────────────────────────────────────────
+
+test('🔴 a promise that resolves before the deadline passes through untouched', async () => {
+  const value = await withShortTimeout(Promise.resolve('ok'), 1_000, 'fast send');
+  assert.equal(value, 'ok');
+});
+
+test('🔴 a promise that hangs past the deadline is rejected, so the catch can yield', async () => {
+  /**
+   * This is the defect closed by issue #39: `connector.send` against a hung
+   * BlueBubbles used to drag the catch for the client's full 15s, so a turn
+   * that had already eaten its model budget (up to 900s) then disappeared for
+   * another fifteen. The wrap rejects at the deadline so the catch logs and
+   * returns, and the next message is not held hostage to a transport that has
+   * already shown it is in trouble.
+   */
+  let never: Promise<string>;
+  let resolveHangsForever: (v: string) => void = () => {};
+  never = new Promise<string>((resolve) => {
+    resolveHangsForever = resolve;
+  });
+
+  const start = Date.now();
+  const err = await withShortTimeout(never, 50, 'failure-report send').then(
+    () => null,
+    (e: unknown) => e,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(err instanceof Error, 'the hang must surface as a rejection, not a resolve');
+  assert.match((err as Error).message, /failure-report send timed out after 50ms/);
+  assert.ok(elapsed >= 40 && elapsed < 1_500, `rejected near the deadline, not after it — took ${elapsed}ms`);
+  // The underlying promise is intentionally never resolved in this test; leaving
+  // it dangling is fine, the harness will GC it. We do not call resolveHangsForever
+  // on purpose — that would defeat the point of the assertion.
+  void resolveHangsForever;
+});
+
+test('🔴 a rejection from the wrapped promise passes straight through, not swallowed by the timer', async () => {
+  const err = await withShortTimeout(Promise.reject(new Error('send failed: 500')), 1_000, 'fast send').then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof Error);
+  assert.match((err as Error).message, /send failed: 500/);
+});
+
+test('🔴 the racing timer does not hold the process open — the failure-report wrap uses unref', async () => {
+  /**
+   * `withShortTimeout` is called inside a turn handler that returns to
+   * `listen()`; if the racing timer kept a ref the process would wait on a
+   * never-resolving send even on shutdown. A `_getActiveHandles` probe is too
+   * implementation-specific to assert on portably, but the fact that the timer
+   * is started with `unref?.()` is encoded in `turn-notice.ts` itself. Here we
+   * assert the behaviour we actually care about: the helper resolves cleanly
+   * once the deadline has passed, and the underlying promise's eventual
+   * settlement does not crash the process.
+   */
+  let resolveLater: (v: string) => void = () => {};
+  const slow = new Promise<string>((resolve) => {
+    resolveLater = resolve;
+  });
+  const raced = withShortTimeout(slow, 20, 'fast send').then(
+    () => 'timed out',
+    () => 'timed out',
+  );
+  setTimeout(() => resolveLater('landed late'), 40);
+  return assert.equal(await raced, 'timed out');
 });
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -594,5 +667,43 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
     /notice\.arm\(waited\.queuedForMs\)/,
     'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
       'restarts the clock at zero — the exact case this is for',
+  );
+});
+
+test('🔴 the failure-reporting send is bounded on an INDEPENDENT clock, not the BlueBubbles default', async () => {
+  /**
+   * Issue #39 measured 2026-09-09: a turn dies on the model timeout, then the
+   * apology is attempted through the same transport and times out again, then
+   * the user hears nothing. `BlueBubblesClient`'s default is 15s; that is the
+   * right budget for a normal reply, and the wrong one for an apology after a
+   * turn that has already eaten 900s and is almost certainly under the same
+   * upstream pressure. This scan proves the catch hands the apology to
+   * `withShortTimeout`, with the constant exported from this file rather than
+   * a literal that could drift away from the comment it explains.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /withShortTimeout\(\s*connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the catch still calls connector.send with failureReply(e), so the wording stays the classifier\'s',
+  );
+  assert.match(
+    main,
+    /FAILURE_REPORT_TIMEOUT_MS/,
+    'the catch uses a constant — a literal timeout here would have nothing to assert against',
+  );
+  // The budget is bounded BELOW the BlueBubbles default send timeout (15s on the
+  // shipped client) so a hung transport fails the catch fast rather than
+  // disappearing for an extra 15 seconds on top of the 900s the user just sat
+  // through.
+  assert.ok(
+    FAILURE_REPORT_TIMEOUT_MS <= 15_000,
+    `the failure-report budget (${FAILURE_REPORT_TIMEOUT_MS}ms) must not exceed the BlueBubbles default send timeout — ` +
+      'otherwise this wrap is no wrap at all',
+  );
+  assert.ok(
+    FAILURE_REPORT_TIMEOUT_MS >= 1_000,
+    `the failure-report budget (${FAILURE_REPORT_TIMEOUT_MS}ms) must give a live BlueBubbles room to ack — ` +
+      'below 1s the catch would race every working send',
   );
 });

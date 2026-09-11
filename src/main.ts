@@ -15,11 +15,13 @@ import {
 } from './connector.js';
 import { BURST_SETTLE_MS, sleep, TurnQueue, type BatchWait } from './turn-queue.js';
 import {
+  FAILURE_REPORT_TIMEOUT_MS,
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
   StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
+  withShortTimeout,
 } from './turn-notice.js';
 import { REPLY_THREADING_ENABLED, ReplyThreading } from './bluebubbles/threading.js';
 import { assertShellIdentityIsSafe, loadConfig } from './config.js';
@@ -820,8 +822,24 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * ⚠️ BOUNDED ON AN INDEPENDENT CLOCK. The default send timeout on
+         * `BlueBubblesClient` is 15s, which is the right budget for a reply on
+         * the happy path; it is the wrong budget for the apology, because by
+         * the time we reach this line the model has already eaten its full
+         * budget (up to 900s on the shipped default) and the upstream that
+         * caused the turn to die is likely to be the same one this send goes
+         * through. Measured 2026-09-09 in issue #39: the model timed out, then
+         * the apology timed out on the same upstream, and the user heard
+         * nothing. `withShortTimeout` rejects after `FAILURE_REPORT_TIMEOUT_MS`
+         * (8s) so the catch logs and yields, and the next message is not held
+         * hostage to a transport that has already shown it is in trouble.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await withShortTimeout(
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          FAILURE_REPORT_TIMEOUT_MS,
+          'failure-report send',
+        );
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
