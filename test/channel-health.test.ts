@@ -194,6 +194,59 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.match(res.content, /NOT\s+"no channels are working"/);
 });
 
+test('🔴 an unreadable results file says WHY so the operator can act', async () => {
+  /**
+   * The tool already degrades to UNKNOWN gracefully — but the operator's first
+   * read of that message is "this is NOT 'no channels are working'", and the
+   * raw stderr (`cat: … No such file or directory`) is buried under an
+   * `exit_code=1` and a `(empty)` stdout block. Without a hint, the operator
+   * cannot tell whether the checker is not running, writes to a different
+   * path, or has a permission problem — the three failure modes the issue
+   * lists explicitly.
+   */
+  const missing: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb({ code: 1 }, '', 'cat: /tmp/check-streams-results.txt: No such file or directory');
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(missing));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /Hint: the results file does not exist on hp/);
+  assert.match(res.content, /CHECK_STREAMS_RESULTS_PATH/);
+  assert.match(res.content, /cron\/systemd timer/);
+
+  // Permission-denied is the OTHER failure mode the issue lists. Different
+  // stderr → different hint; otherwise the "file is missing" branch above is
+  // just hard-coded text.
+  const denied: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb({ code: 1 }, '', 'cat: /tmp/check-streams-results.txt: Permission denied');
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res2 = await channelHealth.run({}, ctx(denied));
+  assert.equal(res2.ok, false);
+  assert.match(res2.content, /Hint: the results file is not readable/);
+  assert.match(res2.content, /HP_SHELL_SSH_HOST/);
+
+  // And an UNRECOGNISED stderr still says UNKNOWN with no fabricated hint —
+  // the hint is purely additive.
+  const other: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb({ code: 1 }, '', 'some completely unrelated failure');
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res3 = await channelHealth.run({}, ctx(other));
+  assert.equal(res3.ok, false);
+  assert.match(res3.content, /UNKNOWN/);
+  assert.doesNotMatch(res3.content, /Hint:/, 'a hint must never be invented for an unknown pattern');
+});
+
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
   const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
   const res = await channelHealth.run({}, ctx(impl));
