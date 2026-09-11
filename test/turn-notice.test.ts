@@ -596,3 +596,59 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 the catch owns its own abort signal — the apology is not killed by the turn\'s timeout (issue #37)', async () => {
+  /**
+   * The cascading-failure shape this exists for: a turn dies (the model
+   * timed out, or the network that stalled the model also stalled BlueBubbles)
+   * AND the catch block's apology send is killed by the same condition. From
+   * the phone, that is the same event as the bot being switched off — the
+   * boot banner's contract is violated.
+   *
+   * `main.ts`'s catch must therefore arm its OWN `AbortController` and pass its
+   * signal into `connector.send`, so the error-reporting send has its OWN
+   * deadline instead of inheriting whatever killed the turn. A mutation that
+   * drops the `new AbortController()` from the catch, or removes the
+   * `apologyAbort.signal` argument from the `connector.send` call, leaves every
+   * other assertion in this file green and reintroduces the exact bug.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  // Anchor on the turn-handler catch — there are several `} catch (e) {` blocks
+  // in this file (the shutdown one is the first), so slice from the one that
+  // apologises with `failureReply(e)` to its closing sendErr catch. The body is
+  // also scoped past `const handleBurst =`, so we cannot match an earlier
+  // unrelated abort controller even if someone adds one to boot.
+  const apologyReplyIdx = main.indexOf('failureReply(e)');
+  assert.ok(apologyReplyIdx >= 0, 'the catch\'s apology reply could not be located');
+  // Walk BACKWARD from the apology reply for the catch that contains it, so
+  // this scan cannot latch onto a future unrelated catch block.
+  const catchIdx = main.lastIndexOf('} catch (e) {', apologyReplyIdx);
+  assert.ok(catchIdx >= 0 && catchIdx < apologyReplyIdx, 'the turn catch could not be located');
+  const sendErrIdx = main.indexOf('} catch (sendErr)', catchIdx);
+  assert.ok(sendErrIdx > apologyReplyIdx, 'the apology sendErr catch could not be located');
+  const body = main.slice(catchIdx, sendErrIdx);
+
+  assert.match(
+    body,
+    /new AbortController\(/,
+    'the catch no longer creates its own AbortController — the apology is back on the turn\'s signal',
+  );
+  assert.match(
+    body,
+    /setTimeout\(\(\)\s*=>\s*\w+\.abort\(\)/,
+    'the catch\'s AbortController is armed with its OWN timer — without it the controller is inert and the apology inherits the turn\'s deadline',
+  );
+  assert.match(
+    body,
+    /\w+\.signal/,
+    'the catch\'s controller.signal is not used — it must be passed to connector.send so BlueBubblesClient can AbortSignal.any() it with its internal timeout',
+  );
+  assert.match(
+    body,
+    /connector\.send\(\s*\n[^]*?\w+\.signal/,
+    'connector.send is called without the catch\'s signal — the apology is back on the default 15s, which is what issue #37 is about',
+  );
+  // And the controller is cleaned up — a pending apology must not hold the
+  // process open on its own, the same way `StillWorkingNotice` already does.
+  assert.match(body, /clearTimeout\(/, 'the catch\'s apology timer is not cleared — it could keep Node alive');
+});

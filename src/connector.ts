@@ -32,8 +32,20 @@ export interface Connector {
    * ⚠️ Optional, and the absent case is REAL, not a shortcut: a follow-up
    * ("that download finished") answers no incoming message at all, and must
    * never be anchored to a stale one.
+   *
+   * `signal` is an OPTIONAL caller-owned abort signal. The transport MUST honour
+   * it alongside its own internal timeout — typically via `AbortSignal.any` —
+   * so the error-reporting path in `main.ts` can give the apology its OWN,
+   * non-shared deadline instead of being killed by the same constraint that
+   * killed the turn. See `main.ts`'s catch block and issue #37.
    */
-  send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void>;
+  send(
+    toHandle: string,
+    text: string,
+    inReplyTo?: string,
+    record?: SendRecord,
+    signal?: AbortSignal,
+  ): Promise<void>;
   /** Begin delivering messages. Resolves when the source is exhausted. */
   listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void>;
 
@@ -163,7 +175,13 @@ export class StdoutConnector implements Connector {
     this.currentSender = defaultSender;
   }
 
-  async send(toHandle: string, text: string, _inReplyTo?: string, record?: SendRecord): Promise<void> {
+  async send(
+    toHandle: string,
+    text: string,
+    _inReplyTo?: string,
+    record?: SendRecord,
+    _signal?: AbortSignal,
+  ): Promise<void> {
     // A terminal cannot quote a message, and says so rather than leaving the
     // record undefined and making an absent capability look like a lost one.
     if (record) {
@@ -219,7 +237,13 @@ export class TestConnector implements Connector {
 
   constructor(private readonly script: IncomingMessage[] = []) {}
 
-  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void> {
+  async send(
+    toHandle: string,
+    text: string,
+    inReplyTo?: string,
+    record?: SendRecord,
+    _signal?: AbortSignal,
+  ): Promise<void> {
     this.sent.push({ to: toHandle, text, inReplyTo });
     if (record) {
       record.anchored = false;

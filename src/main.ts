@@ -820,8 +820,56 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * ── 🔴 A FRESH ABORTCONTROLLER, OWNED BY THIS CATCH. THE TURN'S ABORT ──
+         * ── MUST NOT BE ABLE TO KILL THE APOLOGY. ──────────────────────────────
+         *
+         * Issue #37, measured live 2026-08-26 and again on 2026-09-09: two turns
+         * in twenty-four hours BOTH threw a timeout AND failed to report it,
+         * because the catch block's `connector.send` was running against the
+         * same tight constraints as the rest of the turn — when Ollama timed out
+         * the model call, the same network condition that stalled the model was
+         * stalling BlueBubbles too, and the apology's 15s BlueBubbles timeout
+         * killed it before it could leave. From the phone, a killed turn, a
+         * message that never arrived, and a bot that was switched off were the
+         * same event.
+         *
+         * The boot banner's contract is *"a turn that dies always sends a
+         * message; a timeout says it timed out"*. This block is the only thing
+         * keeping that contract alive on the failure path, and it now gives
+         * that send its OWN signal — a fresh `AbortController` armed with its
+         * own short deadline — instead of letting it inherit the turn's
+         * pressure. `BlueBubblesClient.call` combines the external signal with
+         * its 15s internal timeout via `AbortSignal.any`, so a healthy send
+         * still exits in well under a second and a hung BlueBubbles still
+         * fails fast — just on a deadline that the turn cannot pre-empt.
+         *
+         * ⚠️ 30 SECONDS IS DELIBERATELY GENEROUS. A normal send is <1s; the
+         * budget covers a BlueBubbles that got stuck right as the model did
+         * (the exact 2026-09-09 shape) and still has room for a TLS handshake
+         * and a retry. Holding the catch block open any longer is worse than
+         * failing: a turn that is "still trying to apologise" for a minute is a
+         * turn that cannot start the NEXT message.
+         *
+         * ⚠️ The timer is `unref`'d and the controller is aborted in `finally`
+         * so a pending apology cannot hold the process open on its own, the
+         * same way `StillWorkingNotice` already does.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        const apologyAbort = new AbortController();
+        const apologyTimer = setTimeout(() => apologyAbort.abort(), 30_000);
+        apologyTimer.unref?.();
+        try {
+          await connector.send(
+            message.senderHandle,
+            failureReply(e),
+            message.sourceGuid,
+            undefined,
+            apologyAbort.signal,
+          );
+        } finally {
+          clearTimeout(apologyTimer);
+          apologyAbort.abort();
+        }
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
