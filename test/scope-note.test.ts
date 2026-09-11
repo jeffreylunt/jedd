@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { Agent } from '../src/agent.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
 import { ALL_TOOLS, assertNamedProducersExist, registerable } from '../src/tools/index.js';
+import { makeCheckStatus } from '../src/tools/check-status.js';
 import { jellyfinSessions } from '../src/tools/homelab.js';
 import type { Tool } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
@@ -234,6 +235,73 @@ test('🔴 the note REFUSES the wrong inference, not just states the scope', () 
   const note = jellyfinSessions.scopeNote!;
   assert.match(note, /NOT evidence/);
   assert.match(note, /currently-playing sessions ONLY/);
+});
+
+/**
+ * ── THE SECOND TOOL THE DEFECT WAS MEASURED ON ──────────────────────────────
+ *
+ * 2026-09-02, from a guest: `check_status` returned a STALLED row and the
+ * model said *"I don't have a way to re-search a film for a new one, so I can't
+ * swap it out myself."* — the live queue read as the boundary of the system.
+ * Same defect as `jellyfin_sessions`, different tool. The same fix shape
+ * applies: a scope note that REFUSES the specific wrong inference the model
+ * actually drew, by name, and points at a tool that is co-registered.
+ */
+const checkStatus = makeCheckStatus();
+
+test('check_status carries a scope note, and it names a CO-REGISTERED tool', () => {
+  const note = checkStatus.scopeNote;
+  assert.ok(note, 'this is the tool the 2026-09-02 denial was measured on');
+  // Same isolation discipline as the jellyfin_sessions test: drive the invariant
+  // over THIS tool alone so the name it invents is the only thing that can
+  // satisfy it.
+  assert.throws(() => assertNamedProducersExist([checkStatus]), /catalogue_search/);
+  // ⚠️ A NAME-ONLY stand-in, not the real `catalogue_search`: that tool's own
+  // description names `add_movie` and `add_series`, so passing it here would
+  // drag their dependencies in and could fail for reasons unrelated to this
+  // note. The invariant only ever looks at names, so a stub is the honest
+  // isolate.
+  const standIn: Tool = { ...narrowTool('ok'), name: 'catalogue_search', description: 'stand-in' };
+  assert.doesNotThrow(() => assertNamedProducersExist([checkStatus, standIn]));
+  assert.match(note, /catalogue_search/);
+});
+
+test('🔴 check_status scope note refuses the "stalled = nothing I can do" inference', () => {
+  // Same reasoning as the jellyfin_sessions refusal test: the measured failure
+  // is the model reading a narrow result as the system's boundary. A scope
+  // line that only states what the tool covers leaves that step untouched, so
+  // the refusal of it is asserted separately.
+  const note = checkStatus.scopeNote!;
+  // Refuses the specific over-read: a stalled/stopped/import-blocked row is
+  // NOT "nothing can be done about it".
+  assert.match(note, /NOT "nothing can be done"/);
+  // Names the scope.
+  assert.match(note, /LIVE QUEUE only/);
+});
+
+test('🔴 the shipped registry still passes the post-filter rule after adding check_status scopeNote', () => {
+  // `check_status` names `catalogue_search` and the two carry the SAME
+  // `needsAnyService: ['sonarr', 'radarr']` — so a deploy with one of the two
+  // up registers both and a deploy with neither registers neither. The same
+  // coincidence that keeps `jellyfin_sessions`/`homelab_read` honest, with the
+  // same shape of risk if anyone edits one of the two lists.
+  assert.doesNotThrow(() => registerable(ALL_TOOLS, testConfig()));
+});
+
+test('FAILING CONTROL: a check_status scope note naming add_movie would refuse to boot on readOnly', () => {
+  // Pin that the only reason the shipped note is safe is that it names a
+  // co-registered read tool. Adding `add_movie` to the note would be the
+  // obvious "more specific" version and it would break the test config
+  // (`readOnly: true` filters writes) AND a Sonarr-only deploy. The check below
+  // would throw, which is the right answer — and the only way to know the
+  // shipped note does not is to have this control alongside it.
+  const withAddMovie: Tool = {
+    ...narrowTool('ok'),
+    name: 'check_status',
+    description: 'check_status',
+    scopeNote: 'Re-add it via add_movie or add_series.',
+  };
+  assert.throws(() => registerable([withAddMovie], testConfig()), /add_movie/);
 });
 
 
