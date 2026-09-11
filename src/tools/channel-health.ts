@@ -226,12 +226,53 @@ export interface StreamCheckSnapshot {
 
 export type StreamCheckRead = { ok: true; snapshot: StreamCheckSnapshot } | { ok: false; detail: string };
 
+/**
+ * 🔴 THE "could not read" DETAIL IS THE ANSWER WHEN THE SNAPSHOT IS UNREADABLE.
+ *
+ * A bare `exit_code=1` and a raw `stderr:` block leaves the user guessing which
+ * of the three known causes they are looking at: the cron/systemd timer on hp
+ * is not running, the script writes to a different path than the one we read,
+ * or the SSH transport itself failed. Each has a different fix, and the next
+ * thing the operator does is look at the wrong one. So the stderr is parsed
+ * for the two patterns that account for almost every failure in the wild
+ * (`stat: ... No such file or directory` and `Permission denied`) and a short,
+ * concrete next step is appended. Everything else falls through to an SSH-shaped
+ * hint, since an empty stderr with a non-zero exit means the remote command
+ * never ran — auth failure, host unreachable, or `stat`/`cat` not on PATH.
+ *
+ * Tested as a structural property of the message: every unreadable file reply
+ * names WHAT TO CHECK, not just THAT IT FAILED.
+ */
+function hintForUnreadable(stderr: string, path: string): string {
+  const s = stderr.trim();
+  if (/no such file or directory/i.test(s)) {
+    return (
+      `What this likely means: the check-streams results file (${path}) does not exist on hp, ` +
+      'so the cron/systemd timer that should write it is probably not running, or it writes to ' +
+      'a different path. Verify the timer is enabled on hp and that CHECK_STREAMS_RESULTS_PATH ' +
+      'in .env matches where the script writes.'
+    );
+  }
+  if (/permission denied/i.test(s)) {
+    return (
+      `What this likely means: the check-streams results file (${path}) exists but is not ` +
+      'readable by the ssh user. It is expected to be world-readable; check its mode on hp.'
+    );
+  }
+  return (
+    'What this likely means: the ssh read on hp did not produce output, so this is most likely ' +
+    'an SSH or remote-shell failure rather than a missing results file. Check that the homelab ' +
+    'is reachable and that the ssh key for this host is still accepted.'
+  );
+}
+
 export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<StreamCheckRead> {
   const resultsPath = config.checkStreamsResultsPath;
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    const detail = `could not read ${resultsPath} on hp: ${renderOutcome(results)}\n\n${hintForUnreadable(results.stderr, resultsPath)}`;
+    return { ok: false, detail };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
