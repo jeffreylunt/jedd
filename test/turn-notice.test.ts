@@ -585,6 +585,35 @@ test('🔴 the shipped turn body disarms the notice BEFORE it sends, and apologi
     body.indexOf('notice.arm(') < body.indexOf('failureReply(e)'),
     'the catch must come after the arm — otherwise this scan is matching the wrong block',
   );
+
+  /**
+   * 🔴 THE FAILURE REPLY IS FIRE-AND-FORGET — NOT AWAITED.
+   *
+   * Measured live 2026-09-10: the failure-reply send itself hit the same
+   * `AbortSignal.timeout` that had just killed the turn, so the catch waited
+   * its own 30s anchored timeout and the next message sat unprocessed in those
+   * 30s. The user got no apology AND no reply to the follow-up. `await`-ing
+   * the apology re-binds it to the transport that just failed, which is
+   * precisely the window issue #41 names.
+   *
+   * Source-scanned because it is an ORDERING, not a behaviour any unit test
+   * can reach. The catch lives inside `main()`, which stands up BlueBubbles,
+   * Ollama, IRC, IMAP and two SSH identities before it is reachable.
+   */
+  const failureSend = body.indexOf('connector.send(message.senderHandle, failureReply(e)');
+  const awaitedFailure = body.indexOf('await connector.send(message.senderHandle, failureReply(e)');
+  assert.ok(failureSend >= 0, 'no failure-reply send call was found in the turn body');
+  assert.equal(
+    awaitedFailure,
+    -1,
+    'the failure-reply send is `await`ed — it ties the catch to the same transport that just failed, ' +
+      'creating the silent-failure window issue #41 reports',
+  );
+  const failureCatch = body.indexOf('could not even report the failure');
+  assert.ok(
+    failureCatch >= failureSend,
+    'the "could not even report the failure" log lives outside the .catch chain — failures are swallowed silently',
+  );
 });
 
 test('🔴 the notice clock is fed the queue wait, not left at its default', async () => {
