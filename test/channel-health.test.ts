@@ -194,6 +194,67 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.match(res.content, /NOT\s+"no channels are working"/);
 });
 
+/**
+ * 🔴 A MISSING FILE ON `hp` NAMES THE LIKELY CAUSE, NOT JUST THE FAILURE.
+ *
+ * Two senders hit `channel_health` in 24 h and both got a non-answer: every
+ * call came back as UNKNOWN because the file was unreadable. A bare
+ * `exit_code=1` and a raw `stderr:` block makes the operator guess whether the
+ * cron/systemd timer is dead, the script writes to a different path, or ssh
+ * itself is broken — each fix is different, and the first thing the user does
+ * is look at the wrong one. So the message is required to name WHICH of those
+ * three is most likely, based on the stderr pattern.
+ */
+test('🔴 a missing results file says to check the cron and the path, not just exit_code=1', async () => {
+  const missingFile: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb(
+        { code: 1 },
+        '',
+        "stat: cannot stat '/tmp/check-streams-results.txt': No such file or directory",
+      );
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(missingFile));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN/);
+  assert.match(res.content, /cron\/systemd timer/i, 'the cron is named as the most likely cause');
+  assert.match(res.content, /CHECK_STREAMS_RESULTS_PATH/, 'the env var is named so the operator can verify it');
+});
+
+test('🔴 a permission-denied results file names permissions, not the cron', async () => {
+  // A different cause needs a different hint. A message that always blames the
+  // cron is just a new false zero pointing the other way.
+  const denied: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb({ code: 1 }, '', "cat: /tmp/check-streams-results.txt: Permission denied");
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(denied));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /world-readable/);
+  assert.doesNotMatch(res.content, /cron\/systemd timer/i, 'the cron is NOT named for a permissions failure');
+});
+
+test('🔴 an empty-stderr failure points at ssh, not at the cron', async () => {
+  // Empty stderr with a non-zero exit means the remote command never ran at
+  // all — auth failure, host unreachable, or stat/cat not on PATH. Blaming the
+  // cron here would tell the operator to look at the wrong system.
+  const sshFail: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) return cb({ code: 255 }, '', '');
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(sshFail));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /SSH or remote-shell/);
+  assert.doesNotMatch(res.content, /cron\/systemd timer/i);
+});
+
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
   const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
   const res = await channelHealth.run({}, ctx(impl));
