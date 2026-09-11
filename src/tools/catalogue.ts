@@ -49,22 +49,32 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
 
       // 🔴 An unreachable catalogue is UNKNOWN. Reporting "nothing found" when
       // one side could not be searched is a false negative dressed as an answer.
+      //
+      // Each branch also sets a STRUCTURED `failureKind: 'service_unreachable'`
+      // plus the name of the service that could not be reached. The chain-refusal
+      // gate in `agent.ts` still keys on `ok: false` (the only thing it needs),
+      // but the named flag is what lets a future caller — a followup retry, a
+      // `/health` probe, a test — answer "which side is down" without parsing
+      // the prose. The prose is for the model; the flag is for the code.
       if (films.state === 'unknown' && shows.state === 'unknown') {
         return fail(
           `Could not search either catalogue, so this is UNKNOWN rather than "not available". ` +
             `Radarr: ${films.detail} Sonarr: ${shows.detail}`,
+          { failureKind: 'service_unreachable', unreachableService: 'radarr' },
         );
       }
       if (films.state === 'unknown') {
         return fail(
           `Sonarr searched, but RADARR IS UNREACHABLE (${films.detail}), so I cannot say whether a ` +
             'FILM of this name exists. Report that gap rather than answering as if only shows exist.',
+          { failureKind: 'service_unreachable', unreachableService: 'radarr' },
         );
       }
       if (shows.state === 'unknown') {
         return fail(
           `Radarr searched, but SONARR IS UNREACHABLE (${shows.detail}), so I cannot say whether a ` +
             'SHOW of this name exists. Report that gap rather than answering as if only films exist.',
+          { failureKind: 'service_unreachable', unreachableService: 'sonarr' },
         );
       }
 
