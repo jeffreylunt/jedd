@@ -75,6 +75,30 @@ function recordTurn(record: TurnRecord): void {
 const TICK_MS = 60_000;
 
 /**
+ * ── 🔴 INDEPENDENT BOUND ON THE FAILURE-REPORTING SEND ────────────────────────
+ *
+ * Sized in seconds, against the BlueBubbles client's default 15s ceiling
+ * (`client.ts::call`). The catch below races its apology against THIS timer —
+ * not the inner one — because the live defect (#31, 2026-09-09: two consecutive
+ * turns, model timeout + apology timeout, sender got nothing either time) was
+ * BlueBubbles' own 15s abort firing on the apology too. The apology inherits
+ * the upstream that's already stalled; the only fix is a bound that is NOT
+ * that upstream's bound.
+ *
+ * Slightly ABOVE the inner default, on purpose. A slow-but-alive BlueBubbles
+ * deserves a few extra seconds before we log `could not even report the
+ * failure`; below the inner default we would race the send out under a server
+ * that was about to succeed, and the apology would lose on the path it most
+ * needed to land. Below one minute because anything past that is not an
+ * apology any more — it is the silence this whole constant was added to stop.
+ *
+ * NOT exposed as an env knob: a tuning value nobody can make fire is a value
+ * nobody has tested, and the same argument `STILL_WORKING_AFTER_MS` makes for
+ * itself applies here — measured, single number, written once.
+ */
+const FAILURE_REPLY_TIMEOUT_MS = 20_000;
+
+/**
  * The newest guid in a burst, for a reply that has to name a message.
  *
  * ⚠️ NEWEST-THAT-HAS-ONE, not simply newest. `sourceGuid` is optional on
@@ -820,8 +844,37 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * 🔴 AND THE SEND ITSELF IS RACED AGAINST AN INDEPENDENT TIMER. The catch
+         * is already outside the per-call Ollama `AbortController` (it lives in
+         * `OllamaClient.chat` and is gone by the time we get here), but the send
+         * still goes through `BlueBubblesClient.call` whose own 15s
+         * `AbortSignal.timeout` is what the failure report was observed to hit
+         * live on 2026-09-09 — `aborted due to timeout`, same sentence as the model
+         * call above it, two aborted sends and a silent sender. The race below
+         * puts an upper bound on THIS catch — the bound is its own number, its
+         * own message, and is not whatever the transport happens to be using.
+         * If the inner 15s abort fires first we still hear about it, just from
+         * the inner catch rather than this one, and which side lost is visible
+         * in the log.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await Promise.race([
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `the failure-reporting send itself timed out after ${FAILURE_REPLY_TIMEOUT_MS}ms ` +
+                      '(independent of the turn budget and of the transport)',
+                  ),
+                ),
+              FAILURE_REPLY_TIMEOUT_MS,
+            );
+            // Never hold the process open on the apology's own timer.
+            t.unref?.();
+          }),
+        ]);
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }
