@@ -136,3 +136,58 @@ test('its description tells the model NOT to use it for "do you have"', () => {
   // separation only helps if the model knows which is which.
   assert.match(makeCatalogueSearch().description, /do NOT use it to answer "do you have/i);
 });
+
+// ── 🔴 the failure mode is structured, not prose ──────────────────────────────
+//
+// Issue #23 (2026-08-31): RADARR was down and the tool surfaced the failure as a
+// free-text string. Anything downstream that needed to know WHICH service was
+// down had to re-parse the prose, and a sentence that has to be read both ways
+// is the sentence that gets read wrong. The fix is to also set a structured
+// `failureKind` + `unreachableService` on the result, so the model still sees
+// the prose and the code can answer without it.
+
+test('🔴 RADARR down sets the STRUCTURED unreachable flag, not just prose', async () => {
+  const r = await run(routed(dead, () => json([])));
+  assert.equal(r.ok, false);
+  assert.equal(r.failureKind, 'service_unreachable', 'a transport failure is service_unreachable');
+  assert.equal(r.unreachableService, 'radarr', 'and the named service is radarr');
+  // Prose still travels verbatim — the model still needs the WHY.
+  assert.match(r.content, /RADARR IS UNREACHABLE/);
+});
+
+test('🔴 SONARR down sets the STRUCTURED flag with sonarr as the service', async () => {
+  const r = await run(routed(() => json([]), dead));
+  assert.equal(r.ok, false);
+  assert.equal(r.failureKind, 'service_unreachable');
+  assert.equal(r.unreachableService, 'sonarr');
+  assert.match(r.content, /SONARR IS UNREACHABLE/);
+});
+
+test('🔴 both catalogues down names the FIRST one (radarr) as the unreachable service', async () => {
+  // Both sides are down is still one structured flag — the kind is
+  // service_unreachable, and the named service is radarr (the first declared).
+  // Sonarr's separate failure is in the prose, where the model can read both.
+  // Naming one in the structured field is the contract a downstream caller
+  // can rely on without ambiguity about WHICH one to retry.
+  const r = await run(routed(dead, dead));
+  assert.equal(r.ok, false);
+  assert.equal(r.failureKind, 'service_unreachable');
+  assert.equal(r.unreachableService, 'radarr');
+  assert.match(r.content, /UNKNOWN rather than "not available"/);
+});
+
+test('CONTROL: a successful search has no failureKind set', async () => {
+  const r = await run(
+    routed(() => json([{ title: 'Whiplash', year: 2014, tmdbId: 244786 }]), () => json([])),
+    'whiplash',
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.failureKind, undefined, 'successes do not advertise a failure kind');
+  assert.equal(r.unreachableService, undefined);
+});
+
+test('CONTROL: a "no match" search is ok:true and carries no failure flag', async () => {
+  const r = await run(routed(() => json([]), () => json([])));
+  assert.equal(r.ok, true);
+  assert.equal(r.failureKind, undefined, '"no match" is a successful search, not a failure');
+});

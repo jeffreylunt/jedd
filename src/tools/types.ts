@@ -63,11 +63,37 @@ export interface ToolContext {
  * HTTP error, a refused precondition. Nothing downstream re-derives it from
  * prose. This is the record that makes "did you do it" answerable by
  * construction.
+ *
+ * 🔴 STRUCTURED FAILURE KIND, NOT A STRING MATCH. `failureKind` lets downstream
+ * code (the chain-refusal gate, followups, debug routes, tests) identify the
+ * failure mode without re-parsing the prose in `content`. A tool that only
+ * communicates its state through `content` is a tool the next layer has to
+ * re-read every time, and a sentence that has to be read both ways is the
+ * sentence that gets read wrong.
+ *
+ * `unreachableService` is set only when `failureKind === 'service_unreachable'`
+ * and the tool knows which service it was unable to reach. It is the specific
+ * case `catalogue_search` needs so the model can be told "Radarr is down,
+ * Sonarr is fine" without grepping prose for "RADARR IS UNREACHABLE".
  */
 export interface ToolResult {
   ok: boolean;
   /** Rendered back to the model as the tool message content. */
   content: string;
+  /**
+   * What KIND of failure this is, when `ok` is false. Optional and additive —
+   * tools that have not declared a kind still return plain `{ok,content}`. The
+   * known set today is small; this is a union of named kinds, with a string
+   * escape hatch so a new failure type does not require a refactor of every
+   * tool that returns one.
+   */
+  failureKind?: 'service_unreachable' | 'invalid_args' | 'permission_denied' | string;
+  /**
+   * Which service was unreachable, when `failureKind === 'service_unreachable'`.
+   * The named set mirrors `needsServices` on the Tool interface — a tool that
+   * reaches one of these services and cannot, names which one.
+   */
+  unreachableService?: 'radarr' | 'sonarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr';
 }
 
 export interface Tool {
@@ -265,6 +291,12 @@ export function ok(content: string): ToolResult {
   return { ok: true, content };
 }
 
-export function fail(content: string): ToolResult {
-  return { ok: false, content };
+export function fail(content: string, meta?: { failureKind?: ToolResult['failureKind']; unreachableService?: ToolResult['unreachableService'] }): ToolResult {
+  if (!meta) return { ok: false, content };
+  return {
+    ok: false,
+    content,
+    ...(meta.failureKind !== undefined ? { failureKind: meta.failureKind } : {}),
+    ...(meta.unreachableService !== undefined ? { unreachableService: meta.unreachableService } : {}),
+  };
 }
