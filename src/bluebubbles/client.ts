@@ -462,7 +462,19 @@ export class BlueBubblesClient {
    * server's 120s wall — the point is not to wait it out, it is that aborting at
    * the ordinary 15s would make every slow-but-fine reply look like a failure.
    */
-  async sendText(to: string, text: string, replyToGuid?: string | null): Promise<SendResult> {
+  async sendText(
+    to: string,
+    text: string,
+    replyToGuid?: string | null,
+    /**
+     * Override the per-call timeout. The default is 30s for an anchored send
+     * and 15s for a plain one (via `client.call`'s `this.timeoutMs`). Used by
+     * the failure-reply path in `main.ts`, which passes a larger budget because
+     * the sender has already waited through a full 900s turn before getting
+     * here — see that call site for the reasoning and the number.
+     */
+    timeoutMs?: number,
+  ): Promise<SendResult> {
     const anchored = typeof replyToGuid === 'string' && replyToGuid.length > 0;
     const { status, body } = await this.call(
       '/message/text',
@@ -475,7 +487,7 @@ export class BlueBubblesClient {
           ...(anchored ? { selectedMessageGuid: replyToGuid, partIndex: 0 } : {}),
         }),
       },
-      anchored ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS : undefined,
+      timeoutMs ?? (anchored ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS : undefined),
     );
     if (status >= 400) {
       return {
