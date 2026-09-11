@@ -177,15 +177,29 @@ export class BlueBubblesClient {
    * case, hanging >90s with no response for an unreachable recipient while the
    * text endpoint fails fast in ~1s. Do not assume one endpoint's timing
    * generalises to another.
+   *
+   * `externalSignal` is an optional caller-owned abort signal that is COMBINED
+   * with the internal timeout via `AbortSignal.any`. It exists so the
+   * error-reporting path in `main.ts` can give the apology its OWN deadline —
+   * not the 15s default, not anything inherited from the turn — so a turn that
+   * dies and a BlueBubbles that hangs in the same minute cannot both fail at
+   * the same instant. See issue #34.
    */
   private async call(
     path: string,
     init?: RequestInit,
     timeoutMs?: number,
+    externalSignal?: AbortSignal,
   ): Promise<{ status: number; body: unknown }> {
+    const internal = AbortSignal.timeout(timeoutMs ?? this.timeoutMs);
+    // 🔴 `AbortSignal.any([internal, externalSignal])`, NOT `init.signal`. A caller
+    // who passes its own signal needs it honoured on top of OUR timeout, not
+    // overridden by it. The spread above would have lost it silently otherwise —
+    // exactly the cascading-failure shape issue #34 is about.
+    const signal = externalSignal ? AbortSignal.any([internal, externalSignal]) : internal;
     const res = await this.fetchImpl(this.url(path), {
       ...init,
-      signal: AbortSignal.timeout(timeoutMs ?? this.timeoutMs),
+      signal,
       headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     });
     let body: unknown = null;
@@ -462,7 +476,7 @@ export class BlueBubblesClient {
    * server's 120s wall — the point is not to wait it out, it is that aborting at
    * the ordinary 15s would make every slow-but-fine reply look like a failure.
    */
-  async sendText(to: string, text: string, replyToGuid?: string | null): Promise<SendResult> {
+  async sendText(to: string, text: string, replyToGuid?: string | null, signal?: AbortSignal): Promise<SendResult> {
     const anchored = typeof replyToGuid === 'string' && replyToGuid.length > 0;
     const { status, body } = await this.call(
       '/message/text',
@@ -476,6 +490,7 @@ export class BlueBubblesClient {
         }),
       },
       anchored ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS : undefined,
+      signal,
     );
     if (status >= 400) {
       return {
