@@ -293,6 +293,75 @@ test('🔴 every outbound request carries a timeout', async () => {
   for (const call of calls) assert.equal(call.hasSignal, true, `${call.url} had no AbortSignal`);
 });
 
+test('🔴 sendText honours an explicit timeout — the failure-reply path relies on this', async () => {
+  /**
+   * Issue #26: the failure-reply send used the same 15s default as a normal
+   * reply, and on a slow BlueBubbles that timeout fired before the apology
+   * reached the sender. The fix plumbs an explicit timeout from `main.ts`
+   * through `sendText`; this asserts the value the caller passed is what the
+   * underlying signal uses, NOT some silently overridden default.
+   *
+   * The check is structural: capture the signal, wait past the requested
+   * timeout, observe that it aborted. A test that only reads `hasSignal` would
+   * pass against a hard-coded 15s budget and miss the regression entirely.
+   */
+  let captured: AbortSignal | undefined;
+  const impl: FetchImpl = async (_url, init) => {
+    captured = init?.signal ?? undefined;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { guid: 'g' } }),
+      text: async () => '',
+    } as Response;
+  };
+  const c = new BlueBubblesClient({
+    baseUrl: 'http://bb.invalid:1234',
+    password: 'pw',
+    fetchImpl: impl,
+    // Tiny default — the override has to be the larger value that actually
+    // wins, not the default masquerading as one.
+    timeoutMs: 100,
+  });
+
+  // Anchor it so the default path would pick 30s; an override of 250 must
+  // still beat both.
+  await c.sendText('+1555', 'hi', 'some-guid', 250);
+  const signal = captured;
+  assert.ok(signal, 'sendText did not pass an AbortSignal through');
+  assert.equal(signal.aborted, false, 'a 250ms override must not have fired yet');
+  await new Promise((r) => setTimeout(r, 350));
+  assert.equal(signal.aborted, true, 'the 250ms override did not drive the AbortSignal — the default won');
+});
+
+test('🔴 sendText without an explicit timeout falls back to the per-call default', async () => {
+  // Without this the override path above is just "the new code happens to
+  // work": a regression that drops the override still leaves every other
+  // test green, because none of them exercises the FALLBACK. Pin it.
+  let captured: AbortSignal | undefined;
+  const impl: FetchImpl = async (_url, init) => {
+    captured = init?.signal ?? undefined;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { guid: 'g' } }),
+      text: async () => '',
+    } as Response;
+  };
+  const c = new BlueBubblesClient({
+    baseUrl: 'http://bb.invalid:1234',
+    password: 'pw',
+    fetchImpl: impl,
+    timeoutMs: 200,
+  });
+  await c.sendText('+1555', 'hi');
+  const signal = captured;
+  assert.ok(signal);
+  assert.equal(signal.aborted, false);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(signal.aborted, true, 'the default 200ms budget did not drive the signal');
+});
+
 test('the password is sent as a query param and never in the body', async () => {
   const { impl, calls } = scripted(() => ({ body: { data: { guid: 'g' } } }));
   await client(impl).sendText('+1555', 'hi');

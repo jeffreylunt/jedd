@@ -363,7 +363,12 @@ export class BlueBubblesConnector implements Connector {
    * `null` is never `false`. iMessage acquires delivery on ACK, so treating the
    * first few hundred milliseconds as failure would revoke every working invite.
    */
-  async sendReporting(toHandle: string, text: string, inReplyTo?: string): Promise<SendOutcome> {
+  async sendReporting(
+    toHandle: string,
+    text: string,
+    inReplyTo?: string,
+    timeoutMs?: number,
+  ): Promise<SendOutcome> {
     // 🔴 The gate is HERE, above the transport, not in the agent and not in the
     // prompt. A suppressed reply must be unable to reach `sendText` even if
     // every layer above it decided to answer.
@@ -391,7 +396,7 @@ export class BlueBubblesConnector implements Connector {
     };
 
     try {
-      const r = await this.client.sendText(toHandle, text, decision.replyTo);
+      const r = await this.client.sendText(toHandle, text, decision.replyTo, timeoutMs);
       if (r.accepted) {
         this.threading?.answered(toHandle, inReplyTo);
         return {
@@ -514,9 +519,19 @@ export class BlueBubblesConnector implements Connector {
    * ⚠️ Delegates to `sendReporting` rather than reimplementing the gate. Two send
    * paths would be two places for the audience check to drift, and the drift
    * would be invisible: each path is individually plausible.
+   *
+   * `timeoutMs`, when present, overrides the per-call default (15s plain / 30s
+   * anchored). Used by the failure-reply path in `main.ts` so the apology gets a
+   * dedicated, detached budget independent of any state that aborted the turn.
    */
-  async send(toHandle: string, text: string, inReplyTo?: string, record?: SendRecord): Promise<void> {
-    const r = await this.sendReporting(toHandle, text, inReplyTo);
+  async send(
+    toHandle: string,
+    text: string,
+    inReplyTo?: string,
+    record?: SendRecord,
+    timeoutMs?: number,
+  ): Promise<void> {
+    const r = await this.sendReporting(toHandle, text, inReplyTo, timeoutMs);
     /**
      * 🔴 FILLED BEFORE THE THROW, NOT AFTER.
      *
@@ -580,7 +595,13 @@ export class ShadowConnector implements Connector {
 
   constructor(private readonly receiver: BlueBubblesReceiver) {}
 
-  async send(toHandle: string, text: string, _inReplyTo?: string, _record?: SendRecord): Promise<void> {
+  async send(
+    toHandle: string,
+    text: string,
+    _inReplyTo?: string,
+    _record?: SendRecord,
+    _timeoutMs?: number,
+  ): Promise<void> {
     throw new Error(
       `shadow mode: this connector cannot send (refused ${text.length} chars to ${toHandle}). It ` +
         'holds no BlueBubbles client, so this is not a disabled feature — there is no send path ' +
