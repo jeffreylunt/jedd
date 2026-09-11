@@ -194,6 +194,24 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.match(res.content, /NOT\s+"no channels are working"/);
 });
 
+test('🔴 a missing results file points the operator at the cron/timer on hp, not at jedd-v2', async () => {
+  /**
+   * Issue #47: the user got "could not read /tmp/check-streams-results.txt on hp:
+   * exit_code=1" and had no actionable next step. The file is missing because the
+   * PRODUCER (the stream-checker cron/systemd timer on hp) is missing — that is
+   * what to check, not jedd-v2's read.
+   *
+   * Without this hint, the operator stares at exit_code=1 and concludes the bot
+   * is broken when the bot is fine and the homelab cron is what stopped.
+   */
+  const { impl } = execStub(MTIME, { resultsExit: 1 });
+  const res = await channelHealth.run({}, ctx(impl));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /stream-checker script on hp/);
+  assert.match(res.content, /cron job or systemd timer/);
+  assert.match(res.content, /`crontab -l`/);
+});
+
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
   const { impl } = execStub(MTIME + HOUR, { rosterExit: 1 });
   const res = await channelHealth.run({}, ctx(impl));
