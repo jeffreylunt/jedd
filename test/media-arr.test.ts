@@ -150,6 +150,38 @@ test('the api key travels as a header, and every call is bounded', async () => {
   assert.ok(init?.signal, 'every arr call must carry a timeout');
 });
 
+test('🔴 ARR_TIMEOUT_MS flows into the AbortSignal timeout (issue #19)', async () => {
+  // The 2026-08-31 incident: a 20s timeout was the right ceiling for ONE slow
+  // call against an arr that answered eventually, but it was the WRONG ceiling
+  // for an arr that was simply not there — and the operator had no knob to
+  // shorten it without a source edit. `ARR_TIMEOUT_MS` is the knob, and this
+  // pins that the value actually drives the AbortSignal, not a hardcoded 20s.
+  //
+  // The cheapest real assertion is to set timeoutMs LOW, hand a fetchImpl
+  // that hangs past it, and watch the call come back as the same
+  // TimeoutError the original incident produced. 50ms keeps the test well
+  // under a second on any machine.
+  let signal: AbortSignal | undefined;
+  const c = new ArrClient(
+    {
+      baseUrl: 'http://hp.invalid:8989/sonarr/api/v3',
+      apiKey: 'k',
+      timeoutMs: 50,
+      fetchImpl: async (_u, i) => {
+        signal = i?.signal as AbortSignal | undefined;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+      },
+    },
+    'series',
+  );
+  const r = await c.catalogue('dune');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /could not reach|cancel|abort/i, 'a low ARR_TIMEOUT_MS must surface as a transport failure the breaker can short-circuit');
+});
+
 test('radarr uses the movie endpoints', async () => {
   const urls: string[] = [];
   await new ArrClient(
