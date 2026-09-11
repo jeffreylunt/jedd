@@ -596,3 +596,108 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE FAILURE NOTIFICATION HAS ITS OWN CLOCK — independent of the turn's,
+// short, and not anchored. The defect this exists for (issue #30) is two
+// turns within 24h, each timing out at the LLM level and then timing out
+// again on the apology send, leaving the sender with NOTHING.
+//
+// A behavioural test of the catch block is impossible here: it lives inside
+// `main()`, which has stood up BlueBubbles, Ollama, IRC, IMAP and two SSH
+// identities before becoming reachable. A source scan is what we have.
+// ──────────────────────────────────────────────────────────────────────────
+
+test('🔴 the failure notification is RACED against its OWN short timeout, not the turn-level one', async () => {
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  /**
+   * The constant must exist and be SHORT. A "short timeout" that is anywhere
+   * near `TURN_TIMEOUT_MS` (900s) is the silence the [notice] banner promises
+   * to prevent, with extra steps. The whole reason this catch is raced at
+   * all is that the turn's budget is too long to wait — so the racing
+   * timer has to be visibly a different number, visibly smaller.
+   */
+  const decl = main.match(/const\s+FAILURE_NOTIFY_TIMEOUT_MS\s*=\s*(\d+)/);
+  assert.ok(decl, 'FAILURE_NOTIFY_TIMEOUT_MS is not declared at module scope');
+  const value = Number(decl![1]);
+  assert.ok(
+    value > 0 && value <= 30_000,
+    `the racing timeout must be a positive number of ms no greater than 30_000 (got ${value})`,
+  );
+  assert.ok(
+    value < 900_000,
+    `the racing timeout must NOT approach TURN_TIMEOUT_MS — the whole reason it exists is that the turn budget is too long to wait`,
+  );
+
+  /**
+   * The catch block must wrap the send in `Promise.race` against a setTimeout
+   * whose delay references the constant — not the turn's timer, not a literal,
+   * not a hard-coded 900_000. A literal that happens to be small would pass
+   * the upper-bound check above and still drift away from the named knob the
+   * first time somebody raises the constant.
+   *
+   * Matched with `[\s\S]*?` because the structure spans many lines; anchored
+   * at the `Promise.race` opening and the second occurrence of the constant
+   * (the racing setTimeout's delay), with the failure notification's
+   * `connector.send(... failureReply(e) ...)` between them. A control test
+   * below checks the success-path reply is untouched.
+   */
+  assert.match(
+    main,
+    /Promise\.race\(\s*\[[\s\S]*?connector\.send\([\s\S]*?failureReply\(e\)[\s\S]*?new Promise[\s\S]*?FAILURE_NOTIFY_TIMEOUT_MS/,
+    'the catch must race the failure notification against a Promise that uses FAILURE_NOTIFY_TIMEOUT_MS',
+  );
+});
+
+test('🔴 the failure notification does NOT pass sourceGuid — the anchored send path is the slow one', async () => {
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+
+  /**
+   * Locate the body of the catch — from `const handleBurst` to the
+   * `🔴 EVERY INBOUND MESSAGE` banner, the same slice the disarming test
+   * uses. The catch is inside this slice; nothing outside it should be
+   * matched.
+   */
+  const body = main.slice(main.indexOf('const handleBurst ='), main.indexOf('🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE'));
+  assert.ok(body.length > 0, 'the turn body could not be located — this scan is now measuring nothing');
+
+  /**
+   * Find the failure notification's send call specifically — the one that
+   * sits next to `failureReply(e)`. The earlier `connector.send(... r.replyText ...)`
+   * lives in the success path and correctly uses `message.sourceGuid`.
+   */
+  const failureSend = body.match(/connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)([^)]*)\)/);
+  assert.ok(failureSend, 'the failure notification send could not be located — this scan is measuring nothing');
+
+  /**
+   * The trailing group is the THIRD argument (if any). A passing `message.sourceGuid`
+   * here routes the apology through BlueBubbles' Private API on a 30s ceiling
+   * — exactly the slow path that produced the silence this test exists to
+   * prevent. Anchoring an apology to the message the turn died on serves no
+   * purpose; it costs the only thing the catch has, which is time.
+   */
+  assert.equal(
+    failureSend![1]?.trim() ?? '',
+    '',
+    'the failure notification must NOT pass message.sourceGuid — anchoring routes it through the slow Private API path',
+  );
+});
+
+test('🔴 CONTROL: the success-path reply DOES still anchor to sourceGuid — only the failure notification is plain', async () => {
+  /**
+   * Without this the assertion above passes against a mutation that strips
+   * `message.sourceGuid` from EVERY `connector.send` call, including the
+   * real reply. The two directions must be tested separately or neither
+   * test proves anything: a "must not" without a "must" is indistinguishable
+   * from a "removed everywhere".
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = main.slice(main.indexOf('const handleBurst ='), main.indexOf('🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE'));
+  assert.ok(body.length > 0, 'the turn body could not be located');
+  assert.match(
+    body,
+    /connector\.send\(\s*message\.senderHandle,\s*r\.replyText,\s*message\.sourceGuid,\s*sent\s*\)/,
+    'the success-path reply must still pass sourceGuid — otherwise the test above was matching the wrong call',
+  );
+});
