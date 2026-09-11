@@ -196,6 +196,42 @@ function epoch(line: string | undefined): number | null {
 }
 
 /**
+ * Translate `cat: /tmp/check-streams-results.txt: No such file or directory`
+ * into an operator-actionable note.
+ *
+ * The raw stderr is already on the failure detail (via `renderOutcome`), but
+ * it is buried under `exit_code=1` and `(empty)` lines for stdout, and the
+ * operator's first read is the prefix above. Without this hint, the tool
+ * degrades to UNKNOWN gracefully — and the operator gets no clue which of the
+ * three failure modes in the issue they are facing: the checker is not
+ * running, it writes to a different path, or the file is unreadable.
+ *
+ * Returns an empty string when no recognised pattern matches, so this is a
+ * pure hint on top of the existing UNKNOWN behaviour — it never widens the
+ * failure surface and never narrows what the tool already says.
+ */
+function hintForStreamCheckError(stderr: string): string {
+  const s = stderr.trim();
+  if (!s) return '';
+  if (/No such file or directory/.test(s)) {
+    return (
+      '\nHint: the results file does not exist on hp. Either the stream-checker ' +
+      'pipeline is not running, or it writes to a different path. Verify ' +
+      '`CHECK_STREAMS_RESULTS_PATH` matches the path the checker writes to, ' +
+      'and that the cron/systemd timer on hp is enabled and exiting 0.'
+    );
+  }
+  if (/Permission denied/.test(s)) {
+    return (
+      '\nHint: the results file is not readable by the ssh user. The file ' +
+      'must be world-readable, or readable by the user identified by ' +
+      '`HP_SHELL_SSH_HOST`.'
+    );
+  }
+  return '';
+}
+
+/**
  * 🔴 ONE READER, TWO TOOLS. `sports_fixture` JOINS HEALTH ONTO ITS CHANNELS.
  *
  * Jeff: *"if there is more than one channel a game or event is on, the bot should
@@ -231,7 +267,10 @@ export async function readStreamCheck(config: Config, exec?: ExecImpl): Promise<
   const results = await runOnHp(config.shellSshHost, resultsCmd(resultsPath), 30_000, exec);
   if (results.exitCode !== 0) {
     // 🔴 UNREADABLE IS UNKNOWN, NEVER "NO CHANNELS ARE HEALTHY".
-    return { ok: false, detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}` };
+    return {
+      ok: false,
+      detail: `could not read ${resultsPath} on hp: ${renderOutcome(results)}${hintForStreamCheckError(results.stderr)}`,
+    };
   }
   const lines = results.stdout.split('\n');
   const mtime = epoch(lines[0]);
