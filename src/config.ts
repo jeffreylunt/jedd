@@ -90,8 +90,41 @@ export interface Config {
    * gate registration on. The book tools work without it — worse, but they work.
    */
   openLibrary: { baseUrl: string };
-  sonarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
-  radarr: { baseUrl: string; apiKey: string; rootFolder: string; qualityProfileId: number };
+  sonarr: {
+    baseUrl: string;
+    apiKey: string;
+    rootFolder: string;
+    qualityProfileId: number;
+    /**
+     * Per-call timeout in ms. Undefined means `ArrClient`'s built-in 20s — the
+     * 2026-08-31 incident's value, sized for a slow lookup on a LAN.
+     *
+     * 🔴 IT IS CONFIGURABLE FOR THE SAME REASON `LLM_TURN_TIMEOUT_MS` IS. The
+     * 20s was a guess at what a slow Sonarr/Radarr lookup looks like on Jeff's
+     * homelab, and the catalogue_search path timed out against a Radarr that
+     * was simply not there (issue #19). When a value does not fit the next
+     * network, a source edit + rebuild + redeploy is not the answer; the knob
+     * belongs in the environment.
+     *
+     * Absent on purpose here, so a deployment that does not set
+     * `ARR_TIMEOUT_MS` is indistinguishable from one that did not exist before
+     * the knob — the default is preserved and no test asserts otherwise.
+     */
+    timeoutMs?: number;
+  };
+  radarr: {
+    baseUrl: string;
+    apiKey: string;
+    rootFolder: string;
+    qualityProfileId: number;
+    /**
+     * Same field and same rule as `sonarr.timeoutMs`. Both share `ARR_TIMEOUT_MS`
+     * because they share the client and the failure mode: an unreachable service
+     * looks identical on either side, and a per-arr knob would just be two
+     * ways of typing one number.
+     */
+    timeoutMs?: number;
+  };
   bluebubbles: {
     /**
      * 🔴 `:1234` is JEDD (jedd@example.com). `:1235` is Jeff's PERSONAL
@@ -414,6 +447,39 @@ export function parseTurnTimeout(raw: string | undefined): number | undefined {
   return Math.min(MAX_TURN_TIMEOUT_MS, Math.max(MIN_TURN_TIMEOUT_MS, Math.round(n)));
 }
 
+/**
+ * Narrowest value `ARR_TIMEOUT_MS` may take. The breaker from fix #1 already
+ * short-circuits the SECOND and THIRD calls against an unreachable service —
+ * see `cooledDownFor` in `src/media/arr.ts`. Below 1s the FIRST call cannot
+ * reach even a healthy LAN arr on a busy moment, and the breaker never gets
+ * the chance to be the safety net it was added to be.
+ */
+export const MIN_ARR_TIMEOUT_MS = 1_000;
+/** Widest. A 10-minute arr call is already a network problem, not a slow call. */
+export const MAX_ARR_TIMEOUT_MS = 600_000;
+
+/**
+ * `ARR_TIMEOUT_MS` -> ms, or `undefined` to mean "use the client's built-in
+ * 20s".
+ *
+ * Same fall-back-on-garbage discipline as `parseTurnTimeout`. A nonsense
+ * reading here would be a 1ms first call against an arr the breaker was
+ * supposed to protect, and the model would learn "RADARR IS UNREACHABLE" on
+ * every single `catalogue_search` while Radarr was fine — the failure wearing
+ * the wrong coat. See issue #19.
+ *
+ * Out-of-range values are CLAMPED, not refused. Refusing to boot over an arr
+ * timeout would be a worse outage than the slow lookup the knob exists to
+ * shorten.
+ */
+export function parseArrTimeout(raw: string | undefined): number | undefined {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.min(MAX_ARR_TIMEOUT_MS, Math.max(MIN_ARR_TIMEOUT_MS, Math.round(n)));
+}
+
 export function loadConfig(): Config {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
   // A hostname is deployment configuration; `.env` is authoritative and this
@@ -425,6 +491,14 @@ export function loadConfig(): Config {
   // to sail through the inequality check as a "different" host. Trim first.
   const shellSshHost = (process.env.HP_SHELL_SSH_HOST ?? '').trim() || adminSshHost;
   const turnTimeoutMs = parseTurnTimeout(process.env.LLM_TURN_TIMEOUT_MS);
+  /**
+   * Single env var governs both Sonarr and Radarr call timeouts. They share the
+   * `ArrClient`, the default of 20s, and the failure mode (an unreachable LAN
+   * service that the breaker then short-circuits). A per-arr knob would be two
+   * ways of typing one number — and the operator who tuned one would not know
+   * to tune the other.
+   */
+  const arrTimeoutMs = parseArrTimeout(process.env.ARR_TIMEOUT_MS);
   return {
     ownerHandle: required('OWNER_HANDLE'),
     shellSshHost,
@@ -467,6 +541,8 @@ export function loadConfig(): Config {
        */
       rootFolder: process.env.SONARR_ROOT_FOLDER ?? '/media/tv',
       qualityProfileId: Number(process.env.SONARR_QUALITY_PROFILE_ID ?? 1),
+      // Absent when ARR_TIMEOUT_MS is unset — `ArrClient` falls back to 20s.
+      ...(arrTimeoutMs === undefined ? {} : { timeoutMs: arrTimeoutMs }),
     },
     radarr: {
       baseUrl: process.env.RADARR_URL ?? 'http://10.0.0.10:7878/radarr/api/v3',
@@ -475,6 +551,7 @@ export function loadConfig(): Config {
       // SILENTLY into the wrong folder rather than erroring.
       rootFolder: process.env.RADARR_ROOT_FOLDER ?? '/media/movies',
       qualityProfileId: Number(process.env.RADARR_QUALITY_PROFILE_ID ?? 1),
+      ...(arrTimeoutMs === undefined ? {} : { timeoutMs: arrTimeoutMs }),
     },
     bluebubbles: {
       baseUrl: process.env.BLUEBUBBLES_URL ?? 'http://127.0.0.1:1234',

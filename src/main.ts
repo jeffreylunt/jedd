@@ -556,6 +556,24 @@ async function main(): Promise<void> {
       `${config.llm.turnTimeoutMs === undefined ? ' (built-in default; LLM_TURN_TIMEOUT_MS unset or unparseable)' : ' (from LLM_TURN_TIMEOUT_MS)'}` +
       `; a turn may make up to ${MAX_STEPS} of them.`,
   );
+  /**
+   * 🔴 SAME ARGUMENT AS THE LLM LINE ABOVE. `ARR_TIMEOUT_MS` falls back on
+   * anything unparseable, so `ARR_TIMEOUT_MS=20s` (string with a unit) would
+   * silently run at 20s while looking configured. Without this line the only
+   * signal that the knob took effect is a Radarr timeout at an unusual number,
+   * and nobody connects that to the env var they set. See issue #19.
+   *
+   * Both sides share `ARR_TIMEOUT_MS`, so reading one is enough to know what
+   * the other is doing — but the assertion is on the FIELD, not on the value
+   * being equal: an operator who edits one of `Config.sonarr.timeoutMs` and
+   * forgets the other would still see this line announce the truth.
+   */
+  const sonarrTimeout = config.sonarr.timeoutMs;
+  console.error(
+    `[arr] one Sonarr/Radarr call may run ${sonarrTimeout ?? 20_000}ms` +
+      `${sonarrTimeout === undefined ? ' (built-in default; ARR_TIMEOUT_MS unset or unparseable)' : ' (from ARR_TIMEOUT_MS)'}` +
+      `. The fail-fast breaker short-circuits subsequent calls for 30s after one transport failure.`,
+  );
 
   /**
    * The whole batch answered by one turn.
