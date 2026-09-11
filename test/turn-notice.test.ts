@@ -1,15 +1,20 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
+  FAILURE_REPORT_TIMEOUT_MS,
   failureReply,
   isModelTimeout,
   MAX_NOTICES,
   ModelTimeoutError,
-  StillWorkingNotice,
   parseStillWorkingMs,
+  reportFailure,
+  StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
   stillWorkingText,
   type TimerSeam,
@@ -595,4 +600,233 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
     'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
       'restarts the clock at zero — the exact case this is for',
   );
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE APOLOGY: send with an independent short budget, and never lose the text — issue #25
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A `TimerSeam` that the tests advance by hand, so a slow connector can race
+ * a real timeout without anything waiting on a real timer. Same shape as
+ * `fakeTimers` above but exposed with `clear` semantics matching what
+ * `reportFailure` injects (it stores the handle and clears it on the
+ * `finally`).
+ */
+function raceTimers(): TimerSeam & {
+  advance: (ms: number) => void;
+  pending: () => number;
+  fireLast: () => void;
+} {
+  let next = 1;
+  const scheduled = new Map<number, { fn: () => void; at: number }>();
+  let now = 0;
+  return {
+    set(fn, ms) {
+      const id = next++;
+      scheduled.set(id, { fn, at: now + ms });
+      return id;
+    },
+    clear(handle) {
+      if (typeof handle === 'number') scheduled.delete(handle);
+    },
+    advance(ms) {
+      now += ms;
+      // Snapshot — a fired callback may schedule another, and that one must
+      // not fire in the same tick just because the map grew under us.
+      for (const [id, s] of [...scheduled.entries()]) {
+        if (s.at <= now) {
+          scheduled.delete(id);
+          s.fn();
+        }
+      }
+    },
+    pending: () => scheduled.size,
+    fireLast() {
+      const last = [...scheduled.entries()].pop();
+      if (!last) return;
+      scheduled.delete(last[0]);
+      last[1].fn();
+    },
+  };
+}
+
+function tmpSpool(): string {
+  return join(mkdtempSync(join(tmpdir(), 'jedd-fail-')), 'spool.jsonl');
+}
+
+test('🔴 a successful apology send logs nothing and writes nothing to the spool', async () => {
+  const timers = raceTimers();
+  const logged: string[] = [];
+  const sent: { handle: string; text: string; guid?: string }[] = [];
+
+  await reportFailure('+15551234567', 'the apology text', 'guid-1', 7, {
+    send: async (handle, text, guid) => {
+      sent.push({ handle, text, guid });
+    },
+    spoolPath: tmpSpool(),
+    log: (l) => logged.push(l),
+    setTimer: timers.set,
+    clearTimer: timers.clear,
+  });
+
+  assert.equal(sent.length, 1, 'the apology reaches the connector once');
+  assert.deepEqual(sent[0], { handle: '+15551234567', text: 'the apology text', guid: 'guid-1' });
+  assert.deepEqual(logged, [], 'a delivered apology adds nothing to the log');
+  assert.equal(timers.pending(), 0, 'and clears the race timer even on success');
+});
+
+test('🔴 a connector that throws is logged AND spooled — operator can recover the apology text', async () => {
+  const timers = raceTimers();
+  const logged: string[] = [];
+  const spoolPath = tmpSpool();
+
+  await reportFailure('+15551234567', 'the apology text', 'guid-1', 7, {
+    send: async () => {
+      throw new Error('BlueBubbles refused the send (http 500)');
+    },
+    spoolPath,
+    log: (l) => logged.push(l),
+    setTimer: timers.set,
+    clearTimer: timers.clear,
+  });
+
+  assert.equal(logged.length, 1, 'the failure is logged exactly once');
+  assert.match(logged[0]!, /turn 7/, 'the log names the turn');
+  assert.match(logged[0]!, /could not even report the failure/, 'and the same word as before');
+  assert.match(logged[0]!, /BlueBubbles refused the send/, 'and the underlying error message');
+  assert.match(logged[0]!, /\(send threw\)/, 'and tags it as a thrown send, distinct from a raced-out one');
+
+  const lines = readFileSync(spoolPath, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1, 'one spool line per dropped apology');
+  const record = JSON.parse(lines[0]!);
+  assert.equal(record.handle, '+15551234567');
+  assert.equal(record.text, 'the apology text', 'the spool preserves the apology text — the operator can re-deliver');
+  assert.equal(record.sourceGuid, 'guid-1');
+  assert.equal(record.turn, 7);
+  assert.match(record.sendError, /BlueBubbles refused/);
+  assert.equal(record.racedOut, false, 'a thrown error is not a raced-out one');
+  assert.match(record.ts, /^\d{4}-\d{2}-\d{2}T/, 'and carries an ISO timestamp');
+});
+
+test('🔴 a slow connector is caught by the race, not by its own transport timeout — issue #25', async () => {
+  /**
+   * The defect being closed: the apology timed out on the SAME upstream that
+   * killed the model call, with no user-visible text. Here the connector's
+   * `send` never resolves (simulating a hung BlueBubbles) and the race timer
+   * fires at the small independent budget instead.
+   */
+  const timers = raceTimers();
+  const logged: string[] = [];
+  const spoolPath = tmpSpool();
+  let sendStarted = false;
+
+  const pending = reportFailure('+15551234567', 'the apology text', 'guid-1', 7, {
+    send: () =>
+      new Promise<void>(() => {
+        sendStarted = true;
+      }),
+    spoolPath,
+    log: (l) => logged.push(l),
+    setTimer: timers.set,
+    clearTimer: timers.clear,
+    timeoutMs: 250,
+  });
+
+  assert.equal(sendStarted, true, 'the connector was called');
+  assert.equal(timers.pending(), 1, 'the race timer is armed');
+
+  // Fire the race timer. The send promise is still pending in the background
+  // — exactly what happens in production with a hung BlueBubbles.
+  timers.advance(250);
+  await pending;
+
+  assert.equal(logged.length, 1, 'a single failure line');
+  assert.match(logged[0]!, /raced-out after 250ms/, 'the log names the budget, not the upstream error');
+  assert.match(logged[0]!, /turn 7/);
+
+  const lines = readFileSync(spoolPath, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1);
+  const record = JSON.parse(lines[0]!);
+  assert.equal(record.racedOut, true, 'racedOut distinguishes a hung upstream from a thrown one');
+  assert.equal(record.text, 'the apology text');
+  assert.match(record.sendError, /250ms budget/);
+});
+
+test('🔴 CONTROL: a send that succeeds fast never starts the race timer', async () => {
+  /**
+   * Without this control, a `setTimer`/`clearTimer` pair that was wired but
+   * never reached (because the send won) would look like the race working
+   * when the race was never exercised.
+   */
+  const timers = raceTimers();
+  await reportFailure('h', 't', undefined, 1, {
+    send: async () => undefined,
+    spoolPath: tmpSpool(),
+    log: () => undefined,
+    setTimer: timers.set,
+    clearTimer: timers.clear,
+  });
+  assert.equal(timers.pending(), 0, 'the race timer was either never armed or already cleared');
+});
+
+test('🔴 a spool write failure is logged and swallowed — reportFailure NEVER throws', async () => {
+  /**
+   * `reportFailure` is called from a catch whose own contract is "the next
+   * message must still be handled". A `reportFailure` that threw on a full
+   * disk / read-only mount would defeat that wrapper on the one path where
+   * the caller is most counting on it.
+   */
+  const timers = raceTimers();
+  const logged: string[] = [];
+
+  // Point the spool at a path that cannot be written: a directory whose name
+  // is taken by a regular file. `appendFileSync` will throw EISDIR/ENOTDIR,
+  // and `reportFailure` must swallow it.
+  const blocked = join(mkdtempSync(join(tmpdir(), 'jedd-fail-block-')), 'not-a-dir');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(blocked, '', 'utf8');
+  // `blocked` is now a regular file. `appendFileSync(blocked + '/x', …)` throws.
+
+  let threw = false;
+  try {
+    await reportFailure('+15551234567', 'the apology text', 'guid-1', 7, {
+      send: async () => {
+        throw new Error('send failed');
+      },
+      spoolPath: `${blocked}/x/spool.jsonl`,
+      log: (l) => logged.push(l),
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+    });
+  } catch {
+    threw = true;
+  }
+  assert.equal(threw, false, 'a spool write failure must not propagate');
+
+  const sawSpoolFail = logged.some((l) => /also failed to spool/.test(l));
+  assert.ok(sawSpoolFail, 'the spool failure is logged so the operator sees it');
+  assert.ok(
+    logged.some((l) => /could not even report the failure/.test(l)),
+    'the original "could not even report" line still fires — only the spool write is added',
+  );
+});
+
+test('🔴 the shipped turn catch calls reportFailure, not the silent log line', async () => {
+  /**
+   * Wiring scan in the same style as the others in this file. The catch
+   * block in `main.ts` must now invoke `reportFailure` for the apology —
+   * replacing the bare `console.error` whose only output was the same line
+   * issue #25 reports seeing twice on the same turn.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /reportFailure\(\s*message\.senderHandle/,
+    'the turn catch no longer wires up reportFailure — issue #25 regression',
+  );
+  // The bare log line should no longer be the only thing the catch does.
+  // It is allowed to exist (e.g. in a comment), but as a live statement the
+  // catch delegates to reportFailure now.
+  assert.match(main, /FAILED_REPLIES_SPOOL/);
 });

@@ -1,3 +1,5 @@
+import { appendFileSync } from 'node:fs';
+
 /**
  * ══════════════════════════════════════════════════════════════════════════
  * A TURN THAT IS SLOW OR DEAD HAS TO SAY SO. SILENCE IS NOT AN ANSWER.
@@ -343,5 +345,162 @@ export class StillWorkingNotice {
         .notify(stillWorkingText(index))
         .catch((e) => this.log(`[notice] a "still working" note could not be sent: ${(e as Error).message}`));
     }, gapMs);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// THE APOLOGY MUST REACH DISK EVEN WHEN IT CANNOT REACH THE PHONE — issue #25
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The independent budget for the failure-report send.
+ *
+ * ── 🔴 SEPARATE FROM BLUEBUBBLES' OWN TIMEOUT, AND SHORTER THAN IT. ──────────
+ *
+ * `BlueBubblesConnector.send` uses the transport-level timeout (default 15s,
+ * see `client.ts`). When the original turn timed out — Ollama, network, or the
+ * upstream shared with BlueBubbles was slow — issue #25 reports two distinct
+ * turn-1 events in 24 hours where the apology then timed out on the SAME
+ * upstream at the SAME 15s ceiling, with no user-visible text and no
+ * operator-visible trail beyond one log line per event.
+ *
+ * Racing the apology against a short, independent budget here means a degraded
+ * upstream fails fast (10s) and the catch below writes a spool entry rather
+ * than losing the apology AND its post-mortem. 10s is generous for a healthy
+ * BlueBubbles plain send (~1–2s typical) but well below the 15s transport
+ * timeout, so a hung BlueBubbles is caught HERE first — which is the entire
+ * point of the separate budget.
+ *
+ * ⚠️ THIS NUMBER CHANGES THE USER'S FAILURE EXPERIENCE BY ZERO. On a healthy
+ * send the race resolves on the connector path long before 10s; on a degraded
+ * upstream the race saves the user from waiting the rest of the transport
+ * budget for an apology that would also have failed. It changes the OPERATOR's
+ * experience: there is now a spool line instead of "could not even report the
+ * failure" with no trail.
+ */
+export const FAILURE_REPORT_TIMEOUT_MS = 10_000;
+
+/**
+ * What gets written to the spool when even the raced send fails. JSONL so a
+ * `jq` over the file says who got dropped on which day without a parser.
+ */
+export interface FailureRecord {
+  ts: string;
+  turn: number;
+  handle: string;
+  sourceGuid?: string;
+  text: string;
+  sendError: string;
+  /**
+   * True when the failure was caught by THIS module's own budget, not by
+   * the connector throwing — i.e. the connector is presumed to still be
+   * hanging. Distinct from a thrown error because the operator's first
+   * diagnostic question ("is the upstream up?") has a different answer.
+   */
+  racedOut: boolean;
+}
+
+/** Dependencies `reportFailure` takes by name so tests can stub them. */
+export interface ReportFailureDeps {
+  /** The connector's own send — `BlueBubblesConnector.send` in production. */
+  send: (handle: string, text: string, sourceGuid?: string) => Promise<void>;
+  /** Path of the spool file. Caller picks it (production = `data/failed-replies.jsonl`). */
+  spoolPath: string;
+  /** Override the default `FAILURE_REPORT_TIMEOUT_MS`. */
+  timeoutMs?: number;
+  /** Optional logger; defaults to `console.error`. */
+  log?: (line: string) => void;
+  /**
+   * Clock for the race — tests inject `setTimeout`/`clearTimeout`. Defaults
+   * to the real pair so production does not need a seam.
+   */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+}
+
+/**
+ * Send the apology with an independent short budget, and spool a JSONL record
+ * to disk when the apology itself fails.
+ *
+ * ── 🔴 WHY THIS IS A SEPARATE FUNCTION ──────────────────────────────────────
+ *
+ * The catch block that calls this lives inside `main()`, which stands up
+ * BlueBubbles, Ollama, IRC, IMAP and two SSH identities before it is reachable
+ * — so the catch itself cannot be unit-tested in place, the same argument
+ * `failureReply` made for pulling the sentence out. Putting the race and the
+ * spool write HERE gives both the budget and the spool a seam a test can hold,
+ * and lets `main.ts` stay at one line of apology wiring.
+ *
+ * ── NEVER THROWS. ──
+ *
+ * This is called from a catch block whose own contract is "the next message
+ * must still be handled". A `reportFailure` that threw would defeat the
+ * `try { connector.send(...) } catch { reportFailure(...) }` wrapper above it.
+ * Every failure path — connector throws, race fires, spool write fails — is
+ * logged and swallowed.
+ */
+export async function reportFailure(
+  handle: string,
+  text: string,
+  sourceGuid: string | undefined,
+  turn: number,
+  deps: ReportFailureDeps,
+): Promise<void> {
+  const log = deps.log ?? ((l) => console.error(l));
+  const setT = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+  const clearT = deps.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  const timeoutMs = deps.timeoutMs ?? FAILURE_REPORT_TIMEOUT_MS;
+
+  let racedOut = false;
+  let sendError: Error | null = null;
+  let timer: unknown = null;
+
+  try {
+    await Promise.race([
+      deps.send(handle, text, sourceGuid),
+      new Promise<never>((_, reject) => {
+        timer = setT(() => {
+          racedOut = true;
+          reject(new Error(`failure-report send hit its own ${timeoutMs}ms budget`));
+        }, timeoutMs);
+      }),
+    ]);
+  } catch (e) {
+    sendError = e as Error;
+  } finally {
+    if (timer !== null) clearT(timer);
+  }
+
+  if (!sendError) return;
+
+  const detail = racedOut ? `raced-out after ${timeoutMs}ms` : 'send threw';
+  log(`[jedd] turn ${turn} could not even report the failure: ${sendError.message} (${detail})`);
+
+  /**
+   * 🔴 SPOOL AFTER LOG, NOT BEFORE. A log-only trail is what we have today and
+   * is what produced the report — `data/jedd.log` shows the line, and an
+   * operator with the file in hand has no way to recover the apology text or
+   * who it was meant for. The spool makes the same evidence answerable:
+   * "could not even report" plus a JSONL entry saying WHICH apology text was
+   * dropped to WHICH handle on WHICH turn.
+   *
+   * ⚠️ The spool write is itself wrapped: a full disk, a read-only mount, a
+   * bad path must NOT turn a logged failure into a thrown one — this function
+   * promises never to throw, and a spool-write throw would break that
+   * contract on the only path where the catch caller is most counting on it.
+   */
+  try {
+    const record: FailureRecord = {
+      ts: new Date().toISOString(),
+      turn,
+      handle,
+      sourceGuid,
+      text,
+      sendError: sendError.message,
+      racedOut,
+    };
+    appendFileSync(deps.spoolPath, `${JSON.stringify(record)}\n`, 'utf8');
+  } catch (spoolErr) {
+    log(`[jedd] turn ${turn} also failed to spool the failure: ${(spoolErr as Error).message}`);
   }
 }

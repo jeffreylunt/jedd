@@ -18,6 +18,7 @@ import {
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
+  reportFailure,
   StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
 } from './turn-notice.js';
@@ -70,6 +71,22 @@ function recordTurn(record: TurnRecord): void {
   mkdirSync(DATA_DIR, { recursive: true });
   appendFileSync(`${DATA_DIR}audit.jsonl`, `${JSON.stringify(record)}\n`, 'utf8');
 }
+
+/**
+ * Where `reportFailure` writes a JSONL line when even the raced apology send
+ * cannot reach the phone — see issue #25.
+ *
+ * 🔴 THIS IS THE FILE THAT CLOSES THE "NO USER-VISIBLE ERROR" GAP. Before this
+ * existed, a turn that timed out AND whose apology then timed out on the same
+ * BlueBubbles left the operator with one `[jedd] turn N could not even report
+ * the failure` line in `data/jedd.log` and no way to know WHICH apology text
+ * was dropped or to WHOM. The spool makes that answerable: jq over the file
+ * says `who got dropped on which day` without a parser.
+ *
+ * ⚠️ BIND-MOUNTED, GITIGNORED, AND ONLY WRITTEN. Read only by the operator;
+ * no code path depends on its contents. See `.gitignore` and `data/`.
+ */
+const FAILED_REPLIES_SPOOL = `${DATA_DIR}failed-replies.jsonl`;
 
 /** How often to look for follow-ups that have come due. */
 const TICK_MS = 60_000;
@@ -823,7 +840,33 @@ async function main(): Promise<void> {
          */
         await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
       } catch (sendErr) {
-        console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+        /**
+         * 🔴 ISSUE #25: A TURN TIMEOUT CANNOT MASK ITS OWN APOLOGY.
+         *
+         * The `try` above used to log the apology failure here and stop, on the
+         * assumption that "could not even report the failure" was rare. It is
+         * not rare: two separate turn-1 events in 24 hours, both with the same
+         * `[jedd] turn 1 THREW` / `[jedd] turn 1 could not even report the
+         * failure` pair, both with the apology timing out on the SAME upstream
+         * that just killed the model call. The user got nothing; the operator
+         * got one log line and no way to recover the apology text or who it
+         * was meant for.
+         *
+         * `reportFailure` runs the same send under an independent short budget
+         * (10s vs BlueBubbles' 15s transport timeout — see
+         * `FAILURE_REPORT_TIMEOUT_MS`) and, when even that fails, writes a
+         * JSONL record to `data/failed-replies.jsonl` so the diagnostic trail
+         * is durable. It NEVER throws: throwing here would break the "next
+         * message still gets handled" contract the outer catch exists for.
+         */
+        await reportFailure(message.senderHandle, failureReply(e), message.sourceGuid, turn, {
+          send: (handle, text, sourceGuid) => connector.send(handle, text, sourceGuid),
+          spoolPath: FAILED_REPLIES_SPOOL,
+          log: (line) => console.error(line),
+        });
+        // `reportFailure` logs the same line (and spools the apology text) when
+        // even its raced send fails. It returns silently on success — the
+        // apology reached the phone and there is nothing further to say.
       }
     } finally {
       /**
