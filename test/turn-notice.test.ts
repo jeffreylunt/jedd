@@ -596,3 +596,69 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
       'restarts the clock at zero — the exact case this is for',
   );
 });
+
+test('🔴 the failure-reporting send is raced against an INDEPENDENT timer, not the inner BlueBubbles one', async () => {
+  /**
+   * Issue #45: the apology send was observed to abort with `aborted due to
+   * timeout` — the same sentence the model call had just produced. The boot
+   * banner says *a turn that dies always sends a message*, and a silent apology
+   * is the failure path that promise most depends on. The catch is already
+   * outside the per-call Ollama `AbortController`, but the send goes through
+   * `BlueBubblesClient.call` whose own 15s `AbortSignal.timeout` is the one
+   * that fired. Racing a fresh, untied timer here is what makes the apology
+   * the second line of defence rather than a louder echo of the first.
+   *
+   * This test asserts the wiring rather than the behaviour because the catch
+   * sits inside `main()`, which stands up BlueBubbles, Ollama, IRC, IMAP and
+   * two SSH identities before it is reachable — the same argument the
+   * `failureReply` test above makes for itself. The promise is structural:
+   * the apology's bound is a number this file names, not whatever the
+   * transport happens to be using.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(
+    main,
+    /FAILURE_REPORT_TIMEOUT_MS\s*=\s*20_000/,
+    'the bound is its own number, not borrowed from the BlueBubbles client',
+  );
+  assert.match(
+    main,
+    /Promise\.race\(\s*\[\s*connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the apology send is raced, not awaited bare — without the race a hung ' +
+      'BlueBubbles silences the apology with the same 15s `aborted due to ' +
+      'timeout` measured live on 2026-09-09',
+  );
+  assert.match(
+    main,
+    /setTimeout\([\s\S]*?FAILURE_REPORT_TIMEOUT_MS\s*,/,
+    'the race timer is driven by the named constant — a literal here would ' +
+      'silently drift against any change to the BlueBubbles timeout',
+  );
+  // And it never reaches into the inner BlueBubbles constructor — that would
+  // couple the apology's bound to a transport implementation detail.
+  assert.doesNotMatch(
+    main,
+    /new\s+AbortSignal\.timeout\([^)]*failure/i,
+    'no ad-hoc `AbortSignal.timeout` was inlined near the failure-report — the named constant is the only path',
+  );
+});
+
+test('🔴 the failure-reporting timeout is ABOVE the inner BlueBubbles timeout, never below', async () => {
+  /**
+   * The default `BlueBubblesClient.timeoutMs` is 15_000. Sizing the apology's
+   * race below that would race the send out under a BlueBubbles that was
+   * about to succeed — the very path where the apology most needs to land.
+   * The catch observes this on the order of `setTimeout(<ms>, …)` call, which
+   * is a structural check: a deliberate re-ordering would have to move the
+   * timer constant past the inner default AND keep it there.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const raceMatch = main.match(/FAILURE_REPORT_TIMEOUT_MS\s*=\s*(\d[\d_]*)/);
+  assert.ok(raceMatch, 'the apology timeout is not a named constant any more');
+  // Captured above by `assert.ok`. Non-null so TS sees the index as defined.
+  const raceMs = Number(raceMatch![1]!.replaceAll('_', ''));
+  assert.ok(raceMs >= 15_000, `the apology timeout (${raceMs}ms) is below the BlueBubbles default (15_000ms) — ` +
+    'a slow-but-alive BlueBubbles would lose on the path where the apology most needs to land');
+  assert.ok(raceMs <= 60_000, `the apology timeout (${raceMs}ms) is large enough to swallow a real failure — ` +
+    'silence past a minute is no longer an apology, it is a stuck turn');
+});
