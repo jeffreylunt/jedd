@@ -16,6 +16,7 @@ import {
 import { BURST_SETTLE_MS, sleep, TurnQueue, type BatchWait } from './turn-queue.js';
 import {
   failureReply,
+  FAILURE_REPLY_TIMEOUT_MS,
   MAX_NOTICES,
   parseStillWorkingMs,
   StillWorkingNotice,
@@ -820,8 +821,38 @@ async function main(): Promise<void> {
          * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
+         *
+         * 🔴 AND THE SEND ITSELF HAS ITS OWN DEADLINE. The turn's model-call
+         * budget lives in `llm.ts` (900s by default) and BlueBubbles applies
+         * its own 15s ceiling inside `client.ts::call`, but neither of those
+         * answers the question this catch needs answered: how long is the
+         * apology ALLOWED to take? Measured live twice on 2026-09-09: when the
+         * transport underneath was already stalled, BlueBubbles' 15s ceiling
+         * fired on the apology too, the sender got NO message at all, and the
+         * boot banner's "a turn that dies always sends a message" held only as
+         * long as the apology's send was healthy. The race below puts a hard
+         * upper bound on THIS catch — shorter than the connector's internal
+         * ceiling, so the deadline is ours and logs as ours — and the rejection
+         * below still names whichever side lost the race, so a future
+         * regression that re-couples the two timeouts is visible in the log
+         * line.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        await Promise.race([
+          connector.send(message.senderHandle, failureReply(e), message.sourceGuid),
+          new Promise<never>((_, reject) => {
+            const handle = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `apology send did not land within ${FAILURE_REPLY_TIMEOUT_MS}ms (send has its own ` +
+                      'deadline, separate from the turn budget and from the transport)',
+                  ),
+                ),
+              FAILURE_REPLY_TIMEOUT_MS,
+            );
+            handle.unref?.();
+          }),
+        ]);
       } catch (sendErr) {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
       }

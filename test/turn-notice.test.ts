@@ -5,6 +5,7 @@ import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
   failureReply,
+  FAILURE_REPLY_TIMEOUT_MS,
   isModelTimeout,
   MAX_NOTICES,
   ModelTimeoutError,
@@ -594,5 +595,133 @@ test('🔴 the notice clock is fed the queue wait, not left at its default', asy
     /notice\.arm\(waited\.queuedForMs\)/,
     'arm() is called without the queue wait, so a message that queued behind a 790s turn ' +
       'restarts the clock at zero — the exact case this is for',
+  );
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE DEATH'S SEND: a turn that died must still send SOMETHING, and its send
+// must not be permitted to die too. Measured twice live 2026-09-09 (#32).
+// ──────────────────────────────────────────────────────────────────────────
+
+test('🔴 FAILURE_REPLY_TIMEOUT_MS exists, is short, and is shorter than the connector ceiling', () => {
+  /**
+   * Sizing is itself the contract: the apology must close out before the next
+   * queued message starts to feel ignored, and a value AT the connector
+   * ceiling would just be re-implementing the bug above it. The two numbers
+   * have to be picked apart to be worth picking at all — and a test that
+   * asserts "this number is N" without asserting "smaller than the connector"
+   * makes the constant feel independent when it is not.
+   */
+  assert.ok(Number.isFinite(FAILURE_REPLY_TIMEOUT_MS), 'the timeout is not a number');
+  assert.ok(
+    FAILURE_REPLY_TIMEOUT_MS >= 1_000,
+    'shorter than 1s and a healthy server cannot clear it — the apology dies, just faster',
+  );
+  /**
+   * BlueBubblesClient uses 15_000ms for ordinary sends (`client.ts::call`), with
+   * anchored sends sized to 30s. A failure-reply timeout AT or above the
+   * ordinary ceiling would not close the live defect — the live defect WAS the
+   * connector ceiling firing. The apology timeout must sit BELOW it so its race
+   * always has a winner and the log names our deadline, not theirs.
+   */
+  assert.ok(
+    FAILURE_REPLY_TIMEOUT_MS < 15_000,
+    `the apology timeout (${FAILURE_REPLY_TIMEOUT_MS}ms) must be below the connector ceiling; ` +
+      'otherwise the live defect ("both timed out at 15s") reproduces and the catch is no shorter than before',
+  );
+});
+
+test('🔴 the shipped catch races the apology send against its own deadline, never awaiting it bare', async () => {
+  /**
+   * Source scan, mirroring the SIGTERM ones elsewhere in the suite: the wiring
+   * of a guarded apology send is what every other test in this file cannot
+   * reach. The defect was `await connector.send(...)` with no outer guard —
+   * a regression to that line leaves every `failureReply` assertion green,
+   * and the only way to catch it is to read the source. This is the test that
+   * has to keep it honest.
+   *
+   * `Promise.race` is required: the alternative ("fire-and-forget with its own
+   * deadline") also closes the defect, but it is `void`-ing and would reorder
+   * the `finally` downstream, which this codebase has stated is not the trade
+   * it wants to make. `Promise.race` keeps the `await` and lets the `finally`
+   * keep its ordering.
+   */
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const body = main.slice(main.indexOf('const handleBurst ='), main.indexOf('🔴 EVERY INBOUND MESSAGE GOES THROUGH THE QUEUE'));
+  assert.ok(body.length > 0, 'the turn body could not be located — this scan is now measuring nothing');
+
+  assert.match(
+    body,
+    /Promise\.race\(\s*\[\s*connector\.send\(\s*message\.senderHandle,\s*failureReply\(e\)/,
+    'the apology send is not wrapped in a race; on a stalled transport the catch hangs on connector.send and the sender is silent',
+  );
+  assert.match(
+    body,
+    /FAILURE_REPLY_TIMEOUT_MS/,
+    'the race never resolves into our own constant — somebody hardcoded a timeout, which is unguarded the day the value changes',
+  );
+
+  /**
+   * CONTROL. Without this, an "assert there is a Promise.race" scan would
+   * happily pass against a race that resolves ONLY when the connector does —
+   * i.e., a race with one-and-a-half participants. The fix is structural; a
+   * bare race is no fix.
+   */
+  assert.match(
+    body,
+    /new Promise<never>\(\s*\(_, reject\)\s*=>\s*\{[^}]*FAILURE_REPLY_TIMEOUT_MS/s,
+    'the race has only the connector on one side — there is no timeout opponent to win',
+  );
+
+  assert.match(
+    body,
+    /could not even report the failure/,
+    'the failure log line is missing; this scan is now measuring nothing',
+  );
+});
+
+test('🔴 a hung connector send cannot hang the catch past FAILURE_REPLY_TIMEOUT_MS', async () => {
+  /**
+   * End-to-end of the apology path, with a connector whose `send` never
+   * resolves. The catch in `main.ts` cannot be exercised without standing up
+   * BlueBubbles, Ollama, IRC, IMAP and two SSH identities first; what CAN be
+   * exercised is the race shape. A `Promise.race` between a forever-pending
+   * promise and a timer-fired rejection is the only practical way to test the
+   * "our deadline always fires" half of the contract from outside `main`.
+   */
+  const startedAt = Date.now();
+  const reason = await new Promise<{ ok: false; kind: 'rejection'; detail: string }>((resolve) => {
+    const handle = setTimeout(
+      () => resolve({ ok: false, kind: 'rejection', detail: `apology send exceeded the test's deadline` }),
+      FAILURE_REPLY_TIMEOUT_MS * 4,
+    );
+    handle.unref?.();
+    Promise.race([
+      new Promise<string>((_r, _j) => {
+        // A connector that NEVER resolves mirrors the live stall.
+      }),
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`apology send did not land within ${FAILURE_REPLY_TIMEOUT_MS}ms`)),
+          FAILURE_REPLY_TIMEOUT_MS,
+        );
+      }),
+    ]).then(
+      () => resolve({ ok: false as const, kind: 'rejection', detail: 'unexpectedly resolved' }),
+      (e: Error) => resolve({ ok: false as const, kind: 'rejection', detail: e.message }),
+    );
+  });
+
+  const elapsed = Date.now() - startedAt;
+  assert.equal(reason.ok, false, 'a hung send + a racing timeout must lose the race to the timeout');
+  assert.match(
+    reason.detail,
+    new RegExp(`${FAILURE_REPLY_TIMEOUT_MS}ms`),
+    'the rejection must name the deadline it lost to, so the log line is actionable',
+  );
+  assert.ok(
+    elapsed < FAILURE_REPLY_TIMEOUT_MS * 2,
+    `the catch returned in ${elapsed}ms; with FAILURE_REPLY_TIMEOUT_MS=${FAILURE_REPLY_TIMEOUT_MS}ms the catch ` +
+      'must close within roughly one deadline, otherwise the next queued message inherits the wait',
   );
 });

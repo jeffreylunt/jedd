@@ -123,6 +123,33 @@ export function failureReply(e: unknown): string {
 }
 
 /**
+ * 🔴 A TURN THAT DIES ALWAYS SENDS A MESSAGE — AND THAT SEND MUST NOT DIE TOO.
+ *
+ * Measured live on 2026-09-09 (issue #32): two consecutive turns (`turn 1`,
+ * `turn 2`) timed out at the model and the apology send itself then timed out
+ * with `The operation was aborted due to timeout`. The catch in `main.ts` did
+ * its job and printed `[jedd] turn N could not even report the failure`, but
+ * the sender's phone got nothing either time. The defect the boot banner
+ * promises to close — "a turn that dies always sends a message" — held only as
+ * long as the apology's send was healthy.
+ *
+ * `STILL_WORKING_AFTER_MS` answers the WAIT (a turn still alive). This one
+ * answers the DEATH (a turn already dead, and the catch is its only chance).
+ * They are not interchangeable: a wait-answer that fires AFTER the death is
+ * silently meaningless, and a death-answer that waits the connector's full 15s
+ * ceiling is exactly the gap measured above.
+ *
+ * Sized to clear a normal round-trip on a healthy server (the apology is a
+ * single BlueBubbles `message/text` call) AND to give up before the next queued
+ * message starts to feel ignored. Sits OUTSIDE the connector's own 15s ceiling
+ * on purpose: that ceiling is what fired in the live incident, so making the
+ * apology wait for it again would not close the gap — and the gap is the whole
+ * defect. Sized to a hair under the connector ceiling so the catch can name its
+ * OWN deadline in the log when the transport is the slow one.
+ */
+export const FAILURE_REPLY_TIMEOUT_MS = 8_000;
+
+/**
  * ── 🔴 240 SECONDS, AND THE NUMBER IS MEASURED, NOT PICKED ───────────────────
  *
  * From the durable log (`data/jedd.log`, 110 completed turns):
