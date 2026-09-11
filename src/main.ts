@@ -18,6 +18,7 @@ import {
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
+  sendFailureWithTimeout,
   StillWorkingNotice,
   STILL_WORKING_AFTER_MS,
 } from './turn-notice.js';
@@ -802,29 +803,43 @@ async function main(): Promise<void> {
        * a handle outside the audience is suppressed here exactly as it is on the
        * success path. This does not become a way to text someone we may not.
        *
-       * ⚠️ And it is itself wrapped: if BlueBubbles is what failed, the apology
-       * cannot be delivered either, and throwing from a catch block would take
-       * out the handler that keeps the NEXT message working.
+       * ⚠️ And its failure is contained. If BlueBubbles is what failed, the
+       * apology cannot be delivered either — and the failure-reply promise is
+       * now fire-and-forget, so a throw from it cannot take out this catch.
+       * The `.catch` below owns the log line; the `.finally` in
+       * `sendFailureWithTimeout` owns the timer. There is no path through here
+       * that does not log what happened, and there is no path through here that
+       * costs the lane a `Promise` anyone is still waiting on.
        */
-      try {
-        /**
-         * 🔴 THE WORDING IS `failureReply`'s, NOT A LITERAL HERE, AND THAT IS
-         * THE POINT OF THE CHANGE.
-         *
-         * A timeout used to be told as a generic "worth trying again in a
-         * moment" — advice that is actively wrong for the failure that produced
-         * it, because asking for the same 14-item list again spends another 900
-         * seconds arriving at the same abort. `failureReply` names the timeout
-         * and asks for a shorter question. It is a pure function in
-         * `turn-notice.ts` precisely so a test can assert on the sentence: this
-         * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
-         * IMAP and two SSH identities before it is reachable, so nothing here is
-         * testable in place.
-         */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
-      } catch (sendErr) {
+      /**
+       * 🔴 THE WORDING IS `failureReply`'s, NOT A LITERAL HERE, AND THAT IS
+       * THE POINT OF THE CHANGE.
+       *
+       * A timeout used to be told as a generic "worth trying again in a
+       * moment" — advice that is actively wrong for the failure that produced
+       * it, because asking for the same 14-item list again spends another 900
+       * seconds arriving at the same abort. `failureReply` names the timeout
+       * and asks for a shorter question. It is a pure function in
+       * `turn-notice.ts` precisely so a test can assert on the sentence: this
+       * catch sits inside `main()`, which stands up BlueBubbles, Ollama, IRC,
+       * IMAP and two SSH identities before it is reachable, so nothing here is
+       * testable in place.
+       *
+       * 🔴 The send is plain (no `message.sourceGuid`), fire-and-forget
+       * (the promise below is `void`'d, not awaited), and bounded by its own
+       * `FAILURE_REPLY_TIMEOUT_MS` (10s — well under BlueBubbles' 15s
+       * ceiling). The reasoning is in `turn-notice.ts`: anchoring routes
+       * through the Private API, which can stall 120s and then 500 — the
+       * exact failure mode this catch is built for — and reusing the turn's
+       * 900s controller inherits the timeout that just killed it.
+       */
+      void sendFailureWithTimeout(
+        (handle, text) => connector.send(handle, text),
+        message.senderHandle,
+        failureReply(e),
+      ).catch((sendErr) => {
         console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
-      }
+      });
     } finally {
       /**
        * 🔴 ONE REPLY ANSWERED ALL OF THEM, SO CLOSE ALL OF THEM — ON EVERY PATH.
@@ -835,12 +850,14 @@ async function main(): Promise<void> {
        * this person got in the meantime.
        *
        * ⚠️ IN A `finally`, NOT AFTER THE SEND. On the success path either place
-       * works. On the FAILURE path — the model throws, or the send throws — only
-       * this one runs, and that is the path most likely to hit it: the apology
-       * sent from the catch above closes `message.sourceGuid` and nothing else,
-       * so every earlier message of a failed burst would be left open. Which is
-       * verbatim the leak this block exists to prevent, armed on exactly the
-       * case nobody tests.
+       * works. On the FAILURE path — the model throws, or the catch's apology
+       * send fails — only this one runs, and that is the path most likely to
+       * hit it. The apology deliberately goes out un-anchored (so its own
+       * `threading.answered` cannot fire on `message.sourceGuid`) and the
+       * catch's send never reaches that call on the throw path. Whichever way
+       * the catch ran, the burst is left open here unless this block closes it
+       * — which is verbatim the leak this block exists to prevent, armed on
+       * exactly the case nobody tests.
        *
        * ⚠️ Inert while `REPLY_THREADING_ENABLED` is false — `threading` is
        * `undefined` then. Written now because the alternative is a landmine that
