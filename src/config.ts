@@ -181,6 +181,18 @@ export interface Config {
     validityHours: number;
   };
   /**
+   * Audiobookshelf admin API — account provisioning via `invite_to_audiobookshelf`.
+   *
+   * ⚠️ Empty `apiKey` means ABS is NOT configured and the tool is **not registered**.
+   * Prefer a non-root admin API key (revocable), never the root JWT in logs/PRs.
+   */
+  audiobookshelf: {
+    baseUrl: string;
+    apiKey: string;
+    /** URL printed in the invite text; defaults to baseUrl. */
+    publicUrl: string;
+  };
+  /**
    * The Movie Database — the only source of "what is popular", which no arr has.
    *
    * ⚠️ `readToken` is the **v4 read access token** (a ~237-character JWT sent as
@@ -345,6 +357,7 @@ export interface Config {
     jellyfin: boolean;
     qbittorrent: boolean;
     dispatcharr: boolean;
+    audiobookshelf: boolean;
   };
   displayName: string;
   /**
@@ -574,6 +587,11 @@ export function loadConfig(): Config {
       profile: process.env.JFAGO_PROFILE ?? 'Default',
       validityHours: Number(process.env.JFAGO_INVITE_HOURS ?? 24),
     },
+    audiobookshelf: {
+      baseUrl: (process.env.ABS_URL ?? '').replace(/\/$/, ''),
+      apiKey: process.env.ABS_API_KEY ?? '',
+      publicUrl: (process.env.ABS_PUBLIC_URL ?? process.env.ABS_URL ?? '').replace(/\/$/, ''),
+    },
     tmdb: { readToken: (process.env.TMDB_READ_TOKEN ?? '').trim() },
     qbittorrent: {
       baseUrl: process.env.QBITTORRENT_URL ?? 'http://172.20.0.1:8080',
@@ -594,6 +612,7 @@ export function loadConfig(): Config {
       radarr: Boolean((process.env.RADARR_API_KEY ?? '').trim()),
       prowlarr: Boolean((process.env.PROWLARR_API_KEY ?? '').trim()),
       jellyfin: Boolean((process.env.JELLYFIN_API_KEY ?? '').trim()),
+      audiobookshelf: Boolean((process.env.ABS_API_KEY ?? '').trim()),
       // 🔴 These two have NON-EMPTY defaults, so the env var is the only honest
       // test of whether anyone configured them.
       qbittorrent: Boolean((process.env.QBITTORRENT_LAN_URL ?? '').trim()),

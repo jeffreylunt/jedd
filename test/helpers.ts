@@ -66,6 +66,11 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       profile: 'Default',
       validityHours: 24,
     },
+    audiobookshelf: {
+      baseUrl: 'http://abs.invalid:13378',
+      apiKey: 'test-abs-key',
+      publicUrl: 'http://abs.invalid:13378',
+    },
     readOnly: true,
     // ⚠️ A TEMP PATH, NEVER the real backup directory. A test that exercised
     // `remove` against the default would write captured indexer definitions —
@@ -84,6 +89,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       radarr: true,
       prowlarr: true,
       jellyfin: true,
+      audiobookshelf: true,
       qbittorrent: true,
       dispatcharr: true,
     },

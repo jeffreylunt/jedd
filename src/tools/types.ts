@@ -131,7 +131,7 @@ export interface Tool {
    * in order to avoid a partial one — over-gating, which is the same harm as
    * under-gating pointed the other way. They declare nothing, deliberately.
    */
-  needsServices?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr')[];
+  needsServices?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr' | 'audiobookshelf')[];
   /**
    * Services of which AT LEAST ONE must exist — the any-of counterpart to
    * `needsServices`.
@@ -146,7 +146,7 @@ export interface Tool {
    * Neither all-of nor nothing is right for these, which is why the any-of case
    * exists rather than being squeezed into the other field.
    */
-  needsAnyService?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr')[];
+  needsAnyService?: ('sonarr' | 'radarr' | 'prowlarr' | 'jellyfin' | 'qbittorrent' | 'dispatcharr' | 'audiobookshelf')[];
   /**
    * 🔴 WHICH KIND OF STORED OPTION THIS TOOL RESOLVES A `choice` INTO.
    *
