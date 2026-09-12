@@ -46,6 +46,7 @@ const NONE = {
   jellyfin: false,
   qbittorrent: false,
   dispatcharr: false,
+  audiobookshelf: false,
 };
 
 test('🔴 no Radarr: add_movie is not offered', async () => {

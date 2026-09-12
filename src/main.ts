@@ -29,6 +29,7 @@ import { assertShellIdentityIsSafe, loadConfig } from './config.js';
 import { FollowupStore } from './followups.js';
 import { InviteLedger } from './invite-ledger.js';
 import { JfagoClient } from './jfago.js';
+import { AbsClient } from './audiobookshelf.js';
 import { runDueFollowups } from './followup-runner.js';
 import { proveShellIdentityIsSafe } from './identity-probe.js';
 import { KindleRegistry } from './kindle.js';
@@ -181,6 +182,7 @@ async function main(): Promise<void> {
   const kindle = new KindleRegistry(`${DATA_DIR}kindle.jsonl`);
   const seen = new SeenStore(`${DATA_DIR}seen.jsonl`);
   const invites = new InviteLedger(`${DATA_DIR}invites.jsonl`);
+  const absInvites = new InviteLedger(`${DATA_DIR}abs-invites.jsonl`);
 
   /**
    * 🔴 ONE tracker, shared by the receiver that sees the messages arrive and the
@@ -295,6 +297,15 @@ async function main(): Promise<void> {
     ledger: invites,
     send: (to: string, text: string) => connector.sendReporting(to, text),
   };
+  const absInvite = {
+    abs: new AbsClient({
+      baseUrl: config.audiobookshelf.baseUrl,
+      apiKey: config.audiobookshelf.apiKey,
+      publicUrl: config.audiobookshelf.publicUrl || config.audiobookshelf.baseUrl,
+    }),
+    ledger: absInvites,
+    send: (to: string, text: string) => connector.sendReporting(to, text),
+  };
   /**
    * ⚠️ `send_ebook` IS RESTRICTED TO THE OWNER IN THIS BUILD.
    *
@@ -395,7 +406,7 @@ async function main(): Promise<void> {
       );
   }
 
-  const tools = buildTools(config, shellIdentity, { invite, ebook, ...(irc ? { irc } : {}) });
+  const tools = buildTools(config, shellIdentity, { invite, absInvite, ebook, ...(irc ? { irc } : {}) });
   const agent = new Agent(config, llm, recordTurn, tools, history, followups, choices, kindle);
 
   console.error(
@@ -419,6 +430,7 @@ async function main(): Promise<void> {
   if (!config.kindle.smtpPassword) off.push('ebooks to Kindle (4 tools) — set KINDLE_SMTP_PASSWORD');
   if (!config.tmdb.readToken) off.push('whats_popular / title_details — set TMDB_READ_TOKEN');
   if (!config.jfago.password || !config.jfago.baseUrl) off.push('invite_to_jellyfin — set JFAGO_URL and JFAGO_PASSWORD');
+  if (!config.audiobookshelf.apiKey || !config.audiobookshelf.baseUrl) off.push('invite_to_audiobookshelf — set ABS_URL and ABS_API_KEY');
   if (!config.runbookPath) off.push('read_runbook — set RUNBOOK_PATH');
   // One line per absent service, naming the variable that turns it back on.
   // A stranger's most common state is "most of these", so the list has to read

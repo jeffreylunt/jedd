@@ -25,6 +25,8 @@ import { librarySearch } from './library.js';
 import { makeFindGaps, makeGrabRelease, makeSearchEpisode } from './fill-gaps.js';
 import { makeIndexerAdmin } from './indexer-admin.js';
 import { makeInviteTool, type InviteDeps } from './invite.js';
+import { makeAbsInviteTool, type AbsInviteDeps } from './invite-abs.js';
+import { AbsClient } from '../audiobookshelf.js';
 import { diagnoseHostContention, restoreQbitSpeed, shedHostLoad } from './qbit.js';
 import { makeRunbookTool } from './runbook.js';
 import { makeSearchAudiobook, makeSearchEbook } from './search-release.js';
@@ -143,6 +145,8 @@ const GUEST_WRITE_TOOLS: Tool[] = [
 export interface ToolDeps {
   /** Absent → `invite_to_jellyfin` is not registered at all. */
   invite?: InviteDeps;
+  /** Absent → `invite_to_audiobookshelf` is not registered at all. */
+  absInvite?: AbsInviteDeps;
   /**
    * Absent → `send_ebook` is not registered at all.
    *
@@ -185,6 +189,19 @@ const INERT_SEND_EBOOK: SendEbookDeps = {
     throw new Error('ALL_TOOLS carries an INERT send_ebook; it cannot mail. Use buildTools(deps).');
   },
   onlySendTo: 'nobody@invalid',
+};
+
+
+const INERT_ABS_INVITE: AbsInviteDeps = {
+  abs: new AbsClient({
+    baseUrl: 'http://abs.invalid:13378',
+    apiKey: '',
+    publicUrl: 'http://abs.invalid:13378',
+  }),
+  ledger: new InviteLedger('/nonexistent/jedd-inert-abs-invites.jsonl'),
+  send: async () => {
+    throw new Error('ALL_TOOLS carries an INERT invite_to_audiobookshelf; it cannot send. Use buildTools(deps).');
+  },
 };
 
 const INERT_INVITE: InviteDeps = {
@@ -293,6 +310,9 @@ export function buildTools(config: Config, shellIdentity?: IdentityVerdict, deps
   // gate, it just narrows the ways of getting it wrong.
   if (deps.invite && config.jfago.password && config.jfago.baseUrl) {
     tools.push(makeInviteTool(deps.invite));
+  }
+  if (deps.absInvite && config.audiobookshelf.apiKey && config.audiobookshelf.baseUrl) {
+    tools.push(makeAbsInviteTool(deps.absInvite));
   }
   // Same rule: no SMTP credential, no tool. A send_ebook that cannot mail would
   // tell somebody their book is on the way and then fail at the last step.
@@ -571,6 +591,7 @@ export const ALL_TOOLS: Tool[] = [
   ...OWNER_WRITE_TOOLS,
   hpShell,
   makeInviteTool(INERT_INVITE),
+  makeAbsInviteTool(INERT_ABS_INVITE),
   makeSendEbook(INERT_SEND_EBOOK),
   // ⚠️ `read_runbook` is registered conditionally by `buildTools` and was missing
   // from here, so every invariant quantified over ALL_TOOLS — role gating, the

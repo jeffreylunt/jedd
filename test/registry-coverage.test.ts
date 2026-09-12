@@ -104,6 +104,11 @@ test('🔴 every tool in ALL_TOOLS is reachable from buildTools under SOME confi
         ledger: {} as never,
         send: async () => ({ delivered: null, detail: '' }),
       },
+      absInvite: {
+        abs: {} as never,
+        ledger: {} as never,
+        send: async () => ({ delivered: null, detail: '' }),
+      },
       ebook: { send: async () => ({ messageId: 'x' }) },
     }).map((t) => t.name),
   );
