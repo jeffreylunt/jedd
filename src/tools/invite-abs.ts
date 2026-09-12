@@ -28,8 +28,10 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
     description:
       'Create an Audiobookshelf account and text the login details to someone. Pass `username` ' +
       '(what they asked to be called) and `recipient` (phone) EXACTLY as they typed them — if ' +
-      'either is missing, ask. Never invent a username or number. The account can use Books and ' +
-      'Podcasts (accessAllLibraries). Do not offer this unless they asked for Audiobookshelf access.',
+      'either is missing, ask. Optional `password`: only if they typed the password themselves in ' +
+      'this chat; never invent one. If omitted, a strong password is generated. Never invent a ' +
+      'username or number. The account can use Books and Podcasts (accessAllLibraries). Do not ' +
+      'offer this unless they asked for Audiobookshelf access.',
     minRole: 'guest',
     writes: true,
     needsServices: ['audiobookshelf'],
@@ -43,6 +45,12 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
         recipient: {
           type: 'string',
           description: 'The phone number to text the login to, exactly as they typed it.',
+        },
+        password: {
+          type: 'string',
+          description:
+            'Optional. The password they typed themselves for this account. Omit to generate one. ' +
+            'Never invent or modify a password.',
         },
       },
       required: ['username', 'recipient'],
@@ -101,7 +109,28 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
         }
       }
 
-      const password = generatePassword();
+      const supplied =
+        typeof args['password'] === 'string' ? args['password'] : '';
+      // Do not trim interior spaces — only reject empty-after-trim as "omitted".
+      const suppliedTrimmed = supplied.trim();
+      let password: string;
+      let passwordSource: 'supplied' | 'generated';
+      if (suppliedTrimmed) {
+        if (!appearsInOwnTurns(suppliedTrimmed, ctx.userTurns ?? []) && !appearsInOwnTurns(supplied, ctx.userTurns ?? [])) {
+          return fail(
+            'REFUSED — that password does not appear in anything this person typed, so no account was ' +
+              'created. Ask them to send the password themselves, or omit it to generate one.',
+          );
+        }
+        const weak = validatePassword(suppliedTrimmed);
+        if (weak) return fail(`REFUSED — ${weak} Nothing was created.`);
+        password = suppliedTrimmed;
+        passwordSource = 'supplied';
+      } else {
+        password = generatePassword();
+        passwordSource = 'generated';
+      }
+
       const created = await deps.abs.createUser(username, password);
       if (created.state === 'failed') {
         deps.ledger.record({
@@ -137,7 +166,9 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
         `Open: ${deps.abs.publicUrl}\n` +
         `Username: ${verified.user.username}\n` +
         `Password: ${password}\n` +
-        `Change the password after you log in. This message is the only copy Jedd keeps in chat.`;
+        (passwordSource === 'generated'
+          ? `Change the password after you log in. This message is the only copy Jedd keeps in chat.`
+          : `This is the password you chose. This message is the only copy Jedd keeps in chat.`);
 
       let delivered: boolean | null = null;
       let sendDetail = '';
@@ -192,10 +223,30 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
       return ok(
         `SENT — Audiobookshelf login for "${verified.user.username}" went to ${recipient}` +
           (delivered === true ? ' and was delivered.' : '; delivery is not yet confirmed.') +
+          ` Password was ${passwordSource === 'supplied' ? 'set from what they typed' : 'generated'}.` +
           ' They can use Books and Podcasts. ⚠️ The account is permanent until an admin deletes it.',
       );
     },
   };
+}
+
+/**
+ * Refuse empty/weak passwords. Never include the candidate in the returned reason.
+ */
+function validatePassword(password: string): string | null {
+  if (password.length < 8) return 'password must be at least 8 characters.';
+  if (password.length > 72) return 'password must be at most 72 characters.';
+  for (const ch of password) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return 'password may not contain control characters.';
+  }
+  const lower = password.toLowerCase();
+  const banned = new Set(['password', 'password1', 'password123', '12345678', 'qwertyui', 'letmein1']);
+  if (banned.has(lower)) return 'that password is too common.';
+  const hasLetter = /[A-Za-z]/.test(password);
+  const hasDigit = /[0-9]/.test(password);
+  if (!hasLetter || !hasDigit) return 'password must include at least one letter and one digit.';
+  return null;
 }
 
 function generatePassword(): string {

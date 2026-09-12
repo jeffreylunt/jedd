@@ -178,3 +178,63 @@ test('tool is registered when ABS is configured', () => {
   const tools = buildTools(cfg, undefined, { absInvite: deps });
   assert.equal(tools.some((t) => t.name === 'invite_to_audiobookshelf'), true);
 });
+
+// ── optional password ─────────────────────────────────────────────────────────
+
+test('optional password omitted → generated password is sent', async () => {
+  const a = absClient();
+  const s = sender(true);
+  const tool = makeAbsInviteTool({ abs: a.client, ledger: new InviteLedger(tmp()), send: s.send });
+  const r = await tool.run({ username: USER, recipient: TARGET }, ctx());
+  assert.equal(r.ok, true);
+  assert.match(r.content, /Password was generated/);
+  assert.doesNotMatch(r.content, /Password: /); // tool result must not echo it
+  const body = a.createdBodies[0] as { password: string };
+  assert.ok(body.password.length >= 12);
+  assert.match(s.sent[0]!.text, new RegExp(`Password: ${body.password}`));
+});
+
+test('optional password provided + in turns → used as-is', async () => {
+  const a = absClient();
+  const s = sender(true);
+  const pw = 'CorrectHorse9';
+  const tool = makeAbsInviteTool({ abs: a.client, ledger: new InviteLedger(tmp()), send: s.send });
+  const r = await tool.run(
+    { username: USER, recipient: TARGET, password: pw },
+    ctx([`please make ${USER} for ${TARGET} password ${pw}`]),
+  );
+  assert.equal(r.ok, true, r.content);
+  assert.match(r.content, /Password was set from what they typed/);
+  assert.doesNotMatch(r.content, /CorrectHorse9/);
+  assert.equal((a.createdBodies[0] as { password: string }).password, pw);
+  assert.match(s.sent[0]!.text, /Password: CorrectHorse9/);
+});
+
+test('optional password provided + NOT in turns → REFUSED', async () => {
+  const a = absClient();
+  const tool = makeAbsInviteTool({ abs: a.client, ledger: new InviteLedger(tmp()), send: sender(true).send });
+  const r = await tool.run(
+    { username: USER, recipient: TARGET, password: 'CorrectHorse9' },
+    ctx([`please make ${USER} for ${TARGET}`]),
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.content, /REFUSED/);
+  assert.match(r.content, /does not appear in anything this person typed/i);
+  assert.equal(a.createdBodies.length, 0);
+  assert.doesNotMatch(r.content, /CorrectHorse9/);
+});
+
+test('optional password weak → REFUSED', async () => {
+  const a = absClient();
+  const tool = makeAbsInviteTool({ abs: a.client, ledger: new InviteLedger(tmp()), send: sender(true).send });
+  for (const pw of ['short1A', 'password1', 'abcdefgh', '12345678']) {
+    const r = await tool.run(
+      { username: USER, recipient: TARGET, password: pw },
+      ctx([`please make ${USER} for ${TARGET} ${pw}`]),
+    );
+    assert.equal(r.ok, false, `should refuse ${pw}`);
+    assert.match(r.content, /REFUSED/);
+    assert.doesNotMatch(r.content, new RegExp(pw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  assert.equal(a.createdBodies.length, 0);
+});
