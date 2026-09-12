@@ -210,7 +210,8 @@ export class ChoiceStore {
  * been shown.
  *
  * It stopped being harmless the day the consumers began defaulting to option 1
- * with no argument. `add_audiobook` reads an `infoHash` off whatever it resolves
+ * with no argument. `add_audiobook` reads an `infoHash` (or, since 2026-09-04, a
+ * `downloadUrl` it resolves one from) off whatever it resolves
  * and hands it to qBittorrent under the AUDIOBOOK category with no shape check
  * at all — so a pending EBOOK list resolved cleanly, a `.epub` was filed into
  * `/downloads/audiobooks`, the host cron fed it to Audiobookshelf, and the tool

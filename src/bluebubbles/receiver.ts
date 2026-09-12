@@ -162,6 +162,7 @@ export class BlueBubblesReceiver {
 
     const run = handler ?? this.handler;
     if (!run) return;
+
     try {
       await run(verdict.message);
     } catch (e) {

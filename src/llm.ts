@@ -11,6 +11,46 @@ export interface LlmToolCall {
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /**
+   * Images on a USER turn, as BARE base64 — no `data:` prefix, no wrapper.
+   *
+   * 🔴 THE ENCODING IS PART OF THE CONTRACT, AND GETTING IT WRONG IS SILENT.
+   * Ollama's `/api/chat` takes `messages[].images` as a plain array of base64
+   * strings; a `data:image/png;base64,…` string is accepted by the HTTP layer,
+   * fails to decode inside, and surfaces as the model simply never mentioning
+   * the picture. There is no error and no warning — the reply just reads like
+   * the image was never sent, which is indistinguishable from the model
+   * choosing not to talk about it.
+   */
+  images?: string[];
+  /**
+   * What to tell the model about this turn's attachments, expanded into a
+   * `system` message at request-build time.
+   *
+   * 🔴 STORED ON THE TURN, NOT PUSHED AS ITS OWN HISTORY ENTRY, AND THE
+   * DIFFERENCE IS A BUG THAT ALREADY EXISTED.
+   *
+   * It was a separate `{role:'system'}` message. `boundHistoryImages` later
+   * stripped the BYTES off an older turn to protect `num_ctx` — and could not
+   * see the note, which went on saying *"they attached one image, which is on
+   * this message and you can see it"* about a picture that was no longer in the
+   * request. The model was being told, in the system role, that it could see
+   * something it had not been given; the reply describes an image out of
+   * nothing. Keeping the note ON the turn is what lets one pass rewrite both.
+   */
+  imageNote?: string;
+  /**
+   * What the person actually typed, when `content` is not that.
+   *
+   * 🔴 EXISTS FOR THE PROVENANCE GATES, WHICH ARE A SECURITY BOUNDARY.
+   * `appearsInOwnTurns` (`kindle.ts`) is a substring test over `ctx.userTurns`,
+   * and it is the ONLY thing standing between the model and storing an invented
+   * Kindle address or minting a Jellyfin invite for an invented number. A
+   * captionless photo has no text, so `content` becomes a machine-composed
+   * marker — and machine text inside `userTurns` makes that gate answer
+   * questions about a sentence nobody typed.
+   */
+  rawText?: string;
   /** Present on assistant messages that requested tools. */
   toolCalls?: LlmToolCall[];
   /** Present on tool messages: which call this answers. */
@@ -42,40 +82,127 @@ function toOllamaMessages(messages: LlmMessage[]): unknown[] {
         })),
       };
     }
+    /**
+     * ⚠️ `images` IS OMITTED WHEN EMPTY RATHER THAN SENT AS `[]`. An empty array
+     * on every text turn is a change to the request shape of every existing
+     * conversation in order to say nothing, and this stack has already shown
+     * (`tool_choice`) that it will silently ignore a field rather than complain
+     * about one — so a shape nobody needs is a shape nobody can verify.
+     */
+    if (m.role === 'user' && m.images?.length) {
+      return { role: m.role, content: m.content, images: m.images };
+    }
     return { role: m.role, content: m.content };
   });
 }
 
 /**
- * Ollama client for the pinned local model, `qwen3.8:27b`.
+ * Turn the stored history into the exact message list one request carries.
  *
- * Every setting below was MEASURED against the live endpoint by
- * `scripts/probe-ollama.mjs`, not inherited. See
- * `spaces/jedd-v2/knowledge/qwen3-8-27b-mlx-measured.md`.
+ * Two jobs, done in ONE pass because they are the same decision:
  *
- *  - `think: true` — Jeff wants thinking and will pay latency for it. Reasoning
- *    cost 137–320 characters across the probe, so the feared empty-output trap
- *    is a BUDGET failure, not an argument against thinking.
- *  - `num_predict: 3000` — ~16× the largest reasoning burst observed, so
- *    thinking cannot eat the whole allowance before an answer is emitted.
- *  - `num_ctx: 16384` — keeps the model FULLY resident (`/api/ps` reported
- *    `size_vram === size`). Do not raise it to buy thinking headroom; that is
- *    what spills to CPU and produces 110s turns.
- *  - `keep_alive: '30m'` — an ~18 GB model must not cold-reload mid-conversation.
- *  - `tool_choice` is NOT sent. It is silently ignored by this stack (verified:
- *    `tool_choice:"required"` on a message needing no tool returned no call).
- *    Sending it would imply a guarantee that does not exist.
+ * 1. **Bound the images.** An image left in history is re-sent on every
+ *    subsequent call. `num_ctx` is 16384 and is deliberately not raised — it is
+ *    what keeps the model fully resident in VRAM, and raising it is what
+ *    produces 110-second turns. So a conversation with a few photos in it would
+ *    otherwise spend its whole window re-describing pictures nobody is asking
+ *    about, and it would do it by DEGRADING: the oldest real messages fall out
+ *    of the window first, so the symptom is Jedd forgetting the conversation
+ *    rather than any error pointing back here.
+ *
+ * 2. **Expand each turn's note**, so what the model is told about a picture is
+ *    DERIVED from whether the bytes actually travelled. A note stored as its own
+ *    history entry cannot be kept honest by a later pass, and the stale version
+ *    of it is the worst sentence in the system: *"you can see it"*, in the
+ *    system role, about an image that was dropped.
+ *
+ * 🔴 BOTH A TURN COUNT AND A TOTAL IMAGE COUNT. `keepTurns` alone is not a
+ * bound: a turn may carry up to `maxCount` images, so "keep 2 turns" permitted
+ * eight images in one request — double the per-turn cap, and plausibly the whole
+ * input budget once the system prompt and tool schemas are counted.
+ *
+ * ⚠️ COPIES; DOES NOT MUTATE. Whether a turn's picture travels is decided per
+ * REQUEST, so the tool loop's later calls in the same turn all agree with each
+ * other and nothing is destroyed mid-turn.
  */
+export function buildRequestMessages(
+  messages: LlmMessage[],
+  bounds: { keepTurns: number; maxImages: number },
+): LlmMessage[] {
+  const reversed: LlmMessage[] = [];
+  let imageTurnsKept = 0;
+  let imagesKept = 0;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    const count = m.images?.length ?? 0;
+
+    if (m.role !== 'user' || (count === 0 && !m.imageNote)) {
+      reversed.push(m);
+      continue;
+    }
+
+    const keep =
+      count > 0 && imageTurnsKept < bounds.keepTurns && imagesKept + count <= bounds.maxImages;
+
+    if (keep) {
+      imageTurnsKept += 1;
+      imagesKept += count;
+      reversed.push(m);
+      if (m.imageNote) reversed.push({ role: 'system', content: m.imageNote });
+      continue;
+    }
+
+    if (count === 0) {
+      // No bytes were ever attached to this turn — the note is about an
+      // attachment that FAILED, which is a past-tense fact and cannot go stale.
+      reversed.push(m);
+      if (m.imageNote) reversed.push({ role: 'system', content: m.imageNote });
+      continue;
+    }
+
+    const { images: _dropped, imageNote: _note, ...rest } = m;
+    reversed.push(rest);
+    reversed.push({
+      role: 'system',
+      content:
+        'An image they sent earlier in this conversation is no longer attached to this request. ' +
+        'You cannot see it any more — do not describe it or claim to have seen it. If they ask ' +
+        'about it, say you would need them to send it again.',
+    });
+  }
+
+  return reversed.reverse();
+}
+
 /**
- * Wall clock for ONE MODEL CALL — not one turn. See `MAX_STEPS` in `agent.ts`:
- * a single turn makes up to that many of these, so a turn's worst case is the
- * product, not this number.
+ * Drop from the STORED history the images that can never travel again.
  *
- * ⚠️ EXPORTED because `presence.ts` derives the typing-indicator ceiling from
- * it. They were two independent magic numbers (900_000 and 360_000) and the
- * indicator died at 6 minutes on a turn that ran 787 seconds and completed
- * fine. Changing one now forces you past the other.
+ * 🔴 THIS IS NOT THE SAME DECISION AS `buildRequestMessages` AND IT MUTATES ON
+ * PURPOSE.
+ *
+ * `histories` in `agent.ts` is a per-sender map that nothing prunes. At the
+ * defaults that is up to four 12 MB images — ~64 MB of base64 — retained for the
+ * life of a process that shares a Mac with a resident 27B model, per
+ * image-bearing turn, forever.
+ *
+ * The bound is safe because the window only ever moves FORWARD: a turn that has
+ * already fallen outside `keepTurns` can only get older, so its bytes were
+ * already unreachable. Freeing them loses nothing that could have been used.
  */
+export function pruneStoredImages(messages: LlmMessage[], keepTurns: number): void {
+  let seen = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== 'user' || !m.images?.length) continue;
+    seen += 1;
+    if (seen > keepTurns) {
+      delete m.images;
+      delete m.imageNote;
+    }
+  }
+}
+
 export const TURN_TIMEOUT_MS = 900_000;
 
 export class OllamaClient implements LlmClient {

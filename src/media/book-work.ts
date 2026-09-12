@@ -160,20 +160,223 @@ const NOISE = new Set(
     'the a an of and or in on to for with').split(/\s+/),
 );
 
-/** Everything that is not a letter or a digit is a separator in a filename. */
+/**
+ * Every way a catalogue or a release group writes an apostrophe.
+ *
+ * ⚠️ ONE LIST, USED BY BOTH SITES. The defect this exists for was two places
+ * disagreeing about punctuation; two copies of the class would let them
+ * silently diverge again the first time one is edited.
+ */
+const APOSTROPHES = /['\u2018\u2019\u02BC\u00B4`]/g;
+
+/**
+ * The form of a name to SEND to an indexer.
+ *
+ * ── 🔴 THE SAME CHARACTER, THE SECOND PLACE IT HIDES A BOOK ──────────────────
+ *
+ * Fixing `tokens` alone was not enough, and only running the flow end to end
+ * against the real services showed it. The term handed to Prowlarr is the work's
+ * title AS THE CATALOGUE SPELLS IT, and Open Library spells possessives with a
+ * curly apostrophe that no indexer carries. Measured 2026-09-04, one variable:
+ *
+ *     "The Dungeon Anarchist’s Cookbook Matt Dinniman"  ->  0 results
+ *     "The Dungeon Anarchists Cookbook Matt Dinniman"   ->  1 result
+ *
+ * So the matcher and the search have to agree about punctuation, or the flow
+ * reports "not on the indexers" at whichever of the two sites is still wrong.
+ *
+ * ⚠️ This is for the WIRE only. `describeWork` still shows the title the way the
+ * catalogue spells it, because that is the half a person reads.
+ *
+ * ⚠️ KNOWN LIMIT, UNMEASURED: this glues ELISIONS as well as possessives, so
+ * `L’Étranger` goes out as `LÉtranger` where indexers tend to write
+ * `L Etranger`. The 0→1 measurement above is a possessive; the elision class
+ * runs the other way and nobody has counted it. Fix it when a real search
+ * misses, not on a hunch about French titles.
+ */
+export function indexerTerm(s: string): string {
+  return s.replace(APOSTROPHES, '');
+}
+
+/**
+ * ── 🔴 ONE QUERY FORM IS ONE CHANCE, AND THE FORM WE PREFER MISSES ──────────
+ *
+ * A ladder of ways to ask for the SAME book, most specific first. The caller
+ * walks it and stops at the first rung that yields a candidate; the rest are
+ * never sent.
+ *
+ * The defect, MEASURED live against Prowlarr 2026-09-04 — same indexers, same
+ * minutes, the *only* variable being how the title was spelt:
+ *
+ *     "The Dungeon Anarchist’s Cookbook"   3 results, NONE an audiobook
+ *     "The Dungeon Anarchists Cookbook"    0 results
+ *     "Dungeon Anarchists Cookbook"        1 result  <- IS the audiobook
+ *     "Dungeon Crawler Carl Anarchist"     4 results, one of them the audiobook
+ *
+ * **The apostrophe and the leading article each break the match on their own,
+ * and the exact title the catalogue resolves to is the single form that finds
+ * nothing.** Jedd told Jeff *"Prowlarr still has no audiobook release for it"*
+ * about a release sitting at 14 seeders, and then offered an ebook instead —
+ * which retires the question. An absence in OUR search is not an absence in the
+ * world, and one query form makes the two impossible to tell apart.
+ *
+ * ── WHY "STRIP THE PUNCTUATION" IS NOT A RUNG OF ITS OWN ────────────────────
+ *
+ * It is applied to EVERY rung instead. `indexerTerm` already removes
+ * apostrophes unconditionally, on its own measurement (0 results vs 1 for the
+ * same title), so a rung that put the curly form back on the wire would spend a
+ * whole request — Prowlarr answers in 35-45 s cold — on a spelling already
+ * measured to return nothing.
+ *
+ * ── WHY THE LADDER IS THREE RUNGS AND NOT SIX ──────────────────────────────
+ *
+ * Every rung is a request against a service that warns about hammering, and
+ * five searches in one turn produced timeouts in a probe on 2026-09-04. Rung 1
+ * is exactly the term this code sent before, so **a search that works today
+ * still costs exactly one request**; only a search that would otherwise have
+ * reported a false absence pays for the extra ones.
+ *
+ * ⚠️ DUPLICATE RUNGS ARE DROPPED, so a title with no leading article and no
+ * author does not ask the same question twice.
+ *
+ * ⚠️ THE BROAD RUNGS ARE SAFE ONLY BECAUSE OF `matchWork`. Rungs 2 and 3 drop
+ * words, which means they match MORE things — including other books. Nothing
+ * here decides identity: every release a rung returns is still scored against
+ * the pinned work and refused if it is not a copy of it. Do not use this ladder
+ * anywhere that filter does not run afterwards.
+ */
+export interface SearchTerm {
+  /** What goes on the wire. */
+  term: string;
+  /** How to describe this rung to a person, so a miss can name what it tried. */
+  form: string;
+}
+
+/** Only the leading one, and only when a word survives it. */
+const LEADING_ARTICLE = /^(the|a|an)\s+(?=\S)/i;
+
+/**
+ * The longest significant word of a title, as a stand-in for the rarest one.
+ *
+ * ⚠️ AN ADMITTED PROXY. Rarity would need a corpus nobody has here; length
+ * correlates with it well enough that `anarchists` wins over `dungeon` and
+ * `cookbook` in the case this was built for. It is only ever used to BROADEN a
+ * search whose narrower forms already found nothing, and what it returns is
+ * still filtered for identity, so being wrong costs a request rather than a
+ * wrong book.
+ */
+function mostDistinctiveWord(title: string): string {
+  let best = '';
+  for (const t of significantTitleTokens(title)) if (t.length > best.length) best = t;
+  return best;
+}
+
+export function searchTerms(query: string, work?: Work): SearchTerm[] {
+  const out: SearchTerm[] = [];
+  const add = (raw: string, form: string): void => {
+    const term = indexerTerm(raw).replace(/\s+/g, ' ').trim();
+    if (!term) return;
+    if (out.some((o) => o.term.toLowerCase() === term.toLowerCase())) return;
+    out.push({ term, form });
+  };
+
+  if (!work) {
+    /**
+     * 🔴 NO WORK PINNED MEANS NO IDENTITY FILTER AFTERWARDS, so this half of the
+     * ladder stops one rung short. The third rung is built out of a CATALOGUE
+     * title and author; without a pin there is neither, and broadening a raw
+     * phrase with nothing checking what comes back is how a different book gets
+     * offered as though it were the one that was asked for.
+     */
+    add(query, 'what they said');
+    add(query.replace(LEADING_ARTICLE, ''), 'what they said, without the leading "the"');
+  } else {
+    const author = work.authors[0] ?? '';
+    add(`${work.title} ${author}`.trim(), 'the title and the author');
+    add(work.title.replace(LEADING_ARTICLE, ''), 'the title alone, without the leading "the"');
+    const distinctive = mostDistinctiveWord(work.title);
+    const last = surname(author);
+    if (distinctive && last) {
+      add(`${last} ${distinctive}`, 'the author and the most distinctive word of the title');
+    }
+  }
+
+  /**
+   * ⚠️ NEVER EMPTY, ON EITHER PATH — AND THE EARLY `return` THAT USED TO SIT IN
+   * THE FIRST BRANCH MEANT THIS DID NOT HOLD.
+   *
+   * `indexerTerm` strips apostrophes, so a query of nothing but `'''` produced
+   * zero rungs; the caller then destructured `attempts[0]` and threw. An
+   * invariant asserted in a comment above a branch that skips it is worse than
+   * no invariant, because the caller trusts it.
+   */
+  if (out.length === 0) out.push({ term: query.trim(), form: 'what they said' });
+  return out;
+}
+
+/**
+ * Everything that is not a letter or a digit is a separator in a filename —
+ * EXCEPT an apostrophe, which is removed, and a possessive `s` orphaned by one,
+ * which is joined back on.
+ *
+ * ── 🔴 AN APOSTROPHE IS NOT A WORD BOUNDARY, AND SPLITTING ON ONE HID A BOOK ─
+ *
+ * Found by running the matcher, 2026-09-04. Open Library spells the work with a
+ * CURLY apostrophe and indexers write the same possessive THREE ways:
+ *
+ *     'The Dungeon Anarchist’s Cookbook'   (catalogue)
+ *     'The Dungeon Anarchists Cookbook'    (apostrophe dropped)
+ *     'The Dungeon Anarchist s Cookbook'   (apostrophe became a space)
+ *
+ * Splitting on the apostrophe produced `anarchist` for the first and
+ * `anarchists` for the second, so `matchWork` refused the one release that IS
+ * the book as "does not name" the work, and the tool reported that the book was
+ * not on the indexers — a coverage gap we manufactured about a release sitting
+ * right there at 14 seeders.
+ *
+ * ⚠️ THE THIRD SPELLING IS WHY THE BARE `s` IS RE-JOINED, and it was a
+ * regression introduced by the first version of this fix. It is not imagined:
+ * this repo's own live-captured fixture carries it — `An A Z of JRR Tolkien s
+ * The Hobbit by Sarah Oliver EPUB`. Removing the apostrophe alone fixes spelling
+ * two and breaks spelling three, with the identical user-visible symptom.
+ *
+ * ⚠️ THIS IS NOT A STEMMER AND MUST NOT BECOME ONE. It joins a token that is
+ * LITERALLY the single letter `s` onto the word before it; it never removes a
+ * suffix from a word that has one, and it never decides two different words are
+ * the same word. `matchWork`'s whole value is that it refuses near misses, and
+ * the numbered volumes of one series are the near misses it exists to catch —
+ * there is a control test for exactly that, on a possessive title.
+ */
 export function tokens(s: string): string[] {
-  return s
+  const split = s
     .toLowerCase()
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(APOSTROPHES, '')
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
+
+  const out: string[] = [];
+  for (const t of split) {
+    if (t === 's' && out.length > 0) out[out.length - 1] += 's';
+    else out.push(t);
+  }
+  return out;
 }
 
 /** The tokens that carry meaning: not noise, not a bare initial, not a year. */
 function significant(ts: string[]): string[] {
   return ts.filter((t) => t.length > 1 && !NOISE.has(t) && !/^(19|20)\d{2}$/.test(t));
 }
+
+/**
+ * The words of a TITLE that carry identity — the same filter `matchWork` uses on
+ * a work's title, exported so a caller cannot drift from it.
+ */
+export function significantTitleTokens(title: string): string[] {
+  return significant(tokens(title));
+}
+
 
 /**
  * A person's surname, as it appears in a filename.
@@ -307,7 +510,10 @@ export function matchWork(releaseTitle: string, work: Work): WorkMatch {
   if (BUNDLE.test(releaseTitle)) {
     return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a collection or box set, not this one book' };
   }
-  if (isSeriesPosition(releaseTitle, titleTokens)) {
+  // 🔴 NORMALISED, NOT RAW. The phrase is built from normalised title tokens, so
+  // testing it against the raw name let a release that KEPT the apostrophe walk
+  // past the volume guard: `Carl’s Doomsday Scenario 3` scored CLEAN.
+  if (isSeriesPosition(ts.join(' '), titleTokens)) {
     return { score: WORK_MATCH.NOT_THIS_WORK, reason: 'is a numbered volume of the series, not this book' };
   }
 

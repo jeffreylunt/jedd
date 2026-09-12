@@ -1,5 +1,53 @@
 import { createInterface } from 'node:readline';
 
+/**
+ * One image that arrived with a message, already fetched and ready for a model.
+ *
+ * 🔴 `base64` IS BARE — NO `data:` PREFIX. That is what Ollama's
+ * `messages[].images` takes. A prefixed string is accepted by the HTTP layer and
+ * then silently fails to decode, which shows up as the model not mentioning the
+ * picture rather than as an error, so the encoding is pinned in the type's
+ * documentation rather than left to each caller.
+ */
+export interface InboundImage {
+  base64: string;
+  /** Filename as sent, so a reply can refer to it the way a person would. */
+  name: string;
+  contentType: string;
+}
+
+/**
+ * An attachment that came with the message and will NOT be looked at.
+ *
+ * 🔴 THREE REASONS, NOT ONE FLAG, AND THEY MUST STAY APART.
+ *
+ * Each is a different sentence to whoever sent it — "that's a video", "that
+ * photo is too big", "I couldn't get it off the server" — and only the last one
+ * means anything is broken. Collapsing them into a single `failed` throws away
+ * the only part the sender can act on, and would make Jedd tell someone their
+ * perfectly good photo was the wrong kind of file.
+ */
+export interface AttachmentTrouble {
+  reason: 'unsupported' | 'oversize' | 'unfetchable';
+  name: string;
+  detail: string;
+}
+
+/**
+ * What arrived alongside the text.
+ *
+ * ⚠️ ABSENT AND EMPTY ARE THE SAME THING HERE, deliberately. A transport with no
+ * concept of attachments leaves this unset; a message that simply had none
+ * leaves it unset too. Nothing downstream should distinguish them, because
+ * nothing downstream can act on the difference.
+ */
+export interface InboundAttachments {
+  images: InboundImage[];
+  trouble: AttachmentTrouble[];
+  /** Images that were fine but fell past the per-turn cap. */
+  overflow: number;
+}
+
 export interface IncomingMessage {
   /** Whatever the transport calls the sender: a phone number, an email, a handle. */
   senderHandle: string;
@@ -14,6 +62,28 @@ export interface IncomingMessage {
    * every reply sends plain. See `bluebubbles/threading.ts` for when it is used.
    */
   sourceGuid?: string;
+  /**
+   * Whatever the transport reported as attached, UNFETCHED and untouched.
+   *
+   * 🔴 RAW, AND IT TRAVELS THROUGH THE QUEUE THIS WAY ON PURPOSE.
+   *
+   * Downloading used to happen in the receiver, before the message was even
+   * submitted. That put a multi-megabyte transfer and a `sips` transcode on the
+   * Mac in front of three things that must not wait for it: the read receipt and
+   * typing indicator (whose stated job is to land *as Jedd picks the message
+   * up*), the 5-second burst settle (a photo slower than that missed the burst
+   * its own caption was in, so the caption got answered with no picture), and
+   * `StillWorkingNotice`, which is not armed yet — making the download window
+   * pure silence.
+   *
+   * Carrying the raw array instead keeps ingest cheap and pure, and moves the
+   * fetch inside the turn where the presence signals are already up.
+   *
+   * ⚠️ OPTIONAL BECAUSE IT IS A TRANSPORT CAPABILITY, not because it is
+   * decoration — the same reasoning as `sourceGuid` directly above. A terminal
+   * has no attachments and says so by leaving this unset.
+   */
+  attachmentsRaw?: unknown;
 }
 
 /**
@@ -245,4 +315,62 @@ export class TestConnector implements Connector {
   async listen(handler: (message: IncomingMessage) => Promise<void>): Promise<void> {
     for (const message of this.script) await handler(message);
   }
+}
+
+/**
+ * Fetches the bytes for whatever a transport reports as attached.
+ *
+ * Named at the seam rather than inside the BlueBubbles layer so the receiver can
+ * take one without importing the thing that builds it — and so a test can pass a
+ * function instead of standing up an HTTP server.
+ */
+export type IncomingAttachmentsHydrator = (
+  raw: unknown,
+) => Promise<InboundAttachments | undefined>;
+
+/**
+ * Fold a burst of messages into the single set of attachments the turn sees.
+ *
+ * A burst is already answered as one turn (`handleBurst` in `main.ts`), so its
+ * pictures belong to that one turn too — someone who sends three photos and then
+ * "which of these?" has asked one question about three images.
+ *
+ * 🔴 CONCATENATES THE *UNFETCHED* ARRAYS, SO THE CAP IS APPLIED ONCE, HERE,
+ * BEFORE ANY BYTES MOVE.
+ *
+ * This used to merge already-fetched images, and that placed the cap after the
+ * work it was meant to bound: four messages of four images each were each
+ * capped correctly on their own, so sixteen files were downloaded, transcoded by
+ * the Mac and base64'd — and then twelve were discarded. A cap downstream of the
+ * expense bounds only what the model sees, which was never the part that hurt.
+ *
+ * Merging first means `classifyAttachments` sees the whole burst as one turn and
+ * refuses the extras before they are fetched at all.
+ */
+export function mergeAttachmentsRaw(batch: IncomingMessage[]): unknown[] | undefined {
+  const out: unknown[] = [];
+  let any = false;
+  for (const m of batch) {
+    if (m.attachmentsRaw === undefined) continue;
+    any = true;
+    if (Array.isArray(m.attachmentsRaw)) out.push(...m.attachmentsRaw);
+  }
+  return any ? out : undefined;
+}
+
+/**
+ * The one text a burst is answered as.
+ *
+ * 🔴 EMPTY TEXTS ARE DROPPED, AND THAT IS NEW WITH IMAGES. A captionless photo
+ * arrives as `text: ""`, so a plain `join('\n')` turns "here" + photo into
+ * `"here\n"` — and a lone photo into a BARE NEWLINE. That is the dangerous one:
+ * `"\n"` is not an empty string, so it survives every downstream emptiness test
+ * as though the person had typed something, and the model is handed a turn whose
+ * only content is whitespace.
+ */
+export function joinBurstText(batch: IncomingMessage[]): string {
+  return batch
+    .map((m) => m.text)
+    .filter((t) => t.trim())
+    .join('\n');
 }

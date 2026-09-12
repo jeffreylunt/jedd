@@ -1,5 +1,6 @@
 import { resolveOfKind } from '../choices.js';
 import { grabTorrent } from '../media/grab.js';
+import { isValidInfoHash, resolveMagnet, type FetchImpl } from '../media/prowlarr.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -27,7 +28,42 @@ import { fail, ok, type Tool } from './types.js';
  * never claims the book is in Audiobookshelf, which we do not do and cannot see
  * from here.
  */
-export const addAudiobook: Tool = {
+/**
+ * 🔴 A RELEASE MAY ARRIVE WITH NO infoHash, AND THAT IS NOT A DEAD END.
+ *
+ * Prowlarr publishes `infoHash` for The Pirate Bay and not for 1337x, and
+ * Dungeon Crawler Carl is carried only by 1337x — so the whole series was
+ * unfetchable until this. The `downloadUrl` 301s to a magnet carrying the hash
+ * and the indexer's trackers; reading that redirect is something WE do from
+ * here, not something qBittorrent has to do inside gluetun's netns.
+ *
+ * Returns the pair to grab with, or a sentence saying why not.
+ */
+async function resolveForPick(
+  value: Record<string, unknown>,
+  fetchImpl?: FetchImpl,
+): Promise<{ ok: true; infoHash: string; magnetUri?: string } | { ok: false; detail: string }> {
+  /**
+   * ⚠️ VALIDATED, NOT MERELY PRESENT. `choices.jsonl` is durable and predates
+   * this change, so a stored hash can be anything. A truthy-but-invalid one used
+   * to short-circuit the resolve and dead-end at `grabTorrent`'s refusal — with a
+   * `downloadUrl` sitting right there that would have worked.
+   */
+  const stored = value['infoHash'];
+  const magnetUri = typeof value['magnetUri'] === 'string' ? value['magnetUri'] : undefined;
+  if (isValidInfoHash(stored)) return { ok: true, infoHash: stored, ...(magnetUri ? { magnetUri } : {}) };
+
+  const downloadUrl = typeof value['downloadUrl'] === 'string' ? value['downloadUrl'] : '';
+  if (!downloadUrl) {
+    return { ok: false, detail: 'that release carries neither an infoHash nor a download link, so it cannot be fetched.' };
+  }
+  const resolved = await resolveMagnet(downloadUrl, fetchImpl);
+  if (resolved.state === 'unknown') return { ok: false, detail: resolved.detail };
+  return { ok: true, infoHash: resolved.infoHash, magnetUri: resolved.magnetUri };
+}
+
+export function makeAddAudiobook(fetchImpl?: FetchImpl): Tool {
+  return {
   name: 'add_audiobook',
   // Reaches the homelab over ssh; absent entirely when none is configured.
   needsHomelabSsh: true,
@@ -77,11 +113,16 @@ export const addAudiobook: Tool = {
     const picked = resolveOfKind(ctx.choices, ctx.senderHandle, n, 'audiobook-release');
     if (!picked.ok) return fail(`${picked.reason.toUpperCase()} — ${picked.detail}`);
 
-    const infoHash = String(picked.option.value['infoHash'] ?? '');
     const title = String(picked.option.value['title'] ?? picked.option.label);
-    const magnetUri = typeof picked.option.value['magnetUri'] === 'string'
-      ? picked.option.value['magnetUri']
-      : undefined;
+    const resolved = await resolveForPick(picked.option.value, fetchImpl);
+    if (!resolved.ok) {
+      // 🔴 A FAILURE TO RESOLVE IS NOT A FINDING THAT THE BOOK DOES NOT EXIST.
+      return fail(
+        `COULD NOT FETCH — ${resolved.detail} Nothing was downloaded. Say that this particular ` +
+          'copy could not be started, NOT that the book is unavailable.',
+      );
+    }
+    const { infoHash, magnetUri } = resolved;
 
     const grab = await grabTorrent({
       adminSshHost: ctx.config.adminSshHost,
@@ -111,4 +152,8 @@ export const addAudiobook: Tool = {
         return fail(`FAILED — ${grab.detail}`);
     }
   },
-};
+  };
+}
+
+/** The registered instance. Production uses the real `fetch`. */
+export const addAudiobook: Tool = makeAddAudiobook();

@@ -530,6 +530,50 @@ export function personVerdict(service: ReadService, routed: string): string | nu
     : null;
 }
 
+/**
+ * Normalize a caller `path` against a service base that ALREADY includes an API
+ * prefix (e.g. `http://host:8989/sonarr/api/v3`).
+ *
+ * Measured 2026-09-12 (Chad Powers season-count thread):
+ *   path=`/lookup`        → `…/sonarr/api/v3/lookup`           HTTP 404
+ *   path=`/api/v3/lookup` → `…/sonarr/api/v3/api/v3/lookup`    HTTP 404
+ *
+ * Sonarr's real catalogue endpoint is `/series/lookup` (see `ArrClient.catalogue`
+ * in `src/media/arr.ts`); Radarr's is `/movie/lookup`. Doubling `/api/v3` is a
+ * join bug, not a missing route.
+ */
+export function normalizeHomelabPath(
+  service: ReadService,
+  path: string,
+  basePathname: string,
+): string {
+  let p = path;
+  const basePath = basePathname.replace(/\/$/, '');
+
+  // Strip a full re-statement of the configured base pathname.
+  if (basePath && (p === basePath || p.startsWith(`${basePath}/`))) {
+    p = p.slice(basePath.length) || '/';
+  }
+
+  // Strip a duplicated `/api/vN` when the base already ends with one.
+  const apiMatch = basePath.match(/(\/api\/v\d+)$/i);
+  if (apiMatch) {
+    const api = apiMatch[1]!;
+    const lower = p.toLowerCase();
+    const apiLower = api.toLowerCase();
+    if (lower === apiLower || lower.startsWith(`${apiLower}/`)) {
+      p = p.slice(api.length) || '/';
+    }
+  }
+
+  // Bare `/lookup` is not a Sonarr/Radarr route — rewrite to the real ones.
+  if ((service === 'sonarr' || service === 'radarr') && /^\/lookup\/?$/i.test(p)) {
+    p = service === 'sonarr' ? '/series/lookup' : '/movie/lookup';
+  }
+
+  return p;
+}
+
 export function planRead(
   service: unknown,
   path: unknown,
@@ -597,9 +641,11 @@ export function planRead(
   const base = spec.baseUrl(config).replace(/\/$/, '');
   let baseUrl: URL;
   let target: URL;
+  let routedPath = trimmed;
   try {
     baseUrl = new URL(base);
-    target = new URL(`${base}${trimmed}`);
+    routedPath = normalizeHomelabPath(service as ReadService, trimmed, baseUrl.pathname);
+    target = new URL(`${base}${routedPath}`);
   } catch {
     return { allowed: false, reason: `Could not form a URL from ${spec.label}'s base and "${trimmed}".` };
   }

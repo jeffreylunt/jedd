@@ -172,3 +172,94 @@ test('a lost option list re-asks rather than picking something', async () => {
   assert.equal(r.ok, false);
   assert.match(r.content, /OUT-OF-RANGE/);
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 THE EBOOK RESOLVE PATH — THE `fetchImpl` SEAM, ACTUALLY INJECTED.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `send_ebook` gained the same resolve as `add_audiobook`: a 1337x release
+ * publishes no `infoHash`, and its `downloadUrl` 301s to a magnet.
+ *
+ * ⚠️ THE ORDERING IS THE POINT. The resolve happens ABOVE both consumers, so the
+ * one hash reaches the grab AND the `subject` that `deliverEbook` uses to find
+ * the file. Resolving inside the grab instead would leave delivery looking for
+ * an empty hash — a failure that only shows up after the download finishes.
+ */
+function ctxNoHash(handle: string) {
+  const kindle = new KindleRegistry(tmp());
+  kindle.save(handle, 'readerone@kindle.com', ['readerone@kindle.com']);
+  const choices = new ChoiceStore(tmp());
+  choices.present({
+    senderHandle: handle,
+    subject: 'The Anxious Generation',
+    kind: 'ebook-release',
+    options: [{
+      n: 1,
+      label: 'The Anxious Generation EPUB',
+      value: { source: 'prowlarr', infoHash: '', title: 'The Anxious Generation', downloadUrl: 'http://prowlarr/proxy/1' },
+    }],
+  });
+  return { role: 'guest' as const, senderHandle: handle, config: testConfig({ readOnly: false }), kindle, choices };
+}
+
+const ebookRedirect = (location: string | null): Response =>
+  ({ ok: false, status: 301, headers: { get: (k: string) => (k.toLowerCase() === 'location' ? location : null) } }) as unknown as Response;
+
+test('🔴 EBOOK: a release with no infoHash is resolved, and ONE hash reaches grab and delivery', async () => {
+  const { send } = mailer();
+  const commands: string[] = [];
+  const exec: ExecImpl = (_f, args, _o, cb) => {
+    commands.push(args[args.length - 1]!);
+    cb(null, 'Ok.\n200', '');
+  };
+  const r = await makeSendEbook({
+    send,
+    fetchImpl: async () => ebookRedirect(`magnet:?xt=urn:btih:${HASH}&tr=udp%3A%2F%2Ftracker%3A1337`),
+  }).run({ choice: 1 }, { ...ctxNoHash(JEFF), exec });
+
+  const add = commands.find((c) => c.includes('torrents/add'));
+  assert.ok(add, `nothing was grabbed: ${r.content}`);
+  assert.match(add.toLowerCase(), new RegExp(HASH.toLowerCase()), 'the resolved hash must reach the grab');
+  // Every hash-addressed call must name the SAME hash — never an empty one.
+  for (const c of commands.filter((x) => /hashes=/.test(x))) {
+    assert.doesNotMatch(c, /hashes=(&|'|$)/, `a hash-addressed call went out empty: ${c}`);
+  }
+});
+
+test('🔴 EBOOK: a resolve failure says THIS COPY, and nothing is grabbed or sent', async () => {
+  const { send, sent } = mailer();
+  const commands: string[] = [];
+  const exec: ExecImpl = (_f, args, _o, cb) => {
+    commands.push(args[args.length - 1]!);
+    cb(null, 'Ok.\n200', '');
+  };
+  const r = await makeSendEbook({
+    send,
+    fetchImpl: async () => ebookRedirect('https://example.invalid/not-a-magnet'),
+  }).run({ choice: 1 }, { ...ctxNoHash(JEFF), exec });
+
+  assert.equal(r.ok, false);
+  assert.match(r.content, /^COULD NOT FETCH — /);
+  assert.match(r.content, /NOT that the book is unavailable/);
+  assert.equal(commands.filter((c) => c.includes('torrents/add')).length, 0);
+  assert.equal(sent.length, 0, 'nothing may be emailed');
+});
+
+test('🔴 EBOOK: the resolve does NOT write back into the stored choice', async () => {
+  // The ChoiceStore object is live in memory and is not re-appended to disk, so
+  // a write here makes memory and choices.jsonl disagree for the choice TTL.
+  const { send } = mailer();
+  const c = ctxNoHash(JEFF);
+  const exec: ExecImpl = (_f, _a, _o, cb) => cb(null, 'Ok.\n200', '');
+  await makeSendEbook({
+    send,
+    fetchImpl: async () => ebookRedirect(`magnet:?xt=urn:btih:${HASH}`),
+  }).run({ choice: 1 }, { ...c, exec });
+
+  const stored = c.choices.resolve(JEFF, 1);
+  assert.ok(stored.ok);
+  if (!stored.ok) throw new Error('unreachable');
+  assert.equal(stored.option.value['magnetUri'], undefined, 'the resolved magnet must not be written back');
+  assert.equal(stored.option.value['infoHash'], '', 'and the stored hash is untouched');
+});

@@ -13,7 +13,7 @@
 #
 # ── 🔴 WHY node:24 AND NOT THE HOST'S node 25 ────────────────────────────────
 #
-# The 1218-test suite is green on node 24.12.0 (measured on this machine). 24 is
+# The test suite is green on node 24.12.0 (measured on this machine). 24 is
 # the version with evidence behind it; the host's Homebrew 25.2.1 is pinned in
 # ecosystem.config.cjs for a macOS-only reason that does not exist here (below).
 #

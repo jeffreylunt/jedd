@@ -150,11 +150,22 @@ test('🔴 an unconfigured Prowlarr is UNKNOWN and says it is not an absence', a
   assert.equal(called, false);
 });
 
-test('CONTROL: a real empty result IS a finding — NONE, not UNKNOWN', async () => {
+test('CONTROL: a real empty result IS a finding — NOT FOUND, not UNKNOWN', async () => {
+  /**
+   * 🪦 THIS USED TO ASSERT `/^NONE/`. The premise — an empty answer from a
+   * reachable indexer is a FINDING and must not be dressed up as a failure to
+   * look — is unchanged and is what the two assertions below still pin. Only
+   * the head word moved: `NONE` was read back to Jeff as *"Prowlarr has no
+   * audiobook release for it"*, and the head is the part of this string a model
+   * paraphrases. `NOT FOUND` says the same thing about OUR search without
+   * saying it about the world.
+   */
   const r = await run(async () => json([]), { query: 'x' });
   assert.equal(r.ok, true);
-  assert.match(r.content, /^NONE/);
+  assert.match(r.content, /^NOT FOUND/);
   assert.doesNotMatch(r.content, /UNKNOWN/);
+  // 🔴 And it must not have become the claim it replaced.
+  assert.match(r.content, /NOT a finding that the audiobook does not exist/);
 });
 
 test('found-but-unfetchable is reported distinctly from found-nothing', async () => {
@@ -165,12 +176,36 @@ test('found-but-unfetchable is reported distinctly from found-nothing', async ()
 });
 
 test('a partly-unfetchable result set says how many were dropped', async () => {
+  // ⚠️ WORDING ONLY. The behaviour here is unchanged — this row has neither an
+  // infoHash nor a downloadUrl, so it is still dropped. The NOTE now names both
+  // conditions, because "no infoHash" stopped being the same thing as
+  // "unfetchable" once a download link became resolvable. See prowlarr.ts.
   const r = await run(
     async () => json([release({ infoHash: HASH_A }), release({ infoHash: 'nope' })]),
     { query: 'x' },
   );
   assert.equal(r.ok, true);
-  assert.match(r.content, /1 more had no infoHash and cannot be fetched/);
+  assert.match(r.content, /1 more had no infoHash or download link and cannot be fetched/);
+});
+
+test('🔴 a row with a download link is KEPT and offered, not counted as dropped', async () => {
+  /**
+   * ⚠️ ASSERTS THE BEHAVIOUR, NOT THE ABSENCE OF A STRING. The first version of
+   * this test only said the "dropped" note was absent — which is ALSO true under
+   * the old code, where the row is discarded and the note is worded differently.
+   * It was green on the code it exists to reject.
+   */
+  const r = await run(
+    async () =>
+      json([
+        release({ title: 'Copy A', infoHash: HASH_A }),
+        release({ title: 'Copy B', infoHash: 'nope', downloadUrl: 'http://prowlarr/proxy/1' }),
+      ]),
+    { query: 'x' },
+  );
+  assert.equal(r.ok, true);
+  assert.match(r.content, /Copy B/, 'the resolvable row must reach the person');
+  assert.doesNotMatch(r.content, /had no infoHash or download link/);
 });
 
 // ── 🔴 A FILTER THAT ATE EVERYTHING IS NOT AN ABSENCE ───────────────────────

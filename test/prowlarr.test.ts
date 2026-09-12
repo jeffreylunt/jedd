@@ -6,6 +6,7 @@ import {
   isValidInfoHash,
   magnetFor,
   rankReleases,
+  resolveMagnet,
   type FetchImpl,
 } from '../src/media/prowlarr.js';
 
@@ -18,16 +19,46 @@ const client = (impl: FetchImpl) =>
 
 // ── 🔴 the infoHash is the whole point ───────────────────────────────────────
 
-test('🔴 a release with no infoHash is DISCARDED, not offered', async () => {
-  // qBittorrent lives in gluetun's netns and CANNOT reach Prowlarr. Handing it a
-  // proxy URL fails silently -- pending_count:1 and nothing ever materialises.
-  // Offering such a release is offering a choice the user cannot have.
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 THIS TEST USED TO ASSERT THE OPPOSITE, AND THE PREMISE WAS FALSE.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * It read: *"a release with no infoHash is DISCARDED, not offered"*, reasoning
+ * that qBittorrent lives in gluetun's netns and cannot reach Prowlarr, so a
+ * release we can only name by URL is a choice the user cannot have.
+ *
+ * **The reasoning is still true and the conclusion was wrong.** The
+ * `downloadUrl` is a 301 to a MAGNET, and reading a redirect is something this
+ * process does — qBittorrent is never asked to. Measured 2026-09-04: every
+ * 1337x row publishes no `infoHash`, and 8 of 8 redirected to a magnet carrying
+ * a valid hash and 21 trackers.
+ *
+ * What it cost: Dungeon Crawler Carl is carried ONLY by 1337x, so the entire
+ * series was invisible and the tool truthfully reported that nothing could be
+ * fetched. The old assertion was pinning that behaviour in place.
+ *
+ * ⚠️ The RULE it was protecting survives, narrowed: we still refuse to offer a
+ * release nobody can take. A row with neither an infoHash nor a download link is
+ * still discarded — see the test below this one.
+ */
+test('🔴 a release with no infoHash but a download link is OFFERED, to be resolved later', async () => {
   const r = await client(async () =>
     json([{ title: 'A Book', downloadUrl: 'http://prowlarr/proxy/1', seeders: 9 }]),
   ).search('a book', CATEGORY.ebook);
+  assert.equal(r.state, 'results');
+  if (r.state !== 'results') throw new Error('unreachable');
+  assert.equal(r.releases.length, 1);
+  assert.equal(r.releases[0]!.infoHash, '', 'not resolved yet, and it says so by being empty');
+  assert.equal(r.releases[0]!.downloadUrl, 'http://prowlarr/proxy/1');
+  assert.equal(r.discarded, 0);
+});
+
+test('🔴 a release with NEITHER an infoHash nor a download link is still discarded', async () => {
+  const r = await client(async () => json([{ title: 'A Book', seeders: 9 }])).search('a book', CATEGORY.ebook);
   assert.equal(r.state, 'none');
   if (r.state !== 'none') throw new Error('unreachable');
-  assert.match(r.detail, /none carried an infoHash/);
+  assert.match(r.detail, /none carried an infoHash OR a download link/);
 });
 
 test('discarded-but-present is distinguishable from genuinely-nothing', async () => {
@@ -144,4 +175,56 @@ test('a dead release never outranks a live one, whatever else matches', () => {
 test('unabridged beats abridged when neither is preferred by name', () => {
   const list = [ab('Dune Abridged'), ab('Dune Unabridged')];
   assert.match(rankAudiobooks(list, { wantGraphicAudio: false })[0]!.title, /Unabridged/);
+});
+
+
+// ── 🔴 resolveMagnet: the 301 IS the payload ────────────────────────────────
+
+/** A Response carrying only what `resolveMagnet` reads. */
+const redirect = (location: string | null, status = 301): Response =>
+  ({ ok: false, status, headers: { get: (k: string) => (k.toLowerCase() === 'location' ? location : null) } }) as unknown as Response;
+
+const REAL_MAGNET =
+  'magnet:?xt=urn:btih:F1A841C4EB55D2ECEEBDCAB876724BBF1A99CC8E&dn=The+Dungeon+Anarchists+Cookbook' +
+  '&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce';
+
+test('🔴 resolveMagnet reads the magnet out of the redirect, hash and trackers intact', async () => {
+  // The verbatim redirect target measured 2026-09-04 for DCC book 03.
+  const r = await resolveMagnet('http://prowlarr/proxy/1', async () => redirect(REAL_MAGNET));
+  assert.equal(r.state, 'magnet');
+  if (r.state !== 'magnet') throw new Error('unreachable');
+  assert.equal(r.infoHash, 'F1A841C4EB55D2ECEEBDCAB876724BBF1A99CC8E');
+  assert.match(r.magnetUri, /tracker\.opentrackr\.org/, 'the trackers are the reason to prefer this over a built magnet');
+});
+
+test('🔴 resolveMagnet asks for the redirect and does NOT follow it', async () => {
+  // Following it throws: the target scheme is `magnet:`, which no HTTP client
+  // can fetch. `redirect: manual` is load bearing, not a style choice.
+  let seen: RequestInit | undefined;
+  await resolveMagnet('http://prowlarr/proxy/1', async (_u, init) => {
+    seen = init;
+    return redirect(REAL_MAGNET);
+  });
+  assert.equal(seen?.redirect, 'manual');
+});
+
+test('🔴 a Location that is not a magnet, or carries a bad hash, is UNKNOWN not a grab', async () => {
+  for (const [loc, why] of [
+    [null, 'no redirect at all'],
+    ['https://example.invalid/somewhere', 'redirected somewhere that is not a magnet'],
+    ['magnet:?xt=urn:btih:nothex&dn=x', 'a hash that is not 40 hex'],
+    [`magnet:?xt=urn:btih:${'a'.repeat(39)}`, 'a hash one character short'],
+  ] as const) {
+    const r = await resolveMagnet('http://prowlarr/proxy/1', async () => redirect(loc));
+    assert.equal(r.state, 'unknown', `${why} must not produce a magnet`);
+  }
+});
+
+test('🔴 an unreachable Prowlarr is UNKNOWN — a failure to LOOK is not a "no"', async () => {
+  const r = await resolveMagnet('http://prowlarr/proxy/1', async () => {
+    throw new Error('ECONNREFUSED');
+  });
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /ECONNREFUSED/);
 });

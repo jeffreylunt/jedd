@@ -146,7 +146,11 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
           description:
             'The endpoint under that service, starting with "/" — e.g. "/Search/Hints", ' +
             '"/LiveTv/Programs", "/calendar", "/wanted/missing", "/api/v1/indexerstatus" (Prowlarr has ' +
-            'NO path prefix, so its paths start /api/v1). Do NOT put a querystring here.',
+            'NO path prefix, so its paths start /api/v1). Sonarr/Radarr bases ALREADY include ' +
+            '`/sonarr/api/v3` or `/radarr/api/v3` — use `/series/lookup` or `/movie/lookup` (and put ' +
+            '`term` in `query`), NEVER bare `/lookup` and NEVER re-prefix `/api/v3/...`. For "how ' +
+            'many seasons?" prefer `title_details` or `catalogue_search`, not a raw lookup. Do NOT ' +
+            'put a querystring here.',
         },
         query: {
           type: 'object',

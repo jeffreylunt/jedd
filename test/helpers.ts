@@ -37,6 +37,9 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       path: '/webhook',
       publicUrl: 'http://127.0.0.1:0/webhook',
     },
+    // Small on purpose: a test that has to build a 12 MB buffer to reach the
+    // ceiling is a test nobody writes.
+    images: { maxWidth: 1024, maxBytes: 1000, maxCount: 3, historyTurns: 2 },
     kindle: { smtpHost: 'smtp.invalid', smtpPort: 587, fromEmail: 'jedd@invalid', smtpPassword: 'test-pw' },
     prowlarr: { baseUrl: 'http://prowlarr.invalid:9696', apiKey: 'test-key' },
     /**

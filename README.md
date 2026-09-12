@@ -208,7 +208,7 @@ connector  ──▶  turn queue  ──▶  agent loop  ──▶  permission g
 
 ```bash
 npm install
-npm test        # 1411 tests, no network needed
+npm test        # the full suite, no network needed
 npm run chat    # talk to it on stdout
 ```
 
@@ -265,14 +265,14 @@ Sweep log: `~/dev/jedd-v2/data/issue-sweep.log`. State log: `~/dev/jedd-v2/data/
 `com.jeff.jedd-weekly-fix` (LaunchAgent on the host) runs Sunday at 03:00 MDT / 09:00 UTC. For each open issue on the repo that does not already have an open PR:
 
 1. Fetches `origin/main`, creates a new branch `auto-fix/issue-<NUMBER>-<short-slug>` off it
-2. Invokes the `weekly-fixer` opencode agent (model `minimax/MiniMax-M3`) with the issue body + standing rules. The agent investigates the code, writes the minimum fix, runs `npm test` (must pass at the current count — 1425 as of this writing), commits (`fix #<NUMBER>: <summary>`), pushes the branch, and opens a PR
+2. Invokes the `weekly-fixer` opencode agent (model `minimax/MiniMax-M3`) with the issue body + standing rules. The agent investigates the code, writes the minimum fix, runs `npm test` (which must pass), commits (`fix #<NUMBER>: <summary>`), pushes the branch, and opens a PR
 3. The agent's last line of output is the PR URL — the script enables auto-merge on it (`gh pr merge --auto --squash`); if checks fail the PR stays open for manual review
 4. If `npm test` fails the agent returns `TESTS_FAILED` instead of a PR URL; the script then comments on the issue and skips
 
 **Standing rules baked into the agent:**
 - Never push to `main`, never force-push, never delete other branches
 - Never modify `data/`, `scripts/messages-poke.mjs`, secrets, or `.env`
-- All 1425 tests must pass before any commit/push
+- The full suite must pass before any commit/push (`npm test`, zero failures)
 
 Manual run (does not respect the schedule):
 ```bash
