@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   planRead,
+  normalizeHomelabPath,
   personVerdict,
   renderRead,
   secretVerdict,
@@ -73,6 +74,56 @@ test('🔴 the host comes from the enum — a path cannot name a different one',
   const good = planRead('sonarr', '/series', {}, config, 'owner');
   assert.equal(good.allowed, true);
   assert.ok(good.allowed && good.url.startsWith(config.sonarr.baseUrl));
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SONARR / RADARR PATH JOIN — Chad Powers 2026-09-12 mid-thread 404s
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 Sonarr: bare /lookup rewrites to /series/lookup (not …/api/v3/lookup)', () => {
+  const plan = planRead('sonarr', '/lookup', { term: 'Chad Powers' }, config, 'owner');
+  assert.equal(plan.allowed, true, plan.allowed === false ? plan.reason : '');
+  assert.ok(plan.allowed);
+  assert.equal(
+    plan.url,
+    'http://sonarr.invalid:8989/sonarr/api/v3/series/lookup?term=Chad+Powers',
+  );
+});
+
+test('🔴 Sonarr: /api/v3/lookup does NOT double the api prefix', () => {
+  const plan = planRead('sonarr', '/api/v3/lookup', { term: 'Chad Powers' }, config, 'owner');
+  assert.equal(plan.allowed, true, plan.allowed === false ? plan.reason : '');
+  assert.ok(plan.allowed);
+  assert.equal(
+    plan.url,
+    'http://sonarr.invalid:8989/sonarr/api/v3/series/lookup?term=Chad+Powers',
+  );
+  assert.equal(plan.url.includes('/api/v3/api/v3/'), false);
+});
+
+test('🔴 Sonarr: restating the full base pathname is stripped', () => {
+  const plan = planRead('sonarr', '/sonarr/api/v3/series/lookup', { term: 'x' }, config, 'owner');
+  assert.equal(plan.allowed, true, plan.allowed === false ? plan.reason : '');
+  assert.ok(plan.allowed);
+  assert.equal(plan.url, 'http://sonarr.invalid:8989/sonarr/api/v3/series/lookup?term=x');
+});
+
+test('Radarr: bare /lookup rewrites to /movie/lookup', () => {
+  const plan = planRead('radarr', '/lookup', { term: 'Moneyball' }, config, 'owner');
+  assert.equal(plan.allowed, true, plan.allowed === false ? plan.reason : '');
+  assert.ok(plan.allowed);
+  assert.equal(
+    plan.url,
+    'http://radarr.invalid:7878/radarr/api/v3/movie/lookup?term=Moneyball',
+  );
+});
+
+test('normalizeHomelabPath: /series/lookup is unchanged', () => {
+  assert.equal(
+    normalizeHomelabPath('sonarr', '/series/lookup', '/sonarr/api/v3'),
+    '/series/lookup',
+  );
 });
 
 /**
