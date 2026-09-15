@@ -24,6 +24,15 @@ export interface LlmMessage {
    */
   images?: string[];
   /**
+   * MIME type for each entry in `images`, same index, same length.
+   *
+   * Only the OpenAI-compatible client reads this — it needs a real
+   * `data:<mime>;base64,…` prefix per image. Ollama's `/api/chat` takes bare
+   * base64 with no type alongside it, so that path never looked at this before
+   * and still does not.
+   */
+  imageMimeTypes?: string[];
+  /**
    * What to tell the model about this turn's attachments, expanded into a
    * `system` message at request-build time.
    *
@@ -161,7 +170,7 @@ export function buildRequestMessages(
       continue;
     }
 
-    const { images: _dropped, imageNote: _note, ...rest } = m;
+    const { images: _dropped, imageMimeTypes: _droppedMimes, imageNote: _note, ...rest } = m;
     reversed.push(rest);
     reversed.push({
       role: 'system',
@@ -198,6 +207,7 @@ export function pruneStoredImages(messages: LlmMessage[], keepTurns: number): vo
     seen += 1;
     if (seen > keepTurns) {
       delete m.images;
+      delete m.imageMimeTypes;
       delete m.imageNote;
     }
   }
@@ -338,6 +348,152 @@ export class OllamaClient implements LlmClient {
 }
 
 /**
+ * `baseUrl` may or may not already end in `/v1` — oMLX's default does
+ * (`http://host:8000/v1`), a bare host does not. Appending unconditionally
+ * would produce `/v1/v1/...` for the former.
+ */
+function normalizeV1Base(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/$/, '');
+  return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+}
+
+function toOpenAiMessages(messages: LlmMessage[]): unknown[] {
+  return messages.map((m) => {
+    if (m.role === 'tool') {
+      return { role: 'tool', tool_call_id: m.toolCallId, content: m.content };
+    }
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      return {
+        role: 'assistant',
+        content: m.content || null,
+        tool_calls: m.toolCalls.map((c) => ({
+          id: c.id,
+          type: 'function',
+          function: { name: c.name, arguments: JSON.stringify(c.arguments) },
+        })),
+      };
+    }
+    if (m.role === 'user' && m.images?.length) {
+      const parts: unknown[] = [{ type: 'text', text: m.content }];
+      for (const [i, b64] of m.images.entries()) {
+        // Empty/missing mime type would produce an invalid `data:` URL, so a
+        // guess beats sending nothing — the bytes still decode correctly
+        // either way, only the declared type would be off.
+        const mime = m.imageMimeTypes?.[i] || 'image/jpeg';
+        parts.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } });
+      }
+      return { role: 'user', content: parts };
+    }
+    return { role: m.role, content: m.content };
+  });
+}
+
+export class OpenAiClient implements LlmClient {
+  readonly label: string;
+
+  constructor(
+    private readonly config: Config,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {
+    this.label = `openai:${config.llm.model}`;
+  }
+
+  async chat(messages: LlmMessage[], tools: Tool[]): Promise<LlmReply> {
+    // Same timeout discipline as OllamaClient.chat — see the comment there.
+    const limitMs = this.config.llm.turnTimeoutMs ?? TURN_TIMEOUT_MS;
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const timer = setTimeout(() => controller.abort(), limitMs);
+    let body: {
+      choices?: {
+        finish_reason?: string;
+        message?: {
+          content?: string | null;
+          tool_calls?: { id?: string; function?: { name?: string; arguments?: unknown } }[];
+        };
+      }[];
+    };
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (this.config.llm.apiKey) headers.Authorization = `Bearer ${this.config.llm.apiKey}`;
+      const res = await this.fetchImpl(`${normalizeV1Base(this.config.llm.baseUrl)}/chat/completions`, {
+        method: 'POST',
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: this.config.llm.model,
+          messages: toOpenAiMessages(messages),
+          ...(tools.length
+            ? {
+                tools: tools.map((t) => ({
+                  type: 'function',
+                  function: { name: t.name, description: t.description, parameters: t.parameters },
+                })),
+              }
+            : {}),
+          stream: false,
+          temperature: 0.2,
+          max_tokens: 3000,
+          // Mirrors Ollama's `think: true`: reasoning stays ON, it just arrives
+          // in its own `reasoning_content` field instead of inline, and is
+          // dropped below exactly like `message.thinking` is for Ollama — so
+          // strict-JSON callers still get clean `content`.
+          chat_template_kwargs: { enable_thinking: true },
+        }),
+      });
+
+      if (!res.ok) {
+        // ⚠️ Captured before the await, same reason as OllamaClient.chat: an
+        // abort landing mid-read must not lose the status that was already in.
+        const status = res.status;
+        throw new Error(`OpenAI-compatible HTTP ${status}: ${(await res.text()).slice(0, 300)}`);
+      }
+      body = (await res.json()) as typeof body;
+    } catch (e) {
+      if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs, e);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const choice = body.choices?.[0];
+    const raw = choice?.message?.tool_calls ?? [];
+    const toolCalls: LlmToolCall[] = raw.flatMap((call, i) => {
+      const name = call.function?.name;
+      if (!name) return [];
+      let args: Record<string, unknown> = {};
+      const rawArgs = call.function?.arguments;
+      if (typeof rawArgs === 'string') {
+        try {
+          args = JSON.parse(rawArgs) as Record<string, unknown>;
+        } catch {
+          args = {};
+        }
+      } else if (rawArgs && typeof rawArgs === 'object') {
+        args = rawArgs as Record<string, unknown>;
+      }
+      return [{ id: call.id ?? `call_${Date.now()}_${i}`, name, arguments: args }];
+    });
+
+    const text = choice?.message?.content ?? '';
+
+    // Same rule as Ollama's `done_reason: "length"` check: empty content on a
+    // tool-calling turn is normal, but hitting the token budget with neither a
+    // reply nor a tool call means the reasoning ate the whole allowance.
+    if (choice?.finish_reason === 'length' && !text.trim() && toolCalls.length === 0) {
+      throw new Error(
+        'Model hit its token budget without producing an answer or a tool call ' +
+          '(finish_reason=length). Reasoning consumed the whole max_tokens allowance.',
+      );
+    }
+
+    // `message.reasoning_content` is deliberately NOT returned — same rule as
+    // Ollama's `message.thinking`: it is reasoning, not reply.
+    return { text, toolCalls };
+  }
+}
+
+/**
  * Is the model endpoint actually there, and does it have the model we ask for?
  *
  * 🔴 WARN, NEVER FATAL — AND THE DISTINCTION IS THE WHOLE DESIGN.
@@ -355,44 +511,70 @@ export class OllamaClient implements LlmClient {
  * evidence in a log. This line is the difference between finding that out at
  * boot and finding it out from a user who thinks the bot is ignoring them.
  */
+/**
+ * Shared by both providers' reachability check: hit a model-listing endpoint,
+ * confirm it answers, and confirm the configured model is actually in the
+ * list it returns.
+ *
+ * Reachable but WITHOUT the configured model is its own failure, and a
+ * distinct one: the endpoint answers, so every connectivity check passes, and
+ * the model name is only wrong at generation time. Name what IS there — a
+ * typo is obvious next to the real list and invisible on its own.
+ */
+async function probeModelList(
+  fetchImpl: typeof fetch,
+  url: string,
+  base: string,
+  model: string,
+  extractNames: (body: unknown) => string[],
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const r = await fetchImpl(url, { signal: AbortSignal.timeout(5_000) });
+    if (!r.ok) return { ok: false, detail: `${base} answered http ${r.status}` };
+    const names = extractNames(await r.json());
+    if (!names.includes(model)) {
+      return {
+        ok: false,
+        detail:
+          `${base} is reachable but has no model named "${model}". ` +
+          `It offers: ${names.slice(0, 8).join(', ') || '(none)'}${names.length > 8 ? ', …' : ''}`,
+      };
+    }
+    return { ok: true, detail: `${base} has ${model}` };
+  } catch (e) {
+    return { ok: false, detail: `${base} is unreachable: ${(e as Error).message}` };
+  }
+}
+
 export async function probeLlm(
   config: Config,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ ok: boolean; detail: string }> {
   const base = config.llm.baseUrl.replace(/\/$/, '');
-  try {
-    const r = await fetchImpl(`${base}/api/tags`, { signal: AbortSignal.timeout(5_000) });
-    if (!r.ok) return { ok: false, detail: `${base} answered http ${r.status}` };
-    const body = (await r.json()) as { models?: { name?: string }[] };
-    const names = (body.models ?? []).map((m) => m.name).filter(Boolean) as string[];
-    if (!names.includes(config.llm.model)) {
-      /**
-       * Reachable but WITHOUT the configured model is its own failure, and a
-       * distinct one: the endpoint answers, so every connectivity check passes,
-       * and the model name is only wrong at generation time. Name what IS there
-       * — a typo is obvious next to the real list and invisible on its own.
-       */
-      return {
-        ok: false,
-        detail:
-          `${base} is reachable but has no model named "${config.llm.model}". ` +
-          `It offers: ${names.slice(0, 8).join(', ') || '(none)'}${names.length > 8 ? ', …' : ''}`,
-      };
-    }
-    return { ok: true, detail: `${base} has ${config.llm.model}` };
-  } catch (e) {
-    return { ok: false, detail: `${base} is unreachable: ${(e as Error).message}` };
+  if (config.llm.provider === 'openai') {
+    return probeModelList(
+      fetchImpl,
+      `${normalizeV1Base(config.llm.baseUrl)}/models`,
+      base,
+      config.llm.model,
+      (b) => ((b as { data?: { id?: string }[] }).data ?? []).map((m) => m.id).filter(Boolean) as string[],
+    );
   }
+  return probeModelList(fetchImpl, `${base}/api/tags`, base, config.llm.model, (b) =>
+    ((b as { models?: { name?: string }[] }).models ?? []).map((m) => m.name).filter(Boolean) as string[],
+  );
 }
 
 export function createLlmClient(config: Config): LlmClient {
   switch (config.llm.provider) {
     case 'ollama':
       return new OllamaClient(config);
+    case 'openai':
+      return new OpenAiClient(config);
     case 'anthropic':
       throw new Error(
         'The Anthropic client is not implemented yet — the LlmClient interface is the seam for it. ' +
-          'Set LLM_PROVIDER=ollama.',
+          'Set LLM_PROVIDER=ollama or LLM_PROVIDER=openai.',
       );
     default:
       throw new Error(`Unknown LLM provider: ${String(config.llm.provider)}`);
