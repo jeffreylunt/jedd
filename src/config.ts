@@ -32,7 +32,7 @@ export interface Config {
   /** Dev-only escape hatch permitting the shared-identity case. Never set in a deploy. */
   allowSharedSshIdentity: boolean;
   llm: {
-    provider: 'ollama' | 'anthropic';
+    provider: 'ollama' | 'anthropic' | 'openai';
     baseUrl: string;
     model: string;
     apiKey?: string;
@@ -474,7 +474,7 @@ export function parsePositiveInt(
 }
 
 export function loadConfig(): Config {
-  const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic';
+  const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'anthropic' | 'openai';
   // A hostname is deployment configuration; `.env` is authoritative and this
   // literal is only the fallback for a fresh install.
   const adminSshHost = process.env.HP_ADMIN_SSH_HOST ?? 'homelab';
@@ -494,7 +494,11 @@ export function loadConfig(): Config {
       provider,
       baseUrl:
         process.env.LLM_BASE_URL ??
-        (provider === 'anthropic' ? 'https://api.anthropic.com' : 'http://localhost:11434'),
+        (provider === 'anthropic'
+          ? 'https://api.anthropic.com'
+          : provider === 'openai'
+            ? 'http://localhost:8000/v1'
+            : 'http://localhost:11434'),
       model: process.env.LLM_MODEL ?? 'qwen3.8:27b',
       apiKey: process.env.LLM_API_KEY,
       ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }),

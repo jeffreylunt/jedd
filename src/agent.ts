@@ -573,7 +573,12 @@ export class Agent {
        * send time is what lets a follow-up question still see the picture while
        * a long thread still cannot accumulate them.
        */
-      ...(attachments?.images.length ? { images: attachments.images.map((i) => i.base64) } : {}),
+      ...(attachments?.images.length
+        ? {
+            images: attachments.images.map((i) => i.base64),
+            imageMimeTypes: attachments.images.map((i) => i.contentType),
+          }
+        : {}),
     });
     // What gets LOGGED and replayed is the composed text — never the base64. See
     // `HistoryStore`: it persists `userText`, a string, and replay rebuilds a
