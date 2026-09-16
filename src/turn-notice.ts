@@ -123,6 +123,37 @@ export function failureReply(e: unknown): string {
 }
 
 /**
+ * 🔴 DID THE REPLY LAND, AND IF SO, SILENCE THE APOLOGY.
+ *
+ * The measured defect: a plain send aborting on the client while the server
+ * was still delivering — the turn throws, the catch sends a failure notice,
+ * and Jeff reads his reply FOLLOWED by "Something went wrong on my end". The
+ * catch now asks the transport `verifyDelivery` before it speaks, and THIS is
+ * where the answer becomes a decision, pure and testable here for the same
+ * reason `failureReply` is: the catch sits inside `main()`, so nothing in it
+ * is reachable from a test.
+ *
+ * The three states, mirroring `recentlySent` under the connector:
+ *
+ *   `true`       — the sent history holds the reply. It LANDED. The failure
+ *                  was our answer, not the send. `suppress`: an apology after
+ *                  a delivered reply is the defect, not the cure.
+ *   `false`      — we looked and it is not there. The turn genuinely produced
+ *                  nothing on the wire. `send`.
+ *   `null`       — an implementation looked and could not read. `undefined` —
+ *                  no implementation at all. Both are `send-unverified`: the
+ *                  notice goes out, exactly as it did before this check
+ *                  existed. 🔴 `null` is NOT `false` in the dangerous
+ *                  direction here — the cost of one unneeded apology is small;
+ *                  the cost of suppressing on a guess is a swallowed turn with
+ *                  no one to tell, which is the original silence defect.
+ */
+export function failureNoticeDecision(delivered: boolean | null | undefined): 'send' | 'send-unverified' | 'suppress' {
+  if (delivered === true) return 'suppress';
+  return delivered === false ? 'send' : 'send-unverified';
+}
+
+/**
  * ── 🔴 240 SECONDS, AND THE NUMBER IS MEASURED, NOT PICKED ───────────────────
  *
  * From the durable log (`data/jedd.log`, 110 completed turns):

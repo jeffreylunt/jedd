@@ -403,6 +403,51 @@ test('a REFUSED send reports delivered:false, and send() still throws for the re
   await assert.rejects(() => connector.send('+1555', 'hi'), /send failed/);
 });
 
+// ── 🔴 verifyDelivery: the look-back that keeps a false apology from following ──
+// ── a delivered reply ──────────────────────────────────────────────────────────
+
+test('🔴 verifyDelivery asks recentlySent with the same text, and true stays true', async () => {
+  // The measured defect: the reply landed, the turn threw, and the catch apologised
+  // AFTER the answer. `true` here is the verdict that suppresses that apology.
+  const calls: Array<[string, string, number | undefined]> = [];
+  const client = {
+    async recentlySent(to: string, text: string, withinMs?: number) {
+      calls.push([to, text, withinMs]);
+      return true as const;
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  assert.equal(await connector.verifyDelivery('+15551112222', 'hi', 123_456), true);
+  assert.deepEqual(calls, [['+15551112222', 'hi', 123_456]], 'it must ask with the same text — a re-derived match is a second answer');
+});
+
+test('🔴 CONTROL: a reply that never went out verifies false, so the apology still goes', async () => {
+  const client = {
+    async recentlySent() {
+      return false as const;
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  assert.equal(await connector.verifyDelivery('+1555', 'hi'), false);
+});
+
+test('🔴 null passes through as null, NOT false — an unreadable history is "we do not know"', async () => {
+  // Coercing `null` to `false` here is harmless-looking and exactly wrong in the
+  // other direction: it would let a broken read stand for a negative verdict.
+  const client = {
+    async recentlySent(): Promise<null> {
+      return null;
+    },
+  } as unknown as BlueBubblesClient;
+  const connector = new BlueBubblesConnector(null as unknown as BlueBubblesReceiver, client, 'everyone');
+  assert.equal(await connector.verifyDelivery('+1555', 'hi'), null);
+});
+
+test('🔴 a ShadowConnector has NO verifyDelivery — the absent capability reads as undefined, and main.ts sends the notice on it', () => {
+  const shadow = new ShadowConnector(null as unknown as BlueBubblesReceiver);
+  assert.ok(!('verifyDelivery' in shadow), 'a shadow that could verify could not read its own history');
+});
+
 // ── 🔴 the first boot must not answer history ────────────────────────────────
 
 /** A server holding `history` messages, newest rowid 2601. */

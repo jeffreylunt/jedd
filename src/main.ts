@@ -18,6 +18,7 @@ import {
 } from './connector.js';
 import { BURST_SETTLE_MS, sleep, TurnQueue, type BatchWait } from './turn-queue.js';
 import {
+  failureNoticeDecision,
   failureReply,
   MAX_NOTICES,
   parseStillWorkingMs,
@@ -682,11 +683,28 @@ async function main(): Promise<void> {
      * it structurally impossible to schedule a "still working" note after the
      * answer has been composed.
      */
-    const notice = new StillWorkingNotice({
-      notify: (text) => connector.send(message.senderHandle, text),
-      afterMs: stillWorkingMs,
-    });
-    try {
+     const notice = new StillWorkingNotice({
+       notify: (text) => connector.send(message.senderHandle, text),
+       afterMs: stillWorkingMs,
+     });
+     /**
+      * 🔴 CAPTURED SO THE CATCH CAN ASK "DID IT LAND?".
+      *
+      * The measured defect this exists for: a plain send aborting on the
+      * client while the server was still delivering — the turn throws, the
+      * catch below used to send a failure notice unconditionally, and the
+      * notice landed AFTER the reply it apologised for. `r` lives inside the
+      * `withPresence` closure and is not reachable from the catch, so the
+      * reply text is copied out at the moment the send starts. `undefined`
+      * down in the catch means the model never produced a reply — there is
+      * nothing to verify, and the notice goes out exactly as before.
+      *
+      * ⚠️ DECLARED OUTSIDE THE `try`, exactly like `notice` above: a `let`
+      * inside the try block would be invisible to the catch, and the one path
+      * that needs it is the failure path.
+      */
+     let replyText: string | undefined;
+     try {
       /**
        * 🔴 THE READ RECEIPT AND THE TYPING INDICATOR ARE ONE CALL — see
        * `withPresence`. The typing region covers the model turn AND the send, so
@@ -712,8 +730,8 @@ async function main(): Promise<void> {
        * shared one would be overwritten by whichever reply finished last and the
        * log line would describe the wrong send with total confidence.
        */
-      const sent: SendRecord = { anchored: false, detail: 'no send reached' };
-      const record = await withPresence(
+        const sent: SendRecord = { anchored: false, detail: 'no send reached' };
+        const record = await withPresence(
         connector,
         message,
         async () => {
@@ -776,6 +794,7 @@ async function main(): Promise<void> {
            * and the subject were only ever believed to match; now the batch IS
            * the subject, and there is nothing else in flight to confuse it with.
            */
+          replyText = r.replyText;
           await connector.send(message.senderHandle, r.replyText, message.sourceGuid, sent);
           return r;
         },
@@ -897,7 +916,47 @@ async function main(): Promise<void> {
        * cannot be delivered either, and throwing from a catch block would take
        * out the handler that keeps the NEXT message working.
        */
-      try {
+      /**
+       * 🔴 BEFORE THE APOLOGY SPEAKS, ASK WHETHER THE REPLY IT APOLOGISES FOR
+       * ALREADY LANDED.
+       *
+       * The measured defect: a plain send aborting on the client (15s) while
+       * the server was still delivering over the AppleScript fallback (~120s) —
+       * the send completed on the server, the turn threw here, and the notice
+       * below landed AFTER the reply. So when this turn did produce a reply
+       * (`replyText` set), the transport is asked to read BlueBubbles' own
+       * sent history before anything is sent. The verdict is `failureNoticeDecision`'s,
+       * a pure function in `turn-notice.ts` for the same reason `failureReply`
+       * is: this catch sits inside `main()` and nothing in it is testable in
+       * place.
+       *
+       * 🔴 The look-back itself must be allowed to fail. `connector` is an
+       * interface — a transport without `verifyDelivery` yields `undefined`, and
+       * a BlueBubbles that is DOWN is exactly the case where this catch is
+       * running — so a throw from the check is treated as `null`, unknown, and
+       * the notice goes out. The check can make us MORE cautious, never less
+       * loud: suppression requires the one state, `true`, that a broken read
+       * cannot fake.
+       */
+      let delivered: boolean | null | undefined;
+      if (replyText !== undefined) {
+        try {
+          delivered = await connector.verifyDelivery?.(message.senderHandle, replyText);
+        } catch {
+          delivered = null;
+        }
+      }
+      const decision = failureNoticeDecision(delivered);
+      if (decision === 'suppress') {
+        console.error(
+          `[jedd] turn ${turn} threw after the reply was already in the sent history — failure notice suppressed`,
+        );
+      } else {
+        if (replyText !== undefined && decision === 'send-unverified') {
+          console.error(
+            `[jedd] turn ${turn} reply delivery unverified (no look-back, or history unreadable) — sending the failure notice`,
+          );
+        }
         /**
          * 🔴 THE WORDING IS `failureReply`'s, NOT A LITERAL HERE, AND THAT IS
          * THE POINT OF THE CHANGE.
@@ -912,9 +971,11 @@ async function main(): Promise<void> {
          * IMAP and two SSH identities before it is reachable, so nothing here is
          * testable in place.
          */
-        await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
-      } catch (sendErr) {
-        console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+        try {
+          await connector.send(message.senderHandle, failureReply(e), message.sourceGuid);
+        } catch (sendErr) {
+          console.error(`[jedd] turn ${turn} could not even report the failure: ${(sendErr as Error).message}`);
+        }
       }
     } finally {
       /**

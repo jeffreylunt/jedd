@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { describeError } from '../src/errors.js';
 import { OllamaClient, TURN_TIMEOUT_MS } from '../src/llm.js';
 import {
+  failureNoticeDecision,
   failureReply,
   isModelTimeout,
   MAX_NOTICES,
@@ -260,6 +261,32 @@ test('🔴 a timeout is TOLD as a timeout, and a generic failure is not', () => 
 test('the failure reply never carries the exception text', () => {
   const reply = failureReply(new Error('connect EHOSTUNREACH 10.0.0.10:8096 apikey=SECRET'));
   assert.doesNotMatch(reply, /10\.0\.0\.10|apikey|SECRET|EHOSTUNREACH/);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// THE APOLOGY GATE: a delivered reply must not be followed by an apology
+// ──────────────────────────────────────────────────────────────────────────
+
+test('🔴 the reply is in the sent history — the apology is suppressed, not sent', () => {
+  // The measured defect: the send completed on the server, the turn threw, and
+  // the notice landed AFTER the reply. `true` is the one verdict that must
+  // silence the catch.
+  assert.equal(failureNoticeDecision(true), 'suppress');
+});
+
+test('🔴 CONTROL: a reply that genuinely never went out is apologised for', () => {
+  // The negative of the above. A `failureNoticeDecision` that suppressed on
+  // every input would make a dead turn indistinguishable from a delivered one —
+  // the original silence defect, one layer down.
+  assert.equal(failureNoticeDecision(false), 'send');
+});
+
+test('🔴 unknown is NOT no — unreadable history and absent look-back both still send', () => {
+  // `null` (we looked and could not read) and `undefined` (no look-back at all)
+  // must both send the notice. Suppressing on a guess is how a swallowed turn
+  // goes unreported; one unneeded apology is cheaper than that.
+  assert.equal(failureNoticeDecision(null), 'send-unverified');
+  assert.equal(failureNoticeDecision(undefined), 'send-unverified');
 });
 
 // ──────────────────────────────────────────────────────────────────────────

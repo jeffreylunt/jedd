@@ -139,8 +139,31 @@ export interface Connector {
    * still says its own name, once, through `Presence.report`; this token covers
    * the silence that used to sit underneath it.
    */
-  markRead(toHandle: string): boolean;
-  withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T>;
+   markRead(toHandle: string): boolean;
+   withTyping<T>(toHandle: string, fn: () => Promise<T>, onTyping?: () => void): Promise<T>;
+
+  /**
+   * ── DELIVERY VERIFICATION: DID A SEND THAT THREW ACTUALLY LAND? ─────────────
+   *
+   * The measured defect this exists for: a plain send aborting on the client
+   * while the server was still delivering — the turn throws, the catch sends a
+   * failure notice, and the notice lands AFTER the reply it apologises for.
+   * The catch asks here before it speaks.
+   *
+   * 🔴 OPTIONAL, AND THE ABSENT CASE IS AN ANSWER, NOT AN OMISSION. A transport
+   * that cannot look back simply does not implement this, and the caller reads
+   * `undefined` as UNVERIFIED — the notice goes out exactly as it did before
+   * this method existed. `null` from an implementation that DID look is the
+   * same answer: an unreadable history is "we do not know", never "it did not
+   * land". The three states mirror `recentlySent` below the interface:
+   *
+   *   `true`       — it is in the sent history. It landed. Suppress the notice.
+   *   `false`      — we looked and it is not there. Send the notice.
+   *   `null` / `undefined` — unknown. Send the notice: the cost of an unneeded
+   *   apology is small; the cost of a silent swallowed turn is the original
+   *   silence defect all over again.
+   */
+  verifyDelivery?(toHandle: string, text: string, withinMs?: number): Promise<boolean | null>;
 }
 
 /**

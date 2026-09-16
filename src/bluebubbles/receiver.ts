@@ -535,6 +535,27 @@ export class BlueBubblesConnector implements Connector {
   }
 
   /**
+   * 🔴 THE LOOK-BACK THAT KEEPS A FALSE APOLOGY FROM FOLLOWING A DELIVERED REPLY.
+   *
+   * Delegates to `recentlySent` rather than re-reading the history: there is one
+   * place that knows how to ask BlueBubbles "did this text go out" — the same
+   * read-back `retryPlain` uses to decide whether a retry would double-text —
+   * and a second implementation here would be a second answer that can drift
+   * from it.
+   *
+   * 🔴 `null` passes through as `null`, NOT `false`. The caller sends the notice
+   * on `null` on purpose (see `verifyDelivery` on the `Connector` interface):
+   * an unreadable history is exactly when a swallowed turn is least visible.
+   *
+   * 🔴 NO AUDIENCE GATE ON PURPOSE. This reads BlueBubbles' own history, it
+   * sends nothing, and a read is not a signal the other person sees — unlike
+   * `markRead` and `withTyping`, there is nothing here to suppress.
+   */
+  async verifyDelivery(toHandle: string, text: string, withinMs?: number): Promise<boolean | null> {
+    return this.client.recentlySent(toHandle, text, withinMs);
+  }
+
+  /**
    * ── 🔴 PRESENCE GOES THROUGH THE SAME AUDIENCE GATE AS A SEND ──────────────
    *
    * A read receipt and a typing indicator are both **visible to the other

@@ -475,7 +475,9 @@ export class BlueBubblesClient {
           ...(anchored ? { selectedMessageGuid: replyToGuid, partIndex: 0 } : {}),
         }),
       },
-      anchored ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS : undefined,
+      anchored
+        ? BlueBubblesClient.ANCHORED_SEND_TIMEOUT_MS
+        : BlueBubblesClient.PLAIN_SEND_TIMEOUT_MS,
     );
     if (status >= 400) {
       return {
@@ -505,6 +507,23 @@ export class BlueBubblesClient {
    * path. See `sendText` for the 120s failure wall this sits under.
    */
   private static readonly ANCHORED_SEND_TIMEOUT_MS = 30_000;
+
+  /**
+   * 🔴 PLAIN SENDS GET THEIR OWN TIMEOUT TOO, AND THE 15s DEFAULT IS THE DEFECT.
+   *
+   * Measured 2026-09-16 against this server: a plain send delivered over the
+   * AppleScript fallback can take ~120s to land — the same wall the anchored
+   * 120s `Transaction timeout` sits under — and the client's default 15s abort
+   * fired in the MIDDLE of it. The send completed on the server and answered 500
+   * on the way back, so the turn threw, `main.ts`'s catch sent a failure notice,
+   * and Jeff read his reply FOLLOWED by "Something went wrong on my end".
+   *
+   * 150s clears the 120s wall with margin. The cost of waiting is one slow turn;
+   * the cost of aborting early is a false apology to a real person — and the
+   * look-back `verifyDelivery` added for exactly that case needs the window
+   * between the abort and the read to be small, so it gets it.
+   */
+  private static readonly PLAIN_SEND_TIMEOUT_MS = 150_000;
 
   /**
    * DID THIS EXACT TEXT ALREADY GO OUT TO THIS PERSON JUST NOW?
