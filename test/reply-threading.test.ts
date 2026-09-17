@@ -230,12 +230,15 @@ test('end to end: a lone reply is plain, a reply from a burst is anchored', asyn
 
   threading.arrived(OWNER, 'G-1');
   await connector.send(OWNER, 'one', 'G-1');
-  assert.ok(!('selectedMessageGuid' in bodies[0]!), 'the ordinary exchange must not be quoted');
+  const plain = bodies.find((b) => String(b['__url']).includes('/message/text'));
+  assert.ok(plain && !('selectedMessageGuid' in plain), 'the ordinary exchange must not be quoted');
 
   threading.arrived(OWNER, 'G-2');
   threading.arrived(OWNER, 'G-3');
   await connector.send(OWNER, 'two', 'G-2');
-  assert.equal(bodies[1]?.['selectedMessageGuid'], 'G-2');
+  const texts = bodies.filter((b) => String(b['__url']).includes('/message/text'));
+  assert.equal(texts.length, 2);
+  assert.equal(texts[1]?.['selectedMessageGuid'], 'G-2');
 });
 
 test('a follow-up sends plain even mid-burst — it answers no incoming message', async () => {
@@ -246,7 +249,8 @@ test('a follow-up sends plain even mid-burst — it answers no incoming message'
   threading.arrived(OWNER, 'G-1');
   threading.arrived(OWNER, 'G-2');
   await connector.send(OWNER, 'your download finished');
-  assert.ok(!('selectedMessageGuid' in bodies[0]!));
+  const sent = bodies.find((b) => String(b['__url']).includes('/message/text'));
+  assert.ok(sent && !('selectedMessageGuid' in sent));
 });
 
 test('🔴 a failed anchored send is downgraded to a plain one, not lost', async () => {

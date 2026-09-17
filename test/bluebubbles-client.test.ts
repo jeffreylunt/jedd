@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BlueBubblesClient, type FetchImpl } from '../src/bluebubbles/client.js';
+import { BlueBubblesClient, chatGuidFor, type FetchImpl } from '../src/bluebubbles/client.js';
 
 /**
  * The BlueBubbles HTTP surface, tested against a scripted fetch.
@@ -305,7 +305,9 @@ test('the password is sent as a query param and never in the body', async () => 
 test('markdown is stripped before sending, because iMessage has no renderer', async () => {
   const { impl, calls } = scripted(() => ({ body: { data: { guid: 'g' } } }));
   await client(impl).sendText('+1555', '**Dune** is ready. See `logs` or [here](https://x.invalid/a)');
-  const sent = (calls[0]!.body as { message: string }).message;
+  const textCall = calls.find((c) => String(c.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  const sent = (textCall.body as { message: string }).message;
   assert.equal(sent, 'Dune is ready. See logs or here (https://x.invalid/a)');
 });
 
@@ -315,5 +317,203 @@ test('🔴 stripping does NOT mangle ordinary titles and filenames', async () =>
   const { impl, calls } = scripted(() => ({ body: { data: { guid: 'g' } } }));
   const awkward = '*batteries not included (1987) is in some_file_name.mkv — 2*3 is 6';
   await client(impl).sendText('+1555', awkward);
-  assert.equal((calls[0]!.body as { message: string }).message, awkward);
+  const textCall = calls.find((c) => String(c.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { message: string }).message, awkward);
+});
+
+// ── live thread resolution ────────────────────────────────────────────────────
+
+function chatQueryReply(chats: unknown[], total = chats.length) {
+  return { status: 200, data: chats, metadata: { total, count: chats.length, limit: 100 } };
+}
+
+test('resolveChatGuid reads the live thread guid from /chat/query', async () => {
+  const handle = '+18015550123';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  const guid = await client(impl).resolveChatGuid(handle);
+
+  assert.equal(guid, `any;-;${handle}`);
+  assert.ok(calls.some((call) => String(call.url).includes('/chat/query')), 'expected a /chat/query call');
+});
+
+test('sendText addresses the live thread guid, not the constructed iMessage guid', async () => {
+  const handle = '+18015550123';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  const result = await client(impl).sendText(handle, 'hello');
+
+  assert.equal(result.accepted, true);
+  const textCall = calls.find((call) => String(call.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { chatGuid: string }).chatGuid, `any;-;${handle}`);
+  assert.ok(calls.some((call) => String(call.url).includes('/chat/query')), 'send should resolve the live guid');
+});
+
+test('resolveChatGuid falls back to a participant match when chatIdentifier is absent', async () => {
+  const handle = '+15551234567';
+  const { impl } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return { body: chatQueryReply([{ guid: `any;-;${handle}`, participants: [{ address: handle }] }]) };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  assert.equal(await client(impl).resolveChatGuid(handle), `any;-;${handle}`);
+});
+
+test('an exact chatIdentifier match wins over a participant match', async () => {
+  const handle = '+15551234567';
+  const { impl } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: 'any;-;participant-only', participants: [{ address: handle }] },
+          { guid: `any;-;${handle}`, chatIdentifier: handle },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  assert.equal(await client(impl).resolveChatGuid(handle), `any;-;${handle}`);
+});
+
+test('🔴 a refused /chat/query falls back to the old guid and the send still proceeds', async () => {
+  const handle = '+15551234567';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) return { status: 500, body: { status: 500, message: 'boom' } };
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  const c = client(impl);
+
+  assert.equal(await c.resolveChatGuid(handle), chatGuidFor(handle));
+  const result = await c.sendText(handle, 'hello');
+
+  assert.equal(result.accepted, true);
+  const textCall = calls.find((call) => String(call.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { chatGuid: string }).chatGuid, chatGuidFor(handle));
+  assert.equal(calls.filter((call) => String(call.url).includes('/chat/query')).length, 1);
+});
+
+test('🔴 a transport failure in /chat/query falls back and never breaks the send', async () => {
+  const handle = '+15551234567';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) throw new Error('ECONNREFUSED 127.0.0.1:1234');
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  const c = client(impl);
+
+  assert.equal(await c.resolveChatGuid(handle), chatGuidFor(handle));
+  const result = await c.sendText(handle, 'hello');
+
+  assert.equal(result.accepted, true);
+  const textCall = calls.find((call) => String(call.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { chatGuid: string }).chatGuid, chatGuidFor(handle));
+});
+
+test('a resolved guid is cached, so a second send does not re-query the chat list', async () => {
+  const handle = '+18015550123';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  const c = client(impl);
+
+  await c.sendText(handle, 'one');
+  await c.sendText(handle, 'two');
+
+  assert.equal(calls.filter((call) => String(call.url).includes('/chat/query')).length, 1);
+  assert.equal(calls.filter((call) => String(call.url).includes('/message/text')).length, 2);
+});
+
+test('🔴 a miss is cached briefly, so an empty chat list is not re-queried on every send', async () => {
+  const handle = '+15551234567';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) return { body: chatQueryReply([]) };
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  const c = client(impl);
+
+  await c.sendText(handle, 'one');
+  await c.sendText(handle, 'two');
+
+  const queryCalls = calls.filter((call) => String(call.url).includes('/chat/query'));
+  const textCalls = calls.filter((call) => String(call.url).includes('/message/text'));
+  assert.equal(queryCalls.length, 1);
+  assert.equal(textCalls.length, 2);
+  for (const call of textCalls) {
+    assert.equal((call.body as { chatGuid: string }).chatGuid, chatGuidFor(handle));
+  }
+});
+
+test('recentlySent looks back in the same resolved thread the send addresses', async () => {
+  const handle = '+18015550123';
+  const { impl, calls } = scripted((call) => {
+    const url = String(call.url);
+    if (url.includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    if (url.includes('/message/query')) return { body: { status: 200, data: [] } };
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  const found = await client(impl).recentlySent(handle, 'hello');
+
+  assert.equal(found, false);
+  const messageQuery = calls.find((call) => String(call.url).includes('/message/query'));
+  assert.ok(messageQuery, 'expected a /message/query call');
+  assert.equal((messageQuery.body as { chatGuid: string }).chatGuid, `any;-;${handle}`);
+});
+
+test('resolveChatGuid paginates the chat list past the first 100 rows', async () => {
+  const handle = '+n120';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      const offset = Number((call.body as { offset?: number } | undefined)?.offset ?? 0);
+      const count = offset === 0 ? 100 : 50;
+      const chats = Array.from({ length: count }, (_, i) => {
+        const n = offset + i;
+        return { guid: `any;-;+n${n}`, chatIdentifier: `+n${n}` };
+      });
+      return { body: chatQueryReply(chats, 150) };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  const guid = await client(impl).resolveChatGuid(handle);
+
+  assert.equal(guid, `any;-;${handle}`);
+  assert.equal(calls.filter((call) => String(call.url).includes('/chat/query')).length, 2);
 });

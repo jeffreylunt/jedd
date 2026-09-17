@@ -40,6 +40,12 @@ export interface PresenceCapableClient {
   startTyping(chatGuid: string): Promise<PrivateApiResult>;
   stopTyping(chatGuid: string): Promise<PrivateApiResult>;
   markChatRead(chatGuid: string): Promise<PrivateApiResult>;
+  /**
+   * The LIVE thread guid for a handle. Optional: a client that lacks it (or
+   * throws) gets the constructed `iMessage;-;` form, which is exactly what the
+   * production client falls back to when its own lookup fails.
+   */
+  resolveChatGuid?(handle: string): Promise<string>;
 }
 
 /** Test seam. Real timers are unref'd so a pending refresh cannot hold the process open. */
@@ -259,7 +265,10 @@ class TypingSession {
   }
 
   begin(): void {
-    this.enqueue('start typing', () => this.owner.client.startTyping(chatGuidFor(this.handle)));
+    this.enqueue(
+      'start typing',
+      async () => this.owner.client.startTyping(await this.owner.guidFor(this.handle)),
+    );
     this.arm();
   }
 
@@ -275,7 +284,10 @@ class TypingSession {
         this.finish();
         return;
       }
-      this.enqueue('refresh typing', () => this.owner.client.startTyping(chatGuidFor(this.handle)));
+      this.enqueue(
+        'refresh typing',
+        async () => this.owner.client.startTyping(await this.owner.guidFor(this.handle)),
+      );
       this.arm();
     }, this.owner.refreshMs);
   }
@@ -298,7 +310,11 @@ class TypingSession {
     // phone claiming a reply is coming. THE ENTIRE REASON THIS BUG SURVIVED IS
     // THAT A FAILING STOP REPORTED SUCCESS — so this one failure is exempt from
     // every quieting rule in `report`, and is said on every occurrence.
-    this.enqueue('stop typing', () => this.owner.client.stopTyping(chatGuidFor(this.handle)), true);
+    this.enqueue(
+      'stop typing',
+      async () => this.owner.client.stopTyping(await this.owner.guidFor(this.handle)),
+      true,
+    );
   }
 
   /** Everything queued so far. Only shutdown waits on this. */
@@ -431,6 +447,24 @@ export class Presence {
   }
 
   /**
+   * The guid presence operations address. Resolved against the live thread
+   * (`BlueBubblesClient.resolveChatGuid`) so a start/refresh/stop/read lands on
+   * the SAME thread the reply was sent to — an `iMessage;-;` guid here is a
+   * thread that does not exist on this server, so the indicator never shows
+   * even when the helper is connected. A client without the method, an empty
+   * answer, or a throw all land on the constructed form: presence must never
+   * break a reply, and the fallback is exactly what the old code sent.
+   */
+  async guidFor(handle: string): Promise<string> {
+    try {
+      const resolved = await this.client.resolveChatGuid?.(handle);
+      return typeof resolved === 'string' && resolved.length > 0 ? resolved : chatGuidFor(handle);
+    } catch {
+      return chatGuidFor(handle);
+    }
+  }
+
+  /**
    * Mark the conversation read. Fire-and-forget by construction — it returns
    * `void`, so there is no promise for a caller to accidentally await on the
    * reply path.
@@ -438,7 +472,7 @@ export class Presence {
   markRead(handle: string): void {
     void (async () => {
       try {
-        this.report('mark read', handle, await this.client.markChatRead(chatGuidFor(handle)));
+        this.report('mark read', handle, await this.client.markChatRead(await this.guidFor(handle)));
       } catch (e) {
         this.reportThrow('mark read', handle, e);
       }

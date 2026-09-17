@@ -419,9 +419,11 @@ test('🔴 typing addresses the SAME chat guid that a send addresses — not a s
   // the literal in the assertion. Restating it is exactly what lets the two
   // drift: each would still look right on its own, and only the PAIRING would
   // be wrong — a typing indicator on one thread, the reply on another.
-  const sentGuid = (calls[0]?.body as { chatGuid?: string } | undefined)?.chatGuid;
+  const textCall = calls.find((call) => String(call.url).includes('/message/text'));
+  const sentGuid = (textCall?.body as { chatGuid?: string } | undefined)?.chatGuid;
   assert.equal(sentGuid, chatGuidFor(OWNER));
-  assert.ok(calls[1]?.url.includes(encodeURIComponent(String(sentGuid))), calls[1]?.url);
+  const typingCall = calls.find((call) => String(call.url).includes('/typing'));
+  assert.ok(typingCall?.url.includes(encodeURIComponent(String(sentGuid))), typingCall?.url);
 });
 
 test('🔴 serverInfo reports the SETTING and the HELPER separately — either alone lies', async () => {
@@ -1270,4 +1272,52 @@ test('🔴 the refresh loop keeps re-arming right up to the ceiling', async () =
   assert.ok(clock.pending() > 0, 'the refresh loop must still be armed');
   const starts = calls.filter((c) => c === `start ${chatGuidFor(OWNER)}`).length;
   assert.ok(starts >= 30, `expected continuous refreshes, saw ${starts}`);
+});
+
+// ── 🔴 live thread resolution feeds the presence signals ─────────────────────
+
+test('🔴 presence signals are addressed to the resolved live thread guid, not the constructed one', async () => {
+  // The send path and the indicator path must address the SAME thread. A
+  // resolved `any;-;` guid that is right for the send but replaced by the
+  // constructed `iMessage;-;` guid here is the stuck-"…" bug this file exists
+  // to prevent.
+  const resolved = 'any;-;+18015550123';
+  const calls: string[] = [];
+  const ok: PrivateApiResult = { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+  const impl: PresenceCapableClient = {
+    resolveChatGuid: async () => resolved,
+    startTyping: async (chatGuid) => {
+      calls.push(`start ${chatGuid}`);
+      return ok;
+    },
+    stopTyping: async (chatGuid) => {
+      calls.push(`stop ${chatGuid}`);
+      return ok;
+    },
+    markChatRead: async (chatGuid) => {
+      calls.push(`read ${chatGuid}`);
+      return ok;
+    },
+  };
+  const clock = fakeTimers();
+  const presence = new Presence({
+    client: impl,
+    log: () => {},
+    timers: clock.timers,
+    now: clock.now,
+    refreshMs: 30_000,
+    ceilingMs: CEILING_MS,
+  });
+
+  presence.markRead(OWNER);
+  const reply = await presence.withTyping(OWNER, async () => 'ok');
+  await flush();
+
+  assert.equal(reply, 'ok');
+  assert.deepEqual(calls, [
+    `read ${resolved}`,
+    `start ${resolved}`,
+    `stop ${resolved}`,
+  ]);
+  assert.ok(!calls.includes(`start ${chatGuidFor(OWNER)}`), 'presence must not fall back to the constructed guid');
 });
