@@ -45,6 +45,13 @@ export function stripMarkdown(text: string): string {
  * the sender, and these presence signals inherit that same limitation rather
  * than quietly inventing a second addressing scheme. See the "Group chats"
  * section of `knowledge/bluebubbles-connector.md`.
+ *
+ * ⚠️ THE CONSTRUCTED FORM IS THE FALLBACK, NOT THE ANSWER. On this server the
+ * threads that exist are `any;-;<handle>` (measured 2026-09-17: all 71 threads,
+ * zero `iMessage;-;`), so a send addressed to this string 500s. Callers address
+ * threads through `resolveChatGuid()`, which falls back to this when it cannot
+ * read the live one — so this stays the single owner of the constructed form
+ * and the fallback never behaves differently from the old code.
  */
 export function chatGuidFor(handle: string): string {
   return `iMessage;-;${handle}`;
@@ -160,6 +167,9 @@ export class BlueBubblesClient {
   private readonly fetchImpl: FetchImpl;
 
   private readonly timeoutMs: number;
+
+  /** Resolved live chat guids, per handle. Bounded in practice by the number of threads. */
+  private readonly guidCache = new Map<string, { guid: string; at: number; hit: boolean }>();
 
   constructor(private readonly opts: BlueBubblesOptions) {
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i));
@@ -429,6 +439,119 @@ export class BlueBubblesClient {
   }
 
   /**
+   * The LIVE chat guid for the conversation with `handle`, from the server's
+   * own chat list.
+   *
+   * 🔴 WHY THIS EXISTS. The send path used to address `chatGuidFor(handle)` —
+   * the constructed `iMessage;-;<handle>` — and on this server that 500s,
+   * because the thread BlueBubbles actually wrote is `any;-;<handle>`. Measured
+   * 2026-09-17 against the live `:1234`: all 71 local threads carry the `any;-;`
+   * prefix and zero carry `iMessage;-;`. A send addressed to the constructed
+   * guid never reaches the thread, so the reply is lost and the turn then
+   * apologises to a person who thinks the message arrived. This asks the server
+   * which guid the thread HAS.
+   *
+   * 🔴 IT NEVER THROWS, AND THE FALLBACK IS EXACTLY THE OLD BEHAVIOUR. A
+   * refused request, an unreadable body, an empty list, or a transport failure
+   * all land on `chatGuidFor(handle)` — the string the old code sent — so no
+   * failure mode of this lookup is worse than the status quo it replaces, and a
+   * miss can never turn an answerable question into a delivery failure notice.
+   * (A miss is cached briefly, not forever: the thread can appear later.)
+   *
+   * 🔴 ONE RESOLUTION FEEDS EVERYTHING THAT ADDRESSES THE THREAD. `sendText`,
+   * `recentlySent`'s look-back, and `Presence`'s typing/read receipts all pass
+   * the returned guid to BlueBubbles, so a reply, its dedup read and its
+   * indicator land on the SAME thread. A guid right for the send and wrong for
+   * the indicator is the stuck-"…" bug `presence.ts` exists to prevent.
+   */
+  async resolveChatGuid(handle: string): Promise<string> {
+    const now = Date.now();
+    const cached = this.guidCache.get(handle);
+    if (
+      cached &&
+      now - cached.at < (cached.hit ? BlueBubblesClient.GUID_TTL_MS : BlueBubblesClient.GUID_MISS_TTL_MS)
+    ) {
+      return cached.guid;
+    }
+    let guid: string | null = null;
+    try {
+      guid = await this.queryChatGuid(handle);
+    } catch {
+      guid = null;
+    }
+    if (guid) {
+      this.guidCache.set(handle, { guid, at: now, hit: true });
+      return guid;
+    }
+    const fallback = chatGuidFor(handle);
+    this.guidCache.set(handle, { guid: fallback, at: now, hit: false });
+    return fallback;
+  }
+
+  /** A resolved guid is good for 30 min: threads do not move, and the chat list is the expensive part. */
+  private static readonly GUID_TTL_MS = 30 * 60_000;
+
+  /** A miss (fallback in use) is re-checked after 5 min, in case the thread appears. */
+  private static readonly GUID_MISS_TTL_MS = 5 * 60_000;
+
+  /** Hard page cap for the walk, against a misbehaving `metadata.total`. */
+  private static readonly GUID_MAX_PAGES = 10;
+
+  /**
+   * Walk the server's chat list for the thread with `handle`.
+   *
+   * `POST /chat/query` is the only route that lists chats (measured 2026-09-17:
+   * `GET /chat` is a 404; the route lives in the shipped `app.asar`). The
+   * `where` participant filter it accepts is IGNORED by the server, so the
+   * filtering happens here, on the rows. An exact `chatIdentifier` match wins
+   * over a participant-address match: in the 1:1 threads this bot addresses the
+   * two agree, and a participant-only match is the shape of a GROUP, which this
+   * bot does not address (see `chatGuidFor`).
+   *
+   * Throws on a refused request so the caller can treat it like any transport
+   * failure; returns `null` when the list was read but no thread matched.
+   */
+  private async queryChatGuid(handle: string): Promise<string | null> {
+    let participantMatch: string | null = null;
+    let offset = 0;
+    for (let page = 0; page < BlueBubblesClient.GUID_MAX_PAGES; page += 1) {
+      const { status, body } = await this.call('/chat/query', {
+        method: 'POST',
+        body: JSON.stringify({ limit: PAGE_SIZE, offset }),
+      });
+      if (status >= 400) throw new Error(`chat/query refused (http ${status})`);
+      const rows = BlueBubblesClient.data(body);
+      if (!Array.isArray(rows) || rows.length === 0) break;
+      for (const r of rows as Record<string, unknown>[]) {
+        const guid = typeof r['guid'] === 'string' ? r['guid'] : '';
+        if (!guid) continue;
+        if (r['chatIdentifier'] === handle) return guid;
+        if (participantMatch === null && BlueBubblesClient.chatHasParticipant(r, handle)) {
+          participantMatch = guid;
+        }
+      }
+      const total = Number(
+        (body as { metadata?: { total?: unknown } } | null)?.metadata?.['total'] ?? NaN,
+      );
+      offset += rows.length;
+      // Stop when the server says it has no more. A missing/NaN total stops
+      // after the first page: an unreadable bound is "do not know", and the
+      // miss-fallback then behaves exactly like the old code.
+      if (rows.length < PAGE_SIZE || !Number.isFinite(total) || offset >= total) break;
+    }
+    return participantMatch;
+  }
+
+  /** `participants` is a list of `{ address, service, … }` objects on 1.9.9, not strings. */
+  private static chatHasParticipant(row: Record<string, unknown>, handle: string): boolean {
+    const ps = row['participants'];
+    if (!Array.isArray(ps)) return false;
+    return ps.some(
+      (p) => typeof p === 'object' && p !== null && (p as { address?: unknown })['address'] === handle,
+    );
+  }
+
+  /**
    * Send text, optionally ANCHORED to a message it is replying to.
    *
    * 🔴 A 200 means "no error code at send time". It is NOT delivery. A real
@@ -464,12 +587,13 @@ export class BlueBubblesClient {
    */
   async sendText(to: string, text: string, replyToGuid?: string | null): Promise<SendResult> {
     const anchored = typeof replyToGuid === 'string' && replyToGuid.length > 0;
+    const chatGuid = await this.resolveChatGuid(to);
     const { status, body } = await this.call(
       '/message/text',
       {
         method: 'POST',
         body: JSON.stringify({
-          chatGuid: chatGuidFor(to),
+          chatGuid,
           message: stripMarkdown(text),
           tempGuid: `jedd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           ...(anchored ? { selectedMessageGuid: replyToGuid, partIndex: 0 } : {}),
@@ -557,7 +681,10 @@ export class BlueBubblesClient {
           offset: 0,
           sort: 'DESC',
           with: ['chat'],
-          chatGuid: chatGuidFor(to),
+          // Same resolved guid as the send itself: a look-back that queries the
+          // constructed form reads a thread the send never wrote and says "not
+          // there", so a retry double-texts.
+          chatGuid: await this.resolveChatGuid(to),
         }),
       });
       if (status >= 400) return null;
