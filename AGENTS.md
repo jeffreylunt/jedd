@@ -17,45 +17,75 @@ at the end. Prefer a line with a measurement behind it over one without.
 
 ## 1. Where the code actually runs
 
-**Jedd runs as the Docker container `jedd-v2` on the Mac.** Not pm2, not the
-`hp` homelab box.
+**Jedd runs under pm2 as `jedd-v2`, on THIS Mac.** Not Docker, not the `hp`
+homelab box.
 
 ```bash
-which docker            # -> "docker not found"
-/usr/local/bin/docker ps --filter name=jedd-v2
+export PATH=/opt/homebrew/bin:$PATH
+pm2 describe jedd-v2     # -> online; script path /Users/jeff/dev/jedd-v2-prod/src/main.ts
 ```
 
-`docker` is **not on PATH** (verified 2026-09-01). Use the absolute path or
-your command silently does nothing useful.
+### 🔴 THIS SECTION SAID THE OPPOSITE UNTIL 2026-09-17. READ THE MEASUREMENT.
 
-### 🔴 The pm2 entry reading `stopped` is CORRECT. Do not start it.
+It said Jedd was the Docker container `jedd-v2`, and — in bold, with a 🔴 —
+that **the pm2 entry must be left stopped**. Following that today stops the
+live bot. What is actually true, measured 2026-09-17 on `Mac-Studio.local`
+(which IS `192.168.1.71` — there is no "second Mac"):
 
+| check | result |
+|---|---|
+| `pm2 describe jedd-v2` | **online**, `src/main.ts`, interpreter `/opt/homebrew/bin/node --import tsx` |
+| `docker ps` | **500 Internal Server Error** — the daemon does not answer at all |
+| any `jedd-v2` container | none; Docker Desktop's VM never comes up |
+| BlueBubbles webhook table (`GET /webhook` on `:1234`) | exactly **one** row, pointing at the pm2 process |
+
+The pm2 process served a full live turn end-to-end on 2026-09-17 13:44 (owner
+message in, reply delivered, confirmed in the receiving inbox), so it is not
+merely running — it **is** production.
+
+I did not establish WHEN or WHY the deployment moved back off Docker; the
+`Dockerfile` and `docker-compose.yml` are still in the tree and still build.
+What is established is the state above. If you find Docker serving again,
+re-measure rather than trusting either version of this section.
+
+### 🔴 A pm2 restart DOES deploy your working tree — including uncommitted edits
+
+`ecosystem.config.cjs` runs `src/main.ts` through `tsx` **straight off disk**
+(`interpreter: '/opt/homebrew/bin/node'`, `interpreter_args: '--import tsx'`).
+There is no build step and nothing is baked into an image, so:
+
+```bash
+export PATH=/opt/homebrew/bin:$PATH
+pm2 restart jedd-v2
 ```
-pm2 list  ->  4 │ jedd-v2 │ fork │ 13 restarts │ stopped │ disabled
+
+ships whatever `src/` says at that instant. **Commit before you restart** — a
+restart with a half-finished edit in the tree puts that edit in front of a real
+person.
+
+⚠️ This inverts the previous advice, which told you a restart could not deploy.
+`spaces/jedd-v2/knowledge/restart-deploys-the-working-tree.md` — which this
+file used to dismiss as STALE — is the one that now matches reality.
+
+### Proving what is actually running
+
+pm2's uptime is the check the Docker era lacked: compare it against when your
+commit landed.
+
+```bash
+pm2 jlist | python3 -c "import json,sys;[print(p['pm2_env']['pm_uptime']) for p in json.load(sys.stdin)]"
 ```
 
-That is a leftover from the pre-Docker deployment. Starting it gives you **two
-processes racing for the same BlueBubbles webhook**, and the visible symptom is
-a real person getting two replies to one message.
+A process older than your commit is not running your code, however healthy it
+looks. Better still, find a request only your build can make and watch for it
+in BlueBubbles' own log (`~/Library/Logs/bluebubbles-server/main.log`) — the
+live-guid fix was confirmed that way on 2026-09-17 by the `/api/v1/chat/query`
+call, which no earlier build ever emitted.
 
-### 🔴 A restart does NOT deploy your working tree. A rebuild does.
+### Rebuilding (Docker only — NOT the current deployment, see above)
 
-`Dockerfile:91` is `COPY src ./src`, and `docker-compose.yml` bind-mounts
-**no** source (verified: `docker inspect jedd-v2` shows mounts only for
-`data/`, `data/backups`, and ssh material). So the source is **baked into the
-image at build time**.
-
-Concretely: edit `src/`, run `docker restart jedd-v2`, watch it come up
-healthy — and **your change is not live**. Nothing errors. This is the exact
-shape of "restarted ≠ running-my-code".
-
-⚠️ **`spaces/jedd-v2/knowledge/restart-deploys-the-working-tree.md` describes
-the OPPOSITE, and it is not wrong — it is STALE.** It documents the pm2 era,
-where `ecosystem.config.cjs` ran `src/main.ts` through `tsx` straight off disk,
-so a restart shipped uncommitted edits. Under Docker that mechanism is gone.
-Read the Dockerfile, not that file, for how code reaches production.
-
-### Rebuilding
+Kept because the image still builds and the trap below is real if you ever use
+it. It is **not** how code reaches production today; `pm2 restart` is.
 
 ```bash
 export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
