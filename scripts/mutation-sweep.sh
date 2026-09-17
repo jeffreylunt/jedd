@@ -46,6 +46,44 @@ fi
 
 trap 'git checkout -- "$SRC" 2>/dev/null; echo "[trap] restored $SRC"' EXIT INT TERM
 
+# ── 🔴 `timeout` IS NOT ON macOS, AND ITS ABSENCE SCORED EVERY MUTATION "CAUGHT" ──
+#
+# `timeout` is GNU coreutils. Verified 2026-09-17 on this Mac: `timeout`,
+# `gtimeout` — both absent, and `timeout 5 echo hi` exits **127**. The loop below
+# reads a non-zero exit as "the suite went red", so with no `timeout` binary the
+# test command never ran and EVERY mutation scored ✅ caught — a 100% sweep that
+# is a claim about nothing. That is precisely the self-inflating score the header
+# exists to prevent, arriving through the runner instead of the search strings.
+#
+# So the fallback is a REAL watchdog, not a passthrough: a bare `"$@"` would hand
+# a hung suite an infinite run, and the reason the timeout is here is that a
+# mutation CAN hang the suite rather than fail it.
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return $?; fi
+  "$@" &
+  local pid=$!
+  ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
+  local watchdog=$!
+  wait "$pid"; local rc=$?
+  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+  return $rc
+}
+
+# ── 🔴 THE BASELINE CONTROL ──────────────────────────────────────────────────
+#
+# "Every mutation was caught" is only a claim if the UNMUTATED suite is green.
+# A suite that is red — or a runner that cannot execute at all, as above — marks
+# every mutation caught while testing nothing. Prove the runner can report a
+# PASS before trusting it to report a FAIL.
+if ! run_with_timeout 300 npx tsx --test --test-timeout=5000 "$TESTS" >/dev/null 2>&1; then
+  echo "REFUSING: $TESTS does not pass UNMUTATED. Every mutation would score 'caught' against" >&2
+  echo "          an already-red suite, so the sweep could not mean anything. Fix the suite first." >&2
+  exit 3
+fi
+echo "[control] $TESTS passes unmutated — the runner can report a pass."
+
 INTENDED=0; APPLIED=0; CAUGHT=0; SURVIVED=0; NOTAPPLIED=0
 
 while IFS= read -r line; do
@@ -71,7 +109,7 @@ open(p,"w").write(s.replace(f,t,1))
     continue
   fi
   APPLIED=$((APPLIED+1))
-  if timeout 120 npx tsx --test --test-timeout=5000 "$TESTS" >/dev/null 2>&1; then
+  if run_with_timeout 120 npx tsx --test --test-timeout=5000 "$TESTS" >/dev/null 2>&1; then
     echo "❌ SURVIVED   $name"; SURVIVED=$((SURVIVED+1))
   else
     echo "✅ caught     $name"; CAUGHT=$((CAUGHT+1))
