@@ -109,6 +109,16 @@ export interface BlueBubblesOptions {
   expectedIdentity?: string;
   fetchImpl?: FetchImpl;
   timeoutMs?: number;
+  /**
+   * Test seam for the clock. The guid cache is the only thing that reads it,
+   * and its two TTLs differ by 25 minutes — a difference no test can observe
+   * without travelling. Left unset, this is `Date.now`.
+   *
+   * 🔴 It exists because a mutation sweep proved the need: collapsing the
+   * miss TTL into the hit TTL SURVIVED the suite (2026-09-17), because every
+   * test asked its second question immediately, where both TTLs agree.
+   */
+  nowImpl?: () => number;
 }
 
 export interface ServerInfo {
@@ -168,12 +178,16 @@ export class BlueBubblesClient {
 
   private readonly timeoutMs: number;
 
+  /** See `BlueBubblesOptions.nowImpl`. Only the guid cache reads the clock. */
+  private readonly now: () => number;
+
   /** Resolved live chat guids, per handle. Bounded in practice by the number of threads. */
   private readonly guidCache = new Map<string, { guid: string; at: number; hit: boolean }>();
 
   constructor(private readonly opts: BlueBubblesOptions) {
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i));
     this.timeoutMs = opts.timeoutMs ?? 15_000;
+    this.now = opts.nowImpl ?? (() => Date.now());
   }
 
   private url(path: string): string {
@@ -465,7 +479,7 @@ export class BlueBubblesClient {
    * the indicator is the stuck-"…" bug `presence.ts` exists to prevent.
    */
   async resolveChatGuid(handle: string): Promise<string> {
-    const now = Date.now();
+    const now = this.now();
     const cached = this.guidCache.get(handle);
     if (
       cached &&

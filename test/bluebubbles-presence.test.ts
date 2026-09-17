@@ -1321,3 +1321,61 @@ test('🔴 presence signals are addressed to the resolved live thread guid, not 
   ]);
   assert.ok(!calls.includes(`start ${chatGuidFor(OWNER)}`), 'presence must not fall back to the constructed guid');
 });
+
+/**
+ * The three ways a resolver can decline, and the guid presence used for each.
+ *
+ * `guidFor` promises in prose that a client without the method, an EMPTY
+ * answer, and a THROW all land on the constructed form. Only the first was
+ * tested; a sweep on 2026-09-17 showed the other two mutable with the suite
+ * still green. Presence must never break a reply — an unusable guid here has to
+ * degrade to the old behaviour, not propagate.
+ */
+for (const [label, resolveChatGuid] of [
+  ['an EMPTY resolved guid', async () => ''],
+  ['a THROWING resolver', async () => { throw new Error('chat list unreadable'); }],
+  ['a client with NO resolver at all', undefined],
+] as [string, (() => Promise<string>) | undefined][]) {
+  test(`🔴 ${label} falls back to the constructed guid and never breaks the reply`, async () => {
+    const calls: string[] = [];
+    const ok: PrivateApiResult = { ok: true, status: 200, helperAbsent: false, detail: 'http 200' };
+    const impl: PresenceCapableClient = {
+      ...(resolveChatGuid ? { resolveChatGuid } : {}),
+      startTyping: async (chatGuid) => {
+        calls.push(`start ${chatGuid}`);
+        return ok;
+      },
+      stopTyping: async (chatGuid) => {
+        calls.push(`stop ${chatGuid}`);
+        return ok;
+      },
+      markChatRead: async (chatGuid) => {
+        calls.push(`read ${chatGuid}`);
+        return ok;
+      },
+    };
+    const clock = fakeTimers();
+    const presence = new Presence({
+      client: impl,
+      log: () => {},
+      timers: clock.timers,
+      now: clock.now,
+      refreshMs: 30_000,
+      ceilingMs: CEILING_MS,
+    });
+
+    presence.markRead(OWNER);
+    const reply = await presence.withTyping(OWNER, async () => 'ok');
+    await flush();
+
+    // The reply is the thing that must survive — presence is the nicety.
+    assert.equal(reply, 'ok');
+    assert.deepEqual(calls, [
+      `read ${chatGuidFor(OWNER)}`,
+      `start ${chatGuidFor(OWNER)}`,
+      `stop ${chatGuidFor(OWNER)}`,
+    ]);
+    // CONTROL: the empty string is not quietly passed through as a guid.
+    assert.ok(!calls.some((c) => c.endsWith(' ')), 'an empty guid must never reach the client');
+  });
+}

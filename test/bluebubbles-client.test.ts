@@ -474,6 +474,114 @@ test('🔴 a miss is cached briefly, so an empty chat list is not re-queried on 
   }
 });
 
+/**
+ * A clock-injected client. `client()` cannot express what follows: the hit and
+ * miss guid TTLs differ by 25 minutes, and a test that asks its second question
+ * immediately reads the two as one value — which is how collapsing them
+ * SURVIVED a mutation sweep on 2026-09-17.
+ */
+function clientAt(impl: FetchImpl, nowImpl: () => number) {
+  return new BlueBubblesClient({
+    baseUrl: 'http://bb.invalid:1234',
+    password: 'pw',
+    fetchImpl: impl,
+    nowImpl,
+  });
+}
+
+test('🔴 a cached MISS is re-checked on its OWN short TTL — the thread can appear later', async () => {
+  const handle = '+15551234567';
+  let threadExists = false;
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply(
+          threadExists
+            ? [{ guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] }]
+            : [],
+        ),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  let clock = 0;
+  const c = clientAt(impl, () => clock);
+
+  // No thread yet: the fallback, remembered.
+  assert.equal(await c.resolveChatGuid(handle), chatGuidFor(handle));
+  assert.equal(calls.length, 1);
+
+  // The thread now exists, but four minutes in the miss is still warm.
+  threadExists = true;
+  clock = 4 * 60_000;
+  assert.equal(await c.resolveChatGuid(handle), chatGuidFor(handle));
+  assert.equal(calls.length, 1);
+
+  // Six minutes in the miss has expired, and the thread that appeared is found.
+  // Under the HIT ttl this would stay on the fallback for another 24 minutes —
+  // every reply in that window landing in a thread that does not exist.
+  clock = 6 * 60_000;
+  assert.equal(await c.resolveChatGuid(handle), `any;-;${handle}`);
+  assert.equal(calls.length, 2);
+});
+
+test('CONTROL: a cached HIT holds past the miss TTL, and is re-read after its own', async () => {
+  const handle = '+15551234567';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${handle}`, chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  let clock = 0;
+  const c = clientAt(impl, () => clock);
+
+  assert.equal(await c.resolveChatGuid(handle), `any;-;${handle}`);
+  assert.equal(calls.length, 1);
+
+  // Six minutes: past the MISS ttl, and a hit must not be re-queried there —
+  // this is the half that proves the two TTLs are genuinely different values
+  // rather than one value the test above happens to agree with.
+  clock = 6 * 60_000;
+  assert.equal(await c.resolveChatGuid(handle), `any;-;${handle}`);
+  assert.equal(calls.length, 1);
+
+  clock = 31 * 60_000;
+  assert.equal(await c.resolveChatGuid(handle), `any;-;${handle}`);
+  assert.equal(calls.length, 2);
+});
+
+test('🔴 a REFUSED chat/query is not mined for rows — a 500 is "unknown", not an answer', async () => {
+  const handle = '+15551234567';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      // A non-2xx that still carries a body is the shape that makes the status
+      // check look redundant: the rows are RIGHT THERE. Reading them addresses
+      // whatever thread the error copy happens to hold — here, someone else's.
+      return {
+        status: 500,
+        body: chatQueryReply([
+          { guid: 'any;-;+19995550000', chatIdentifier: handle, participants: [{ address: handle }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+  const c = client(impl);
+
+  assert.equal(await c.resolveChatGuid(handle), chatGuidFor(handle));
+
+  const result = await c.sendText(handle, 'hello');
+  assert.equal(result.accepted, true);
+  const textCall = calls.find((call) => String(call.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { chatGuid: string }).chatGuid, chatGuidFor(handle));
+});
+
 test('recentlySent looks back in the same resolved thread the send addresses', async () => {
   const handle = '+18015550123';
   const { impl, calls } = scripted((call) => {
