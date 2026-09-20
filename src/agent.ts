@@ -7,6 +7,7 @@ import type { KindleRegistry } from './kindle.js';
 import { safeLabel } from './bluebubbles/attachments.js';
 import type { InboundAttachments } from './connector.js';
 import { buildRequestMessages, pruneStoredImages, type LlmClient, type LlmMessage } from './llm.js';
+import { isModelTimeout } from './turn-notice.js';
 import type { HistoryStore } from './store.js';
 import { roleFor, roleSatisfies, type Role } from './permissions.js';
 import { ALL_TOOLS } from './tools/index.js';
@@ -17,7 +18,7 @@ import type { Tool, ToolContext } from './tools/types.js';
  * clock: one turn makes up to this many model calls, each capped by
  * `TURN_TIMEOUT_MS`. The typing ceiling is the product.
  */
-export const MAX_STEPS = 8;
+export const MAX_STEPS = 30;
 
 /**
  * The head of a tool result, for the durable record.
@@ -607,13 +608,26 @@ export class Agent {
      * which is at most once per turn.
      */
     for (; steps < MAX_STEPS; steps++) {
-      const reply = await this.llm.chat(
-        buildRequestMessages(history, {
+      // ⚠️ One retry on ModelTimeoutError. oMLX on .71 is shared with Hermes;
+      // a long wait is acceptable, but a single busy window should not kill the
+      // whole turn. Exactly one retry — not a loop — so a truly stuck model
+      // still surfaces.
+      let reply;
+      {
+        const reqMessages = buildRequestMessages(history, {
           keepTurns: this.config.images.historyTurns,
           maxImages: this.config.images.maxCount,
-        }),
-        tools,
-      );
+        });
+        try {
+          reply = await this.llm.chat(reqMessages, tools);
+        } catch (e) {
+          if (!isModelTimeout(e)) throw e;
+          console.warn(
+            `[jedd] model call timed out after ${Math.round(e.limitMs / 1000)}s (oMLX may be busy with Hermes); retrying once`,
+          );
+          reply = await this.llm.chat(reqMessages, tools);
+        }
+      }
 
       if (reply.toolCalls.length === 0) {
         replyText = reply.text.trim();

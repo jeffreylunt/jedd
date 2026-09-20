@@ -42,7 +42,11 @@ export async function jellyfinGet(
   try {
     const doFetch: FetchImpl = fetchImpl ?? ((u, i) => fetch(u, i));
     const res = await doFetch(url, {
-      headers: { 'X-Emby-Token': config.jellyfin.apiKey, Accept: 'application/json' },
+      headers: {
+        // Jellyfin 12 rejects bare X-Emby-Token (HTTP 401). MediaBrowser Token works.
+        Authorization: `MediaBrowser Token="${config.jellyfin.apiKey}"`,
+        Accept: 'application/json',
+      },
       signal: controller.signal,
     });
     const text = await res.text();

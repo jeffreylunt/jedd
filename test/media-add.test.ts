@@ -167,3 +167,79 @@ test('🔴 an add with a zero id is refused before any request', async () => {
   assert.equal(r.state, 'failed');
   assert.equal(sent.length, 0);
 });
+
+test('🔴 movie already in Radarr WITHOUT a file re-searches — not "nothing to do"', async () => {
+  // Measured 2026-09-19: The Breadwinner (2026) was monitored with hasFile=false;
+  // add_movie returned already-have and Jedd told Jeff nothing to do.
+  const sent: Sent[] = [];
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    sent.push({ url: u, method, body });
+    if (method === 'POST' && u.endsWith('/movie')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"This movie has already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/movie')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify([{ id: 613, tmdbId: 1440050, title: 'The Breadwinner', hasFile: false }]),
+      } as Response;
+    }
+    if (method === 'POST' && u.endsWith('/command')) {
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: 1 }) } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  const r = await radarr(impl).addMovie({
+    tmdbId: 1440050,
+    title: 'The Breadwinner',
+    rootFolder: '/movies',
+    qualityProfileId: 6,
+  });
+  assert.equal(r.state, 'started');
+  assert.match(r.detail, /no file|searching/i);
+  assert.doesNotMatch(r.detail, /nothing to do/i);
+  const cmd = sent.find((s) => s.url.endsWith('/command'));
+  assert.ok(cmd, 'must POST MoviesSearch');
+  assert.equal(cmd!.body['name'], 'MoviesSearch');
+  assert.deepEqual(cmd!.body['movieIds'], [613]);
+});
+
+test('🔴 movie already in Radarr WITH a file is already-have', async () => {
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (method === 'POST' && u.endsWith('/movie')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"This movie has already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/movie')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify([{ id: 42, tmdbId: 60308, title: 'Moneyball', hasFile: true }]),
+      } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  const r = await radarr(impl).addMovie({
+    tmdbId: 60308,
+    title: 'Moneyball',
+    rootFolder: '/movies',
+    qualityProfileId: 6,
+  });
+  assert.equal(r.state, 'already-have');
+  assert.match(r.detail, /file on disk/i);
+});
+

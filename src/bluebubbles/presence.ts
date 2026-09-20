@@ -123,7 +123,7 @@ export const REFRESH_MS = 30_000;
  * indicator exists to prevent.
  *
  * ⚠️ `TURN_TIMEOUT_MS` IS PER MODEL CALL, NOT PER TURN. A turn makes up to
- * `MAX_STEPS` of them — today's 787s turn used all 8 — so a turn's worst-case
+ * `MAX_STEPS` of them — today's 787s turn used all of MAX_STEPS — so a turn's worst-case
  * wall clock is the PRODUCT. Ceiling-as-900_000 would have been another number
  * that merely *looked* related and would have cut a slow multi-step turn off
  * early, reproducing this same complaint. Multiplying is what makes "until we

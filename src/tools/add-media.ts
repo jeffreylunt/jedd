@@ -60,7 +60,9 @@ export function makeAddMovie(fetchImpl?: FetchImpl): Tool {
     needsServices: ['radarr'],
     description:
       'Add a film to the library and start searching for it. Use the tmdbId from catalogue_search — ' +
-      'do not invent one. If catalogue_search said AMBIGUOUS, ask which they meant first; do not pick.',
+      'do not invent one. If catalogue_search said AMBIGUOUS, ask which they meant first; do not pick. ' +
+      'If Radarr already has the movie but no file is on disk yet, this re-triggers a search rather than ' +
+      'claiming it is already watchable.',
     minRole: 'guest',
     writes: true,
     parameters: {

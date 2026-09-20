@@ -317,7 +317,7 @@ const SERVICES: Record<ReadService, ServiceSpec> = {
   jellyfin: {
     label: 'Jellyfin',
     baseUrl: (c) => c.jellyfin.baseUrl,
-    auth: (c) => ({ 'X-Emby-Token': c.jellyfin.apiKey }),
+    auth: (c) => ({ Authorization: `MediaBrowser Token="${c.jellyfin.apiKey}"` }),
     unconfigured: (c) => (c.jellyfin.apiKey ? null : 'JELLYFIN_API_KEY is not configured'),
     secret: JELLYFIN_SECRET_PATHS,
     person: JELLYFIN_PERSON_PATHS,

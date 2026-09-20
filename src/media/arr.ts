@@ -758,7 +758,77 @@ export class ArrClient {
       monitored: true,
       addOptions: { searchForMovie: true },
     });
+    // 🔴 "Already added" is NOT "already watchable". Measured 2026-09-19: Jeff
+    // asked for The Breadwinner (2026); Radarr already had the row with no file;
+    // interpretAdd returned already-have ("nothing to do") and Jedd stopped.
+    // Re-search when the movie is monitored but hasFile is false.
+    if (res.status === 400 && /already been added|already exists/i.test(res.detail)) {
+      return this.researchExistingMovie(input.tmdbId, input.title);
+    }
     return this.interpretAdd(res, [], input.title);
+  }
+
+  /**
+   * Radarr already has this tmdbId. If a file is on disk, that is already-have.
+   * If not, queue MoviesSearch — "in Radarr" without a file is still unfinished.
+   */
+  private async researchExistingMovie(tmdbId: number, title: string): Promise<AddOutcome> {
+    const list = await this.call('/movie');
+    if (!list.ok) {
+      return {
+        state: 'unknown',
+        detail:
+          `"${title}" may already be in Radarr, but I could not read the library to check ` +
+          `whether a file is on disk or to start a search. (${list.detail})`,
+      };
+    }
+    const rows = Array.isArray(list.body) ? (list.body as Record<string, unknown>[]) : [];
+    const row = rows.find((r) => Number(r['tmdbId']) === tmdbId);
+    if (!row) {
+      return {
+        state: 'unknown',
+        detail:
+          `Radarr said "${title}" was already added, but I cannot find it by tmdbId ${tmdbId} ` +
+          `in the library listing. Check before trying again.`,
+      };
+    }
+    const id = Number(row['id']);
+    const hasFile = row['hasFile'] === true;
+    if (hasFile) {
+      return {
+        state: 'already-have',
+        detail: `"${title}" is already in the library with a file on disk — nothing to do.`,
+      };
+    }
+    if (!Number.isFinite(id) || id <= 0) {
+      return {
+        state: 'unknown',
+        detail: `"${title}" is in Radarr without a file, but I could not read its id to search.`,
+      };
+    }
+    const search = await this.post('/command', { name: 'MoviesSearch', movieIds: [id] });
+    if (search.status === 0) {
+      return {
+        state: 'unknown',
+        detail:
+          `"${title}" is already in Radarr with no file, but I could not reach Radarr to ` +
+          `start a search. (${search.detail})`,
+      };
+    }
+    if (!search.ok) {
+      return {
+        state: 'failed',
+        detail:
+          `"${title}" is already in Radarr with no file, and MoviesSearch was refused ` +
+          `(http ${search.status}): ${search.detail.slice(0, 160)}`,
+      };
+    }
+    return {
+      state: 'started',
+      detail:
+        `"${title}" was already in Radarr but has no file yet — searching for a release now.`,
+      confirmed: [],
+    };
   }
 
   /** Map an arr response onto the four states. Never collapses them. */
