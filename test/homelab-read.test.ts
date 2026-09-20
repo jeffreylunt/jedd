@@ -191,7 +191,11 @@ test('🔴 a path character outside the allowed set is refused, and the characte
 test('🔴 the credential is chosen by code and is never the caller‘s to name', () => {
   const jf = planRead('jellyfin', '/System/Info', {}, config, 'owner');
   assert.ok(jf.allowed);
-  assert.equal(jf.headers['X-Emby-Token'], config.jellyfin.apiKey);
+  assert.equal(
+    jf.headers['Authorization'],
+    `MediaBrowser Token="${config.jellyfin.apiKey}"`,
+  );
+  assert.equal(jf.headers['X-Emby-Token'], undefined);
   assert.equal(jf.headers['X-Api-Key'], undefined);
 
   const sonarr = planRead('sonarr', '/series', {}, config, 'owner');

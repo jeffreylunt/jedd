@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Agent } from '../src/agent.js';
+import { Agent, MAX_STEPS } from '../src/agent.js';
 import type { LlmClient, LlmMessage, LlmReply } from '../src/llm.js';
 import type { Tool } from '../src/tools/types.js';
 import { testConfig } from './helpers.js';
@@ -179,7 +179,7 @@ test('a denial with NO tool calls at all is counted — the 2026-08-26 Prowlarr 
 test('the "I got stuck" step-limit reply is never counted as a denial', async () => {
   // It is the loop's own sentence, not the model's claim about its tools, and
   // counting it would inflate the metric with turns that timed out.
-  const llm = new ScriptedLlm(Array.from({ length: 8 }, (_, i) => call('homelab_read', `c${i}`)));
+  const llm = new ScriptedLlm(Array.from({ length: MAX_STEPS }, (_, i) => call('homelab_read', `c${i}`)));
   const agent = new Agent(config, llm, undefined, TOOLS);
 
   const record = await agent.handle(OWNER, 'q');
