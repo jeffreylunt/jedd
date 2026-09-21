@@ -87,22 +87,35 @@ export class InviteLedger {
   }
 
   /**
-   * Was this recipient invited very recently?
+   * The most recent attempt for this recipient inside the dedupe window, if any.
    *
-   * 🔴 Counts ANY outcome, and the reason matters because it will be reused.
+   * 🔴 Returns the RECORD, not a boolean — because the outcome is what the caller
+   * must branch on.
    *
-   * **NOT** "re-minting would create a second live credential" — after a
-   * SUCCESSFUL revoke there is no live credential, so a retry creates one, not
-   * two. That reason is wrong and would mis-rank the case it fails to cover.
-   *
-   * The reason it actually holds is the **orphaned** and **revoke-failed**
-   * cases: precisely the ones where **we do not know whether a credential
-   * survived**. Branching on the revoke outcome would buy precision we cannot
-   * reliably compute, so all failures are treated alike.
+   * "Any recent attempt" was the wrong shape the moment a failure path needed a
+   * recovery path: after a successful revoke there is no live credential, so a
+   * re-mint creates one, not two, and a revoked attempt is exactly the case where
+   * "send it again" is the right thing and the window was standing in the way
+   * (2026-09-20: a false-negative send failure revoked a working invite, then
+   * the window refused to mint a replacement for two minutes while the recipient
+   * sat on a dead link). The ORPHANED and REVOKE-FAILED cases still block, but
+   * at the call site, where the outcome is visible.
    */
-  recentlyInvited(recipient: string, now = new Date()): boolean {
+  recentRecord(recipient: string, now = new Date()): InviteRecord | undefined {
     const cutoff = now.getTime() - DEDUPE_MS;
-    return this.records.some((r) => r.recipient === recipient && Date.parse(r.at) >= cutoff);
+    let newest: InviteRecord | undefined;
+    for (const r of this.records) {
+      if (r.recipient !== recipient) continue;
+      const t = Date.parse(r.at);
+      if (t < cutoff) continue;
+      if (!newest || t >= Date.parse(newest.at)) newest = r;
+    }
+    return newest;
+  }
+
+  /** True if this recipient was attempted inside the dedupe window. */
+  recentlyInvited(recipient: string, now = new Date()): boolean {
+    return this.recentRecord(recipient, now) !== undefined;
   }
 
   all(): InviteRecord[] {

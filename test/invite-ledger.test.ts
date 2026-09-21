@@ -50,11 +50,23 @@ test('quota is per-sender and windowed', async () => {
 test('🔴 per-recipient dedupe counts FAILED attempts too', async () => {
   // NOT because re-minting would create a second live credential -- after a
   // successful revoke there is none. It holds for the ORPHANED and
-  // REVOKE-FAILED cases, where we do not know whether a credential survived, and
-  // branching on the revoke outcome buys precision we cannot reliably compute.
+  // REVOKE-FAILED cases, where we do not know whether a credential survived.
   const l = new InviteLedger(tmp());
-  l.record(rec({ recipient: '+15550009', outcome: 'failed' }));
-  assert.equal(l.recentlyInvited('+15550009', now), true);
+  l.record(rec({ recipient: '+155****0009', outcome: 'failed' }));
+  assert.equal(l.recentlyInvited('+155****0009', now), true);
+});
+
+test('🔴 recentRecord exposes the OUTCOME, not just the fact of a recent attempt', async () => {
+  // The boolean was the 2026-09-20 dead end: "invited recently" said nothing
+  // about whether anything was still live, so a recovery re-mint looked
+  // identical to a duplicate.
+  const l = new InviteLedger(tmp());
+  l.record(rec({ recipient: '+155****0009', outcome: 'revoked' }));
+  const recent = l.recentRecord('+155****0009', now);
+  assert.equal(recent?.outcome, 'revoked');
+  l.record(rec({ recipient: '+155****0009', outcome: 'confirmed' }));
+  assert.equal(l.recentRecord('+155****0009', now)?.outcome, 'confirmed', 'newest wins');
+  assert.equal(l.recentRecord('+155****0001', now), undefined, 'no record, no record');
 });
 
 test('the dedupe window expires', async () => {

@@ -3,7 +3,7 @@ import type { AbsClient } from '../audiobookshelf.js';
 import { appearsInOwnTurns } from '../kindle.js';
 import { QUOTA_MAX, type InviteLedger } from '../invite-ledger.js';
 import { fail, ok, type Tool, type ToolContext } from './types.js';
-import type { InviteSender } from './invite.js';
+import type { InviteSender, InviteVerifier } from './invite.js';
 
 /**
  * Create an Audiobookshelf login and text the credentials.
@@ -19,6 +19,8 @@ export interface AbsInviteDeps {
   abs: AbsClient;
   ledger: InviteLedger;
   send: InviteSender;
+  /** Read the transport's sent history back before destroying the account. Optional. */
+  verifySent?: InviteVerifier;
   now?: () => Date;
 }
 
@@ -86,13 +88,19 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
       }
 
       const by = ctx.senderHandle;
-      if (deps.ledger.recentlyInvited(`abs:${recipient}`, now)) {
+      // Same recovery rule as the Jellyfin tool: a REVOKED outcome means the
+      // send failed AND the credential was destroyed — nothing live to collide
+      // with, and "send it again" is the whole point. Any other recent record
+      // still blocks.
+      const recentRecipient = deps.ledger.recentRecord(`abs:${recipient}`, now);
+      if (recentRecipient && recentRecipient.outcome !== 'revoked') {
         return fail(
           `ALREADY_INVITED — ${recipient} already received an Audiobookshelf invite within the last few ` +
             'minutes. Nothing new was created.',
         );
       }
-      if (deps.ledger.recentlyInvited(`abs-user:${username}`, now)) {
+      const recentUser = deps.ledger.recentRecord(`abs-user:${username}`, now);
+      if (recentUser && recentUser.outcome !== 'revoked') {
         return fail(
           `ALREADY_INVITED — username "${username}" was used in an Audiobookshelf invite very recently. ` +
             'Nothing new was created.',
@@ -182,6 +190,44 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
       }
 
       if (delivered === false) {
+        /**
+         * 🔴 BEFORE DESTROYING THE ACCOUNT, READ THE TRANSPORT'S OWN HISTORY BACK.
+         * Same false negative as the Jellyfin tool: a 500 is a verdict about
+         * our request, not about the phone. `true` = the password is on their
+         * screen and the "failed" was the answer we lost — deleting the account
+         * would leave them with credentials and no login. `null` = unreadable,
+         * and destroying is the safe side of that coin.
+         */
+        let sentInHistory: boolean | null = null;
+        if (deps.verifySent) {
+          try {
+            sentInHistory = await deps.verifySent(recipient, text);
+          } catch {
+            sentInHistory = null;
+          }
+        }
+        if (sentInHistory === true) {
+          deps.ledger.record({
+            at: now.toISOString(),
+            by,
+            recipient: `abs:${recipient}`,
+            label: `abs:${username}`,
+            outcome: 'confirmed',
+            detail: `reportedly failed (${sendDetail}) but found in sent history — account kept`,
+          });
+          deps.ledger.record({
+            at: now.toISOString(),
+            by,
+            recipient: `abs-user:${username}`,
+            label: `abs:${username}`,
+            outcome: 'confirmed',
+            detail: 'username dedupe marker',
+          });
+          return ok(
+            `SENT — the send was reported failed (${sendDetail}) but the text IS in the sent history, ` +
+              `so the login for "${verified.user.username}" went to ${recipient}.`,
+          );
+        }
         const revoke = await deps.abs.deleteUser(verified.user.id);
         deps.ledger.record({
           at: now.toISOString(),
@@ -189,7 +235,8 @@ export function makeAbsInviteTool(deps: AbsInviteDeps): Tool {
           recipient: `abs:${recipient}`,
           label: `abs:${username}`,
           outcome: revoke.state === 'deleted' ? 'revoked' : 'orphaned',
-          detail: `${sendDetail} | ${revoke.detail}`,
+          detail: `${sendDetail} | ${revoke.detail}` +
+            (sentInHistory === null ? ' | verified in history: unreadable' : ''),
         });
         return fail(
           revoke.state === 'deleted'

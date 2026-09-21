@@ -136,6 +136,96 @@ test('a repeat to the same recipient within the window is refused', async () => 
   assert.match(again.content, /ALREADY_INVITED/);
 });
 
+// ── 🔴 2026-09-20: a 500 is a verdict about OUR request, not the phone ──────
+
+test('🔴 a reported-FAILED send found in sent history is NOT revoked — the text landed', async () => {
+  // BlueBubbles 500s after the write and the verdict says failed, but the
+  // recipient has the link. Revoking on the verdict is how a working invite
+  // died mid-handshake. The read-back is the tiebreaker.
+  const j = jfago();
+  const tool = makeInviteTool({
+    jfago: j.client, ledger: new InviteLedger(tmp()), send: sender(false).send,
+    verifySent: async () => true,
+  });
+  const r = await tool.run({ recipient: TARGET }, ctx());
+  assert.equal(r.ok, true);
+  assert.deepEqual(j.deletes, [], 'the live invite must survive a false negative');
+  assert.match(r.content, /reported failed/);
+  assert.match(r.content, /SENT/);
+});
+
+test('🔴 a reported-FAILED send NOT in sent history IS revoked, as before', async () => {
+  const j = jfago();
+  const tool = makeInviteTool({
+    jfago: j.client, ledger: new InviteLedger(tmp()), send: sender(false).send,
+    verifySent: async () => false,
+  });
+  const r = await tool.run({ recipient: TARGET }, ctx());
+  assert.equal(r.ok, false);
+  assert.deepEqual(j.deletes, [{ code: 'CODE1' }], 'a genuinely unsent link is still destroyed');
+});
+
+test('🔴 an UNREADABLE history revokes — unknown must land on the safe side', async () => {
+  const j = jfago();
+  const tool = makeInviteTool({
+    jfago: j.client, ledger: new InviteLedger(tmp()), send: sender(false).send,
+    verifySent: async () => null,
+  });
+  const r = await tool.run({ recipient: TARGET }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /REVOKED/);
+  assert.deepEqual(j.deletes, [{ code: 'CODE1' }]);
+});
+
+test('a crash in the verifier degrades to revocation, never to an unhandled throw', async () => {
+  const j = jfago();
+  const tool = makeInviteTool({
+    jfago: j.client, ledger: new InviteLedger(tmp()), send: sender(false).send,
+    verifySent: async () => { throw new Error('boom'); },
+  });
+  const r = await tool.run({ recipient: TARGET }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /REVOKED/);
+});
+
+test('🔴 a REVOKED attempt inside the window does not block "send it again"', async () => {
+  // The 2026-09-20 dead end: the false negative revoked the invite, then the
+  // dedupe window answered the owner's recovery attempt with ALREADY_INVITED.
+  // A revoked outcome means no live credential — re-minting is the fix, not a
+  // collision.
+  const j = jfago();
+  const ledger = new InviteLedger(tmp());
+  const tool = makeInviteTool({ jfago: j.client, ledger, send: sender(false).send, verifySent: async () => false });
+  const first = await tool.run({ recipient: TARGET }, ctx());
+  assert.match(first.content, /REVOKED/);
+  const again = await tool.run({ recipient: TARGET }, ctx());
+  // The second mint ALSO reports a failed send — the point is that it was
+  // MINTED at all, not ALREADY_INVITED. It gets its own revoke, which is
+  // correct: each false negative destroys its own credential.
+  assert.doesNotMatch(again.content, /ALREADY_INVITED/, 'a revoked attempt must be re-mintable');
+  assert.match(again.content, /DELIVERY_FAILED/, 'and its own failure is handled on its own terms');
+});
+
+test('a CONFIRMED attempt inside the window STILL blocks the repeat', async () => {
+  const j = jfago();
+  const ledger = new InviteLedger(tmp());
+  const tool = makeInviteTool({ jfago: j.client, ledger, send: sender(true).send });
+  await tool.run({ recipient: TARGET }, ctx());
+  const again = await tool.run({ recipient: TARGET }, ctx());
+  assert.match(again.content, /ALREADY_INVITED/);
+});
+
+test('an ORPHANED attempt inside the window STILL blocks — a credential may be live', async () => {
+  const j = jfago({ mintFails: true });
+  const ledger = new InviteLedger(tmp());
+  const tool = makeInviteTool({ jfago: j.client, ledger, send: sender(true).send });
+  // mint fails -> ORPHANED record; a second attempt must not stack on it.
+  const first = await tool.run({ recipient: TARGET }, ctx());
+  assert.equal(first.ok, false);
+  const again = await tool.run({ recipient: TARGET }, ctx());
+  assert.match(again.content, /ALREADY_INVITED/);
+});
+
 // ── the irreversible half ────────────────────────────────────────────────────
 
 test('🔴 a successful invite NEVER implies the account can be undone', async () => {

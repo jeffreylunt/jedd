@@ -296,6 +296,10 @@ async function main(): Promise<void> {
     }),
     ledger: invites,
     send: (to: string, text: string) => connector.sendReporting(to, text),
+    // Read the transport's own history back before the tool revokes on a
+    // reported failure — the 2026-09-20 false negative (500 after the text
+    // landed) must not kill a working invite again.
+    verifySent: (to: string, text: string) => client.recentlySent(to, text),
   };
   const absInvite = {
     abs: new AbsClient({
@@ -305,6 +309,7 @@ async function main(): Promise<void> {
     }),
     ledger: absInvites,
     send: (to: string, text: string) => connector.sendReporting(to, text),
+    verifySent: (to: string, text: string) => client.recentlySent(to, text),
   };
   /**
    * ⚠️ `send_ebook` IS RESTRICTED TO THE OWNER IN THIS BUILD.
