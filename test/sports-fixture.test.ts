@@ -227,7 +227,8 @@ test('🔴 UNREACHABLE fixture source FAILS and NEVER reads the guide', async ()
   // happen. This is what a "warning and continue" refactor would break, and the
   // return value alone would not show it.
   assert.equal(s.guideCalls.length, 0, 'the guide must NOT be consulted when the fixture source failed');
-  assert.equal(s.espnCalls.length, 1);
+  // Default 30-day window fans out to 30 per-day calls, and each one threw.
+  assert.equal(s.espnCalls.length, 30, 'a 30-day window fans out to 30 ESPN calls');
   assert.match(r.content, /FIXTURE SOURCE IS UNREACHABLE/);
   assert.match(r.content, /ECONNREFUSED/);
   assert.match(r.content, /did NOT fall back/i);
@@ -1372,6 +1373,9 @@ test('no matching team is a WINDOW-bounded zero, and says which window', async (
   assert.equal(s.guideCalls.length, 0, 'there is no fixture to look up a channel for');
   assert.match(r.content, /NO FIXTURE FOUND/);
   assert.match(r.content, /next 7 days/);
+  // The 7-day window fans out to one per-day ESPN call; the SAME event is
+  // returned by every one of them and the merge dedupes it to a single fixture.
+  assert.equal(s.espnCalls.length, 7, 'a 7-day window fans out to seven per-day calls');
   assert.match(r.content, /1 events across those competitions and none involve/);
   assert.match(r.content, /bounded by the WINDOW and by the COMPETITION LIST above/);
   // 🔴 The scope must be on the answer, not implied by the caller's argument.
@@ -1416,7 +1420,10 @@ test('days_ahead is clamped, and a non-finite value never reaches a date', async
       ctx(),
     );
     assert.doesNotMatch(r.content, /NaN|Invalid Date/, `days_ahead=${String(bad)} leaked`);
-    assert.equal(s.espnCalls.length, 1);
+    // The clamped window size determines the fan-out: 30 for the default/clamp
+    // cases, 1 when -5 floors to MIN_DAYS, 120 when 10_000 caps at MAX_DAYS.
+    const expected = String(bad) === '-5' ? 1 : String(bad) === '10000' ? 120 : 30;
+    assert.equal(s.espnCalls.length, expected);
     assert.doesNotMatch(s.espnCalls[0] as string, /NaN/);
   }
 });
@@ -1435,7 +1442,8 @@ test('every advertised league key is actually callable', async () => {
     const s = spy({ espn: () => res(espnBody([])) });
     const r = await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: key }, ctx());
     assert.equal(r.ok, true, `${key} should be a usable league`);
-    assert.equal(s.espnCalls.length, 1);
+    // Default 30-day window → 30 per-day calls (fan-out), all hitting the named league.
+    assert.equal(s.espnCalls.length, 30);
   }
 });
 
