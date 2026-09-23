@@ -409,6 +409,7 @@ export class OpenAiClient implements LlmClient {
         finish_reason?: string;
         message?: {
           content?: string | null;
+          reasoning_content?: string;
           tool_calls?: { id?: string; function?: { name?: string; arguments?: unknown } }[];
         };
       }[];
@@ -477,13 +478,33 @@ export class OpenAiClient implements LlmClient {
 
     const text = choice?.message?.content ?? '';
 
-    // Same rule as Ollama's `done_reason: "length"` check: empty content on a
-    // tool-calling turn is normal, but hitting the token budget with neither a
-    // reply nor a tool call means the reasoning ate the whole allowance.
-    if (choice?.finish_reason === 'length' && !text.trim() && toolCalls.length === 0) {
+    // ⚠️ Empty content on a TOOL-CALLING turn is normal — the model returns a
+    // call and no prose. The real budget failure is `finish_reason: "length"`
+    // with no tool call, and it is WORSE than the old empty-content case only
+    // caught here:
+    //
+    // 🔴 The thinking-capable Qwen backend (chat_template_kwargs
+    // `enable_thinking`) separates `reasoning_content` from `content` — content
+    // is supposed to be the FINAL answer alone. When the thinking overruns
+    // max_tokens, the server does NOT move the partial thinking to
+    // `reasoning_content`; the truncated stream of thought is left sitting in
+    // `content` with `finish_reason: "length"` and no tool call. The old guard
+    // required `!text.trim()`, so that 2,000-character reasoning dump slipped
+    // through and was sent to the user as the reply (observed 2026-09-23,
+    // "Dancing with the Stars" turn: a 176s reasoning monologue delivered
+    // verbatim to iMessage, ending mid-sentence "Wait, I just realized").
+    //
+    // Any `length` finish with no tool call is a failed turn: empty content
+    // means the budget was eaten entirely, non-empty content means a truncated
+    // answer. Neither is a reply a person should receive — a turn notice is
+    // better than a monologue.
+    if (choice?.finish_reason === 'length' && toolCalls.length === 0) {
       throw new Error(
-        'Model hit its token budget without producing an answer or a tool call ' +
-          '(finish_reason=length). Reasoning consumed the whole max_tokens allowance.',
+        text.trim()
+          ? 'Model hit its token budget mid-answer (finish_reason=length) with no tool call — the ' +
+            'content is truncated reasoning, not a reply. Refusing to send it.'
+          : 'Model hit its token budget without producing an answer or a tool call ' +
+            '(finish_reason=length). Reasoning consumed the whole max_tokens allowance.',
       );
     }
 
