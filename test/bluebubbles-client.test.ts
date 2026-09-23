@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BlueBubblesClient, chatGuidFor, type FetchImpl } from '../src/bluebubbles/client.js';
+import { BlueBubblesClient, canonicalPhone, chatGuidFor, type FetchImpl } from '../src/bluebubbles/client.js';
 
 /**
  * The BlueBubbles HTTP surface, tested against a scripted fetch.
@@ -396,6 +396,73 @@ test('an exact chatIdentifier match wins over a participant match', async () => 
   });
 
   assert.equal(await client(impl).resolveChatGuid(handle), `any;-;${handle}`);
+});
+
+// ── typed-form canonicalization ─────────────────────────────────────────────
+// A person types a number the way they wrote it — "(801) 555-4271" — while the
+// thread the server stored is +180****4271. 2026-09-22: the exact-match lookup
+// found nothing, fell back to a constructed guid, and the invite send 500'd.
+
+test('canonicalPhone maps the stored and the typed forms of one US number', () => {
+  assert.equal(canonicalPhone('(801) 555-4271'), '+18015554271');
+  assert.equal(canonicalPhone('801 555 4271'), '+18015554271');
+  assert.equal(canonicalPhone('8015554271'), '+18015554271');
+  assert.equal(canonicalPhone('+18015554271'), '+18015554271');
+  // Ambiguity and non-phones: never guess.
+  assert.equal(canonicalPhone('18015554271'), null); // 11 bare digits
+  assert.equal(canonicalPhone('+33612345678'), null); // non-US
+  assert.equal(canonicalPhone('jeff'), null);
+});
+
+test('resolveChatGuid finds a +1-stored thread from a typed (801) 555-4271', async () => {
+  const typed = '(801) 555-4271';
+  const stored = '+18015554271';
+  const { impl } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${stored}`, chatIdentifier: stored, participants: [{ address: stored }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  const guid = await client(impl).resolveChatGuid(typed);
+  assert.equal(guid, `any;-;${stored}`);
+});
+
+test('resolveChatGuid matches a +1 participant when the thread has no chatIdentifier', async () => {
+  const typed = '8015554271';
+  const stored = '+18015554271';
+  const { impl } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return { body: chatQueryReply([{ guid: `any;-;${stored}`, participants: [{ address: stored }] }]) };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  assert.equal(await client(impl).resolveChatGuid(typed), `any;-;${stored}`);
+});
+
+test('the send is addressed to the resolved thread, not the typed string', async () => {
+  const typed = '(801) 555-4271';
+  const stored = '+18015554271';
+  const { impl, calls } = scripted((call) => {
+    if (String(call.url).includes('/chat/query')) {
+      return {
+        body: chatQueryReply([
+          { guid: `any;-;${stored}`, chatIdentifier: stored, participants: [{ address: stored }] },
+        ]),
+      };
+    }
+    return { body: { status: 200, data: { guid: 'sent' } } };
+  });
+
+  await client(impl).sendText(typed, 'hi');
+  const textCall = calls.find((c) => String(c.url).includes('/message/text'));
+  assert.ok(textCall, 'expected a /message/text call');
+  assert.equal((textCall.body as { chatGuid: string }).chatGuid, `any;-;${stored}`);
 });
 
 test('🔴 a refused /chat/query falls back to the old guid and the send still proceeds', async () => {

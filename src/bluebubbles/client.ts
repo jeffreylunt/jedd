@@ -58,6 +58,38 @@ export function chatGuidFor(handle: string): string {
 }
 
 /**
+ * The E.164 form of a US phone number, for matching against the form
+ * BlueBubbles writes into `chatIdentifier` and `participants[].address`.
+ *
+ * 🔴 WHY THIS EXISTS. Those fields carry `+1XXXXXXXXXX` (measured 2026-09-22
+ * against the live `:1234`), but a person types a number the way they wrote it
+ * in a message — `(801) 555-4271`, `801 687 4271`, `+1801…`. A lookup keyed on
+ * the raw string finds nothing, falls back to the constructed guid, and the
+ * send 500s. This maps the raw form onto the one the server stores, so either
+ * spelling finds the same thread.
+ *
+ * Only 10-digit national numbers canonicalize. Anything else — an existing
+ * `+1XXXXXXXXXX` form, an 11-digit ambiguity, a non-US number, a non-phone
+ * string — returns `null` and the caller keeps its exact-match behaviour
+ * unchanged.
+ */
+export function canonicalPhone(handle: string): string | null {
+  const digits = handle.replace(/[^\d]/g, '');
+  if (digits.length === 10) {
+    // A bare 10-digit national number reads as the US number the server
+    // stores as +1XXXXXXXXXX.
+    return `+1${digits}`;
+  }
+  // 11 digits with a leading +1 IS the stored spelling — return it unchanged
+  // (the caller's exact match already covers it; a second form would be a
+  // fake spelling, e.g. +11801… that matches nothing). Anything else —
+  // 11 bare digits, a non-US number, a non-phone string — returns null and
+  // the caller keeps its exact-match behaviour unchanged.
+  if (digits.length === 11 && handle.startsWith('+1')) return handle;
+  return null;
+}
+
+/**
  * What a Private API call did.
  *
  * 🔴 `helperAbsent` IS A FIRST-CLASS OUTCOME, NOT AN ERROR.
@@ -497,7 +529,8 @@ export class BlueBubblesClient {
       this.guidCache.set(handle, { guid, at: now, hit: true });
       return guid;
     }
-    const fallback = chatGuidFor(handle);
+    const canonicalFallback = canonicalPhone(handle);
+    const fallback = chatGuidFor(canonicalFallback ?? handle);
     this.guidCache.set(handle, { guid: fallback, at: now, hit: false });
     return fallback;
   }
@@ -526,6 +559,11 @@ export class BlueBubblesClient {
    * failure; returns `null` when the list was read but no thread matched.
    */
   private async queryChatGuid(handle: string): Promise<string | null> {
+    // The forms the server may have stored for this same person: the raw
+    // string, plus its E.164 spelling. BlueBubbles writes `+1XXXXXXXXXX`
+    // while a message types `(801) 555-4271` — both must find one thread.
+    const canonical = canonicalPhone(handle);
+    const forms = canonical ? [handle, canonical] : [handle];
     let participantMatch: string | null = null;
     let offset = 0;
     for (let page = 0; page < BlueBubblesClient.GUID_MAX_PAGES; page += 1) {
@@ -539,8 +577,8 @@ export class BlueBubblesClient {
       for (const r of rows as Record<string, unknown>[]) {
         const guid = typeof r['guid'] === 'string' ? r['guid'] : '';
         if (!guid) continue;
-        if (r['chatIdentifier'] === handle) return guid;
-        if (participantMatch === null && BlueBubblesClient.chatHasParticipant(r, handle)) {
+        if (BlueBubblesClient.identifierMatches(r['chatIdentifier'], forms)) return guid;
+        if (participantMatch === null && BlueBubblesClient.chatHasParticipant(r, forms)) {
           participantMatch = guid;
         }
       }
@@ -557,12 +595,20 @@ export class BlueBubblesClient {
   }
 
   /** `participants` is a list of `{ address, service, … }` objects on 1.9.9, not strings. */
-  private static chatHasParticipant(row: Record<string, unknown>, handle: string): boolean {
+  private static chatHasParticipant(row: Record<string, unknown>, forms: string[]): boolean {
     const ps = row['participants'];
     if (!Array.isArray(ps)) return false;
     return ps.some(
-      (p) => typeof p === 'object' && p !== null && (p as { address?: unknown })['address'] === handle,
+      (p) =>
+        typeof p === 'object' &&
+        p !== null &&
+        forms.includes((p as { address?: unknown })['address'] as string),
     );
+  }
+
+  /** Exact-or-canonical: the thread's `chatIdentifier` matches any of `forms`. */
+  private static identifierMatches(identifier: unknown, forms: string[]): boolean {
+    return typeof identifier === 'string' && forms.includes(identifier);
   }
 
   /**
