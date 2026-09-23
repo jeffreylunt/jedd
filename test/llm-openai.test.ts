@@ -242,6 +242,21 @@ test('🔴 finish_reason length with no content and no tool call throws — the 
   await assert.rejects(() => client.chat([userMsg('hi')], NOOP_TOOLS), /finish_reason=length/);
 });
 
+test('🔴 finish_reason length WITH truncated reasoning in content and no tool call throws — it is reasoning, not a reply', async () => {
+  const truncatedThinking =
+    'The user is saying "let\'s get the latest season" — this is a continuation. The catalog returned ' +
+    'AMBIGUOUS. Let me think about what latest season means. Actually I think I should just proceed. ' +
+    'I\'ll call add_series with the show. Wait, I just realized';
+  const { impl } = scripted(() => ({
+    body: { choices: [{ finish_reason: 'length', message: { content: truncatedThinking } }] } as const,
+  }));
+  const client = new OpenAiClient(testConfig({ llm: { provider: 'openai', baseUrl: 'http://host:8000/v1', model: 'm' } }), impl);
+  await assert.rejects(
+    () => client.chat([userMsg('hi')], NOOP_TOOLS),
+    /truncated reasoning|finish_reason=length/,
+  );
+});
+
 test('CONTROL: finish_reason length WITH a tool call does not throw', async () => {
   const { impl } = scripted(() => ({
     body: {
