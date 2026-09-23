@@ -1,5 +1,5 @@
 import { ArrClient, type FetchImpl } from '../media/arr.js';
-import { typeVerdict, type Candidate } from '../media/matching.js';
+import { typeVerdict, orderForDisplay, type Candidate } from '../media/matching.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -76,13 +76,18 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
        * persisted it — not because the model remembered to.
        */
       const remember = (opts: { label: string; value: Record<string, unknown> }[]) => {
-        if (!ctx.choices || opts.length === 0) return '';
-        ctx.choices.present({
-          senderHandle: ctx.senderHandle,
-          subject: title,
-          kind: 'media-choice',
-          options: opts.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
-        });
+        if (opts.length === 0) return '';
+        // Always include the numbered list in the tool text so the model (and
+        // tests) see networks/years even when a choices store is not wired.
+        // Persistence is best-effort and must not gate what we say.
+        if (ctx.choices) {
+          ctx.choices.present({
+            senderHandle: ctx.senderHandle,
+            subject: title,
+            kind: 'media-choice',
+            options: opts.map((o, i) => ({ n: i + 1, label: o.label, value: o.value })),
+          });
+        }
         return opts.map((o, i) => `\n  ${i + 1}. ${o.label}`).join('');
       };
 
@@ -106,7 +111,9 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
         case 'movie': {
           if (verdict.pick.contested) {
             const listed = remember(
-              films.candidates.slice(0, 5).map((c) => ({ label: `${describe(c)} — film`, value: { arr: 'movie', id: c.id, title: c.title } })),
+              orderForDisplay(title, films.candidates)
+                .slice(0, 5)
+                .map((c) => ({ label: `${describe(c)} — film`, value: { arr: 'movie', id: c.id, title: c.title } })),
             );
             return ok(`FILM (CONTESTED) — do NOT add without asking. Offer these:${listed}`);
           }
@@ -115,9 +122,17 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
         case 'series': {
           if (verdict.pick.contested) {
             const listed = remember(
-              shows.candidates.slice(0, 5).map((c) => ({ label: `${describe(c)} — show`, value: { arr: 'series', id: c.id, title: c.title } })),
+              orderForDisplay(title, shows.candidates)
+                .slice(0, 5)
+                .map((c) => ({
+                  label: `${describe(c)} — show`,
+                  value: { arr: 'series', id: c.id, title: c.title, network: c.network },
+                })),
             );
-            return ok(`SHOW (CONTESTED) — do NOT add without asking. Offer these:${listed}`);
+            return ok(
+              `SHOW (CONTESTED) — multiple near-exact title matches (often different networks). ` +
+                `Do NOT add without asking. Offer these:${listed}`,
+            );
           }
           return ok(`SHOW — ${describe(verdict.pick.best)} (sonarr tvdbId ${verdict.pick.best.id}).`);
         }
@@ -127,7 +142,9 @@ export function makeCatalogueSearch(fetchImpl?: FetchImpl): Tool {
 }
 
 function describe(c: Candidate): string {
-  return `${c.title}${c.year ? ` (${c.year})` : ''}`;
+  const year = c.year ? ` (${c.year})` : '';
+  const network = c.network ? ` — ${c.network}` : '';
+  return `${c.title}${year}${network}`;
 }
 
 

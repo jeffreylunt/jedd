@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { matchScore, pickBest, typeVerdict, type Candidate } from '../src/media/matching.js';
+import { matchScore, pickBest, typeVerdict, orderForDisplay, type Candidate } from '../src/media/matching.js';
 
 const c = (id: number, title: string, year?: number): Candidate => ({ id, title, year });
 
@@ -87,4 +87,33 @@ test('case, punctuation and leading articles do not defeat a match', () => {
   assert.equal(matchScore('the office', 'The Office'), 1);
   assert.equal(matchScore('wall-e', 'WALL·E') > 0.4, true);
   assert.equal(matchScore("jojo's bizarre adventure", 'JoJos Bizarre Adventure'), 1);
+});
+
+// ── multi-network same title must never silent-pick ──────────────────────────
+
+test('🔴 multi-network identical titles are contested (never a silent SHOW pick)', () => {
+  const p = pickBest('dancing with the stars', [
+    { id: 1, title: 'Dancing with the Stars', year: 2005, network: 'Imedi' },
+    { id: 2, title: 'Dancing with the Stars', year: 2005, network: 'ABC (US)' },
+  ]);
+  assert.equal(p?.contested, true);
+  // Soft preference only: US/English-looking network sorts first when title scores tie.
+  assert.equal(p?.best.network, 'ABC (US)');
+});
+
+test('orderForDisplay prefers US network on equal title scores without dropping others', () => {
+  const ordered = orderForDisplay('dancing with the stars', [
+    { id: 1, title: 'Dancing with the Stars', year: 2005, network: 'Imedi' },
+    { id: 2, title: 'Dancing with the Stars', year: 2005, network: 'ABC (US)' },
+    { id: 3, title: 'Dancing with the Stars', year: 2004, network: 'ITV' },
+  ]);
+  assert.equal(ordered[0]?.network, 'ABC (US)');
+  assert.equal(ordered.length, 3);
+});
+
+test('CONTROL: single-network exact title is not contested', () => {
+  const p = pickBest('breaking bad', [
+    { id: 1396, title: 'Breaking Bad', year: 2008, network: 'AMC' },
+  ]);
+  assert.equal(p?.contested, false);
 });
