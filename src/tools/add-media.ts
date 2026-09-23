@@ -109,11 +109,15 @@ export function makeAddSeries(fetchImpl?: FetchImpl): Tool {
     // Useless without this service; absent rather than always-failing.
     needsServices: ['sonarr'],
     description:
-      'Add a TV show and start searching. Use the tvdbId from catalogue_search — do not invent one. ' +
-      'Pass `seasons` as the list of season numbers the person actually asked for: work out which ' +
-      'those are from what they said and from `available_seasons`. Only the seasons you list are ' +
-      'monitored, so listing extra ones downloads things nobody asked for. If they did not say, ask.',
-    minRole: 'guest',
+      'Add a TV show, monitor ONLY the seasons asked for, and queue an explicit SeasonSearch for each. ' +
+      'Use the tvdbId from catalogue_search — do not invent one. Pass `seasons` as the season numbers ' +
+      'the person actually asked for (from what they said and from `available_seasons`); listing extras ' +
+      'downloads things nobody asked for. If they did not say which seasons, ask. If the show is already ' +
+      'in Sonarr this still turns on the requested seasons and searches — it does not claim "already have" ' +
+      'unless those seasons are complete on disk. The result includes a release scout (seeder health on a ' +
+      'sample missing episode). If swarms look dead or thin, or a download later sits at 0%, fall through ' +
+      'to the gap-fill / episode-release tools that rank by seeder health (and can grab outside the quality profile).',
+minRole: 'guest',
     writes: true,
     parameters: {
       type: 'object',

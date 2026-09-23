@@ -333,7 +333,30 @@ export function classify(release: Release, now: Date): Assessment {
 export function matching(releases: Release[], title: string): Release[] {
   const needle = normalise(title);
   if (!needle) return releases;
-  return releases.filter((r) => normalise(r.subject).includes(needle) || normalise(r.releaseTitle).includes(needle));
+  /**
+   * 🔴 SUBSTRING `includes` WAS TOO LOOSE FOR NAMED-TITLE STATUS.
+   *
+   * Measured 2026-09-20 on *Shrinking*: check_status(title) reported 11 queue
+   * releases "matching" the show while follow-ups still sat at 0 files — and a
+   * later turn admitted the queue activity was not Shrinking. Prefer the SERIES
+   * / MOVIE subject as an exact or token-bounded match; only then allow the
+   * release name when it starts with the title ("Shrinking.S01E01...").
+   */
+  return releases.filter((r) => titleMatches(normalise(r.subject), needle) || releaseStartsWith(normalise(r.releaseTitle), needle));
+}
+
+function titleMatches(subject: string, needle: string): boolean {
+  if (!subject) return false;
+  if (subject === needle) return true;
+  // "shrinking 2023", "shrinking (2023)" after normalise collapses punct to spaces
+  if (subject.startsWith(needle + ' ')) return true;
+  // Token boundary: needle as a whole word, not a substring of another word.
+  return (` ${subject} `).includes(` ${needle} `);
+}
+
+function releaseStartsWith(releaseTitle: string, needle: string): boolean {
+  if (!releaseTitle) return false;
+  return releaseTitle === needle || releaseTitle.startsWith(needle + ' ');
 }
 
 function normalise(s: string): string {
