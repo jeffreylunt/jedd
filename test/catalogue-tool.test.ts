@@ -136,3 +136,34 @@ test('its description tells the model NOT to use it for "do you have"', () => {
   // separation only helps if the model knows which is which.
   assert.match(makeCatalogueSearch().description, /do NOT use it to answer "do you have/i);
 });
+
+test('🔴 multi-network series catalogue is CONTESTED and labels include network', async () => {
+  const r = await run(
+    routed(
+      () => json([]),
+      () =>
+        json([
+          { title: 'Dancing with the Stars', year: 2005, tvdbId: 10, network: 'Imedi' },
+          { title: 'Dancing with the Stars', year: 2005, tvdbId: 20, network: 'ABC (US)' },
+        ]),
+    ),
+    'dancing with the stars',
+  );
+  assert.equal(r.ok, true);
+  assert.match(r.content, /CONTESTED/);
+  assert.match(r.content, /do NOT add without asking/i);
+  assert.match(r.content, /ABC \(US\)/);
+  assert.match(r.content, /Imedi/);
+  assert.doesNotMatch(r.content, /^SHOW — Dancing with the Stars/m);
+});
+
+test('CONTROL: Moneyball film/series AMBIGUOUS still fires (no regression)', async () => {
+  const r = await run(
+    routed(
+      () => json([{ title: 'Moneyball', year: 2011, tmdbId: 60308 }]),
+      () => json([{ title: 'Moneyball', year: 2021, tvdbId: 99, network: 'Netflix' }]),
+    ),
+  );
+  assert.match(r.content, /AMBIGUOUS/);
+  assert.doesNotMatch(r.content, /CONTESTED/);
+});

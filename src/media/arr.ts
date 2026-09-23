@@ -252,10 +252,16 @@ export class ArrClient {
     return rows.map((r) => {
       const row = r as Record<string, unknown>;
       const raw = row[idField];
+      const networkRaw = row['network'];
+      const network =
+        this.kind === 'series' && typeof networkRaw === 'string' && networkRaw.trim()
+          ? networkRaw.trim()
+          : undefined;
       return {
         id: typeof raw === 'number' && Number.isFinite(raw) ? raw : 0,
         title: String(row['title'] ?? ''),
         year: typeof row['year'] === 'number' ? row['year'] : undefined,
+        network,
       };
     });
   }
