@@ -459,7 +459,123 @@ export class EspnClient {
       nameMatches: name === entry.espnName,
     };
   }
+
+  /**
+   * Range version of `fixtures()`.
+   *
+   * 🔴 ESPN's `dates` parameter only honours a single `YYYYMMDD` per call —
+   * the `start-end` range form and repeated `dates` params both return zero
+   * events (verified against the live API, 2026-09-22: `dates=20260922-20260923`
+   * → 400, `dates=A&dates=B` → 200 with 0 events). So a range is fanned out
+   * into one `fixtures()` call per UTC day and the results are merged,
+   * de-duplicated by `id` (a fixture must not appear twice because the range
+   * spans its day boundary).
+   *
+   * Partial coverage is NOT hidden. A day that does not come back `results`
+   * (a transport fault, a shape change) is recorded in `softFails` and the
+   * merged answer's `detail` counts how many days loaded. The caller can then
+   * tell "definitely not playing" (all days loaded, none involved) from "I only
+   * saw some of the days" (soft-failed days present) — the same two-zeros-are-
+   * different rule this file is built around.
+   */
+  async fixturesForRange(league: LeagueKey, fromMs: number, toMs: number): Promise<RangeAnswer> {
+    const entry = LEAGUES[league];
+    if (!entry) return { state: 'unknown', detail: `no such league "${league}"`, softFails: [] };
+
+    const DAY_MS = 86_400_000;
+    const firstDay = Math.ceil(fromMs / DAY_MS);
+    const lastDay = Math.floor(toMs / DAY_MS);
+    const nDays = Math.max(1, lastDay - firstDay + 1);
+
+    const perDay = await Promise.all(
+      Array.from({ length: nDays }, (_, i) => {
+        const dayStart = (firstDay + i) * DAY_MS;
+        return this.fixtures(league, dayStart, dayStart + DAY_MS - 1);
+      }),
+    );
+
+    const softFails: DaySoftFail[] = [];
+    const merged: Fixture[] = [];
+    const seen = new Set<string>();
+    let sampleKeys: string[] = [];
+    let espnName: string = entry.espnName;
+    let nameMatches = true;
+    let foundDays = 0;
+    let firstHardDetail = '';
+
+    for (let i = 0; i < perDay.length; i++) {
+      const a = perDay[i];
+      if (!a) continue;
+      const dayDate = espnDate((firstDay + i) * DAY_MS);
+      if (a.state === 'results') {
+        foundDays++;
+        if (a.sampleKeys.length) sampleKeys = a.sampleKeys;
+        // The name should agree across days; take the first, flag drift.
+        if (i === 0) {
+          espnName = a.espnName;
+          nameMatches = a.nameMatches;
+        } else if (a.espnName !== espnName || !a.nameMatches) {
+          nameMatches = false;
+        }
+        for (const f of a.fixtures) {
+          if (!seen.has(f.id)) {
+            seen.add(f.id);
+            merged.push(f);
+          }
+        }
+      } else {
+        softFails.push({ date: dayDate, detail: a.detail });
+        if (!firstHardDetail) firstHardDetail = a.detail;
+      }
+    }
+
+    const base = {
+      league,
+      fixtures: merged,
+      considered: merged.length,
+      sampleKeys,
+      windowFrom: new Date(fromMs).toISOString(),
+      windowTo: new Date(toMs).toISOString(),
+      espnName,
+      nameMatches,
+    };
+
+    if (foundDays === 0) {
+      return { state: 'unknown', detail: firstHardDetail, softFails };
+    }
+    if (softFails.length > 0) {
+      return {
+        state: 'results',
+        ...base,
+        detail: `${merged.length} fixtures across ${foundDays}/${nDays} days (${softFails.length} day${softFails.length === 1 ? '' : 's'} did not load)`,
+        softFails,
+        nDaysLoaded: foundDays,
+        nDaysTotal: nDays,
+      };
+    }
+    return { state: 'results', ...base, detail: `${merged.length} fixtures`, softFails, nDaysLoaded: foundDays, nDaysTotal: nDays };
+  }
 }
+
+/** A UTC day whose per-day request did not come back `results`. */
+export interface DaySoftFail {
+  /** YYYY-MM-DD (UTC) of the day that did not load. */
+  date: string;
+  /** The day's answer `state` plus `detail`. */
+  detail: string;
+}
+
+/** Merged answer from `fixturesForRange()`: a `FixtureAnswer` plus soft-fail provenance. */
+export type RangeAnswer =
+  | (FixtureAnswer & {
+      detail: string;
+      softFails: DaySoftFail[];
+      /** How many UTC days in the range came back `results`. */
+      nDaysLoaded: number;
+      /** Total UTC days the range spanned. */
+      nDaysTotal: number;
+    })
+  | { state: 'unknown'; detail: string; softFails: DaySoftFail[] };
 
 /**
  * How well does this fixture match the team the person named?

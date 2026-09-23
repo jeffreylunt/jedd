@@ -391,9 +391,30 @@ export class ArrClient {
         monitored: input.seasons.includes(n),
       })),
       // 🔴 'none' so the service does not re-expand what we scoped above.
+      // searchForMissingEpisodes is belt-and-suspenders only — measured 2026-09-20 on
+      // *Shrinking*: add returned STARTED with this flag set, then S1/S2 sat 0/N for
+      // four hours until an explicit SeasonSearch (via add_season) moved them.
       addOptions: { monitor: 'none', searchForMissingEpisodes: true },
     });
-    return this.interpretAdd(res, input.seasons, input.title);
+    // 🔴 "Already added" is NOT "already watchable" — same shape as addMovie / Breadwinner.
+    if (res.status === 400 && /already been added|already exists/i.test(res.detail)) {
+      return this.researchExistingSeries(input.tvdbId, input.title, input.seasons);
+    }
+    if (!res.ok) return this.interpretAdd(res, input.seasons, input.title);
+
+    const body = (res.body && typeof res.body === 'object' ? res.body : {}) as Record<string, unknown>;
+    const seriesId = Number(body['id']);
+    if (!Number.isFinite(seriesId) || seriesId <= 0) {
+      return {
+        state: 'started',
+        detail:
+          `"${input.title}" was added (season(s) ${input.seasons.join(', ')}), but I could not read ` +
+          `Sonarr's series id back, so I could not queue per-season SeasonSearch. Do not assume ` +
+          `downloads have started — use add_season or check_status if nothing moves.`,
+        confirmed: input.seasons,
+      };
+    }
+    return this.searchSeasonsAndScout(seriesId, input.title, input.seasons, 'added');
   }
 
   /**
@@ -766,6 +787,224 @@ export class ArrClient {
       return this.researchExistingMovie(input.tmdbId, input.title);
     }
     return this.interpretAdd(res, [], input.title);
+  }
+
+
+  /**
+   * 🔴 SERIES ALREADY IN SONARR IS NOT "NOTHING TO DO".
+   *
+   * Measured 2026-09-20 (*Shrinking*): add_series claimed searching, follow-ups
+   * sat at S1 0/10 and S2 0/12 for four hours, then abandoned. The next day
+   * add_season's monitor + SeasonSearch path actually moved the files. Same
+   * class of defect as Breadwinner on Radarr — "already in the library" without
+   * files (or without a live search) is unfinished work, not success.
+   */
+  private async researchExistingSeries(
+    tvdbId: number,
+    title: string,
+    seasons: number[],
+  ): Promise<AddOutcome> {
+    const list = await this.call('/series');
+    if (!list.ok) {
+      return {
+        state: 'unknown',
+        detail:
+          `"${title}" may already be in Sonarr, but I could not read the library to check ` +
+          `its seasons or start a search. (${list.detail})`,
+      };
+    }
+    const rows = Array.isArray(list.body) ? (list.body as Record<string, unknown>[]) : [];
+    const row = rows.find((r) => Number(r['tvdbId']) === tvdbId);
+    if (!row) {
+      return {
+        state: 'unknown',
+        detail:
+          `Sonarr said "${title}" was already added, but I cannot find it by tvdbId ${tvdbId} ` +
+          `in the library listing. Check before trying again.`,
+      };
+    }
+    const seriesId = Number(row['id']);
+    if (!Number.isFinite(seriesId) || seriesId <= 0) {
+      return {
+        state: 'unknown',
+        detail: `"${title}" is in Sonarr but I could not read its id to search.`,
+      };
+    }
+
+    const seasonRows = Array.isArray(row['seasons']) ? (row['seasons'] as Record<string, unknown>[]) : [];
+    const incomplete: number[] = [];
+    const complete: number[] = [];
+    for (const n of seasons) {
+      const s = seasonRows.find((r) => Number(r['seasonNumber']) === n);
+      const stats = (s?.['statistics'] as Record<string, unknown> | undefined) ?? {};
+      const have = Number(stats['episodeFileCount'] ?? 0);
+      const want = Number(stats['totalEpisodeCount'] ?? stats['episodeCount'] ?? 0);
+      if (want > 0 && have >= want) complete.push(n);
+      else incomplete.push(n);
+    }
+
+    if (incomplete.length === 0) {
+      return {
+        state: 'already-have',
+        detail:
+          `"${title}" is already in the library with season(s) ${seasons.join(', ')} on disk — nothing to do.`,
+      };
+    }
+
+    // Ensure the requested incomplete seasons are monitored, then SeasonSearch.
+    // monitorSeasons is the same verb add_season uses; it also flips series.monitored.
+    const monitored = await this.monitorSeasons(seriesId, incomplete);
+    if (monitored.state === 'unknown') {
+      return { state: 'unknown', detail: monitored.detail };
+    }
+    if (monitored.state === 'failed') {
+      return { state: 'failed', detail: monitored.detail };
+    }
+    if (!monitored.seriesMonitored) {
+      return {
+        state: 'failed',
+        detail:
+          `"${title}" season(s) ${monitored.confirmed.join(', ')} switched on, but the SHOW itself ` +
+          `came back unmonitored, so Sonarr will grab nothing. Nothing is searching.`,
+      };
+    }
+    const toSearch = monitored.confirmed.length ? monitored.confirmed : incomplete;
+    const searched = await this.searchSeasonsAndScout(seriesId, title, toSearch, 'already-in-library');
+    if (complete.length && searched.state === 'started') {
+      return {
+        ...searched,
+        detail: `${searched.detail} (season(s) ${complete.join(', ')} already complete on disk.)`,
+      };
+    }
+    return searched;
+  }
+
+  /**
+   * Queue an explicit SeasonSearch per season, then SAMPLE indexer swarms.
+   *
+   * 🔴 MONITORING / addOptions.searchForMissingEpisodes ALONE IS NOT ENOUGH.
+   * add_season already documents this; add_series must follow the same rule.
+   *
+   * The scout asks `/release?episodeId=` for one missing episode per season
+   * (capped) and ranks by seeders the same way search_episode does. It does NOT
+   * auto-grab — grabbing every episode of a new show would bypass the quality
+   * profile and hammer indexers. It tells the caller when swarms look dead so
+   * Jedd can fall through to find_gaps / search_episode / grab_release.
+   */
+  private async searchSeasonsAndScout(
+    seriesId: number,
+    title: string,
+    seasons: number[],
+    how: 'added' | 'already-in-library',
+  ): Promise<AddOutcome> {
+    const searched: number[] = [];
+    const failed: { season: number; why: string }[] = [];
+    for (const n of seasons) {
+      const r = await this.seasonSearch(seriesId, n);
+      if (r.ok) searched.push(n);
+      else failed.push({ season: n, why: r.detail });
+    }
+
+    if (searched.length === 0) {
+      const why = failed.map((f) => `S${f.season}: ${f.why}`).join('; ');
+      return {
+        state: 'failed',
+        detail:
+          how === 'added'
+            ? `"${title}" was added and season(s) ${seasons.join(', ')} are monitored, but SeasonSearch ` +
+              `failed for every one, so NOTHING is searching. ${why}`
+            : `"${title}" is in the library and the seasons were switched on, but SeasonSearch failed ` +
+              `for every one, so NOTHING is searching. ${why}`,
+      };
+    }
+
+    const scout = await this.scoutReleaseHealth(seriesId, searched);
+    const partial =
+      failed.length > 0
+        ? ` Season(s) ${failed.map((f) => f.season).join(', ')} could NOT be searched (${failed
+            .map((f) => f.why)
+            .join('; ')}).`
+        : '';
+    const prefix =
+      how === 'added'
+        ? `"${title}" added; SeasonSearch queued for season(s) ${searched.join(', ')}.`
+        : `"${title}" was already in Sonarr; SeasonSearch queued for season(s) ${searched.join(', ')}.`
+
+    return {
+      state: 'started',
+      detail: `${prefix}${partial}${scout}`,
+      confirmed: searched,
+    };
+  }
+
+  /**
+   * One missing episode per season, max three seasons — enough to know whether
+   * indexers are offering live swarms without searching the whole show.
+   */
+  private async scoutReleaseHealth(seriesId: number, seasons: number[]): Promise<string> {
+    const eps = await this.episodes(seriesId);
+    if (eps.state !== 'episodes') {
+      return (
+        ' Could not sample indexer releases after search, so I do not know whether seeders look healthy — ' +
+        'if downloads stall, use find_gaps / search_episode / grab_release (those pick by seeder health).'
+      );
+    }
+    const notes: string[] = [];
+    let anyHealthy = false;
+    let anyThin = false;
+    let anyDeadOnly = false;
+    let anyEmpty = false;
+    for (const season of seasons.slice(0, 3)) {
+      const missing = eps.rows.find(
+        (e) => e.season === season && e.monitored && !e.hasFile && e.episode > 0,
+      );
+      if (!missing) continue;
+      const rel = await this.releasesFor(missing.id);
+      if (rel.state !== 'releases') {
+        notes.push(`S${season} release scout failed`);
+        continue;
+      }
+      if (rel.rows.length === 0) {
+        anyEmpty = true;
+        notes.push(`S${season}E${missing.episode}: no indexer releases`);
+        continue;
+      }
+      const withSeeds = rel.rows.filter((r) => r.seeders > 0);
+      if (withSeeds.length === 0) {
+        anyDeadOnly = true;
+        notes.push(`S${season}E${missing.episode}: ${rel.rows.length} release(s), all with NO seeders`);
+        continue;
+      }
+      const best = [...withSeeds].sort((a, b) => b.seeders - a.seeders || b.resolution - a.resolution)[0]!;
+      if (best.seeders >= 5) {
+        anyHealthy = true;
+        notes.push(
+          `S${season}E${missing.episode}: best swarm ${best.seeders} seeder(s) (${best.quality}` +
+            `${best.approved ? '' : ', outside profile — grab_release can still take it'})`,
+        );
+      } else {
+        anyThin = true;
+        notes.push(
+          `S${season}E${missing.episode}: best swarm only ${best.seeders} seeder(s) (${best.quality})`,
+        );
+      }
+    }
+
+    if (notes.length === 0) {
+      return ' No missing monitored episodes to sample yet (Sonarr may still be refreshing the episode list).';
+    }
+
+    let advice = '';
+    if (anyDeadOnly || anyEmpty) {
+      advice =
+        ' If the automatic search stalls or grabs dead torrents, use find_gaps then search_episode / ' +
+        'grab_release — those rank by seeder health and can take a release the quality profile refused.';
+    } else if (anyThin && !anyHealthy) {
+      advice =
+        ' Swarms look thin; if a download sits at 0%, unstick it and use search_episode / grab_release ' +
+        'to pick a healthier release.';
+    }
+    return ` Release scout — ${notes.join('; ')}.${advice}`;
   }
 
   /**

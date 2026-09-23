@@ -448,8 +448,14 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
       const espn = new EspnClient({ fetchImpl });
       // Measured: 13 competitions in parallel is 612 ms / 3.87 MB, and the
       // dormant ones are ~1 KB each. Breadth is cheap; the gap was not.
+      //
+      // Each competition fans out into ONE ESPN CALL PER DAY (the `dates`
+      // parameter only honours a single day — see fixturesForRange in espn.ts).
+      // At the default 30-day window that is 30 calls per league; the calls
+      // within a league and across leagues all run concurrently, so wall time
+      // is one request, not 30 × 13 of them.
       const answers = await Promise.all(
-        searched.map((k) => espn.fixtures(k, nowMs, nowMs + days * 86_400_000)),
+        searched.map((k) => espn.fixturesForRange(k, nowMs, nowMs + days * 86_400_000)),
       );
 
       /**
@@ -547,6 +553,22 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
           ? [`${leagueLabel(key)} → ESPN returned "${a.espnName}"`]
           : [],
       );
+      /**
+       * 🔴 A RANGE IS NOW N PER-DAY CALLS — A DAY THAT DID NOT LOAD IS NOT "NO
+       * FIXTURE".
+       *
+       * `fixturesForRange` fans the window out one ESPN call per UTC day. A day
+       * that failed (a transport blip, a shape change) is recorded in
+       * `softFails` on the merged answer. If it were swallowed, a 29/30-day load
+       * would render as a 30-day clean total, and the one missing day could be
+       * exactly the day the fixture lives on — the same false-zero this tool
+       * exists to remove, wearing a new mask. So the partial coverage is named.
+       */
+      const partial = okAnswers.flatMap(({ key, a }) =>
+        a.state === 'results' && a.softFails && a.softFails.length
+          ? [`${leagueLabel(key)}: ${a.nDaysLoaded} of ${a.nDaysTotal} day(s) loaded`]
+          : [],
+      );
       const scopeLine =
         `SEARCHED ${searched.length} competition(s): ${scopeLabel}. ` +
         'Anything NOT in that list was not checked — do not report on it.' +
@@ -556,6 +578,10 @@ export function makeSportsFixture(fetchImpl?: FetchImpl, now: () => number = () 
         (misnamed.length
           ? `\n🔴 ${misnamed.length} came back under an UNEXPECTED NAME, so its fixtures may be from the ` +
             `wrong competition entirely — treat them as suspect: ${misnamed.join('; ')}`
+          : '') +
+        (partial.length
+          ? `\n🔴 ${partial.length} competition(s) loaded only PARTIALLY (per-day ESPN calls), so a ` +
+            `fixture on an unloaded day is NOT confirmed absent: ${partial.join('; ')}`
           : '');
       const sourceLine =
         `${asOf}\n${scopeLine}\nFIXTURE SOURCE (ESPN): ${considered} events across those ` +

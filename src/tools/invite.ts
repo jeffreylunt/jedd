@@ -30,10 +30,21 @@ import { fail, ok, type Tool, type ToolContext } from './types.js';
 /** How an invite is delivered. Injected, so the live gate stays shut until opened. */
 export type InviteSender = (to: string, text: string) => Promise<{ delivered: boolean | null; detail: string }>;
 
+/**
+ * Verify a send the transport reported as failed: `true` means the text is in
+ * the transport's own sent history (it landed, the *answer* was lost),
+ * `false` means it is not, `null` means the history is unreadable. Injected,
+ * like `send`, so a transport with no history (terminal, tests) leaves it
+ * undefined and the tool falls back to trusting the verdict.
+ */
+export type InviteVerifier = (to: string, text: string) => Promise<boolean | null>;
+
 export interface InviteDeps {
   jfago: JfagoClient;
   ledger: InviteLedger;
   send: InviteSender;
+  /** Read the transport's sent history back before revoking. Optional. */
+  verifySent?: InviteVerifier;
   now?: () => Date;
 }
 
@@ -81,8 +92,16 @@ export function makeInviteTool(deps: InviteDeps): Tool {
 
       const by = ctx.senderHandle;
 
-      // Dedupe BEFORE quota: a repeat within ten minutes is the same request.
-      if (deps.ledger.recentlyInvited(recipient, now)) {
+      // Dedupe BEFORE quota: a repeat within ten minutes is the same request —
+      // except a REVOKED one, which is a failed request with no live credential
+      // left. Re-minting after a confirmed revoke creates one live invite, not
+      // two, and "send it again" is the whole point of the ledger remembering.
+      // 2026-09-20: the window stood in the way of exactly this recovery, so an
+      // orphaned recipient sat on a dead link while "send it again" got
+      // ALREADY_INVITED. Orphaned and revoke-failed still block: there we do
+      // not know whether a credential survived, and blocking is the safe side.
+      const recent = deps.ledger.recentRecord(recipient, now);
+      if (recent && recent.outcome !== 'revoked') {
         return fail(
           `ALREADY_INVITED — ${recipient} was invited within the last few minutes. Nothing new was ` +
             'created. Give it a moment and check with them before trying again.',
@@ -139,11 +158,51 @@ export function makeInviteTool(deps: InviteDeps): Tool {
        * Only an explicit `false` triggers revocation.
        */
       if (delivered === false) {
+        /**
+         * 🔴 BEFORE TRUSTING A `false`, READ THE TRANSPORT'S OWN HISTORY BACK.
+         *
+         * "THE SEND REPORTED FAILURE" AND "THE PERSON DID NOT GET IT" ARE
+         * DIFFERENT FACTS. BlueBubbles has returned 500 for a send that LANDED —
+         * the anchored (Private API) path stalls 120s and 500s after the write,
+         * and 2026-09-20 measured exactly that: the text was on the recipient's
+         * phone, the verdict said failed, and the working invite was revoked
+         * mid-handshake, leaving them on a dead link for two minutes (and the
+         * dedupe window would not mint a replacement).
+         *
+         * The read-back is the same `recentlySent` the retry path trusts, so
+         * the two layers agree on what the history means:
+         *
+         *   `true`  → it landed. Keep the invite. Report that it went out.
+         *   `false` → not in the history. Revoke, as before.
+         *   `null`  → unreadable. Revoke: an unreadable history is exactly when
+         *             a false "landed" would be undetectable, and a dead link
+         *             is a support question while a live one is an exposure.
+         */
+        let verified: boolean | null = null;
+        if (deps.verifySent) {
+          try {
+            verified = await deps.verifySent(recipient, text);
+          } catch {
+            verified = null;
+          }
+        }
+        if (verified === true) {
+          deps.ledger.record({
+            at: now.toISOString(), by, recipient, label, outcome: 'confirmed',
+            detail: `reportedly failed (${sendDetail}) but found in sent history — NOT revoked`,
+          });
+          return ok(
+            `SENT — the send was reported failed (${sendDetail}) but the text IS in the sent history, ` +
+              `so it went to ${recipient}. The invite is live. It works once and expires in 24 hours. ` +
+              '⚠️ Once they use it their account is permanent — it cannot be undone by expiring the invite.',
+          );
+        }
         const revoke = await deps.jfago.revoke(minted.invite.code);
         deps.ledger.record({
           at: now.toISOString(), by, recipient, label,
           outcome: revoke.revoked ? 'revoked' : 'orphaned',
-          detail: `${sendDetail} | ${revoke.detail}`,
+          detail: `${sendDetail} | ${revoke.detail}` +
+            (deps.verifySent ? ` | verified in history: ${verified === false ? 'no' : 'unreadable'}` : ''),
         });
         return fail(
           revoke.revoked

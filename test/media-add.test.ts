@@ -90,10 +90,37 @@ test('a season that does not exist is refused, and NOTHING is added', async () =
 
 // ── 🔴 DEFECT 2 (the outcome enum) ───────────────────────────────────────────
 
-test('🔴 a duplicate add is ALREADY-HAVE, which is success — never "retry"', async () => {
+test('🔴 a duplicate add with complete seasons is ALREADY-HAVE — never "retry"', async () => {
   // V1's ebook path read a duplicate-add rejection as a download FAILURE and
   // told the user to retry: the one action guaranteed never to work.
-  const { impl } = capturing(400, {}, '[{"errorMessage":"This series has already been added"}]');
+  // After 2026-09-22, "already added" re-reads the library: complete seasons
+  // stay already-have; incomplete ones SeasonSearch (covered below).
+  const seriesRow = {
+    id: 207,
+    title: 'Peppa Pig',
+    tvdbId: peppa.tvdbId,
+    monitored: true,
+    seasons: peppa.seasons.map((n) => ({
+      seasonNumber: n,
+      monitored: true,
+      statistics: { episodeFileCount: 52, totalEpisodeCount: 52 },
+    })),
+  };
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (method === 'POST' && u.endsWith('/series')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"This series has already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/series')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([seriesRow]) } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
   const r = await sonarr(impl).addSeries(peppa);
   assert.equal(r.state, 'already-have');
   assert.doesNotMatch(r.detail, /retry|try again/i);
@@ -116,9 +143,35 @@ test('a real refusal is FAILED, distinct from unknown and from already-have', as
 });
 
 test('🔴 all four states are distinguishable — none collapses into another', async () => {
+  const completeSeries = {
+    id: 207,
+    title: peppa.title,
+    tvdbId: peppa.tvdbId,
+    monitored: true,
+    seasons: peppa.seasons.map((n) => ({
+      seasonNumber: n,
+      monitored: true,
+      statistics: { episodeFileCount: 10, totalEpisodeCount: 10 },
+    })),
+  };
+  const alreadyHaveImpl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (method === 'POST' && u.endsWith('/series')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/series')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([completeSeries]) } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
   const outcomes = await Promise.all([
     sonarr(capturing(201).impl).addSeries(peppa),
-    sonarr(capturing(400, {}, '[{"errorMessage":"already been added"}]').impl).addSeries(peppa),
+    sonarr(alreadyHaveImpl).addSeries(peppa),
     sonarr(capturing(400, {}, '[{"errorMessage":"nope"}]').impl).addSeries(peppa),
     sonarr(
       (async () => {
@@ -243,3 +296,135 @@ test('🔴 movie already in Radarr WITH a file is already-have', async () => {
   assert.match(r.detail, /file on disk/i);
 });
 
+test('🔴 addSeries queues explicit SeasonSearch per requested season after create', async () => {
+  // Measured 2026-09-20 (*Shrinking*): searchForMissingEpisodes on add claimed
+  // STARTED, then S1/S2 sat 0/N for hours until SeasonSearch via add_season.
+  const sent: Sent[] = [];
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    sent.push({ url: u, method, body });
+    if (method === 'POST' && u.endsWith('/series')) {
+      return {
+        ok: true,
+        status: 201,
+        text: async () => JSON.stringify({ id: 207, title: peppa.title, tvdbId: peppa.tvdbId }),
+      } as Response;
+    }
+    if (method === 'POST' && u.endsWith('/command')) {
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: 1 }) } as Response;
+    }
+    if (method === 'GET' && u.includes('/episode')) {
+      return { ok: true, status: 200, text: async () => '[]' } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  const r = await sonarr(impl).addSeries(peppa);
+  assert.equal(r.state, 'started');
+  if (r.state !== 'started') throw new Error('unreachable');
+  assert.deepEqual(r.confirmed, [1, 2, 3]);
+  const searches = sent.filter((s) => s.url.endsWith('/command') && s.body['name'] === 'SeasonSearch');
+  assert.equal(searches.length, 3);
+  assert.deepEqual(
+    searches.map((s) => s.body['seasonNumber']).sort((a, b) => Number(a) - Number(b)),
+    [1, 2, 3],
+  );
+  assert.ok(searches.every((s) => s.body['seriesId'] === 207));
+});
+
+test('🔴 series already in Sonarr WITHOUT complete seasons re-monitors and SeasonSearches', async () => {
+  const sent: Sent[] = [];
+  const seriesRow = {
+    id: 207,
+    title: peppa.title,
+    tvdbId: peppa.tvdbId,
+    monitored: true,
+    seasons: peppa.seasons.map((n) => ({
+      seasonNumber: n,
+      monitored: false,
+      statistics: { episodeFileCount: 0, totalEpisodeCount: 52 },
+    })),
+  };
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    sent.push({ url: u, method, body });
+    if (method === 'POST' && u.endsWith('/series')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"This series has already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/series')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([seriesRow]) } as Response;
+    }
+    if (method === 'GET' && /\/series\/207$/.test(u)) {
+      return { ok: true, status: 200, text: async () => JSON.stringify(seriesRow) } as Response;
+    }
+    if (method === 'PUT' && /\/series\/207$/.test(u)) {
+      const seasons = (body['seasons'] as { seasonNumber: number; monitored: boolean }[]) ?? [];
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            ...seriesRow,
+            monitored: true,
+            seasons: seasons.map((s) => ({
+              seasonNumber: s.seasonNumber,
+              monitored: s.monitored,
+              statistics: { episodeFileCount: 0, totalEpisodeCount: 52 },
+            })),
+          }),
+      } as Response;
+    }
+    if (method === 'POST' && u.endsWith('/command')) {
+      return { ok: true, status: 201, text: async () => JSON.stringify({ id: 1 }) } as Response;
+    }
+    if (method === 'GET' && u.includes('/episode')) {
+      return { ok: true, status: 200, text: async () => '[]' } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  const r = await sonarr(impl).addSeries(peppa);
+  assert.equal(r.state, 'started');
+  assert.match(r.detail, /already in Sonarr|SeasonSearch/i);
+  assert.doesNotMatch(r.detail, /nothing to do/i);
+  const searches = sent.filter((s) => s.url.endsWith('/command') && s.body['name'] === 'SeasonSearch');
+  assert.equal(searches.length, 3);
+});
+
+test('series already complete on disk is already-have', async () => {
+  const seriesRow = {
+    id: 207,
+    title: peppa.title,
+    tvdbId: peppa.tvdbId,
+    monitored: true,
+    seasons: peppa.seasons.map((n) => ({
+      seasonNumber: n,
+      monitored: true,
+      statistics: { episodeFileCount: 52, totalEpisodeCount: 52 },
+    })),
+  };
+  const impl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (method === 'POST' && u.endsWith('/series')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => '[{"errorMessage":"This series has already been added"}]',
+      } as Response;
+    }
+    if (method === 'GET' && u.endsWith('/series')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([seriesRow]) } as Response;
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  const r = await sonarr(impl).addSeries(peppa);
+  assert.equal(r.state, 'already-have');
+  assert.match(r.detail, /on disk/i);
+});
