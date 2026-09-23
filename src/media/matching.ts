@@ -19,6 +19,8 @@ export interface Candidate {
   id: number;
   title: string;
   year?: number;
+  /** Sonarr network name when present (series only), e.g. "ABC (US)". */
+  network?: string;
   /** Relative popularity within its own catalogue, when the source provides it. */
   popularity?: number;
 }
@@ -84,15 +86,79 @@ export interface Pick {
  */
 export const MATCH_FLOOR = 0.34;
 
+/** Soft presentation rank only — never a silent auto-pick. Higher = more preferred. */
+export function networkPreference(network: string | undefined): number {
+  const n = (network ?? '').toLowerCase();
+  if (!n) return 0;
+  // US broadcast / major US streamers
+  if (
+    /\b(abc|nbc|cbs|fox|the cw|cw|hbo|max|netflix|hulu|disney\+?|amc|showtime|paramount\+?|peacock|usa network|espn|fx|tnt|tbs|syfy|freeform)\b/.test(
+      n,
+    ) ||
+    /\(us\)|\bunited states\b|\bus\b/.test(n)
+  ) {
+    return 2;
+  }
+  // Other English-primary networks
+  if (/\b(bbc|itv|channel 4|channel 5|sky|stan|nine|seven|ten|cbc|ctv|global)\b/.test(n) || /\(uk\)|\(ca\)|\(au\)/.test(n)) {
+    return 1;
+  }
+  return 0;
+}
+
+function normaliseTitle(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[‘’']/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/^(the|a|an) /, '')
+    .trim();
+}
+
+/**
+ * Near-exact title matches that disagree on network must never resolve silently.
+ * Score-tie contested still applies; this catches same-title franchises across nets.
+ */
+function multiNetworkNearExact(scored: { c: Candidate; s: number }[]): boolean {
+  const near = scored.filter((x) => x.s >= 0.99);
+  if (near.length < 2) return false;
+  const byTitle = new Map<string, Set<string>>();
+  for (const { c } of near) {
+    const key = normaliseTitle(c.title);
+    const net = (c.network ?? '').trim().toLowerCase();
+    if (!net) continue;
+    let set = byTitle.get(key);
+    if (!set) {
+      set = new Set();
+      byTitle.set(key, set);
+    }
+    set.add(net);
+  }
+  for (const nets of byTitle.values()) {
+    if (nets.size >= 2) return true;
+  }
+  return false;
+}
+
+/** Best-first, with US/English network soft preference only on equal title scores. */
+export function orderForDisplay(query: string, candidates: Candidate[]): Candidate[] {
+  return [...candidates]
+    .map((c) => ({ c, s: matchScore(query, c.title), pref: networkPreference(c.network) }))
+    .sort((a, b) => b.s - a.s || b.pref - a.pref)
+    .map((x) => x.c);
+}
+
 export function pickBest(query: string, candidates: Candidate[]): Pick | null {
   if (candidates.length === 0) return null;
   const scored = candidates
     .map((c) => ({ c, s: matchScore(query, c.title) }))
-    .sort((a, b) => b.s - a.s);
+    .sort((a, b) => b.s - a.s || networkPreference(b.c.network) - networkPreference(a.c.network));
   const top = scored[0]!;
   if (top.s < MATCH_FLOOR) return null; // resembles nothing; do not fall back to [0]
   const runner = scored[1];
-  const contested = Boolean(runner && top.s - runner.s < 0.15);
+  const contestedByScore = Boolean(runner && top.s - runner.s < 0.15);
+  const contestedByNetwork = multiNetworkNearExact(scored);
+  const contested = contestedByScore || contestedByNetwork;
   return { best: top.c, score: top.s, contested };
 }
 
