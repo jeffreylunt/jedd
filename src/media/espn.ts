@@ -330,19 +330,20 @@ export class EspnClient {
   /**
    * Fixtures for one league between two instants.
    *
-   * The requested window is padded by a day on each side before it is sent,
-   * because ESPN's `dates` parameter is day-granular in its own timezone and a
-   * fixture at the boundary would otherwise fall outside it. The precise cut is
-   * made here, client-side, against the real ISO kickoff.
+   * 🔴 ONE `dates` DAY PER CALL, NO RANGE. Measured live 2026-09-23: ESPN
+   * rejects the range form — `dates=20260922-20261023` is HTTP 400 while
+   * `dates=20260924` is 200 — so the window the caller asks for is requested
+   * as a single day and the precise cut is made here, client-side, against the
+   * real ISO kickoff. Boundary fixtures are covered by the per-UTC-day fan-out
+   * in `fixturesForRange`, which is how production reaches this method: each
+   * call's window is one day, and its fixtures are cut exactly below.
    */
   async fixtures(league: LeagueKey, fromMs: number, toMs: number): Promise<FixtureAnswer> {
     const entry = LEAGUES[league];
     if (!entry) return { state: 'unknown', detail: `no such league "${league}"` };
 
-    const day = 86_400_000;
-    const from = espnDate(fromMs - day);
-    const to = espnDate(toMs + day);
-    const url = `${BASE_URL}/${entry.path}/scoreboard?dates=${from}-${to}`;
+    const date = espnDate(fromMs);
+    const url = `${BASE_URL}/${entry.path}/scoreboard?dates=${date}`;
 
     let res: Response;
     try {
