@@ -472,6 +472,19 @@ export class EspnClient {
    * de-duplicated by `id` (a fixture must not appear twice because the range
    * spans its day boundary).
    *
+   * 🔴 BOUNDARY RULE — the day SET and the CUT are different jobs (measured
+   * live 2026-09-24, the Falcons-at-Packers TNF miss):
+   * - ESPN keys its scoreboard by EASTERN day. The 8:15 PM ET Thursday game
+   *   is `2026-09-25T00:15Z` and comes back under `dates=20260924`. So the
+   *   UTC day the caller's window STARTS in must be requested (floor, not
+   *   ceil — ceil dropped the current day whenever "now" was not exactly
+   *   midnight), and so must the UTC day the window ENDS in plus any day an
+   *   evening ET kickoff spills into (ceil of `toMs`).
+   * - The PRECISE cut is then applied client-side against `kickoffMs` with
+   *   the caller's ORIGINAL `fromMs`/`toMs` (see `fixtures()` below), never
+   *   the UTC-day boundary — a per-day cut drops exactly the evening-ET
+   *   kickoffs above. The id-dedup makes the overlapping windows safe.
+   *
    * Partial coverage is NOT hidden. A day that does not come back `results`
    * (a transport fault, a shape change) is recorded in `softFails` and the
    * merged answer's `detail` counts how many days loaded. The caller can then
@@ -484,14 +497,26 @@ export class EspnClient {
     if (!entry) return { state: 'unknown', detail: `no such league "${league}"`, softFails: [] };
 
     const DAY_MS = 86_400_000;
-    const firstDay = Math.ceil(fromMs / DAY_MS);
-    const lastDay = Math.floor(toMs / DAY_MS);
+    // floor/ceil so the boundary UTC days are REQUESTED even when the window
+    // starts/ends mid-day; the client-side cut in `fixtures()` keeps the
+    // precise answer. See the boundary rule above.
+    const firstDay = Math.floor(fromMs / DAY_MS);
+    const lastDay = Math.ceil(toMs / DAY_MS);
     const nDays = Math.max(1, lastDay - firstDay + 1);
+
+    // ESPN keys a scoreboard by EASTERN day: an evening-ET kickoff (e.g. the
+    // 8:15 PM ET Thursday game at 00:15Z the next UTC day) is returned under
+    // the PREVIOUS UTC date. Widen each per-day cut by the Eastern time offset
+    // so those kickoffs survive their UTC day's cut; the caller's window is
+    // re-applied exactly at the merge and the id-dedup removes the overlap.
+    const EASTERN_SPILL_MS = 6 * 3_600_000; // ET = UTC+4..5, use 6 for headroom
 
     const perDay = await Promise.all(
       Array.from({ length: nDays }, (_, i) => {
         const dayStart = (firstDay + i) * DAY_MS;
-        return this.fixtures(league, dayStart, dayStart + DAY_MS - 1);
+        const perFrom = Math.max(dayStart, fromMs);
+        const perTo = Math.min(dayStart + DAY_MS - 1 + EASTERN_SPILL_MS, toMs);
+        return this.fixtures(league, perFrom, perTo);
       }),
     );
 
@@ -519,6 +544,11 @@ export class EspnClient {
           nameMatches = false;
         }
         for (const f of a.fixtures) {
+          // The per-day cuts are deliberately WIDER than the caller's window
+          // (Eastern spill + adjacent-day overlap) — re-apply the caller's
+          // exact bounds here. `in`-state fixtures keep their past kickoff
+          // (same rule as `fixtures()`), everything else must sit inside.
+          if (f.state === 'in' ? f.kickoffMs > toMs : f.kickoffMs < fromMs) continue;
           if (!seen.has(f.id)) {
             seen.add(f.id);
             merged.push(f);
