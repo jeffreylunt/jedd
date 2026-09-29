@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   channelHealth,
+  classifyResultsReadFailure,
   describeAge,
   describeRow,
   parseRoster,
@@ -192,6 +193,131 @@ test('🔴 an unreadable results file is UNKNOWN, never "no channels are working
   assert.equal(res.ok, false);
   assert.match(res.content, /UNKNOWN/);
   assert.match(res.content, /NOT\s+"no channels are working"/);
+});
+
+test('🔴 a MISSING FILE is named as such, not as a bare exit_code=1', async () => {
+  /**
+   * `cat: ...: No such file or directory` and `stat: cannot stat ...` both
+   * reach this case. The audit log records the first two lines of the error
+   * (`agent.ts: firstLines`), so a generic `exit_code=1` would persist with the
+   * reason dropped — and "the checker hasn't run" looks identical to "the
+   * host is down" from there. The fix names the mode in plain English.
+   */
+  const missing: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb(
+        { code: 1 },
+        '',
+        'stat: cannot stat \'/tmp/check-streams-results.txt\': No such file or directory',
+      );
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(missing));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN/);
+  assert.match(res.content, /file does not exist/);
+  assert.match(res.content, /checker has not run/);
+  assert.match(res.content, /cron entry/);
+});
+
+test('🔴 a PERMISSION DENIED is named as such, not conflated with a missing file', async () => {
+  /**
+   * A permission error is a different problem from a missing file (fix the
+   * file mode or the ssh user) and the two fixes are different. Without this,
+   * an operator told "the checker hasn't run" would spend time looking at the
+   * cron when the actual fix is `chmod` or a user-mode change on hp.
+   *
+   * The user-facing message replaces the raw stderr ("Permission denied")
+   * with a human-readable equivalent so the diagnosis survives the audit log's
+   * two-line truncation (`agent.ts: firstLines`). The raw stderr is a string
+   * the audit log never sees either way; the human wording is what we assert
+   * on here.
+   */
+  const denied: ExecImpl = (_f, args, _o, cb) => {
+    const command = args[args.length - 1] ?? '';
+    if (command.includes('check-streams-results.txt')) {
+      return cb(
+        { code: 1 },
+        '',
+        'cat: /tmp/check-streams-results.txt: Permission denied',
+      );
+    }
+    return cb(null, `${ROSTER}\n`, '');
+  };
+  const res = await channelHealth.run({}, ctx(denied));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN/);
+  assert.match(res.content, /not readable/);
+  assert.match(res.content, /permissions/);
+  // 🔴 Specifically: must NOT be reported as a missing file. Conflating them
+  // sends the operator down the wrong path.
+  assert.doesNotMatch(res.content, /file does not exist/, 'a permission error must not look like a missing file');
+  assert.doesNotMatch(res.content, /checker has not run/, 'a permission error must not look like a missing file');
+});
+
+test('🔴 an ssh TRANSPORT failure is named as such, not conflated with a missing file', async () => {
+  /**
+   * Empty stderr AND empty stdout with a non-zero exit is the fingerprint of
+   * ssh itself erroring — the command never reached the remote side. This is
+   * NOT a stream-check problem and must NOT be reported as one. The operator
+   * needs to look at hp and at the ssh config, not at the checker's cron.
+   */
+  const transport: ExecImpl = (_f, _args, _o, cb) => {
+    // `runOnHp` translates a transport error (no numeric code) to exitCode=1.
+    return cb({ message: 'ssh: connect to host hp port 22: No route to host' }, '', '');
+  };
+  const res = await channelHealth.run({}, ctx(transport));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN/);
+  assert.match(res.content, /could not reach host hp/);
+  assert.match(res.content, /ssh transport/);
+  assert.match(res.content, /NOT a missing-file/);
+  // And specifically: must not point at the checker.
+  assert.doesNotMatch(res.content, /file does not exist/, 'a transport error must not look like a missing file');
+  assert.doesNotMatch(res.content, /checker has not run/, 'a transport error must not look like a missing file');
+});
+
+test('🔴 a timed-out transport failure is named as such, not just "ssh error"', async () => {
+  const timedOut: ExecImpl = (_f, _args, _o, cb) => {
+    return cb(Object.assign(new Error('killed'), { killed: true }), '', '');
+  };
+  const res = await channelHealth.run({}, ctx(timedOut));
+  assert.equal(res.ok, false);
+  assert.match(res.content, /TIMED OUT/);
+  assert.match(res.content, /ssh transport/);
+});
+
+test('classifyResultsReadFailure falls back to renderOutcome for unknown stderr shapes', () => {
+  /**
+   * The classifier is conservative: a stderr we don't recognise gets the full
+   * diagnostic so we never lose information we couldn't categorise. Without
+   * this fallback the unknown case would still say "could not read ... on hp"
+   * but lose the exit code and the actual stderr text.
+   */
+  const detail = classifyResultsReadFailure('/tmp/check-streams-results.txt', {
+    exitCode: 7,
+    stdout: 'partial output',
+    stderr: 'something completely unexpected',
+    timedOut: false,
+  });
+  assert.match(detail, /exit_code=7/);
+  assert.match(detail, /something completely unexpected/);
+  assert.match(detail, /partial output/);
+});
+
+test('classifyResultsReadFailure: stderr that mentions the path but not "No such file" still falls back', () => {
+  // A file that exists but is unreadable for an obscure reason should not be
+  // guessed at. The full renderOutcome preserves the text for the operator.
+  const detail = classifyResultsReadFailure('/tmp/check-streams-results.txt', {
+    exitCode: 1,
+    stdout: '',
+    stderr: 'cat: /tmp/check-streams-results.txt: Input/output error',
+    timedOut: false,
+  });
+  assert.match(detail, /Input\/output error/);
+  assert.match(detail, /could not read/);
 });
 
 test('🔴 an unreadable roster does not read as "every channel was covered"', async () => {
