@@ -53,7 +53,28 @@ export interface ArrOptions {
   apiKey: string;
   fetchImpl?: FetchImpl;
   timeoutMs?: number;
+  /**
+   * Test seam ONLY: how `call()` waits between transport-failure retries.
+   * Unset in production, where it is a real `setTimeout`. A test that wants
+   * to assert the backoff values passes a spy and observes what ms it was
+   * asked to wait.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * 🔴 ONE RETRY BUDGET FOR EVERY AR RETRY, AND IT IS THE NUMBER THAT BOUNDSTHE
+ * USER'S WAIT IN A SINGLE CALL.
+ *
+ * Issue #99 measured `ms: 17` for the EHOSTUNAGH path — kernel rejects the
+ * SYN immediately, so each attempt is fast. Three attempts with 250/500ms
+ * backoffs adds ~750ms worst case, which is the same shape as a single
+ * slow Sonarr call. **Longer is not "more thorough"** — it is just more
+ * latency against a service that is genuinely down, paid by a model that
+ * asked once.
+ */
+export const ARR_RETRY_ATTEMPTS = 3;
+export const ARR_RETRY_BASE_MS = 250;
 
 /**
  * 🔴 THREE STATES, AND `unknown` IS NEVER A "NO".
@@ -124,6 +145,8 @@ export class ArrClient {
 
   private readonly timeoutMs: number;
 
+  private readonly sleep: (ms: number) => Promise<void>;
+
   constructor(
     private readonly opts: ArrOptions,
     /** 'series' for Sonarr, 'movie' for Radarr. Decides the endpoint names. */
@@ -131,6 +154,7 @@ export class ArrClient {
   ) {
     this.fetchImpl = opts.fetchImpl ?? ((u, i) => fetch(u, i));
     this.timeoutMs = opts.timeoutMs ?? 20_000;
+    this.sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   }
 
   /**
@@ -162,6 +186,27 @@ export class ArrClient {
    * applies here. The breaker does NOT replace the per-call timeout — the
    * FIRST failure still pays 20s, deliberately, because a single slow call is
    * not the defect; the second and third are.
+   *
+   * ── 🔴 RETRIES RIDE THROUGH TRANSIENT FAILURES WITHIN ONE CALL ────────────
+   *
+   * The breaker is a CROSS-CALL optimization; it does nothing for the FIRST
+   * call to a service that turns out to be transiently unreachable. Measured
+   * 2026-09-30 against a live Sonarr at `192.168.1.7:8989`: the model asked
+   * `check_status`, the kernel returned EHOSTUNREACH in 17 ms, and the tool
+   * reported UNKNOWN — without retrying. That is correct given one attempt
+   * and wrong given that the SAME service often recovers within a second
+   * (ARP cache flushing, route re-converging, the container coming back).
+   *
+   * The retry is bounded — `ARR_RETRY_ATTEMPTS` × `ARR_RETRY_BASE_MS` — and
+   * only applies to **transport** failures (the catch below). An HTTP 5xx is
+   * the service answering, and re-asking is not safer than not re-asking. The
+   * first attempt still pays the full timeout on purpose: a single slow call
+   * is not the defect, and a retry budget that masks the first failure
+   * silently would hide the signal from the breaker.
+   *
+   * ⚠️ Breaker state is read OUTSIDE the retry loop — known-down services
+   * still short-circuit on the first attempt of the first call, so a Radarr
+   * flagged 30s ago does not get a fresh three-attempt retry this turn.
    */
   private async call(path: string): Promise<{ ok: boolean; status: number; body: unknown; detail: string }> {
     const url = `${this.opts.baseUrl}${path}`;
@@ -177,15 +222,28 @@ export class ArrClient {
           'wait, or check the service, then try once.',
       };
     }
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        headers: { 'X-Api-Key': this.opts.apiKey },
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch (e) {
-      // 🔴 `.message` alone is the constant string "fetch failed" — see src/errors.ts.
-      const detail = `could not reach ${redactUrlSecrets(url)}: ${describeError(e, redactUrlSecrets)}`;
+    let res: Response | undefined;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= ARR_RETRY_ATTEMPTS; attempt++) {
+      try {
+        res = await this.fetchImpl(url, {
+          headers: { 'X-Api-Key': this.opts.apiKey },
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        break;
+      } catch (e) {
+        // 🔴 `.message` alone is the constant string "fetch failed" — see src/errors.ts.
+        lastErr = e;
+        if (attempt < ARR_RETRY_ATTEMPTS) {
+          // Exponential backoff: 250ms, 500ms. Bounded — see the constants.
+          await this.sleep(ARR_RETRY_BASE_MS * 2 ** (attempt - 1));
+        }
+      }
+    }
+    if (!res) {
+      const detail =
+        `could not reach ${redactUrlSecrets(url)}: ${describeError(lastErr, redactUrlSecrets)} ` +
+        `(after ${ARR_RETRY_ATTEMPTS} attempts)`;
       recordTransportFailure(this.opts.baseUrl, detail);
       return {
         ok: false,
