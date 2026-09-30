@@ -35,6 +35,18 @@ const dead = (): Response => {
   throw new Error('ECONNREFUSED');
 };
 
+/**
+ * The exact DOMException `AbortSignal.timeout` throws when its deadline fires
+ * against a hanging connection. Reproduced live (Node 22) against
+ * `10.255.255.1:9999` with `AbortSignal.timeout(50)` — name `TimeoutError`,
+ * message `The operation was aborted due to timeout`, code `23`. The message
+ * is what the user saw in issue #21's audit entry, so the test asserts on
+ * its exact shape, not on a paraphrase.
+ */
+const timeout = (): never => {
+  throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+};
+
 const run = (f: FetchImpl, title = 'moneyball') =>
   makeCatalogueSearch(f).run({ title }, ctx());
 
@@ -92,6 +104,59 @@ test('🔴 both down is UNKNOWN, never "not available"', async () => {
   const r = await run(routed(dead, dead));
   assert.equal(r.ok, false);
   assert.match(r.content, /UNKNOWN rather than "not available"/);
+});
+
+// ── 🔴 issue #21 — a real timeout is reported like every other unreachable radarr,
+//                 AND the breaker opens so the next call in the same window does
+//                 not pay another 20s ──────────────────────────────────────────
+//
+// The 2026-08-31 22:23:39Z turn timed out at `192.168.1.7:7878` for "Better Off
+// Dead". The error came back as `RADARR IS UNREACHABLE (... operation was
+// aborted due to timeout)`. The downstream check the operator cares about is
+// that this case — a HANG, not a refused connection — trips the same breaker
+// as `ECONNREFUSED`. The breaker is keyed on transport failure, not on a
+// particular failure code, so the timeout path must open it too; if it did
+// not, every retry the model issued in the same turn would pay another 20s.
+
+test('🔴 issue #21: a Radarr TIMEOUT is reported as RADARR IS UNREACHABLE with the abort verbatim', async () => {
+  // The `dead` helper above throws `Error('ECONNREFUSED')`. That exercises one
+  // transport failure. The other one — a hang that fires `AbortSignal.timeout`
+  // — produces a `DOMException` with name `TimeoutError` and the specific
+  // message the audit log recorded. Without this test a future refactor that
+  // keyed the breaker on `e.code === 'ECONNREFUSED'` would silently regress
+  // the timeout path back to paying 20s on every retry.
+  const r = await run(routed(timeout, () => json([{ title: 'Better Off Dead', year: 1985, tmdbId: 1 }])));
+  assert.equal(r.ok, false, 'a timed-out catalogue is not a successful answer');
+  assert.match(r.content, /RADARR IS UNREACHABLE/);
+  assert.match(r.content, /cannot say whether a FILM/i);
+  // The original abort message travels through so the model can quote it back.
+  // `describeError` reads `e.message` by name — a refactor that switched to
+  // `e.toString()` would lose the rest of the sentence.
+  assert.match(r.content, /operation was aborted due to timeout/i);
+});
+
+test('🔴 issue #21: a Radarr TIMEOUT trips the breaker so the second call is short-circuited', async () => {
+  // Same shape as the media-arr breaker test, but at the catalogue_search
+  // layer — the place issue #21 was actually observed. The breaker is keyed
+  // on baseUrl, not on a particular failure, so a hang must open it just like
+  // a refused connection does. A test that only exercised `ECONNREFUSED`
+  // would leave the timeout case uncovered, and a future code change could
+  // quietly narrow the breaker to one of the two.
+  let called = 0;
+  const f = routed(
+    () => {
+      called++;
+      throw timeout();
+    },
+    () => json([{ title: 'Better Off Dead', year: 1985, tmdbId: 1 }]),
+  );
+  const first = await run(f);
+  assert.equal(first.ok, false);
+  assert.equal(called, 1, 'first call still reaches fetchImpl — the 20s is the design, see fix #1');
+  const second = await run(f);
+  assert.equal(called, 1, 'second call is short-circuited by the breaker opened by the timeout');
+  assert.equal(second.ok, false);
+  assert.match(second.content, /NOT retrying yet/);
 });
 
 // ── nothing found is not the closest thing ───────────────────────────────────
