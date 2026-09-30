@@ -217,6 +217,63 @@ test('a Jellyfin failure is a failure even when Sonarr answered', async () => {
   assert.equal(r.ok, false);
   assert.match(r.content, /UNKNOWN/);
   assert.match(r.content, /S1-S3 complete/);
+  // Issue #103: the OLD lead was "Library search failed", which buried the
+  // working Sonarr half under a whole-tool failure label. Fix names the gap.
+  assert.match(r.content, /JELLYFIN IS UNREACHABLE/);
+  assert.doesNotMatch(r.content, /^Library search failed/);
+});
+
+test('🔴 ISSUE #103: Jellyfin transport failure names Jellyfin, not the whole tool', async () => {
+  // Live evidence (2026-09-17): EHOSTUNREACH at 192.168.1.7:8096 produced
+  // "Library search failed: request failed: fetch failed — connect EHOSTUNREACH …"
+  // — a whole-tool failure label on what was a half-tool failure, with the
+  // Sonarr results buried underneath. The named signal puts the gap up top.
+  const r = await makeLibrarySearch({
+    jellyfin: async () => ({
+      ok: false,
+      status: 0,
+      error: 'request failed: EHOSTUNREACH: fetch failed (connect 192.168.1.7 8096)',
+    }),
+    fetchImpl: sonarrSeries([fringe]),
+  }).run({ query: 'fringe' }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /JELLYFIN IS UNREACHABLE/);
+  // The diagnostic must ride along so the gap is actionable.
+  assert.match(r.content, /EHOSTUNREACH/);
+  // The Sonarr half is the result the tool HAS, and is reported first-line as
+  // a Sonarr result, not as part of the Jellyfin-failure sentence.
+  assert.match(r.content, /S1-S3 complete/);
+  assert.match(r.content, /Sonarr, which WAS reachable, holds/);
+  // CONTROL: the old whole-tool-failure lead is GONE.
+  assert.doesNotMatch(r.content, /^Library search failed/);
+});
+
+test('CONTROL: Jellyfin reachable, half the message still reads as "IN LIBRARY"', async () => {
+  // The new lead must not regress the only-success path.
+  const r = await makeLibrarySearch({
+    jellyfin: jellyfinItems([owned('Fringe', 2008)]),
+    fetchImpl: sonarrSeries([fringe]),
+  }).run({ query: 'fringe' }, ctx());
+  assert.equal(r.ok, true);
+  assert.match(r.content, /IN LIBRARY/);
+  assert.match(r.content, /S1-S3 complete/);
+});
+
+test('both Jellyfin and Sonarr unreachable names BOTH, not a half of one', async () => {
+  const r = await makeLibrarySearch({
+    jellyfin: async () => ({
+      ok: false,
+      status: 0,
+      error: 'request failed: EHOSTUNREACH: fetch failed (connect 192.168.1.7 8096)',
+    }),
+    fetchImpl: async () => {
+      throw new Error('ECONNREFUSED');
+    },
+  }).run({ query: 'fringe' }, ctx());
+  assert.equal(r.ok, false);
+  assert.match(r.content, /JELLYFIN IS UNREACHABLE/);
+  assert.match(r.content, /Could not read Sonarr/);
+  assert.match(r.content, /UNKNOWN/);
 });
 
 test('an unrelated Sonarr library contributes nothing to a film query', async () => {
