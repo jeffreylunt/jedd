@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { testConfig } from './helpers.js';
 import { loadConfig } from '../src/config.js';
-import { ModelTimeoutError } from '../src/turn-notice.js';
+import { ModelTimeoutError, isModelTimeout, isModelUnavailable } from '../src/turn-notice.js';
 import {
   OpenAiClient,
   createLlmClient,
@@ -344,4 +344,96 @@ test('CONTROL: probeLlm still checks /api/tags for the ollama provider (unchange
   const result = await probeLlm(testConfig({ llm: { provider: 'ollama', baseUrl: 'http://localhost:11434', model: 'test-model' } }), impl);
   assert.equal(result.ok, true);
   assert.equal(calls[0]!.url, 'http://localhost:11434/api/tags');
+});
+
+// ── retry while the model server is unavailable ─────────────────────────────
+
+/**
+ * The retry loop sleeps between attempts; tests substitute an instant sleep
+ * (still abort-aware, or a persistent failure would spin past its budget).
+ * Attempt logging is silenced so the suite stays quiet.
+ */
+const immediateSleep = async (_ms: number, signal: AbortSignal): Promise<void> => {
+  if (signal.aborted) throw new Error('aborted');
+};
+const quietRetry = { sleep: immediateSleep, log: (_line: string) => {} };
+
+function retryClient(impl: typeof fetch, llm: Record<string, unknown> = {}) {
+  return new OpenAiClient(
+    testConfig({ llm: { provider: 'openai', baseUrl: 'http://host:8000/v1', model: 'm', ...llm } }),
+    impl,
+    quietRetry,
+  );
+}
+
+/** What undici throws when the gate is not accepting connections. */
+function refused(): TypeError {
+  const e = new TypeError('fetch failed');
+  (e as unknown as { cause: unknown }).cause = Object.assign(new Error('connect ECONNREFUSED 192.168.1.71:8010'), {
+    code: 'ECONNREFUSED',
+  });
+  return e;
+}
+
+test('🔴 a 502 from the gate is retried, and the turn succeeds when the server recovers', async () => {
+  let n = 0;
+  const { impl, calls } = scripted(() =>
+    ++n === 1 ? { status: 502, body: 'upstream error' } : { body: { choices: [{ message: { content: 'recovered' } }] } },
+  );
+  const reply = await retryClient(impl).chat([userMsg('hi')], NOOP_TOOLS);
+  assert.equal(reply.text, 'recovered');
+  assert.equal(calls.length, 2);
+});
+
+test('🔴 a refused connection is retried, not thrown', async () => {
+  let n = 0;
+  const impl = (async () => {
+    if (++n === 1) throw refused();
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: 'back' } }] }),
+      text: async () => '',
+    } as Response;
+  }) as typeof fetch;
+  const reply = await retryClient(impl).chat([userMsg('hi')], NOOP_TOOLS);
+  assert.equal(reply.text, 'back');
+});
+
+test('a 400 is not retried — the request itself was bad', async () => {
+  const { impl, calls } = scripted(() => ({ status: 400, body: 'bad request' }));
+  await assert.rejects(() => retryClient(impl).chat([userMsg('hi')], NOOP_TOOLS), /OpenAI-compatible HTTP 400/);
+  assert.equal(calls.length, 1);
+});
+
+test('a 500 is not retried — the server broke the generation, it is not busy', async () => {
+  const { impl, calls } = scripted(() => ({ status: 500, body: 'server exploded' }));
+  await assert.rejects(() => retryClient(impl).chat([userMsg('hi')], NOOP_TOOLS), /OpenAI-compatible HTTP 500/);
+  assert.equal(calls.length, 1);
+});
+
+test('🔴 persistent 503s exhaust the budget as ModelUnavailableError, not a timeout and not generic', async () => {
+  const { impl, calls } = scripted(() => ({ status: 503, body: 'overloaded' }));
+  const err = await retryClient(impl, { turnTimeoutMs: 120 })
+    .chat([userMsg('hi')], NOOP_TOOLS)
+    .then(
+      () => null,
+      (e: unknown) => e,
+    );
+  assert.ok(isModelUnavailable(err), `expected ModelUnavailableError, got ${String(err)}`);
+  assert.ok(!isModelTimeout(err), 'a server that never answered must not be reported as a slow turn');
+  assert.ok(calls.length > 1, 'it retried instead of dying on the first 503');
+});
+
+test('🔴 a server that never comes back ends the wait honestly, after retrying', async () => {
+  const impl = (async () => {
+    throw refused();
+  }) as unknown as typeof fetch;
+  const err = await retryClient(impl, { turnTimeoutMs: 120 })
+    .chat([userMsg('hi')], NOOP_TOOLS)
+    .then(
+      () => null,
+      (e: unknown) => e,
+    );
+  assert.ok(isModelUnavailable(err), `expected ModelUnavailableError, got ${String(err)}`);
 });

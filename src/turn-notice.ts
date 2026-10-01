@@ -82,6 +82,42 @@ export function isModelTimeout(e: unknown): e is ModelTimeoutError {
 }
 
 /**
+ * The model server never answered — every attempt failed with a retryable
+ * "busy or unreachable" signal and the per-call budget died in backoff.
+ *
+ * Distinct from `ModelTimeoutError` (the server was reached but the
+ * generation ran long): the timeout reply tells the sender to "ask for a
+ * shorter one", which is wrong advice when nothing ever answered. `cause`
+ * carries the last transport error so `describeError` puts it in the log.
+ */
+export class ModelUnavailableError extends Error {
+  /**
+   * ⚠️ Set in the constructor rather than as a class field, same reason as
+   * `ModelTimeoutError` above: `name` has to survive the `describeError`
+   * path in `errors.ts`, which reads properties BY NAME off the object.
+   */
+  constructor(
+    readonly elapsedMs: number,
+    readonly limitMs: number,
+    readonly attempts: number,
+    cause?: unknown,
+  ) {
+    super(
+      `the model server did not answer within ${Math.round(elapsedMs / 1000)}s ` +
+        `(limit ${Math.round(limitMs / 1000)}s, ${attempts} attempt${attempts === 1 ? '' : 's'})`,
+      { cause },
+    );
+    this.name = 'ModelUnavailableError';
+  }
+}
+
+/** True for a turn that waited out an unreachable model server, and nothing else. */
+export function isModelUnavailable(e: unknown): e is ModelUnavailableError {
+  return e instanceof ModelUnavailableError;
+}
+
+
+/**
  * The budget, in the unit a person would use for it.
  *
  * 🔴 SECONDS BELOW TWO MINUTES, AND NOT AS A NICETY. Rounding to whole minutes
@@ -117,6 +153,20 @@ export function failureReply(e: unknown): string {
     return (
       `That one ran past my ${describeLimit(e.limitMs)} limit, so I stopped it rather than leave you hanging. ` +
       'A long list is usually what does it — ask me for a shorter one and it should come straight back.'
+    );
+  }
+  if (isModelUnavailable(e)) {
+    // 🔴 NOT the timeout sentence: "ask for a shorter one" is wrong advice
+    // when the server never answered at all. And not the generic one either:
+    // after waiting the whole budget, the sender deserves to know what the
+    // wait was spent on.
+    const waited =
+      e.limitMs >= 120_000
+        ? `${Math.round(e.limitMs / 60_000)} minutes`
+        : `${Math.max(1, Math.round(e.limitMs / 1000))} seconds`;
+    return (
+      `I waited ${waited} and the model server never answered. It is probably swamped or down. ` +
+      'Try again in a bit.'
     );
   }
   return 'Something went wrong on my end and I could not answer that. It has been logged — worth trying again in a moment.';
