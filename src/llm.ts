@@ -1,6 +1,6 @@
 import type { Config } from './config.js';
 import type { Tool } from './tools/types.js';
-import { ModelTimeoutError } from './turn-notice.js';
+import { ModelTimeoutError, ModelUnavailableError } from './turn-notice.js';
 
 export interface LlmToolCall {
   id: string;
@@ -215,10 +215,173 @@ export function pruneStoredImages(messages: LlmMessage[], keepTurns: number): vo
 
 export const TURN_TIMEOUT_MS = 900_000;
 
+/**
+ * ── A BUSY MODEL SERVER IS WAITED OUT, NOT DIED ON ─────────────────────────
+ *
+ * oMLX on .71 is shared with Hermes behind a single-flight gate (omlx-gate:
+ * priority port 8010 for Jedd, normal port 8011 for Hermes). When Hermes is
+ * mid-generation the gate holds Jedd's connection; when oMLX is restarting or
+ * wedged the connect fails outright and `fetch` throws `TypeError: fetch
+ * failed`, or the gate answers 502. Before this helper, either one killed the
+ * turn instantly with the generic "Something went wrong", even though waiting
+ * was the right move — the turn had done nothing wrong.
+ *
+ * So one model call now waits out a busy or unreachable server: transport
+ * failures and HTTP 429/502/503/504 are retried with backoff for the whole
+ * per-call budget (`limitMs`). Anything else still throws immediately:
+ * 400/401/403/404 (the request was bad — retrying a 404 for a renamed model
+ * alias would burn the budget on a bug) and 500 (the server's own problem,
+ * not load).
+ *
+ * 🔴 THE BUDGET IS THE EXISTING PER-CALL TIMEOUT, NOT A NEW ONE. The abort
+ * timer still fires at `limitMs`; a retry loop with its own ceiling would be
+ * a second timeout to keep in agreement with the first. When the budget dies
+ * between attempts — every attempt failed and we were backing off — the
+ * throw is `ModelUnavailableError`, not `ModelTimeoutError`: the timeout
+ * reply tells the sender to "ask for a shorter one", which is wrong advice
+ * when the server never answered at all.
+ *
+ * 🔴 ABORT CLASSIFICATION IS UNCHANGED. An abort landing mid-attempt still
+ * surfaces through the caller's `controller.signal.aborted` check as
+ * `ModelTimeoutError`, exactly as before — this helper rethrows it without
+ * touching it. Only loop-head exhaustion, with nothing in flight, produces
+ * `ModelUnavailableError`.
+ */
+
+/** "Try again later" statuses. 500 is deliberately absent — see above. */
+const RETRYABLE_HTTP = new Set([429, 502, 503, 504]);
+
+/**
+ * Undici `cause.code`s that mean "briefly unreachable", not "misconfigured".
+ * A permanently wrong hostname would also match ENOTFOUND — but the per-call
+ * budget still bounds the wait, and the final error says what happened.
+ */
+const RETRYABLE_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EHOSTDOWN',
+]);
+
+function isRetryableTransport(e: unknown): boolean {
+  for (const x of [e, (e as { cause?: unknown } | null)?.cause]) {
+    const code = (x as { code?: unknown } | null)?.code;
+    if (typeof code === 'string' && RETRYABLE_CODES.has(code)) return true;
+    if (/socket hang up|fetch failed/i.test(String((x as Error | null)?.message ?? ''))) return true;
+  }
+  return false;
+}
+
+/** 5s, 10s, 20s, 40s, then 60s, with jitter — polite to a struggling server. */
+function retryDelayMs(failedAttempts: number): number {
+  const base = Math.min(60_000, 5_000 * 2 ** (Math.min(failedAttempts, 6) - 1));
+  return Math.round(base * (0.75 + Math.random() * 0.5));
+}
+
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error('retry backoff aborted'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new Error('retry backoff aborted'));
+    };
+    const t = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Test seams for the retry loop. Production never passes these. */
+export interface RetryHooks {
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  log?: (line: string) => void;
+}
+
+export interface RetryRequest {
+  fetchImpl: typeof fetch;
+  url: string;
+  init: RequestInit;
+  /** The per-call abort controller: its timer is the total retry budget. */
+  controller: AbortController;
+  startedAt: number;
+  limitMs: number;
+  /** 'Ollama' or 'OpenAI-compatible' — used in the HTTP error and the log line. */
+  label: string;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** One line per failed attempt. Defaults to console.error. */
+  log?: (line: string) => void;
+}
+
+function shortError(e: unknown): string {
+  const m = (e as { message?: unknown } | null)?.message;
+  const s = typeof m === 'string' && m ? m : String(e);
+  return s.length > 160 ? s.slice(0, 157) + '...' : s;
+}
+
+export async function fetchWithRetry(req: RetryRequest): Promise<Response> {
+  const sleep = req.sleep ?? sleepAbortable;
+  const log = req.log ?? ((line: string) => console.error(line));
+  let failedAttempts = 0;
+  let lastError: unknown;
+  for (;;) {
+    const elapsed = Date.now() - req.startedAt;
+    if (elapsed >= req.limitMs || req.controller.signal.aborted) {
+      // Nothing in flight: every attempt failed and the budget died in
+      // backoff. (Zero attempts means a degenerate zero budget — the old
+      // immediate-abort path, still a timeout.)
+      if (failedAttempts === 0) throw new ModelTimeoutError(elapsed, req.limitMs);
+      throw new ModelUnavailableError(elapsed, req.limitMs, failedAttempts, lastError);
+    }
+    try {
+      const res = await req.fetchImpl(req.url, req.init);
+      if (res.ok || !RETRYABLE_HTTP.has(res.status)) return res;
+      failedAttempts += 1;
+      lastError = new Error(`${req.label} HTTP ${res.status}`);
+      // Drain the (small) error body so the socket can be reused. An abort
+      // landing mid-drain rethrows and is classified as the turn timeout.
+      try {
+        await res.text();
+      } catch (e) {
+        if (req.controller.signal.aborted) throw e;
+      }
+    } catch (e) {
+      // 🔴 Our controller first — the same invariant as the callers: an abort
+      // is a timeout no matter what the error is named.
+      if (req.controller.signal.aborted) throw e;
+      if (!isRetryableTransport(e)) throw e;
+      failedAttempts += 1;
+      lastError = e;
+    }
+    const waitMs = retryDelayMs(failedAttempts);
+    log(
+      `[llm] model unavailable (${req.label} attempt ${failedAttempts}: ${shortError(lastError)}), ` +
+        `retrying in ${Math.round(waitMs / 1000)}s`,
+    );
+    try {
+      await sleep(waitMs, req.controller.signal);
+    } catch {
+      // Aborted mid-backoff: the loop head throws the exhaustion error.
+    }
+  }
+}
+
 export class OllamaClient implements LlmClient {
   readonly label: string;
 
-  constructor(private readonly config: Config) {
+  constructor(
+    private readonly config: Config,
+    private readonly retry: RetryHooks = {},
+  ) {
     this.label = `ollama:${config.llm.model}`;
   }
 
@@ -265,11 +428,14 @@ export class OllamaClient implements LlmClient {
       };
     };
     try {
-      const res = await fetch(`${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
+      const res = await fetchWithRetry({
+        fetchImpl: fetch,
+        url: `${this.config.llm.baseUrl.replace(/\/$/, '')}/api/chat`,
+        init: {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
           model: this.config.llm.model,
           messages: toOllamaMessages(messages),
           tools: tools.map((t) => ({
@@ -280,7 +446,13 @@ export class OllamaClient implements LlmClient {
           think: true,
           keep_alive: '30m',
           options: { temperature: 0.2, num_ctx: 16384, num_predict: 3000 },
-        }),
+          }),
+        },
+        controller,
+        startedAt,
+        limitMs,
+        label: 'Ollama',
+        ...this.retry,
       });
 
       if (!res.ok) {
@@ -304,6 +476,11 @@ export class OllamaClient implements LlmClient {
        */
       body = (await res.json()) as typeof body;
     } catch (e) {
+      // 🔴 An exhausted retry loop throws ModelUnavailableError WITHOUT the
+      // controller being aborted (the budget died in backoff). It passes
+      // through untouched: wrapping it as a timeout would tell the sender to
+      // "ask for a shorter one" about a server that never answered.
+      if (e instanceof ModelUnavailableError) throw e;
       if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs, e);
       throw e;
     } finally {
@@ -394,6 +571,7 @@ export class OpenAiClient implements LlmClient {
   constructor(
     private readonly config: Config,
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly retry: RetryHooks = {},
   ) {
     this.label = `openai:${config.llm.model}`;
   }
@@ -417,11 +595,14 @@ export class OpenAiClient implements LlmClient {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (this.config.llm.apiKey) headers.Authorization = `Bearer ${this.config.llm.apiKey}`;
-      const res = await this.fetchImpl(`${normalizeV1Base(this.config.llm.baseUrl)}/chat/completions`, {
-        method: 'POST',
-        headers,
-        signal: controller.signal,
-        body: JSON.stringify({
+      const res = await fetchWithRetry({
+        fetchImpl: this.fetchImpl,
+        url: `${normalizeV1Base(this.config.llm.baseUrl)}/chat/completions`,
+        init: {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
           model: this.config.llm.model,
           messages: toOpenAiMessages(messages),
           ...(tools.length
@@ -440,7 +621,13 @@ export class OpenAiClient implements LlmClient {
           // dropped below exactly like `message.thinking` is for Ollama — so
           // strict-JSON callers still get clean `content`.
           chat_template_kwargs: { enable_thinking: true },
-        }),
+          }),
+        },
+        controller,
+        startedAt,
+        limitMs,
+        label: 'OpenAI-compatible',
+        ...this.retry,
       });
 
       if (!res.ok) {
@@ -451,6 +638,11 @@ export class OpenAiClient implements LlmClient {
       }
       body = (await res.json()) as typeof body;
     } catch (e) {
+      // 🔴 An exhausted retry loop throws ModelUnavailableError WITHOUT the
+      // controller being aborted (the budget died in backoff). It passes
+      // through untouched: wrapping it as a timeout would tell the sender to
+      // "ask for a shorter one" about a server that never answered.
+      if (e instanceof ModelUnavailableError) throw e;
       if (controller.signal.aborted) throw new ModelTimeoutError(Date.now() - startedAt, limitMs, e);
       throw e;
     } finally {

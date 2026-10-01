@@ -7,6 +7,8 @@ import {
   failureNoticeDecision,
   failureReply,
   isModelTimeout,
+  isModelUnavailable,
+  ModelUnavailableError,
   MAX_NOTICES,
   ModelTimeoutError,
   StillWorkingNotice,
@@ -114,15 +116,24 @@ test('🔴 a model call killed by its own timer throws a ModelTimeoutError, not 
   }
 });
 
-test('🔴 CONTROL: a failure that is NOT the timer stays itself', async () => {
+test('🔴 CONTROL: a failure that is NOT the timer is still not a timeout — now waited out, then reported as unavailable', async () => {
   /**
    * Without this the classification above passes against a `catch` that labels
    * EVERY thrown thing a timeout — which would tell somebody with an unreachable
    * Ollama to "ask for a shorter list", the single most misleading sentence
    * available for that failure.
+   *
+   * UPDATE 2026-10-01: an unreachable model is now RETRIED for the per-call
+   * budget instead of thrown immediately (oMLX is shared with Hermes; one busy
+   * window must not kill the turn). The invariant this test guards — "not
+   * labeled a timeout" — is unchanged; what changed is the error it becomes.
+   * The underlying rejection still survives, as the cause.
    */
-  const config = { ...testConfig(), llm: { ...testConfig().llm, turnTimeoutMs: 60_000 } };
-  const client = new OllamaClient(config);
+  const config = { ...testConfig(), llm: { ...testConfig().llm, turnTimeoutMs: 120 } };
+  const instantSleep = async (_ms: number, signal: AbortSignal): Promise<void> => {
+    if (signal.aborted) throw new Error('aborted');
+  };
+  const client = new OllamaClient(config, { sleep: instantSleep, log: () => {} });
 
   const original = globalThis.fetch;
   globalThis.fetch = (() =>
@@ -136,7 +147,12 @@ test('🔴 CONTROL: a failure that is NOT the timer stays itself', async () => {
       (e: unknown) => e,
     );
     assert.equal(isModelTimeout(err), false, 'an unreachable model is not a turn timeout');
-    assert.match((err as Error).message, /fetch failed/);
+    assert.ok(isModelUnavailable(err), `an unreachable model is waited out, then reported honestly: ${String(err)}`);
+    assert.match(
+      String((err as ModelUnavailableError).cause),
+      /fetch failed/,
+      'the underlying rejection still survives, as the cause',
+    );
   } finally {
     globalThis.fetch = original;
   }
@@ -256,6 +272,15 @@ test('🔴 a timeout is TOLD as a timeout, and a generic failure is not', () => 
   assert.notEqual(generic, timedOut, 'a non-timeout failure must not be described as a timeout');
   assert.doesNotMatch(generic, /too long|shorter/i);
   assert.match(generic, /trying again/i, 'a generic failure is the one where retrying is sound advice');
+});
+
+test('🔴 an unavailable model server is told as unreachable — not a timeout, not generic', () => {
+  const reply = failureReply(new ModelUnavailableError(1_799_000, 1_800_000, 34, new Error('fetch failed')));
+  assert.match(reply, /never answered/i);
+  assert.match(reply, /try again/i);
+  assert.match(reply, /30 minutes/i, 'names the wait from the error, honestly');
+  assert.doesNotMatch(reply, /shorter/i, 'must not give the timeout advice for a server that never answered');
+  assert.doesNotMatch(reply, /fetch failed/i, 'must not leak the exception text');
 });
 
 test('the failure reply never carries the exception text', () => {
