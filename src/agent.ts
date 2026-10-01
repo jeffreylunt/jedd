@@ -240,6 +240,18 @@ function systemPrompt(config: Config, role: Role): string {
     'another way around a refusal — the refusal is the answer.',
     'A tool result marked UNKNOWN is not a "no" — report the uncertainty.',
     '',
+    // 🔴 A REAL TURN, 2026-10-01. "Try again" -> add_movie SUCCEEDED, then the model
+    // wrote "the arr stack was down when I last checked." It had checked nothing this
+    // turn; it was repeating the Sept 11/15/20/26 outages from history. A tool that
+    // just succeeded is proof its service is reachable RIGHT NOW, and that proof
+    // outranks everything remembered from earlier turns.
+    'A tool that succeeded this turn proves its service is up right now. That proof',
+    'outranks anything from earlier turns — never describe a service as down, degraded,',
+    'or "down when you last checked" in the same turn one of its tools just worked.',
+    'If a state is genuinely unknown (the add worked but you have not seen the queue),',
+    'say what is unknown and what already covers it — the scheduled follow-up — instead',
+    'of upgrading "unknown" into "down".',
+    '',
     'Use only the tools you have been given. If something is not among them, say you cannot do it',
     'rather than guessing at who is asking or what you might be permitted elsewhere.',
     '',

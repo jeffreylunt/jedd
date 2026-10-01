@@ -536,6 +536,54 @@ test('an unreachable service is UNKNOWN, not "nothing found"', async () => {
   assert.match(res.content, /UNKNOWN, not an empty result/);
 });
 
+test('🔴 an UNREACHABLE homelab service surfaces the cause, not just "fetch failed" — issue #89', async () => {
+  /**
+   * Issue #89 evidence, verbatim:
+   *   "Could not reach Jellyfin at http://192.168.1.7:8096/jellyfin/Search/Hints?
+   *    includeItemTypes=LiveTvProgram&limit=20&searchTerm=Formula+1:
+   *    fetch failed. This is UNKNOWN, not an empty result."
+   *
+   * `fetch failed` is what `Error.message` says on every failed Node fetch.
+   * The diagnosis — `EHOSTUNREACH 192.168.1.7:8096` — sat one field away in
+   * `e.cause`, and `tools/homelab-read.ts` was throwing it away (commit
+   * `86ab4d1` fixed jellyfin.ts / media/arr.ts / jfago.ts / agent.ts, but
+   * missed this site). The fix here routes the catch through `describeError`
+   * so the operator sees the cause — not the constant "fetch failed" string.
+   *
+   * Without this assertion, "the catch fires" and "the cause is named" are
+   * the same line and a regression passes the silent path.
+   *
+   * The querystring goes in `query`, not `path` — `planRead` refuses `?` in
+   * `path` (a separate guard, with its own test).
+   */
+  const impl = async () => {
+    throw Object.assign(new Error('fetch failed'), {
+      cause: Object.assign(new Error('connect EHOSTUNREACH 192.168.1.7:8096'), {
+        code: 'EHOSTUNREACH',
+        syscall: 'connect',
+        address: '192.168.1.7',
+        port: 8096,
+      }),
+    });
+  };
+  const res = await makeHomelabRead(impl).run(
+    {
+      service: 'jellyfin',
+      path: '/Search/Hints',
+      query: { includeItemTypes: 'LiveTvProgram', limit: 20, searchTerm: 'Formula 1' },
+    },
+    ctx(),
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.content, /UNKNOWN, not an empty result/);
+  // The diagnosis, not the constant "fetch failed" alone.
+  assert.match(res.content, /EHOSTUNREACH/);
+  assert.match(res.content, /192\.168\.1\.7:8096/);
+  // And the URL it tried, so the operator does not have to re-derive it.
+  assert.match(res.content, /\/Search\/Hints\?/);
+  assert.match(res.content, /searchTerm=Formula[+]1/);
+});
+
 test('a DECLARED oversize content-length is refused before the body is read at all', async () => {
   const impl = async () =>
     new Response('x'.repeat(10), { status: 200, headers: { 'content-length': '13455324' } });

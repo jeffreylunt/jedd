@@ -132,12 +132,33 @@ export function makeLibrarySearch(deps: LibrarySearchDeps = {}): Tool {
             : [];
 
       if (!res.ok) {
-        const head =
-          `Library search failed: ${res.error}. Whether "${query}" is watchable in Jellyfin is UNKNOWN.`;
+        /**
+         * 🔴 `library_search` is TWO independent lookups against TWO services.
+         * "Library search failed" was the lead even when Sonarr had answered —
+         * a whole-tool failure label on what was actually a half-tool failure,
+         * with the half that WORKED buried under the half that did not. Same
+         * naming discipline as `catalogue_search`'s `RADARR IS UNREACHABLE` /
+         * `SONARR IS UNREACHABLE`: name WHICH side is missing, and put the
+         * working side up top.
+         *
+         * `jellyfinGet` returns `status === 0` for transport failures and
+         * `status >= 400` for HTTP errors. The `RADARR IS UNREACHABLE` wording
+         * covers both in `catalogue.ts`, deliberately, because the caller only
+         * needs to know "this side did not answer" — not why. Same call here.
+         */
+        const jellyfinDown =
+          `JELLYFIN IS UNREACHABLE — could not read Jellyfin (${res.error}). ` +
+          `Whether "${query}" is watchable in Jellyfin is UNKNOWN.`;
+        if (seasonLines.length === 0) {
+          // Both halves down. Lead with both named.
+          const sonarrDown = seasons.state === 'unknown'
+            ? ` ⚠️ Could not read Sonarr either (${seasons.detail}), so which SEASONS are present is UNKNOWN — not "none".`
+            : '';
+          return fail(`${jellyfinDown}${sonarrDown}`);
+        }
+        // Sonarr half succeeded: lead with what we know, name the gap separately.
         return fail(
-          seasonLines.length
-            ? `${head}\nSonarr, which was reachable, holds:\n${seasonLines.join('\n')}`
-            : head,
+          `${jellyfinDown}\nSonarr, which WAS reachable, holds:\n${seasonLines.join('\n')}`,
         );
       }
 

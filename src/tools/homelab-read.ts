@@ -1,5 +1,6 @@
 import { planRead, renderRead, stripCredentials, READ_SERVICES } from '../homelab-read.js';
 import type { FetchImpl } from '../media/arr.js';
+import { describeError, redactUrlSecrets } from '../errors.js';
 import { fail, ok, type Tool } from './types.js';
 
 /**
@@ -196,7 +197,19 @@ export function makeHomelabRead(fetchImpl?: FetchImpl): Tool {
         });
       } catch (e) {
         return fail(
-          `Could not reach ${plan.label} at ${plan.url}: ${(e as Error).message}. ` +
+          /**
+           * 🔴 Same trap `86ab4d1` fixed at jellyfin.ts / media/arr.ts /
+           * jfago.ts / agent.ts — but missed here. `(e as Error).message` on a
+           * failed `fetch()` is the constant string `"fetch failed"`, with the
+           * diagnosis (`EHOSTUNREACH 192.168.1.7:8096`, `ECONNREFUSED`,
+           * `ENOTFOUND`, `ETIMEDOUT`) sitting one field away in `e.cause`.
+           *
+           * Surfaced to the operator verbatim, redacted for the credentials the
+           * cause carries in its URL. This is issue #89's evidence:
+           * `Could not reach Jellyfin at …: fetch failed. This is UNKNOWN, …`
+           * — `fetch failed` because the cause was thrown away.
+           */
+          `Could not reach ${plan.label} at ${plan.url}: ${describeError(e as unknown, redactUrlSecrets)}. ` +
             'This is UNKNOWN, not an empty result.',
         );
       }

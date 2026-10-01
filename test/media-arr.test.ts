@@ -254,12 +254,18 @@ test('🔴 the FIRST transport failure still pays the full timeout (does not sil
   // would be told "Radarr is fine, nothing matched" and the user's report would
   // never say RADARR IS UNREACHABLE. This pins that the first call STILL
   // reaches the fetchImpl and still surfaces the underlying error verbatim.
+  //
+  // Issue #99 changed this from "exactly once" to "at least once": a single
+  // SYN-then-EHOSTUNREACH is often transient (ARP cache flushing, route
+  // re-converging, the container coming back), and the same call pays the
+  // fetchImpl N times before the breaker records a transport failure. What
+  // must NOT change is the *visibility* of the failure to the caller.
   let called = 0;
   const r = await breakerClient(async () => {
     called++;
     throw new Error('ECONNREFUSED');
   }).catalogue('dune');
-  assert.equal(called, 1, 'the first call must reach the fetchImpl');
+  assert.ok(called >= 1, 'the first call must reach the fetchImpl');
   assert.equal(r.state, 'unknown');
   if (r.state !== 'unknown') throw new Error('unreachable');
   assert.match(r.detail, /could not reach/);
@@ -269,15 +275,20 @@ test('🔴 the SECOND transport failure within the cooldown does NOT reach fetch
   // This is the actual repair: catalogue_search → add_movie → catalogue_search
   // in one turn paid three 20s waits. After the first, the breaker must
   // short-circuit and the fetchImpl must NOT be called.
+  //
+  // Issue #99 added the within-call retry, which inflates `called` during the
+  // first call. The invariant that matters is "the second CALL (not the second
+  // attempt) does not reach the fetchImpl", which is what this pins.
   let called = 0;
   const c = breakerClient(async () => {
     called++;
     throw new Error('ECONNREFUSED');
   });
   await c.catalogue('dune');
-  assert.equal(called, 1, 'first call reaches fetchImpl');
+  const afterFirst = called;
+  assert.ok(afterFirst >= 1, 'first call reaches fetchImpl');
   const r = await c.catalogue('dune');
-  assert.equal(called, 1, 'second call is short-circuited by the breaker');
+  assert.equal(called, afterFirst, 'second call is short-circuited by the breaker');
   assert.equal(r.state, 'unknown');
   if (r.state !== 'unknown') throw new Error('unreachable');
   assert.match(r.detail, /NOT retrying yet/);
@@ -376,4 +387,160 @@ test('🔴 resetTransportBreaker closes the breaker so the next call goes throug
   const r = await fresh.catalogue('dune');
   assert.equal(called, 1, 'after a reset, fetchImpl is reached again');
   assert.equal(r.state, 'results');
+});
+
+// ── 🔴 RETRY ON TRANSIENT TRANSPORT FAILURES (issue #99) ─────────────────────
+//
+// The breaker addresses the SECOND and third CALLS in a burst. This block pins
+// the within-call retry: one SYN-then-EHOSTUNREACH is often transient, and a
+// tool that surfaces the failure on the first attempt without trying again
+// reports a real outage as a UNKNOWN that does not need to be.
+
+/** Sleep that records what it was asked to wait, so a test can assert the backoff values. */
+function recordingSleep(): { sleep: (ms: number) => Promise<void>; sleeps: number[] } {
+  const sleeps: number[] = [];
+  return {
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+    },
+    sleeps,
+  };
+}
+
+test('🔴 a transient transport failure that recovers on the second attempt is RETRYED, not surfaced as UNKNOWN', async () => {
+  // Issue #99 measured a live Sonarr at `192.168.1.7:8989` returning
+  // EHOSTUNREACH on a `check_status` call. A single SYN-then-RST is fast
+  // (kernel returns ~17 ms), so a tool that retries once stands a real chance
+  // of catching the service mid-recovery. Without the retry, every transient
+  // blip reads as "I could not check" — the same defect as a genuinely dead
+  // service, which is the wrong message to send to the model.
+  let calls = 0;
+  const r = await new ArrClient(
+    {
+      baseUrl: UNREACHABLE_URL,
+      apiKey: 'k',
+      sleep: (async (_ms: number) => undefined) as unknown as (ms: number) => Promise<void>,
+      fetchImpl: async () => {
+        calls += 1;
+        if (calls === 1) throw Object.assign(new Error('fetch failed'), { cause: { code: 'EHOSTUNREACH' } });
+        return json([]);
+      },
+    },
+    'movie',
+  ).catalogue('dune');
+  assert.equal(calls, 2, 'a transient failure is retried exactly once before giving up');
+  assert.equal(r.state, 'results');
+});
+
+test('🔴 three transport failures exhaust the retry budget and name the attempt count', async () => {
+  // The retry is BOUNDED. Issue #99 said "lack of retry logic" — the repair is
+  // a budget, not an unbounded loop. The user must see the same UNKNOWN they
+  // saw before, with a message that names the number of attempts so a model
+  // can act on it. The breaker also records this final message so the
+  // cooldown quoted by later calls reflects what actually happened.
+  let calls = 0;
+  const { sleep, sleeps: aslept } = recordingSleep();
+  const c = new ArrClient(
+    {
+      baseUrl: UNREACHABLE_URL,
+      apiKey: 'k',
+      sleep,
+      fetchImpl: async () => {
+        calls += 1;
+        throw Object.assign(new Error('connect EHOSTUNREACH 192.168.1.7:8989'), { code: 'EHOSTUNREACH' });
+      },
+    },
+    'movie',
+  );
+  const r = await c.catalogue('dune');
+  assert.equal(calls, 3, 'the retry budget is exactly ARR_RETRY_ATTEMPTS');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /after 3 attempts/);
+  assert.match(r.detail, /EHOSTUNREACH/);
+  assert.deepEqual(aslept, [250, 500], 'exponential backoff: 250 ms, 500 ms');
+});
+
+test('🔴 an HTTP 5xx is NOT retried — a server error is the service answering', async () => {
+  // The breaker comment pins this: a 5xx is "the service answering", a
+  // different signal from "the service did not answer". Retrying would
+  // compound the outage (the server is overloaded; ask again later).
+  let calls = 0;
+  const { sleep, sleeps: aslept } = recordingSleep();
+  const r = await new ArrClient(
+    {
+      baseUrl: UNREACHABLE_URL,
+      apiKey: 'k',
+      sleep,
+      fetchImpl: async () => {
+        calls += 1;
+        return json({}, 503);
+      },
+    },
+    'movie',
+  ).catalogue('dune');
+  assert.equal(calls, 1, 'an HTTP 5xx is NOT retried');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /http 503/);
+  assert.equal(aslept.length, 0, 'no sleep happens on a non-transport failure');
+});
+
+test('🔴 a transport-failure retry does NOT also re-run the breaker check between attempts', async () => {
+  // The breaker is consulted ONCE per call, OUTSIDE the retry loop. A bug
+  // that put the breaker check inside the loop would make the second attempt
+  // short-circuit on the failure the first attempt just recorded — which
+  // would silently drop the retry budget to one attempt and turn this whole
+  // block into decoration. Pin the structure.
+  let calls = 0;
+  const c = new ArrClient(
+    {
+      baseUrl: UNREACHABLE_URL,
+      apiKey: 'k',
+      sleep: (async (_ms: number) => undefined) as unknown as (ms: number) => Promise<void>,
+      fetchImpl: async () => {
+        calls += 1;
+        throw Object.assign(new Error('connect EHOSTUNREACH'), { code: 'EHOSTUNREACH' });
+      },
+    },
+    'movie',
+  );
+  await c.catalogue('dune');
+  // All three attempts reached fetchImpl, so the breaker did NOT short-circuit
+  // any of them. (If it had, `calls` would be 1 or 2.)
+  assert.equal(calls, 3);
+});
+
+test('🔴 the retry does not change the SECOND call’s cooldown behaviour — issue #99′s "twice in a single turn"', async () => {
+  // The issue reports two `check_status` calls in one turn. The first paid
+  // its retries, recorded a transport failure, and tripped the breaker. The
+  // SECOND call must short-circuit without retrying, because the breaker
+  // already knows the service is down — three more attempts would just stack
+  // latency on top of a known-bad state.
+  const { sleep, sleeps: aslept } = recordingSleep();
+  let calls = 0;
+  const c = new ArrClient(
+    {
+      baseUrl: UNREACHABLE_URL,
+      apiKey: 'k',
+      sleep,
+      fetchImpl: async () => {
+        calls += 1;
+        throw Object.assign(new Error('connect EHOSTUNREACH'), { code: 'EHOSTUNREACH' });
+      },
+    },
+    'movie',
+  );
+  await c.catalogue('dune');
+  assert.equal(calls, 3, 'first call paid its retry budget');
+  assert.deepEqual(aslept, [250, 500]);
+  const beforeSecond = calls;
+  const r = await c.catalogue('dune');
+  assert.equal(calls, beforeSecond, 'second call is short-circuited BEFORE any retry');
+  assert.equal(r.state, 'unknown');
+  if (r.state !== 'unknown') throw new Error('unreachable');
+  assert.match(r.detail, /NOT retrying yet/);
+  // No sleeps recorded by the second call. If a retry happened here, the
+  // breaker would be meaningless.
+  assert.equal(aslept.length, 2);
 });
