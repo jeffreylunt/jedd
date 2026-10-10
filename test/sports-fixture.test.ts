@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LEAGUE_KEYS, fixtureInvolves, matchQuality, teamVariants, type Fixture } from '../src/media/espn.js';
+import { LEAGUE_KEYS, LEAGUES, fixtureInvolves, matchQuality, teamVariants, type Fixture } from '../src/media/espn.js';
 import { discriminatingVariants, kickoffWindow, programmeNamesAllTeams } from '../src/media/guide.js';
 import { qualityOf, rankChannelOptions, type HealthRow } from '../src/media/channel-options.js';
 import type { FetchImpl } from '../src/media/arr.js';
@@ -1449,6 +1449,89 @@ test('every advertised league key is actually callable', async () => {
     // Default 30-day window → 32 per-day calls (fan-out: floor day through
     // ceil day, the Eastern-spill boundary days included).
     assert.equal(s.espnCalls.length, 32);
+  }
+});
+
+/**
+ * 🔴 THE BUG FROM ISSUE #111, MEASURED ON 2026-09-17.
+ *
+ * The reported error was:
+ *   http 400 from https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=20260916-20261018
+ *   (ESPN rejected the "football/nfl" slug)
+ *
+ * The slugs are fine. The misleading 400 message blamed the slug — but ESPN's
+ * site API rejects the `dates=A-B` range form of the URL with HTTP 400 and
+ * only honours a single `YYYYMMDD` per call. Verified live 2026-09-29 and
+ * re-verified 2026-10-09 against `football/nfl` and `soccer/eng.1`:
+ *
+ *     ?dates=20261001-20261003 → 400  (the shape the old code emitted)
+ *     ?dates=20261001          → 200  (the only shape ESPN accepts)
+ *
+ * This test pins BOTH halves of the fix so neither can quietly regress:
+ *
+ *   - the URL must use single-date `?dates=YYYYMMDD` — not the range form
+ *     that the old code emitted and that ESPN answers with HTTP 400,
+ *   - the URL must contain the league's advertised slug — not a different
+ *     sport path that would silently misroute to the wrong competition.
+ *
+ * The test asserts on URL content, not call count, because a stub that
+ * ignores the URL could satisfy a count-only assertion with broken URLs.
+ */
+test('🔴 issue #111: every ESPN URL uses single-date format AND the league slug — no range form, no mistyped slug', async () => {
+  const s = spy({ espn: () => res(espnBody([])) });
+  await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: 'epl' }, ctx());
+  assert.ok(s.espnCalls.length > 0, 'expected per-day fan-out calls');
+  for (const url of s.espnCalls) {
+    assert.match(
+      url,
+      /[?&]dates=\d{8}(?:&|$)/,
+      `URL must use single-date ?dates=YYYYMMDD, got: ${url}`,
+    );
+    assert.doesNotMatch(
+      url,
+      /dates=\d{8}-\d{8}/,
+      `URL must NOT use range form ?dates=A-B (ESPN replies HTTP 400), got: ${url}`,
+    );
+  }
+});
+
+/**
+ * CONTROL for the test above — without this, the URL-format assertion could
+ * be satisfied by always fetching the same league regardless of what the
+ * caller asked for, which would be a silent misroute.
+ *
+ * Hard-coded expected slugs per league, NOT read from LEAGUES[key].path —
+ * otherwise a typo in the enum would mirror through both the URL and the
+ * assertion and the test would silently stay green. The expected slugs are
+ * the live-measured values from the ESPN API as of 2026-10-04.
+ */
+test('CONTROL: every league queries the live-measured ESPN slug — not a typo or a neighbour', async () => {
+  const expected: Record<string, string> = {
+    epl: 'soccer/eng.1',
+    efl_cup: 'soccer/eng.league_cup',
+    fa_cup: 'soccer/eng.fa',
+    ucl: 'soccer/uefa.champions',
+    uel: 'soccer/uefa.europa',
+    uecl: 'soccer/uefa.europa.conf',
+    mls: 'soccer/usa.1',
+    leagues_cup: 'soccer/concacaf.leagues.cup',
+    us_open_cup: 'soccer/usa.open',
+    concacaf_cc: 'soccer/concacaf.champions',
+    nfl: 'football/nfl',
+    nba: 'basketball/nba',
+    mlb: 'baseball/mlb',
+  };
+  for (const key of LEAGUE_KEYS) {
+    const s = spy({ espn: () => res(espnBody([])) });
+    await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: key }, ctx());
+    const want = expected[key];
+    assert.ok(want, `the expected-slug table is missing an entry for ${key}`);
+    for (const url of s.espnCalls) {
+      assert.ok(
+        url.includes(`/sports/${want}/`),
+        `${key} should query the live-measured slug "${want}"; got ${url}`,
+      );
+    }
   }
 });
 
