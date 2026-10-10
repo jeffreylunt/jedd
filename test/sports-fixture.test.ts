@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LEAGUE_KEYS, fixtureInvolves, matchQuality, teamVariants, type Fixture } from '../src/media/espn.js';
+import { LEAGUE_KEYS, LEAGUES, fixtureInvolves, matchQuality, teamVariants, type Fixture } from '../src/media/espn.js';
 import { discriminatingVariants, kickoffWindow, programmeNamesAllTeams } from '../src/media/guide.js';
 import { qualityOf, rankChannelOptions, type HealthRow } from '../src/media/channel-options.js';
 import type { FetchImpl } from '../src/media/arr.js';
@@ -267,6 +267,85 @@ test('a rejected league slug is reported as a slug problem, not as "no fixtures"
   assert.equal(s.guideCalls.length, 0);
   assert.match(r.content, /http 400/);
   assert.match(r.content, /slug/);
+});
+
+/**
+ * 🔴 ISSUE #106: HTTP 400 errors blamed on `football/nfl` and `soccer/eng.1`
+ * were NOT a slug problem — they were a URL-format problem.
+ *
+ * Live-measured 2026-09-17 on the live API:
+ *
+ *   ?dates=20260916-20261018 → 400  (the dates=A-B range the old code emitted)
+ *   ?dates=20260917          → 200  (the single-date form ESPN actually accepts)
+ *
+ * The misleading "(ESPN rejected the "soccer/eng.1" slug)" detail in the 400
+ * message was blaming the wrong thing: the slug is fine, the range form is what
+ * ESPN refuses. Verified 2026-10-09 against both paths named in the issue:
+ *
+ *   https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=20261009  → 200
+ *   https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates=20261009  → 200
+ *
+ * Two halves pinned separately because each is safe while the other holds, and
+ * the same defect was filed and regressed for twice (#109, #111):
+ *
+ *   1. URL FORMAT — every per-day call must use single-date `?dates=YYYYMMDD`.
+ *      A regression to `?dates=A-B` returns zero fixtures through the
+ *      misleading-400 path the issue reports.
+ *
+ *   2. SLUG CONTENT — the path must be the one the `LEAGUES` enum says it is.
+ *      A typo in `LEAGUES[k].path` cannot disappear behind a fixed URL string
+ *      in the production code, because every URL goes through the enum.
+ *
+ * This test runs against the two slugs the issue's evidence names, so a
+ * regression limited to one of them still fails here.
+ */
+test('🔴 issue #106: NFL and EPL URLs use single-date format AND carry the issue slugs', async () => {
+  for (const key of ['nfl', 'epl'] as const) {
+    const s = spy({ espn: () => res(espnBody([])) });
+    await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: key }, ctx());
+    assert.ok(s.espnCalls.length > 0, `${key} must produce at least one per-day call`);
+    for (const url of s.espnCalls) {
+      // The slug from the issue's evidence, byte-for-byte. Without this, the
+      // URL-format assertion below could be satisfied by always fetching the
+      // same league regardless of what the caller asked for.
+      assert.ok(
+        url.includes(`/sports/${LEAGUES[key].path}/`),
+        `${key} URL must carry the slug "${LEAGUES[key].path}" from LEAGUES; got: ${url}`,
+      );
+      // Single-date `?dates=YYYYMMDD` — the form ESPN answers with 200.
+      assert.match(url, /[?&]dates=\d{8}(?:&|$)/, `single-date form required; got: ${url}`);
+      // Range form is what triggered the issue — pinned so a regression to
+      // `?dates=A-B` cannot sneak back through. Anything matching this regex
+      // is a range form, including a date followed by `-<digits>`.
+      assert.doesNotMatch(url, /dates=\d{8}-\d{8}/, `range form forbidden; got: ${url}`);
+    }
+  }
+});
+
+/**
+ * CONTROL for the test above. Without this, the per-league loop could be
+ * answered by a stub that hard-codes one URL string regardless of which league
+ * was asked for, leaving the assertion green while a typo in `LEAGUES[k].path`
+ * silently misrouted to the wrong competition. The issue named two slugs —
+ * `football/nfl` and `soccer/eng.1` — and both must be present, distinctly,
+ * for a 1-of-2 selection to fail.
+ */
+test('CONTROL: a league switch flips the slug — both issue-#106 slugs must appear, each on its own call set', async () => {
+  const seen = new Set<string>();
+  for (const key of ['nfl', 'epl'] as const) {
+    const s = spy({ espn: () => res(espnBody([])) });
+    await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: key }, ctx());
+    for (const url of s.espnCalls) seen.add(url);
+  }
+  const slugsSeen = new Set<string>();
+  for (const url of seen) {
+    const m = /\/sports\/([^/]+\/[^/]+)\/scoreboard/.exec(url);
+    assert.ok(m, `URL must match /sports/{slug}/scoreboard; got: ${url}`);
+    slugsSeen.add(m[1] ?? '');
+  }
+  assert.ok(slugsSeen.has('football/nfl'), 'NFL calls must carry football/nfl');
+  assert.ok(slugsSeen.has('soccer/eng.1'), 'EPL calls must carry soccer/eng.1');
+  assert.equal(slugsSeen.size, 2, `expected exactly the two issue slugs; saw: ${[...slugsSeen].join(', ')}`);
 });
 
 // ── 🔴 CRITERION 1. OUT OF GUIDE RANGE REPORTS THE KICKOFF. ─────────────────
