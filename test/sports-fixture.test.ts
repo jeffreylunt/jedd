@@ -1498,19 +1498,38 @@ test('🔴 issue #111: every ESPN URL uses single-date format AND the league slu
 /**
  * CONTROL for the test above — without this, the URL-format assertion could
  * be satisfied by always fetching the same league regardless of what the
- * caller asked for, which would be a silent misroute. Verify the slug
- * advertised in the tool's enum is the one that actually gets queried, so a
- * typo in `LEAGUES[k].path` cannot disappear behind a fixed URL.
+ * caller asked for, which would be a silent misroute.
+ *
+ * Hard-coded expected slugs per league, NOT read from LEAGUES[key].path —
+ * otherwise a typo in the enum would mirror through both the URL and the
+ * assertion and the test would silently stay green. The expected slugs are
+ * the live-measured values from the ESPN API as of 2026-10-04.
  */
-test('CONTROL: the URL path carries the league slug the enum advertises, for every league', async () => {
+test('CONTROL: every league queries the live-measured ESPN slug — not a typo or a neighbour', async () => {
+  const expected: Record<string, string> = {
+    epl: 'soccer/eng.1',
+    efl_cup: 'soccer/eng.league_cup',
+    fa_cup: 'soccer/eng.fa',
+    ucl: 'soccer/uefa.champions',
+    uel: 'soccer/uefa.europa',
+    uecl: 'soccer/uefa.europa.conf',
+    mls: 'soccer/usa.1',
+    leagues_cup: 'soccer/concacaf.leagues.cup',
+    us_open_cup: 'soccer/usa.open',
+    concacaf_cc: 'soccer/concacaf.champions',
+    nfl: 'football/nfl',
+    nba: 'basketball/nba',
+    mlb: 'baseball/mlb',
+  };
   for (const key of LEAGUE_KEYS) {
     const s = spy({ espn: () => res(espnBody([])) });
     await makeSportsFixture(s.fetchImpl, () => NOW).run({ league: key }, ctx());
-    const path = LEAGUES[key].path;
+    const want = expected[key];
+    assert.ok(want, `the expected-slug table is missing an entry for ${key}`);
     for (const url of s.espnCalls) {
       assert.ok(
-        url.includes(`/sports/${path}/`),
-        `${key} should query its advertised slug "${path}"; got ${url}`,
+        url.includes(`/sports/${want}/`),
+        `${key} should query the live-measured slug "${want}"; got ${url}`,
       );
     }
   }
